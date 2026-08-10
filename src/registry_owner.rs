@@ -304,7 +304,7 @@ pub enum DeadPeerReleaseOutcome {
     /// Ownership was retracted at this commit.
     Released(CommitSeq),
     /// Refused: `addr` has direct or ordinary liveness evidence causally
-    /// AFTER the failure this reap is acting on (`claim_committed_at` or
+    /// AT OR AFTER the failure this reap is acting on (`claim_committed_at` or
     /// `liveness_evidence_at`) -- this peer has been proven alive. Callers
     /// must treat this exactly like a live peer: no destructive cleanup
     /// of ANY kind for this candidate, not just ownership. Also the
@@ -698,7 +698,7 @@ enum OwnerCommand {
     /// Refused entirely (no receipts touched, no ownership cleared) if
     /// `addr` has DIRECT evidence of a live owner -- the owner's OWN
     /// `claim_committed_at` record, not any liveness snapshot the caller
-    /// took -- that is causally NEWER than `evidence_before`: the instant,
+    /// took -- that is causally AT OR AFTER `evidence_before`: the instant,
     /// on this same process's monotonic clock, that the failure evidence
     /// the caller's selection is acting on was itself recorded. This is a
     /// causal fence, not a temporal one -- "did direct evidence of life
@@ -730,7 +730,7 @@ enum OwnerCommand {
     /// A PURE READ, answering exactly the same causal-fence question
     /// `ReleaseDeadPeer` checks FIRST -- does `addr` have direct evidence
     /// of life (`claim_committed_at`) or ordinary liveness
-    /// (`liveness_evidence_at`) causally NEWER than `evidence_before` --
+    /// (`liveness_evidence_at`) causally AT OR AFTER `evidence_before` --
     /// but with NONE of that command's side effects: no
     /// `connection_scoped_claims` purge, no ownership retraction. This
     /// shape exists separately so `reap_reserved_candidates` can obtain the
@@ -837,7 +837,7 @@ enum OwnerCommand {
     },
     /// Atomically check the causal fence `ReleaseDeadPeer` also checks
     /// (does `addr` have DIRECT evidence of a live owner -- a
-    /// connection-scoped claim -- causally NEWER than `evidence_before`,
+    /// connection-scoped claim -- causally AT OR AFTER `evidence_before`,
     /// the failure this candidate was selected on?) AND revalidate the
     /// FULL identity the caller's selection observed for `addr` --
     /// ownership (peer id + generation) and operator pin state -- against
@@ -1258,7 +1258,7 @@ impl RegistryOwnerHandle {
     /// connection-scoped receipt recorded for it under any session, and the
     /// address ownership itself if `peer_id` still holds it and `addr` is not
     /// operator-pinned -- but ONLY if `addr` has no direct OR ordinary
-    /// liveness evidence causally newer than `evidence_before`; otherwise a
+    /// liveness evidence causally at or after `evidence_before`; otherwise a
     /// no-op. See `OwnerCommand::ReleaseDeadPeer` and
     /// `DeadPeerReleaseOutcome`.
     pub async fn release_dead_peer(
@@ -2433,7 +2433,7 @@ impl PeerRegistryOwner {
 
     /// `OwnerCommand::HasNewerLivenessEvidence`'s handler: the SAME causal
     /// fence `release_dead_peer` checks first (`claim_committed_at` OR
-    /// `liveness_evidence_at` causally newer than `evidence_before`), as a
+    /// `liveness_evidence_at` causally at or after `evidence_before`), as a
     /// PURE READ -- `&self`, not `&mut self`, and no mutation of any kind.
     /// See that command's own doc comment for why this exists separately
     /// from `release_dead_peer` rather than the caller trying to infer the
@@ -2441,14 +2441,18 @@ impl PeerRegistryOwner {
     /// `reap_reserved_candidates` decide whether a candidate is worth
     /// destroying at all WITHOUT that decision itself performing the
     /// first destructive step.
-    fn has_newer_liveness_evidence(&self, addr: SocketAddr, evidence_before: std::time::Instant) -> bool {
+    fn has_newer_liveness_evidence(
+        &self,
+        addr: SocketAddr,
+        evidence_before: std::time::Instant,
+    ) -> bool {
         self.claim_committed_at
             .get(&addr)
-            .is_some_and(|committed_at| *committed_at > evidence_before)
+            .is_some_and(|committed_at| *committed_at >= evidence_before)
             || self
                 .liveness_evidence_at
                 .get(&addr)
-                .is_some_and(|seen_at| *seen_at > evidence_before)
+                .is_some_and(|seen_at| *seen_at >= evidence_before)
     }
 
     /// `OwnerCommand::ReapBaselineActivityDetected`'s handler -- see that
@@ -2501,7 +2505,7 @@ impl PeerRegistryOwner {
     /// `claim_committed_at` -- owner-internal, exclusively owner-written
     /// state -- rather than against anything the caller observed or against
     /// elapsed wall-clock time. It answers "did this address get direct
-    /// evidence of a live owner AFTER the failure evidence this reap is
+    /// evidence of a live owner AT OR AFTER the failure evidence this reap is
     /// acting on was itself recorded", not "how long ago was the last
     /// commit" and not "does the generation still match what the caller
     /// saw". Both of those alternatives are temporal/snapshot LEASES: each
@@ -2522,7 +2526,10 @@ impl PeerRegistryOwner {
     /// the failure invalidates the reap permanently -- it cannot expire by
     /// waiting -- and a claim causally before it (or no direct evidence at
     /// all) never protects the address, no matter how promptly the sweep
-    /// reaches this command.
+    /// reaches this command. Equality is deliberately treated as protected:
+    /// consecutive `Instant` observations may be indistinguishable on a
+    /// coarse monotonic clock, and an equal timestamp cannot prove that the
+    /// peer was not live when the failure evidence was recorded.
     ///
     /// `claim_committed_at` alone only ever advances on a NEW claim/session
     /// event -- it says nothing about ongoing traffic on a connection
@@ -2547,12 +2554,12 @@ impl PeerRegistryOwner {
         if self
             .claim_committed_at
             .get(&addr)
-            .is_some_and(|committed_at| *committed_at > evidence_before)
+            .is_some_and(|committed_at| *committed_at >= evidence_before)
         {
             trace!(
                 addr = %addr,
                 peer = %peer_id,
-                "dead-peer release refused: address has direct evidence of life after the \
+                "dead-peer release refused: address has direct evidence of life at or after the \
                  failure this reap is acting on"
             );
             return DeadPeerReleaseOutcome::ProvenAlive;
@@ -2560,13 +2567,13 @@ impl PeerRegistryOwner {
         if self
             .liveness_evidence_at
             .get(&addr)
-            .is_some_and(|seen_at| *seen_at > evidence_before)
+            .is_some_and(|seen_at| *seen_at >= evidence_before)
         {
             trace!(
                 addr = %addr,
                 peer = %peer_id,
                 "dead-peer release refused: address has ordinary liveness evidence (a response \
-                 on an already-claimed connection) after the failure this reap is acting on"
+                 on an already-claimed connection) at or after the failure this reap is acting on"
             );
             return DeadPeerReleaseOutcome::ProvenAlive;
         }
@@ -2625,11 +2632,11 @@ impl PeerRegistryOwner {
         if self
             .claim_committed_at
             .get(&addr)
-            .is_some_and(|committed_at| *committed_at > evidence_before)
+            .is_some_and(|committed_at| *committed_at >= evidence_before)
         {
             trace!(
                 addr = %addr,
-                "reap reservation refused: address has direct evidence of life after the \
+                "reap reservation refused: address has direct evidence of life at or after the \
                  failure this reap is acting on"
             );
             return None;
@@ -4006,6 +4013,41 @@ mod tests {
              own serialization -- a check-then-act gap here would have let this retract a \
              peer that had already proven itself alive"
         );
+    }
+
+    /// Consecutive monotonic-clock observations can be equal. Treat an
+    /// ordinary liveness marker at exactly the reap's evidence fence as
+    /// protected; strict `>` would release a peer whose authenticated traffic
+    /// is indistinguishable from the failure observation on that clock.
+    #[tokio::test]
+    async fn equal_liveness_timestamp_fails_closed_for_dead_peer_release() {
+        let (owner, _publisher) = owner_handle();
+        let node = peer("equal-liveness-fence");
+        let target = addr(30_047);
+        let session = addr(30_048);
+
+        assert!(
+            owner
+                .claim_connection_scoped(
+                    target,
+                    claim_of(node.clone(), ClaimKind::Verified),
+                    session,
+                )
+                .await
+                .is_accepted()
+        );
+
+        let evidence_before = std::time::Instant::now();
+        owner.note_liveness_evidence(target, evidence_before).await;
+
+        assert_eq!(
+            owner
+                .release_dead_peer(node.clone(), target, evidence_before)
+                .await,
+            DeadPeerReleaseOutcome::ProvenAlive,
+            "equal monotonic timestamps must fail closed rather than purge a peer"
+        );
+        assert_eq!(owner.routes_to(&target), Some(node));
     }
 
     /// Address re-resolution moves ownership rather than stranding it.

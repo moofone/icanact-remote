@@ -4859,7 +4859,7 @@ pub(crate) fn handle_incoming_message(
                     )
                     .await;
 
-                if from_current_session {
+                let admitted_current_session = if from_current_session {
                     let mut gossip_state = registry.gossip_state.lock().await;
                     // Same guard, same check: peer/session bookkeeping is
                     // address-keyed and must not be applied on behalf of a
@@ -4909,6 +4909,20 @@ pub(crate) fn handle_incoming_message(
                     if admitted {
                         gossip_state.full_sync_exchanges += 1;
                     }
+                    admitted
+                } else {
+                    false
+                };
+
+                if admitted_current_session {
+                    registry
+                        .mark_authenticated_inbound_liveness(
+                            sender_socket_addr,
+                            &sender_peer_id,
+                            session_source,
+                            crate::current_timestamp_millis(),
+                        )
+                        .await;
                 }
 
                 // Send back our state as a response so the sender can receive our actors
@@ -5096,10 +5110,39 @@ pub(crate) fn handle_incoming_message(
                 sequence: _,
                 wall_clock_time: _,
             } => {
+                let Some(authenticated_sender_peer_id) = authenticated_peer_id.as_ref() else {
+                    warn!(
+                        tcp_source = %_peer_addr,
+                        claimed_sender = %sender_peer_id,
+                        "Ignoring FullSyncRequest without an authenticated transport identity"
+                    );
+                    return Ok(());
+                };
+                if authenticated_sender_peer_id != &sender_peer_id {
+                    warn!(
+                        tcp_source = %_peer_addr,
+                        authenticated_sender = %authenticated_sender_peer_id,
+                        claimed_sender = %sender_peer_id,
+                        "Ignoring FullSyncRequest whose claimed sender does not match the authenticated transport"
+                    );
+                    return Ok(());
+                }
+
                 debug!(
                     sender = %sender_peer_id,
                     "received full sync request on bidirectional connection"
                 );
+
+                let sender_socket_addr =
+                    resolve_peer_state_addr(&registry, Some(&sender_peer_id), _peer_addr).await;
+                registry
+                    .mark_authenticated_inbound_liveness(
+                        sender_socket_addr,
+                        &sender_peer_id,
+                        session_source,
+                        crate::current_timestamp_millis(),
+                    )
+                    .await;
 
                 {
                     let mut gossip_state = registry.gossip_state.lock().await;
@@ -5153,6 +5196,15 @@ pub(crate) fn handle_incoming_message(
                     );
                     return Ok(());
                 }
+
+                registry
+                    .mark_authenticated_inbound_liveness(
+                        sender_socket_addr,
+                        &delta.sender_peer_id,
+                        session_source,
+                        crate::current_timestamp_millis(),
+                    )
+                    .await;
 
                 // Same §1.6 trust anchor as the DeltaGossip branch above:
                 // responses also carry actor additions, and repair must use
@@ -5354,6 +5406,18 @@ pub(crate) fn handle_incoming_message(
                 if from_current_session {
                     gossip_state.full_sync_exchanges += 1;
                 }
+
+                drop(gossip_state);
+                if from_current_session {
+                    registry
+                        .mark_authenticated_inbound_liveness(
+                            sender_socket_addr,
+                            &sender_peer_id,
+                            session_source,
+                            crate::current_timestamp_millis(),
+                        )
+                        .await;
+                }
                 Ok(())
             }
             RegistryMessage::PeerListGossip {
@@ -5365,6 +5429,13 @@ pub(crate) fn handle_incoming_message(
                 // logs/merge cannot be misattributed to another peer.
                 sender_addr: _wire_sender_addr,
             } => {
+                let Some(authenticated_sender_peer_id) = authenticated_peer_id.as_ref() else {
+                    warn!(
+                        tcp_source = %_peer_addr,
+                        "Ignoring PeerListGossip without an authenticated transport identity"
+                    );
+                    return Ok(());
+                };
                 let peer_state_addr = resolve_peer_state_addr(&registry, None, _peer_addr).await;
                 let authenticated_sender = peer_state_addr.to_string();
                 debug!(
@@ -5387,6 +5458,22 @@ pub(crate) fn handle_incoming_message(
                     debug!(
                         peer = %peer_state_addr,
                         "ignoring peer list gossip from peer without capability"
+                    );
+                    return Ok(());
+                }
+
+                if !registry
+                    .mark_authenticated_inbound_liveness(
+                        peer_state_addr,
+                        authenticated_sender_peer_id,
+                        session_source,
+                        crate::current_timestamp_millis(),
+                    )
+                    .await
+                {
+                    debug!(
+                        peer = %peer_state_addr,
+                        "ignoring peer list gossip from a superseded authenticated session"
                     );
                     return Ok(());
                 }

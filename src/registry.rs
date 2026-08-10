@@ -7537,6 +7537,52 @@ impl<T: 'static> GossipRegistry<T> {
         }
     }
 
+    /// Record direct liveness from an authenticated inbound message on the
+    /// connection's current session. A stale, superseded connection must not
+    /// clear transport failures or refresh the owner fence for its successor;
+    /// the session check and the peer-state update therefore happen under one
+    /// `gossip_state` lock before the owner marker is enqueued.
+    pub(crate) async fn mark_authenticated_inbound_liveness(
+        &self,
+        peer_addr: SocketAddr,
+        peer_id: &crate::PeerId,
+        session_source: SocketAddr,
+        now: u64,
+    ) -> bool {
+        let accepted = {
+            let mut gossip_state = self.gossip_state.lock().await;
+            match gossip_state.peers.get_mut(&peer_addr) {
+                None => true,
+                Some(peer_info) => {
+                    if !self.peer_info_is_from_current_session(
+                        peer_id,
+                        peer_info,
+                        Some(session_source),
+                    ) {
+                        false
+                    } else {
+                        peer_info.last_response_received_ms =
+                            peer_info.last_response_received_ms.max(now);
+                        peer_info.last_success = peer_info.last_success.max(current_timestamp());
+                        if peer_info.failures > 0 {
+                            peer_info.failures = 0;
+                            peer_info.last_failure_time = None;
+                            peer_info.last_failure_instant = None;
+                        }
+                        true
+                    }
+                }
+            }
+        };
+
+        if accepted {
+            self.registry_owner
+                .note_liveness_evidence(peer_addr, std::time::Instant::now())
+                .await;
+        }
+        accepted
+    }
+
     /// Handle gossip response with vector clock updates
     pub async fn handle_gossip_response(
         &self,
@@ -11659,6 +11705,51 @@ mod tests {
 
     fn test_config() -> GossipConfig {
         test_config_with_seed("registry_tests")
+    }
+
+    #[tokio::test]
+    async fn authenticated_inbound_liveness_refreshes_owner_and_failure_state() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_120), test_config());
+        let peer_addr = test_addr(20_121);
+        let peer_id = test_peer_id("authenticated-inbound-liveness");
+
+        {
+            let mut state = registry.gossip_state.lock().await;
+            let mut peer = PeerInfo::local(peer_addr);
+            peer.node_id = Some(peer_id.to_node_id());
+            peer.failures = 3;
+            peer.last_response_received_ms = 1;
+            state.peers.insert(peer_addr, peer);
+        }
+
+        let evidence_before = std::time::Instant::now();
+        assert!(
+            registry
+                .mark_authenticated_inbound_liveness(
+                    peer_addr,
+                    &peer_id,
+                    peer_addr,
+                    crate::current_timestamp_millis(),
+                )
+                .await
+        );
+
+        let state = registry.gossip_state.lock().await;
+        let peer = state
+            .peers
+            .get(&peer_addr)
+            .expect("the liveness fixture must remain present");
+        assert_eq!(peer.failures, 0);
+        assert!(peer.last_response_received_ms > 1);
+        drop(state);
+
+        assert!(
+            registry
+                .registry_owner
+                .has_newer_liveness_evidence(peer_addr, evidence_before)
+                .await,
+            "authenticated inbound liveness must reach the owner fence used by dead-peer reaping"
+        );
     }
 
     fn clock_caps() -> crate::handshake::PeerCapabilities {
