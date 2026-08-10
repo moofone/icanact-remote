@@ -113,6 +113,17 @@ fn stable_concurrent_location_wins(
     candidate.local_registration_time > existing.local_registration_time
 }
 
+/// Return whether two actor advertisements are the same location, rather
+/// than merely the same owner and vector-clock version.  The liveness side
+/// table is only a receipt for an unchanged owner advertisement; accepting a
+/// different address, incarnation, priority, registration, or metadata here
+/// would keep an older location alive after a replacement was rejected by the
+/// equal-clock tie-breaker.
+#[inline]
+fn same_actor_location(candidate: &RemoteActorLocation, existing: &RemoteActorLocation) -> bool {
+    candidate == existing
+}
+
 #[inline]
 fn stable_concurrent_removal_wins(
     removing_node_id: &crate::GossipNodeId,
@@ -7082,7 +7093,7 @@ impl<T: 'static> GossipRegistry<T> {
                 .actor_state
                 .known_actors
                 .read_sync(name, |_, existing| {
-                    location.peer_id == existing.peer_id
+                    same_actor_location(location, existing)
                         && *sender_peer_id == existing.peer_id
                         && matches!(
                             location.vector_clock.compare(&existing.vector_clock),
@@ -7136,7 +7147,7 @@ impl<T: 'static> GossipRegistry<T> {
             .actor_state
             .known_actors
             .read_sync(name, |_, existing| {
-                location.peer_id == existing.peer_id
+                same_actor_location(location, existing)
                     && *sender_peer_id == existing.peer_id
                     && matches!(
                         location.vector_clock.compare(&existing.vector_clock),
@@ -13084,6 +13095,84 @@ mod tests {
             "an unchanged re-advertisement via incremental delta gossip must also refresh the \
              actor's EFFECTIVE freshness (got {effective_wall_clock_time}, \
              wanted >= {before_reannounce})"
+        );
+    }
+
+    /// An equal-clock owner advertisement with a different location is not
+    /// live confirmation.  The deterministic equal-clock tie-break can
+    /// reject a changed address/priority, but that rejected replacement must
+    /// not keep the old location fresh indefinitely.
+    #[tokio::test]
+    async fn apply_delta_from_changed_equal_clock_location_does_not_refresh_liveness() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7430),
+            test_config_with_seed("wall-clock-refresh-changed-location"),
+        );
+        let owner =
+            KeyPair::new_for_testing("wall-clock-refresh-changed-location-owner").peer_id();
+        let actor_name = "wall-clock-refresh-changed-location/service";
+
+        let mut location = RemoteActorLocation::new_with_peer(test_addr(9416), owner.clone());
+        location.wall_clock_time = current_timestamp().saturating_sub(1_000_000);
+        let first_change = RegistryChange::ActorAdded {
+            name: actor_name.to_string(),
+            location: location.clone(),
+            priority: RegistrationPriority::Normal,
+        };
+        reg.apply_delta_from(
+            RegistryDelta {
+                since_sequence: 0,
+                current_sequence: 1,
+                changes: vec![first_change],
+                sender_peer_id: owner.clone(),
+                wall_clock_time: current_timestamp(),
+                precise_timing_nanos: 0,
+            },
+            None,
+            None,
+            Some(&owner),
+        )
+        .await
+        .unwrap();
+
+        // Keep the vector clock and wall-clock tie-break fields equal, but
+        // change two location fields.  The lower address loses the stable
+        // equal-clock tie-break, so this exercises the liveness-refresh
+        // branch rather than a normal upsert.
+        let mut changed_location = location.clone();
+        changed_location.address = "127.0.0.1:1".to_string();
+        changed_location.priority = RegistrationPriority::Immediate;
+        reg.apply_delta_from(
+            RegistryDelta {
+                since_sequence: 1,
+                current_sequence: 2,
+                changes: vec![RegistryChange::ActorAdded {
+                    name: actor_name.to_string(),
+                    location: changed_location,
+                    priority: RegistrationPriority::Normal,
+                }],
+                sender_peer_id: owner.clone(),
+                wall_clock_time: current_timestamp(),
+                precise_timing_nanos: 0,
+            },
+            None,
+            None,
+            Some(&owner),
+        )
+        .await
+        .unwrap();
+
+        let effective = reg.effective_actor_wall_clock_time(actor_name, &location);
+        assert_eq!(
+            effective, location.wall_clock_time,
+            "a changed equal-clock location rejected by the tie-break must not refresh the old \
+             location's liveness"
+        );
+        assert!(
+            !reg.actor_state
+                .reannouncement_liveness
+                .contains_sync(actor_name),
+            "the changed location must not create an owner-issued lease for the old record"
         );
     }
 

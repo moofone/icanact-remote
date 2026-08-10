@@ -2549,13 +2549,20 @@ impl<T> ConnectionPool<T> {
         // `candidate.abort_tasks()` from also cancelling every in-flight ask
         // on that live, restored connection. Only cancel the shared tracker
         // when `existing` does not depend on it.
-        let mut keep_correlation = false;
+        //
+        // Compute this independently of `removed`: a concurrent publisher
+        // can replace/reindex `addr` before the identity-scoped removal, so
+        // the removal may lose even while the live sibling still shares the
+        // session tracker. Basing this only on the successful-removal branch
+        // would cancel that sibling's in-flight asks.
+        let keep_correlation = existing_before.is_some_and(|existing| {
+            existing.has_live_stream() && candidate.shares_correlation_tracker(existing)
+        });
         if removed {
             match existing_before {
                 Some(existing) if existing.addr == addr && existing.has_live_stream() => {
                     let _ = self.connections_by_addr.upsert_sync(addr, existing.clone());
                     let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
-                    keep_correlation = candidate.shares_correlation_tracker(existing);
                 }
                 _ => {
                     let _ = self.addr_to_peer_id.remove_sync(&addr);
@@ -2568,9 +2575,6 @@ impl<T> ConnectionPool<T> {
                     // `get_or_create_correlation_tracker(peer_id)`).
                     // Discarding this slot must not silently cancel that
                     // still-live sibling's in-flight asks.
-                    keep_correlation = existing_before.is_some_and(|existing| {
-                        existing.has_live_stream() && candidate.shares_correlation_tracker(existing)
-                    });
                 }
             }
         }
