@@ -522,9 +522,18 @@ impl<T> RemoteActorRef<T> {
     /// correct no matter how the pool's index happens to be ordered at the
     /// moment of the call.
     fn is_unhealed_candidate(candidate: &RemoteConnection, failed: &Arc<RemoteConnection>) -> bool {
-        candidate.is_closed()
-            || (candidate.instance_id().is_some()
-                && candidate.instance_id() == failed.instance_id())
+        if candidate.is_closed() {
+            return true;
+        }
+
+        match (candidate.instance_id(), failed.instance_id()) {
+            (Some(candidate_id), Some(failed_id)) => candidate_id == failed_id,
+            // A handle without a stream instance cannot be a usable replacement. Treat a
+            // same-address no-instance candidate as the same unhealed session rather than
+            // installing a handle that can only fail with NotConnected on the next call.
+            (None, None) => candidate.addr == failed.addr,
+            _ => false,
+        }
     }
 
     /// Dial (or reuse) a connection to `peer_id`, respecting `deadline` when
@@ -575,14 +584,25 @@ impl<T> RemoteActorRef<T> {
         if !Self::is_unhealed_candidate(&candidate, failed) {
             return Ok(Arc::new(candidate));
         }
-        if let Some(instance_id) = failed.instance_id() {
+        // Evict the candidate that was actually rejected. It may be a different closed
+        // instance from `failed`; removing `failed` here leaves that candidate indexed and lets
+        // the next pool lookup return the same dead handle again.
+        if let Some(instance_id) = candidate.instance_id() {
             registry
                 .connection_pool
-                .remove_connection_instance_for_peer(peer_id, failed.addr, instance_id);
+                .remove_connection_instance_for_peer(peer_id, candidate.addr, instance_id);
         }
         let redial = RemoteConnection::from_handle(
             Self::dial_connection_to_peer(registry, peer_id, deadline).await?,
         );
+        if Self::is_unhealed_candidate(&redial, failed) {
+            if let Some(instance_id) = redial.instance_id() {
+                registry
+                    .connection_pool
+                    .remove_connection_instance_for_peer(peer_id, redial.addr, instance_id);
+            }
+            return Err(crate::GossipError::ConnectionClosed(redial.addr));
+        }
         Ok(Arc::new(redial))
     }
 
@@ -621,6 +641,15 @@ impl<T> RemoteActorRef<T> {
         }
 
         let peer_id = self.location.peer_id.clone();
+        // Retire the exact failed instance before asking the pool for a replacement. The pool's
+        // get-or-create path may still have that session indexed briefly after the transport
+        // reports its error; resolving first can return the same dead instance and make the CAS
+        // below appear to heal while changing nothing underneath.
+        if let Some(instance_id) = failed.instance_id() {
+            registry
+                .connection_pool
+                .remove_connection_instance_for_peer(&peer_id, failed.addr, instance_id);
+        }
         let fresh = Self::dial_replacement(&registry, &peer_id, failed, None).await?;
 
         Ok(
@@ -676,7 +705,7 @@ impl<T> RemoteActorRef<T> {
         let connection = connection.map(RemoteConnection::from_handle);
         Self {
             location,
-            connection: Arc::new(ArcSwapOption::from_pointee(connection)),
+            connection: Arc::new(ArcSwapOption::from(connection.map(Arc::new))),
             registry: Arc::downgrade(&registry), // Weak reference - prevents cycle
             _marker: PhantomData,
         }
@@ -904,7 +933,7 @@ impl<T> RemoteActorRef<T> {
                     Ok(None) => Err(crate::GossipError::Timeout),
                     Err(repair_err) => {
                         tracing::debug!(error = ?repair_err, "failed to repair cached connection after timed-out ask");
-                        Err(crate::GossipError::Timeout)
+                        Err(repair_err)
                     }
                 }
             }
@@ -1164,8 +1193,26 @@ impl<T> std::fmt::Debug for RemoteActorRef<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::registry::{ActorMessageFuture, ActorMessageHandler};
     use crate::{GossipConfig, GossipRegistryHandle, KeyPair};
-    use tokio::time::{Duration, sleep};
+    use tokio::time::{sleep, Duration};
+
+    struct NeverRespondsHandler;
+
+    impl ActorMessageHandler for NeverRespondsHandler {
+        fn handle_actor_message(
+            &self,
+            _actor_id: u64,
+            _type_hash: u32,
+            _payload: crate::AlignedBytes,
+            _correlation_id: Option<u32>,
+        ) -> ActorMessageFuture<'_> {
+            Box::pin(async move {
+                sleep(Duration::from_secs(30)).await;
+                Ok(None)
+            })
+        }
+    }
 
     /// `add_peer`/`connect` dial in one fixed direction; order the pair so
     /// the lower `NodeId` always dials out, matching every other two-node
@@ -1253,6 +1300,85 @@ mod tests {
             current.instance_id(),
             "reheal must not accept the same instance that was passed in as failed, even when \
              the pool's own get-or-create still has it indexed"
+        );
+
+        handle_a.shutdown().await;
+        handle_b.shutdown().await;
+    }
+
+    /// A timeout-recovery failure is a distinct caller-visible outcome from the original ask
+    /// timing out. In particular, a registry that is already shutting down must not be reported
+    /// as a peer timeout: callers use `Shutdown` to stop issuing work and `Timeout` to consider a
+    /// bounded retry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn timeout_recovery_propagates_registry_shutdown() {
+        let addr_a: SocketAddr = "127.0.0.1:28493".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:28494".parse().unwrap();
+        let (key_pair_a, key_pair_b) = ordered_pair("timeout_shutdown_a", "timeout_shutdown_b");
+        let peer_id_b = key_pair_b.peer_id();
+        let config = GossipConfig {
+            gossip_interval: Duration::from_secs(300),
+            peer_supervisor_interval: Duration::from_secs(300),
+            connection_recovery: crate::ConnectionRecoveryPolicy {
+                evict_peer_on_ask_timeout: true,
+                evict_peer_on_ask_cancel: false,
+                retry_actor_ask_once_after_timeout: false,
+                consecutive_timeout_threshold: 0,
+            },
+            ..Default::default()
+        };
+
+        let handle_a = GossipRegistryHandle::new_with_transport_stack(
+            addr_a,
+            key_pair_a.to_secret_key(),
+            Some(config.clone()),
+            crate::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(
+            addr_b,
+            key_pair_b.to_secret_key(),
+            Some(config),
+            crate::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
+        handle_b
+            .registry
+            .set_actor_message_handler(Arc::new(NeverRespondsHandler))
+            .await;
+
+        handle_a
+            .add_peer(&peer_id_b)
+            .await
+            .connect(&addr_b)
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(300)).await;
+        let remote_actor = handle_a
+            .lookup_peer(&peer_id_b)
+            .await
+            .expect("lookup should succeed");
+
+        // Keep the cached connection alive long enough for the first ask to time out, then make
+        // the recovery boundary observe shutdown. The old implementation converted this precise
+        // `Shutdown` into `Timeout`.
+        handle_a
+            .registry
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        let result = remote_actor
+            .ask_actor_frame(
+                0x5E1F_4EA1,
+                0xC0DE_CAFE,
+                bytes::Bytes::from_static(b"shutdown"),
+                Duration::from_millis(50),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(crate::GossipError::Shutdown)),
+            "timeout recovery must preserve Shutdown, got {result:?}"
         );
 
         handle_a.shutdown().await;
