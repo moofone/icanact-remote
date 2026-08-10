@@ -353,24 +353,17 @@ impl RemoteConnection {
 pub struct RemoteActorRef<T = ()> {
     /// The actor location information
     pub location: RemoteActorLocation,
-    /// Cached connection handle - set during `lookup()`, used for direct
-    /// zero-lookup sending. Lock-free swappable slot: a transport-level
-    /// failure or actor-ask timeout can atomically replace the contents
-    /// with a freshly re-resolved connection (see the "Self-Healing
-    /// Reconnection" section above), and every clone of this ref shares the
-    /// same `Arc<ArcSwapOption<..>>` slot so the heal is visible everywhere.
-    /// `None` for actors that aren't listening yet (established lazily on
-    /// first use).
-    ///
-    /// Exposed directly only under test/debug builds, matching the
-    /// visibility the plain-`Option` field had before this slot became
-    /// swappable: release callers go through `connection_ref()` so the
-    /// self-healing CAS protocol above stays the only way this slot is
-    /// ever mutated.
+    /// Initial cached connection snapshot retained for source compatibility
+    /// with the former public debug/test field. Use [`Self::connection_ref`]
+    /// for the live self-healing connection; this snapshot is not updated by
+    /// later repairs.
     #[cfg(any(test, feature = "test-helpers", debug_assertions))]
-    pub connection: Arc<ArcSwapOption<RemoteConnection>>,
+    pub connection: Option<RemoteConnection>,
     #[cfg(not(any(test, feature = "test-helpers", debug_assertions)))]
-    connection: Arc<ArcSwapOption<RemoteConnection>>,
+    connection: Option<RemoteConnection>,
+    /// Lock-free live slot shared by every clone of this ref. A transport
+    /// failure or actor-ask timeout replaces this slot atomically.
+    connection_slot: Arc<ArcSwapOption<RemoteConnection>>,
     /// Registry weak reference - doesn't prevent registry shutdown/cleanup
     /// Used for reconnection after DNS changes
     registry: Weak<crate::registry::GossipRegistry>,
@@ -462,7 +455,7 @@ impl<T> RemoteActorRef<T> {
 
     #[inline]
     fn current_connection_or_not_listening(&self) -> crate::Result<Arc<RemoteConnection>> {
-        self.connection.load_full().ok_or_else(|| {
+        self.connection_slot.load_full().ok_or_else(|| {
             crate::GossipError::ActorNotFound(format!(
                 "'{}' - not listening yet",
                 self.location.address
@@ -508,7 +501,9 @@ impl<T> RemoteActorRef<T> {
         new: Arc<RemoteConnection>,
     ) -> std::result::Result<(), Option<Arc<RemoteConnection>>> {
         let expected_owned: Option<Arc<RemoteConnection>> = expected.cloned();
-        let previous = self.connection.compare_and_swap(&expected_owned, Some(new));
+        let previous = self
+            .connection_slot
+            .compare_and_swap(&expected_owned, Some(new));
         let matched = match (&expected_owned, &*previous) {
             (None, None) => true,
             (Some(exp), Some(prev)) => Arc::ptr_eq(exp, prev),
@@ -646,7 +641,7 @@ impl<T> RemoteActorRef<T> {
         // failed, reuse it only when that replacement is still healthy.
         // A closed replacement is not a heal: retain it as the CAS expected
         // value below so this repair can replace that exact stale pointer.
-        let expected = self.connection.load_full();
+        let expected = self.connection_slot.load_full();
         if let Some(current) = expected.as_ref() {
             if !Arc::ptr_eq(current, failed) && !current.is_closed() {
                 return Ok(current.clone());
@@ -688,7 +683,7 @@ impl<T> RemoteActorRef<T> {
                             return Err(crate::GossipError::ConnectionClosed(current.addr));
                         }
                         Err(None) => {
-                            self.connection.store(Some(fresh.clone()));
+                            self.connection_slot.store(Some(fresh.clone()));
                             fresh
                         }
                     }
@@ -696,7 +691,7 @@ impl<T> RemoteActorRef<T> {
                 Err(None) => {
                     // Slot had already been cleared out from under us; nothing
                     // better than our own fresh dial is available.
-                    self.connection.store(Some(fresh.clone()));
+                    self.connection_slot.store(Some(fresh.clone()));
                     fresh
                 }
             },
@@ -768,7 +763,8 @@ impl<T> RemoteActorRef<T> {
     ) {
         let remote = RemoteActorRef::<()> {
             location: self.location.clone(),
-            connection: Arc::clone(&self.connection),
+            connection: self.connection.clone(),
+            connection_slot: Arc::clone(&self.connection_slot),
             registry: self.registry.clone(),
             recovery_in_flight: Arc::clone(&self.recovery_in_flight),
             _marker: PhantomData,
@@ -794,7 +790,8 @@ impl<T> RemoteActorRef<T> {
         let connection = connection.map(RemoteConnection::from_handle);
         Self {
             location,
-            connection: Arc::new(ArcSwapOption::from(connection.map(Arc::new))),
+            connection: connection.clone(),
+            connection_slot: Arc::new(ArcSwapOption::from(connection.map(Arc::new))),
             registry: Arc::downgrade(&registry), // Weak reference - prevents cycle
             recovery_in_flight: Arc::new(AtomicBool::new(false)),
             _marker: PhantomData,
@@ -818,7 +815,7 @@ impl<T> RemoteActorRef<T> {
     ///
     /// Returns None if no connection is established yet.
     pub fn connection_ref(&self) -> Option<RemoteConnection> {
-        self.connection.load_full().map(|arc| (*arc).clone())
+        self.connection_slot.load_full().map(|arc| (*arc).clone())
     }
 
     fn actor_ask_cancellation_guard(
@@ -891,9 +888,27 @@ impl<T> RemoteActorRef<T> {
         let fresh = Self::dial_replacement(&registry, peer_id, failed_conn, Some(deadline)).await?;
         let healed = match self.compare_and_set_connection(Some(failed_conn), fresh.clone()) {
             Ok(()) => fresh,
-            Err(Some(other)) => other,
+            Err(Some(other)) if !other.is_closed() => other,
+            Err(Some(other)) => {
+                if let Some(instance_id) = other.instance_id() {
+                    registry
+                        .connection_pool
+                        .remove_connection_instance_for_peer(peer_id, other.addr, instance_id);
+                }
+                match self.compare_and_set_connection(Some(&other), fresh.clone()) {
+                    Ok(()) => fresh,
+                    Err(Some(current)) if !current.is_closed() => current,
+                    Err(Some(current)) => {
+                        return Err(crate::GossipError::ConnectionClosed(current.addr));
+                    }
+                    Err(None) => {
+                        self.connection_slot.store(Some(fresh.clone()));
+                        fresh
+                    }
+                }
+            }
             Err(None) => {
-                self.connection.store(Some(fresh.clone()));
+                self.connection_slot.store(Some(fresh.clone()));
                 fresh
             }
         };
@@ -1380,7 +1395,7 @@ mod tests {
             .await
             .expect("lookup should succeed");
         let current = remote_actor
-            .connection
+            .connection_slot
             .load_full()
             .expect("connection should be cached");
 
