@@ -40,6 +40,83 @@ struct PeerSession {
     /// the session (which survives reconnects) so the streak is genuinely
     /// per-peer. Reset on a successful ask or on eviction.
     consecutive_ask_timeouts: AtomicU8,
+    outbound_dial_retry: OutboundDialRetry,
+}
+
+const OUTBOUND_DIAL_RETRY_FLOOR: Duration = Duration::from_secs(1);
+
+/// Per-peer cold-path dial cadence. The state lives on `PeerSession`, so all
+/// callers share it across failed connection instances without retaining an
+/// address-keyed dial gate forever.
+struct OutboundDialRetry {
+    // LOCK-RATIONALE: failed-dial control path only; never read on a live
+    // connection or message hot path. Eligibility and reservation must be one
+    // atomic state transition across every address known for this peer.
+    state: std::sync::Mutex<OutboundDialRetryState>,
+    retry_floor: Duration,
+}
+
+struct OutboundDialRetryState {
+    consecutive_failures: u8,
+    retry_not_before: Option<Instant>,
+}
+
+impl OutboundDialRetry {
+    fn new() -> Self {
+        Self::with_retry_floor(OUTBOUND_DIAL_RETRY_FLOOR)
+    }
+
+    fn with_retry_floor(retry_floor: Duration) -> Self {
+        Self {
+            state: std::sync::Mutex::new(OutboundDialRetryState {
+                consecutive_failures: 0,
+                retry_not_before: None,
+            }),
+            retry_floor,
+        }
+    }
+
+    fn try_claim_attempt(&self) -> bool {
+        let now = Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state
+            .retry_not_before
+            .is_some_and(|deadline| now < deadline)
+        {
+            return false;
+        }
+
+        // Reserve this peer's slot while the socket attempt is in flight. If
+        // the future is cancelled, the bounded reservation expires by itself.
+        state.retry_not_before = Some(now + self.retry_floor);
+        true
+    }
+
+    fn record_failure(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        let delay = if state.consecutive_failures == 1 {
+            Duration::ZERO
+        } else {
+            self.retry_floor
+        };
+        state.retry_not_before = Some(Instant::now() + delay);
+    }
+
+    fn record_success(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.consecutive_failures = 0;
+        state.retry_not_before = None;
+    }
 }
 
 impl PeerSession {
@@ -51,6 +128,7 @@ impl PeerSession {
             correlation: CorrelationTracker::new(),
             current_connection: ArcSwapOption::empty(),
             consecutive_ask_timeouts: AtomicU8::new(0),
+            outbound_dial_retry: OutboundDialRetry::new(),
         }
     }
 
@@ -66,8 +144,7 @@ impl PeerSession {
     }
 
     fn configured_addr(&self) -> Option<SocketAddr> {
-        self.route_addr()
-            .or_else(|| self.required_addr())
+        self.route_addr().or_else(|| self.required_addr())
     }
 
     fn set_configured_addr(&self, addr: SocketAddr) {
