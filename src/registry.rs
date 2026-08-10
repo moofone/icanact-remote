@@ -11,7 +11,7 @@ use arc_swap::ArcSwapOption;
 use futures::future::{BoxFuture, poll_fn};
 use futures::task::AtomicWaker;
 use lru::LruCache;
-use scc::HashMap as SccHashMap;
+use scc::{HashMap as SccHashMap, hash_map::Entry};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::task::{Context, Poll};
@@ -112,6 +112,65 @@ fn stable_concurrent_location_wins(
     }
 
     candidate.local_registration_time > existing.local_registration_time
+}
+
+#[inline]
+fn stable_equal_version_location_cmp(
+    candidate: &RemoteActorLocation,
+    existing: &RemoteActorLocation,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    // Equal vector clocks are one actor-registration version. Observation
+    // timestamps are not version fields, so a legacy peer refreshing only
+    // those timestamps must remain an idempotent duplicate. If malformed or
+    // mixed-version peers attach different semantic payloads to one version,
+    // converge on a stable payload-only order instead of letting the latest
+    // observer timestamp keep flipping the winner forever.
+    match candidate.node_id.cmp(&existing.node_id) {
+        Ordering::Greater => return Ordering::Greater,
+        Ordering::Less => return Ordering::Less,
+        Ordering::Equal => {}
+    }
+    match candidate
+        .peer_id
+        .as_bytes()
+        .cmp(existing.peer_id.as_bytes())
+    {
+        Ordering::Greater => return Ordering::Greater,
+        Ordering::Less => return Ordering::Less,
+        Ordering::Equal => {}
+    }
+    match candidate.address.cmp(&existing.address) {
+        Ordering::Greater => return Ordering::Greater,
+        Ordering::Less => return Ordering::Less,
+        Ordering::Equal => {}
+    }
+    match candidate.priority.cmp(&existing.priority) {
+        Ordering::Greater => return Ordering::Greater,
+        Ordering::Less => return Ordering::Less,
+        Ordering::Equal => {}
+    }
+    candidate.metadata.cmp(&existing.metadata)
+}
+
+#[derive(Debug, Clone)]
+enum ActorUpsertPlan {
+    Apply {
+        clear_tombstone: bool,
+        is_update: bool,
+    },
+    RefreshOwnerLease {
+        expected_location: RemoteActorLocation,
+    },
+    OwnerLeaseRefreshed,
+    Ignore,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct KnownActorObservation {
+    observed_at: Instant,
+    generation: u64,
 }
 
 #[inline]
@@ -1400,6 +1459,12 @@ impl RemovedActorTombstone {
 pub struct ActorState {
     pub local_actors: SccHashMap<String, RemoteActorLocation>,
     pub known_actors: SccHashMap<String, RemoteActorLocation>,
+    /// Monotonic, local-only lease observations for known actors. This state
+    /// must never be serialized: wire timestamps describe the actor version,
+    /// while this map answers only whether the direct owner is still
+    /// advertising that unchanged version.
+    pub(crate) known_actor_last_observed: SccHashMap<String, KnownActorObservation>,
+    next_known_actor_observation_generation: AtomicU64,
     pub removed_actors: SccHashMap<String, RemovedActorTombstone>,
 }
 
@@ -3038,7 +3103,7 @@ impl<T: 'static> GossipRegistry<T> {
         name: String,
         location: RemoteActorLocation,
     ) -> Result<()> {
-        let _ = self.actor_state.known_actors.remove_sync(name.as_str());
+        let _ = self.remove_known_actor(name.as_str());
         self.register_actor_with_priority(name, location, RegistrationPriority::Normal)
             .await
     }
@@ -3176,7 +3241,7 @@ impl<T: 'static> GossipRegistry<T> {
             .read_sync(name.as_str(), |_, location| location.clone())
         {
             if loc.node_id == self_node_id || loc.address == location.address {
-                let _ = self.actor_state.known_actors.remove_sync(name.as_str());
+                let _ = self.remove_known_actor(name.as_str());
             }
         }
 
@@ -3308,7 +3373,7 @@ impl<T: 'static> GossipRegistry<T> {
             .read_sync(name, |_, location| location.clone())
         {
             if loc.node_id == self_node_id {
-                let _ = self.actor_state.known_actors.remove_sync(name);
+                let _ = self.remove_known_actor(name);
             }
         }
 
@@ -3383,13 +3448,12 @@ impl<T: 'static> GossipRegistry<T> {
             .known_actors
             .read_sync(name, |_, location| location.clone())
         {
-            let now = current_timestamp();
-            let age_secs = now.saturating_sub(location.wall_clock_time);
-            if age_secs < self.config.actor_ttl.as_secs() {
+            let age = self.known_actor_age(name, &location);
+            if age < self.config.actor_ttl {
                 debug!(
                     actor_name = %name,
                     location = "remote",
-                    age_seconds = age_secs,
+                    age_seconds = age.as_secs(),
                     "actor found"
                 );
                 return Some(location);
@@ -3547,20 +3611,27 @@ impl<T: 'static> GossipRegistry<T> {
                         location,
                         priority,
                     } => {
-                        let Some((clear_tombstone, _is_update)) = self.current_actor_upsert_plan(
-                            name.as_str(),
-                            &location,
-                            &sender_peer_id,
-                        ) else {
-                            continue;
-                        };
+                        let clear_tombstone =
+                            match self.actor_upsert_plan(name.as_str(), &location, &sender_peer_id)
+                            {
+                                ActorUpsertPlan::Apply {
+                                    clear_tombstone, ..
+                                } => clear_tombstone,
+                                ActorUpsertPlan::OwnerLeaseRefreshed => {
+                                    peer_actors_added.insert(name);
+                                    continue;
+                                }
+                                ActorUpsertPlan::RefreshOwnerLease { .. }
+                                | ActorUpsertPlan::Ignore => continue,
+                            };
                         if clear_tombstone {
                             let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
                         }
-                        let _ = self
-                            .actor_state
-                            .known_actors
-                            .upsert_sync(name.clone(), location.clone());
+                        self.commit_known_actor_upsert(
+                            name.clone(),
+                            location.clone(),
+                            sender_peer_id == location.peer_id,
+                        );
                         peer_actors_added.insert(name.clone());
                         applied_count += 1;
                         if priority.should_trigger_immediate_gossip() {
@@ -3602,12 +3673,7 @@ impl<T: 'static> GossipRegistry<T> {
                                 .push(Self::as_regular_gossip_change(&forwarded));
                             continue;
                         }
-                        if self
-                            .actor_state
-                            .known_actors
-                            .remove_sync(name.as_str())
-                            .is_some()
-                        {
+                        if self.remove_known_actor(name.as_str()).is_some() {
                             peer_actors_removed.insert(name.clone());
                             applied_count += 1;
                             let _ = self
@@ -3946,18 +4012,206 @@ impl<T: 'static> GossipRegistry<T> {
         (local, known)
     }
 
+    #[inline]
+    fn next_known_actor_observation(&self) -> KnownActorObservation {
+        let generation = match self
+            .actor_state
+            .next_known_actor_observation_generation
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_add(1))
+            }) {
+            Ok(previous) => previous.saturating_add(1),
+            Err(current) => current,
+        };
+        KnownActorObservation {
+            observed_at: Instant::now(),
+            generation,
+        }
+    }
+
+    #[cfg(test)]
+    #[inline]
+    fn mark_known_actor_observed(&self, name: &str) {
+        let observation = self.next_known_actor_observation();
+        match self
+            .actor_state
+            .known_actor_last_observed
+            .entry_sync(name.to_owned())
+        {
+            Entry::Occupied(mut entry) => {
+                if observation.generation > entry.get().generation {
+                    *entry.get_mut() = observation;
+                }
+            }
+            Entry::Vacant(entry) => {
+                let _ = entry.insert_entry(observation);
+            }
+        }
+    }
+
+    #[inline]
+    fn mark_known_actor_observed_if_location(
+        &self,
+        name: &str,
+        expected_location: &RemoteActorLocation,
+    ) -> bool {
+        let observation = self.next_known_actor_observation();
+        match self
+            .actor_state
+            .known_actor_last_observed
+            .entry_sync(name.to_owned())
+        {
+            Entry::Occupied(mut entry) => {
+                let location_matches = self
+                    .actor_state
+                    .known_actors
+                    .read_sync(name, |_, current| current == expected_location)
+                    .unwrap_or(false);
+                if location_matches && observation.generation > entry.get().generation {
+                    *entry.get_mut() = observation;
+                }
+                location_matches
+            }
+            Entry::Vacant(entry) => {
+                let location_matches = self
+                    .actor_state
+                    .known_actors
+                    .read_sync(name, |_, current| current == expected_location)
+                    .unwrap_or(false);
+                if location_matches {
+                    let _ = entry.insert_entry(observation);
+                }
+                location_matches
+            }
+        }
+    }
+
+    #[inline]
+    fn known_actor_observation(&self, name: &str) -> Option<KnownActorObservation> {
+        self.actor_state
+            .known_actor_last_observed
+            .read_sync(name, |_, observation| *observation)
+    }
+
+    #[inline]
+    fn remove_known_actor_observation_if_unchanged(
+        &self,
+        name: &str,
+        stale_observation: KnownActorObservation,
+    ) {
+        let _ = self
+            .actor_state
+            .known_actor_last_observed
+            .remove_if_sync(name, |current| {
+                current.generation == stale_observation.generation
+                    && !self.actor_state.known_actors.contains_sync(name)
+            });
+    }
+
+    #[inline]
+    fn commit_known_actor_upsert(
+        &self,
+        name: String,
+        location: RemoteActorLocation,
+        observed_directly: bool,
+    ) {
+        match self
+            .actor_state
+            .known_actor_last_observed
+            .entry_sync(name.clone())
+        {
+            Entry::Occupied(mut observation_entry) => {
+                let _ = self.actor_state.known_actors.upsert_sync(name, location);
+                if observed_directly {
+                    *observation_entry.get_mut() = self.next_known_actor_observation();
+                } else {
+                    let _ = observation_entry.remove();
+                }
+            }
+            Entry::Vacant(observation_entry) => {
+                let _ = self.actor_state.known_actors.upsert_sync(name, location);
+                if observed_directly {
+                    let _ = observation_entry.insert_entry(self.next_known_actor_observation());
+                }
+            }
+        }
+    }
+
+    #[inline]
+    fn known_actor_age(&self, name: &str, location: &RemoteActorLocation) -> Duration {
+        Self::known_actor_age_from_observation(location, self.known_actor_observation(name))
+    }
+
+    #[inline]
+    fn known_actor_age_from_observation(
+        location: &RemoteActorLocation,
+        observation: Option<KnownActorObservation>,
+    ) -> Duration {
+        observation.map_or_else(
+            || Duration::from_secs(current_timestamp().saturating_sub(location.wall_clock_time)),
+            |observation| observation.observed_at.elapsed(),
+        )
+    }
+
+    #[inline]
+    fn remove_known_actor(&self, name: &str) -> Option<(String, RemoteActorLocation)> {
+        let previous_observation = self.known_actor_observation(name);
+        let removed = self.actor_state.known_actors.remove_sync(name);
+        if let Some(previous_observation) = previous_observation {
+            self.remove_known_actor_observation_if_unchanged(name, previous_observation);
+        }
+        removed
+    }
+
+    #[inline]
+    fn remove_known_actor_if_stale_snapshot(
+        &self,
+        name: &str,
+        expected_location: &RemoteActorLocation,
+        expected_observation: Option<KnownActorObservation>,
+    ) -> Option<(String, RemoteActorLocation)> {
+        match self
+            .actor_state
+            .known_actor_last_observed
+            .entry_sync(name.to_owned())
+        {
+            Entry::Occupied(observation_entry) => {
+                let expected_observation = expected_observation?;
+                if observation_entry.get().generation != expected_observation.generation {
+                    return None;
+                }
+                let removed = self
+                    .actor_state
+                    .known_actors
+                    .remove_if_sync(name, |current| current == expected_location);
+                if removed.is_some() {
+                    let _ = observation_entry.remove();
+                }
+                removed
+            }
+            Entry::Vacant(_observation_guard) => {
+                if expected_observation.is_some() {
+                    return None;
+                }
+                self.actor_state
+                    .known_actors
+                    .remove_if_sync(name, |current| current == expected_location)
+            }
+        }
+    }
+
     fn current_actor_upsert_plan(
         &self,
         name: &str,
         location: &RemoteActorLocation,
         sender_peer_id: &PeerId,
-    ) -> Option<(bool, bool)> {
+    ) -> ActorUpsertPlan {
         if location.peer_id == self.peer_id {
             debug!(
                 actor_name = %name,
                 "skipping remote actor update - change references this node as the host"
             );
-            return None;
+            return ActorUpsertPlan::Ignore;
         }
 
         if self.actor_state.local_actors.contains_sync(name) {
@@ -3965,7 +4219,7 @@ impl<T: 'static> GossipRegistry<T> {
                 actor_name = %name,
                 "skipping remote actor update - actor is local"
             );
-            return None;
+            return ActorUpsertPlan::Ignore;
         }
 
         let mut clear_tombstone = false;
@@ -3990,7 +4244,7 @@ impl<T: 'static> GossipRegistry<T> {
                         actor_name = %name,
                         "skipping remote actor update - actor tombstone is newer or concurrent"
                     );
-                    return None;
+                    return ActorUpsertPlan::Ignore;
                 }
             }
         }
@@ -4003,22 +4257,73 @@ impl<T: 'static> GossipRegistry<T> {
                     .vector_clock
                     .compare(&existing_location.vector_clock)
                 {
-                    crate::ClockOrdering::After => Some(true),
-                    crate::ClockOrdering::Concurrent | crate::ClockOrdering::Equal => {
-                        stable_concurrent_location_wins(location, existing_location).then_some(true)
+                    crate::ClockOrdering::After => ActorUpsertPlan::Apply {
+                        clear_tombstone,
+                        is_update: true,
+                    },
+                    crate::ClockOrdering::Concurrent => {
+                        if stable_concurrent_location_wins(location, existing_location) {
+                            ActorUpsertPlan::Apply {
+                                clear_tombstone,
+                                is_update: true,
+                            }
+                        } else {
+                            ActorUpsertPlan::Ignore
+                        }
                     }
-                    crate::ClockOrdering::Before => None,
+                    crate::ClockOrdering::Equal => {
+                        let refreshes_stored_owner = sender_peer_id == &existing_location.peer_id
+                            && location.peer_id == existing_location.peer_id;
+                        match stable_equal_version_location_cmp(location, existing_location) {
+                            std::cmp::Ordering::Greater => ActorUpsertPlan::Apply {
+                                clear_tombstone,
+                                is_update: true,
+                            },
+                            std::cmp::Ordering::Equal | std::cmp::Ordering::Less
+                                if refreshes_stored_owner =>
+                            {
+                                ActorUpsertPlan::RefreshOwnerLease {
+                                    expected_location: existing_location.clone(),
+                                }
+                            }
+                            std::cmp::Ordering::Equal | std::cmp::Ordering::Less => {
+                                ActorUpsertPlan::Ignore
+                            }
+                        }
+                    }
+                    crate::ClockOrdering::Before => ActorUpsertPlan::Ignore,
                 }
             });
 
         match is_update {
-            Some(Some(true)) => Some((clear_tombstone, true)),
-            Some(Some(false)) | Some(None) => None,
+            Some(plan) => plan,
             None => {
                 debug!(actor_name = %name, "applying new actor");
-                Some((clear_tombstone, false))
+                ActorUpsertPlan::Apply {
+                    clear_tombstone,
+                    is_update: false,
+                }
             }
         }
+    }
+
+    fn actor_upsert_plan(
+        &self,
+        name: &str,
+        location: &RemoteActorLocation,
+        sender_peer_id: &PeerId,
+    ) -> ActorUpsertPlan {
+        for _ in 0..2 {
+            match self.current_actor_upsert_plan(name, location, sender_peer_id) {
+                ActorUpsertPlan::RefreshOwnerLease { expected_location } => {
+                    if self.mark_known_actor_observed_if_location(name, &expected_location) {
+                        return ActorUpsertPlan::OwnerLeaseRefreshed;
+                    }
+                }
+                plan => return plan,
+            }
+        }
+        ActorUpsertPlan::Ignore
     }
 
     fn current_actor_removal_plan(
@@ -5003,18 +5308,27 @@ impl<T: 'static> GossipRegistry<T> {
             let mut gossip_state = self.gossip_state.lock().await;
 
             for (name, location, addr) in &updates_to_apply {
-                let Some((clear_tombstone, is_update)) =
-                    self.current_actor_upsert_plan(name.as_str(), location, &sender_peer_id)
-                else {
-                    continue;
-                };
+                let (clear_tombstone, is_update) =
+                    match self.actor_upsert_plan(name.as_str(), location, &sender_peer_id) {
+                        ActorUpsertPlan::Apply {
+                            clear_tombstone,
+                            is_update,
+                        } => (clear_tombstone, is_update),
+                        ActorUpsertPlan::OwnerLeaseRefreshed => {
+                            continue;
+                        }
+                        ActorUpsertPlan::RefreshOwnerLease { .. } | ActorUpsertPlan::Ignore => {
+                            continue;
+                        }
+                    };
                 if clear_tombstone {
                     let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
                 }
-                let _ = self
-                    .actor_state
-                    .known_actors
-                    .upsert_sync(name.clone(), location.clone());
+                self.commit_known_actor_upsert(
+                    name.clone(),
+                    location.clone(),
+                    sender_peer_id == location.peer_id,
+                );
                 if is_update {
                     updated_actors += 1;
                 } else {
@@ -5063,12 +5377,7 @@ impl<T: 'static> GossipRegistry<T> {
                     );
                     continue;
                 }
-                if self
-                    .actor_state
-                    .known_actors
-                    .remove_sync(actor_name.as_str())
-                    .is_some()
-                {
+                if self.remove_known_actor(actor_name.as_str()).is_some() {
                     info!(
                         actor_name = %actor_name,
                         peer = %sender_addr,
@@ -5105,30 +5414,55 @@ impl<T: 'static> GossipRegistry<T> {
         );
     }
 
-    /// Clean up stale actor entries (using wall clock for TTL)
+    /// Clean up stale actor entries using local monotonic observations for TTL.
     pub async fn cleanup_stale_actors(&self) {
         let now = current_timestamp();
-        let ttl_secs = self.config.actor_ttl.as_secs();
 
-        // Clean up stale known actors (using wall clock time for TTL)
+        // Clean up stale known actors. Entries learned before the local lease
+        // map existed fall back to their wire wall-clock timestamp.
         {
             let before_count = self.actor_state.known_actors.len();
 
-            let mut to_remove = Vec::new();
+            let mut known_snapshot = Vec::new();
             self.actor_state.known_actors.iter_sync(|k, location| {
-                if now.saturating_sub(location.wall_clock_time) >= ttl_secs {
-                    to_remove.push(k.clone());
-                }
+                known_snapshot.push((k.clone(), location.clone()));
                 true
             });
+            let mut to_remove = Vec::new();
+            for (name, location) in known_snapshot {
+                let observation = self.known_actor_observation(name.as_str());
+                if Self::known_actor_age_from_observation(&location, observation)
+                    >= self.config.actor_ttl
+                {
+                    to_remove.push((name, location, observation));
+                }
+            }
 
-            for name in &to_remove {
-                let _ = self.actor_state.known_actors.remove_sync(name.as_str());
+            for (name, location, observation) in &to_remove {
+                let _ = self.remove_known_actor_if_stale_snapshot(
+                    name.as_str(),
+                    location,
+                    *observation,
+                );
             }
 
             let removed = before_count.saturating_sub(self.actor_state.known_actors.len());
             if removed > 0 {
                 info!(removed_count = removed, "cleaned up stale actor entries");
+            }
+
+            // The two lock-free maps cannot be mutated atomically. Prune any
+            // observation left behind by a racing actor removal so the local
+            // lease side table remains bounded by `known_actors`.
+            let mut observed_entries = Vec::new();
+            self.actor_state
+                .known_actor_last_observed
+                .iter_sync(|name, observation| {
+                    observed_entries.push((name.clone(), *observation));
+                    true
+                });
+            for (name, observation) in observed_entries {
+                self.remove_known_actor_observation_if_unchanged(name.as_str(), observation);
             }
         }
 
@@ -5274,11 +5608,7 @@ impl<T: 'static> GossipRegistry<T> {
                         );
 
                         if should_remove.unwrap_or(false)
-                            && self
-                                .actor_state
-                                .known_actors
-                                .remove_sync(actor_name.as_str())
-                                .is_some()
+                            && self.remove_known_actor(actor_name.as_str()).is_some()
                         {
                             actors_removed += 1;
                         }
@@ -5442,6 +5772,7 @@ impl<T: 'static> GossipRegistry<T> {
         {
             self.actor_state.local_actors.clear_sync();
             self.actor_state.known_actors.clear_sync();
+            self.actor_state.known_actor_last_observed.clear_sync();
         }
 
         // Clear gossip state
@@ -6667,12 +6998,7 @@ impl<T: 'static> GossipRegistry<T> {
             let mut removed = 0;
 
             for actor_name in &actors_to_remove {
-                if self
-                    .actor_state
-                    .known_actors
-                    .remove_sync(actor_name.as_str())
-                    .is_some()
-                {
+                if self.remove_known_actor(actor_name.as_str()).is_some() {
                     removed += 1;
                 }
                 // Also remove from local_actors if somehow present (defensive)
@@ -10788,10 +11114,9 @@ mod tests {
         loc_a.local_registration_time = 0;
         loc_b.local_registration_time = 0;
 
-        let expected = if stable_concurrent_location_wins(&loc_a, &loc_b) {
-            loc_a.clone()
-        } else {
-            loc_b.clone()
+        let expected = match stable_equal_version_location_cmp(&loc_a, &loc_b) {
+            std::cmp::Ordering::Greater => loc_a.clone(),
+            std::cmp::Ordering::Equal | std::cmp::Ordering::Less => loc_b.clone(),
         };
 
         let mut sync_a = HashMap::new();
@@ -10880,6 +11205,486 @@ mod tests {
         reg.apply_delta(delta).await.unwrap();
         let after_second = read_known_actor(&reg, actor).expect("actor should exist");
         assert_eq!(after_first, after_second);
+    }
+
+    #[tokio::test]
+    async fn timestamp_only_refresh_with_equal_actor_version_is_ignored() {
+        let mut config = test_config();
+        config.actor_ttl = Duration::from_secs(1);
+        let reg = GossipRegistry::<()>::new(test_addr(7005), config);
+        let actor = "actor.timestamp-refresh";
+        let peer = test_peer_id("peer_timestamp_refresh");
+
+        let mut original = RemoteActorLocation::new_with_peer(test_addr(9005), peer.clone());
+        original.wall_clock_time = 123;
+        original.local_registration_time = 456;
+
+        let initial_delta = RegistryDelta {
+            since_sequence: 0,
+            current_sequence: 1,
+            changes: vec![RegistryChange::ActorAdded {
+                name: actor.to_string(),
+                location: original.clone(),
+                priority: RegistrationPriority::Normal,
+            }],
+            sender_peer_id: peer.clone(),
+            wall_clock_time: 0,
+            precise_timing_nanos: 0,
+        };
+        reg.apply_delta(initial_delta).await.unwrap();
+        let _ = reg
+            .actor_state
+            .known_actor_last_observed
+            .update_sync(actor, |_, observation| {
+                observation.observed_at = Instant::now() - Duration::from_secs(2);
+            });
+        assert!(
+            reg.lookup_actor(actor).await.is_none(),
+            "the test must first prove the local actor lease has expired"
+        );
+
+        let mut refreshed = original.clone();
+        refreshed.wall_clock_time += 10_000;
+        refreshed.local_registration_time += 10_000;
+        let refresh_delta = RegistryDelta {
+            since_sequence: 1,
+            current_sequence: 2,
+            changes: vec![RegistryChange::ActorAdded {
+                name: actor.to_string(),
+                location: refreshed.clone(),
+                priority: RegistrationPriority::Normal,
+            }],
+            sender_peer_id: peer.clone(),
+            wall_clock_time: 0,
+            precise_timing_nanos: 0,
+        };
+        let applied = reg.apply_delta(refresh_delta).await.unwrap();
+        assert!(
+            applied.is_empty(),
+            "a lease refresh must not produce a fresh immediate-ack candidate"
+        );
+        assert!(
+            reg.lookup_actor(actor).await.is_some(),
+            "an equal-version advertisement from the direct owner must renew only the local lease"
+        );
+        assert_eq!(
+            read_known_actor(&reg, actor),
+            Some(original.clone()),
+            "an equal vector clock makes timestamp-only delta churn a duplicate"
+        );
+
+        for sequence in 3..1_003 {
+            let mut storm_refresh = refreshed.clone();
+            storm_refresh.wall_clock_time += sequence;
+            storm_refresh.local_registration_time += u128::from(sequence);
+            let applied = reg
+                .apply_delta(RegistryDelta {
+                    since_sequence: sequence - 1,
+                    current_sequence: sequence,
+                    changes: vec![RegistryChange::ActorAdded {
+                        name: actor.to_string(),
+                        location: storm_refresh,
+                        priority: RegistrationPriority::Immediate,
+                    }],
+                    sender_peer_id: peer.clone(),
+                    wall_clock_time: 0,
+                    precise_timing_nanos: 0,
+                })
+                .await
+                .unwrap();
+            assert!(applied.is_empty());
+        }
+        assert_eq!(reg.actor_state.known_actors.len(), 1);
+        assert_eq!(reg.actor_state.known_actor_last_observed.len(), 1);
+        assert!(reg.gossip_state.lock().await.pending_changes.is_empty());
+
+        refreshed.wall_clock_time += 10_000;
+        refreshed.local_registration_time += 10_000;
+        let _ = reg
+            .actor_state
+            .known_actor_last_observed
+            .update_sync(actor, |_, observation| {
+                observation.observed_at = Instant::now() - Duration::from_secs(2);
+            });
+        let mut full_sync = HashMap::new();
+        full_sync.insert(actor.to_string(), refreshed.clone());
+        reg.merge_full_sync(
+            full_sync,
+            HashMap::new(),
+            peer.clone(),
+            test_addr(7006),
+            3,
+            0,
+        )
+        .await;
+        assert!(
+            reg.lookup_actor(actor).await.is_some(),
+            "a direct-owner full sync must renew only the local lease"
+        );
+        assert_eq!(
+            read_known_actor(&reg, actor),
+            Some(original.clone()),
+            "an equal vector clock makes timestamp-only full-sync churn a duplicate"
+        );
+
+        let _ = reg
+            .actor_state
+            .known_actor_last_observed
+            .update_sync(actor, |_, observation| {
+                observation.observed_at = Instant::now() - Duration::from_secs(2);
+            });
+        let mut relayed_sync = HashMap::new();
+        relayed_sync.insert(actor.to_string(), refreshed.clone());
+        reg.merge_full_sync(
+            HashMap::new(),
+            relayed_sync,
+            test_peer_id("timestamp_refresh_relay"),
+            test_addr(7007),
+            4,
+            0,
+        )
+        .await;
+        assert!(
+            reg.lookup_actor(actor).await.is_none(),
+            "a relay must not keep an actor lease alive after the direct owner disappears"
+        );
+        assert_eq!(read_known_actor(&reg, actor), Some(original));
+
+        reg.mark_known_actor_observed(actor);
+        let relayed_newer_version = refreshed;
+        relayed_newer_version
+            .vector_clock
+            .increment(peer.to_node_id());
+        reg.apply_delta(RegistryDelta {
+            since_sequence: 4,
+            current_sequence: 5,
+            changes: vec![RegistryChange::ActorAdded {
+                name: actor.to_string(),
+                location: relayed_newer_version.clone(),
+                priority: RegistrationPriority::Normal,
+            }],
+            sender_peer_id: test_peer_id("timestamp_refresh_relay"),
+            wall_clock_time: 0,
+            precise_timing_nanos: 0,
+        })
+        .await
+        .unwrap();
+        assert_eq!(read_known_actor(&reg, actor), Some(relayed_newer_version));
+        assert!(
+            reg.actor_state
+                .known_actor_last_observed
+                .read_sync(actor, |_, observed_at| *observed_at)
+                .is_none(),
+            "a relayed new version must not inherit the previous owner's direct lease"
+        );
+        assert!(reg.lookup_actor(actor).await.is_none());
+
+        reg.mark_known_actor_observed("orphaned-observation");
+        reg.cleanup_stale_actors().await;
+        assert!(read_known_actor(&reg, actor).is_none());
+        assert_eq!(
+            reg.actor_state.known_actor_last_observed.len(),
+            0,
+            "lease state must remain bounded by known actors even across racing removals"
+        );
+    }
+
+    #[tokio::test]
+    async fn equal_version_owner_refresh_records_peer_attribution_without_reapplying() {
+        let reg = GossipRegistry::<()>::new(test_addr(7008), test_config());
+        let actor = "actor.owner-attribution-refresh";
+        let owner = test_peer_id("owner_attribution_refresh");
+        let owner_addr = test_addr(7009);
+        let relay = test_peer_id("owner_attribution_relay");
+        let relay_addr = test_addr(7010);
+        reg.connection_pool
+            .set_configured_peer_addr(&owner, owner_addr);
+        reg.connection_pool
+            .set_configured_peer_addr(&relay, relay_addr);
+
+        let original = RemoteActorLocation::new_with_peer(test_addr(9008), owner.clone());
+        reg.apply_delta(RegistryDelta {
+            since_sequence: 0,
+            current_sequence: 1,
+            changes: vec![RegistryChange::ActorAdded {
+                name: actor.to_string(),
+                location: original.clone(),
+                priority: RegistrationPriority::Normal,
+            }],
+            sender_peer_id: relay,
+            wall_clock_time: 0,
+            precise_timing_nanos: 0,
+        })
+        .await
+        .unwrap();
+
+        let mut refreshed = original.clone();
+        refreshed.wall_clock_time += 10_000;
+        refreshed.local_registration_time += 10_000;
+        let applied = reg
+            .apply_delta(RegistryDelta {
+                since_sequence: 1,
+                current_sequence: 2,
+                changes: vec![RegistryChange::ActorAdded {
+                    name: actor.to_string(),
+                    location: refreshed,
+                    priority: RegistrationPriority::Immediate,
+                }],
+                sender_peer_id: owner,
+                wall_clock_time: 0,
+                precise_timing_nanos: 0,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            applied.is_empty(),
+            "owner attribution must not turn a lease refresh into a registry update"
+        );
+        assert_eq!(read_known_actor(&reg, actor), Some(original));
+        let state = reg.gossip_state.lock().await;
+        assert!(
+            state
+                .peer_to_actors
+                .get(&owner_addr)
+                .is_some_and(|actors| actors.contains(actor)),
+            "a direct-owner refresh must attribute a relay-learned actor to its owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn losing_equal_version_direct_owner_payload_still_renews_lease() {
+        let mut config = test_config();
+        config.actor_ttl = Duration::from_secs(1);
+        let reg = GossipRegistry::<()>::new(test_addr(7013), config);
+        let actor = "actor.losing-owner-payload-refresh";
+        let owner = test_peer_id("losing_payload_owner");
+
+        let mut stored = RemoteActorLocation::new_with_peer(test_addr(9013), owner.clone());
+        stored.wall_clock_time = 123;
+        stored.metadata = vec![2];
+        reg.apply_delta(RegistryDelta {
+            since_sequence: 0,
+            current_sequence: 1,
+            changes: vec![RegistryChange::ActorAdded {
+                name: actor.to_string(),
+                location: stored.clone(),
+                priority: RegistrationPriority::Normal,
+            }],
+            sender_peer_id: test_peer_id("losing_payload_relay"),
+            wall_clock_time: 0,
+            precise_timing_nanos: 0,
+        })
+        .await
+        .unwrap();
+        reg.mark_known_actor_observed(actor);
+        let _ = reg
+            .actor_state
+            .known_actor_last_observed
+            .update_sync(actor, |_, observation| {
+                observation.observed_at = Instant::now() - Duration::from_secs(2);
+            });
+        assert!(reg.lookup_actor(actor).await.is_none());
+
+        let mut losing_owner_payload = stored.clone();
+        losing_owner_payload.wall_clock_time += 10_000;
+        losing_owner_payload.local_registration_time += 10_000;
+        losing_owner_payload.metadata = vec![1];
+        reg.apply_delta(RegistryDelta {
+            since_sequence: 1,
+            current_sequence: 2,
+            changes: vec![RegistryChange::ActorAdded {
+                name: actor.to_string(),
+                location: losing_owner_payload,
+                priority: RegistrationPriority::Normal,
+            }],
+            sender_peer_id: owner,
+            wall_clock_time: 0,
+            precise_timing_nanos: 0,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            read_known_actor(&reg, actor),
+            Some(stored),
+            "the deterministic semantic winner must remain stored"
+        );
+        assert!(
+            reg.lookup_actor(actor).await.is_some(),
+            "the stored actor must stay live when its direct owner advertises a lower-sorting equal version"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_lease_cleanup_preserves_concurrent_replacement_observation() {
+        let reg = GossipRegistry::<()>::new(test_addr(7011), test_config());
+        let actor = "actor.concurrent-lease-replacement";
+        let owner = test_peer_id("concurrent_lease_owner");
+        let original = RemoteActorLocation::new_with_peer(test_addr(9011), owner.clone());
+        let _ = reg
+            .actor_state
+            .known_actors
+            .insert_sync(actor.to_string(), original.clone());
+        reg.mark_known_actor_observed(actor);
+        let stale_observation = reg
+            .actor_state
+            .known_actor_last_observed
+            .read_sync(actor, |_, observation| *observation)
+            .unwrap();
+
+        let _ = reg.actor_state.known_actors.remove_sync(actor);
+        let replacement = RemoteActorLocation::new_with_peer(test_addr(9012), owner);
+        let _ = reg
+            .actor_state
+            .known_actors
+            .insert_sync(actor.to_string(), replacement.clone());
+        reg.mark_known_actor_observed(actor);
+
+        reg.remove_known_actor_observation_if_unchanged(actor, stale_observation);
+
+        assert_eq!(read_known_actor(&reg, actor), Some(replacement));
+        assert!(
+            reg.actor_state
+                .known_actor_last_observed
+                .contains_sync(actor),
+            "cleanup for the removed generation must preserve a replacement generation's lease"
+        );
+        assert!(reg.lookup_actor(actor).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn stale_actor_cleanup_preserves_lease_refreshed_after_age_check() {
+        let mut config = test_config();
+        config.actor_ttl = Duration::from_secs(1);
+        let reg = GossipRegistry::<()>::new(test_addr(7014), config);
+        let actor = "actor.refresh-during-stale-cleanup";
+        let owner = test_peer_id("refresh_during_stale_cleanup");
+        let mut location = RemoteActorLocation::new_with_peer(test_addr(9014), owner);
+        location.wall_clock_time = 123;
+        let _ = reg
+            .actor_state
+            .known_actors
+            .insert_sync(actor.to_string(), location.clone());
+        reg.mark_known_actor_observed(actor);
+        let _ = reg
+            .actor_state
+            .known_actor_last_observed
+            .update_sync(actor, |_, observation| {
+                observation.observed_at = Instant::now() - Duration::from_secs(2);
+            });
+        let stale_observation = reg.known_actor_observation(actor).unwrap();
+        assert!(
+            stale_observation.observed_at.elapsed() >= reg.config.actor_ttl,
+            "the cleanup snapshot must first classify the actor as stale"
+        );
+
+        reg.mark_known_actor_observed(actor);
+        reg.remove_known_actor_if_stale_snapshot(actor, &location, Some(stale_observation));
+
+        assert_eq!(read_known_actor(&reg, actor), Some(location));
+        assert!(
+            reg.lookup_actor(actor).await.is_some(),
+            "a direct-owner refresh after the age check must prevent stale cleanup removal"
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_owner_lease_refresh_does_not_create_orphan_observation() {
+        let reg = GossipRegistry::<()>::new(test_addr(7015), test_config());
+        let actor = "actor.conditional-owner-refresh";
+        let owner = test_peer_id("conditional_owner_refresh");
+        let location = RemoteActorLocation::new_with_peer(test_addr(9015), owner);
+        let _ = reg
+            .actor_state
+            .known_actors
+            .insert_sync(actor.to_string(), location.clone());
+        reg.mark_known_actor_observed(actor);
+
+        let _ = reg.remove_known_actor(actor);
+        assert!(
+            !reg.mark_known_actor_observed_if_location(actor, &location),
+            "a lease refresh planned for a removed location must be rejected"
+        );
+        assert!(read_known_actor(&reg, actor).is_none());
+        assert!(
+            !reg.actor_state
+                .known_actor_last_observed
+                .contains_sync(actor),
+            "a rejected refresh must not leave an orphan lease observation"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn direct_owner_apply_commits_location_and_lease_together() {
+        let reg = Arc::new(GossipRegistry::<()>::new(test_addr(7016), test_config()));
+        let actor = "actor.atomic-owner-apply";
+        let owner = test_peer_id("atomic_owner_apply");
+        let location = RemoteActorLocation::new_with_peer(test_addr(9016), owner.clone());
+
+        let observation_guard = match reg
+            .actor_state
+            .known_actor_last_observed
+            .entry_sync(actor.to_string())
+        {
+            Entry::Vacant(entry) => entry,
+            Entry::Occupied(_) => panic!("the test actor must start without an observation"),
+        };
+
+        let apply_reg = Arc::clone(&reg);
+        let apply_location = location.clone();
+        let apply = tokio::spawn(async move {
+            apply_reg
+                .apply_delta(RegistryDelta {
+                    since_sequence: 0,
+                    current_sequence: 1,
+                    changes: vec![RegistryChange::ActorAdded {
+                        name: actor.to_string(),
+                        location: apply_location,
+                        priority: RegistrationPriority::Normal,
+                    }],
+                    sender_peer_id: owner,
+                    wall_clock_time: 0,
+                    precise_timing_nanos: 0,
+                })
+                .await
+                .unwrap()
+        });
+
+        // Wait until apply holds the gossip state and has reached this guarded
+        // registry update. The location must remain unpublished while its
+        // matching lease cannot be committed.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut apply_entered_registry_update = false;
+        while Instant::now() < deadline {
+            if reg.gossip_state.try_lock().is_err() {
+                apply_entered_registry_update = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            apply_entered_registry_update,
+            "the apply task must reach the guarded registry update"
+        );
+        assert!(
+            read_known_actor(&reg, actor).is_none(),
+            "the location must not become visible before its lease can be published"
+        );
+        drop(observation_guard);
+
+        let _ = apply.await.unwrap();
+        assert_eq!(
+            read_known_actor(&reg, actor),
+            Some(location),
+            "a directly observed advertisement must not be lost between location and lease publication"
+        );
+        assert!(
+            reg.actor_state
+                .known_actor_last_observed
+                .contains_sync(actor),
+            "a published direct-owner location must have its local lease"
+        );
     }
 
     #[tokio::test]
