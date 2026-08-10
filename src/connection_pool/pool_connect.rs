@@ -5142,14 +5142,21 @@ pub(crate) fn handle_incoming_message(
 
                 let sender_socket_addr =
                     resolve_peer_state_addr(&registry, Some(&sender_peer_id), _peer_addr).await;
-                registry
+                if !registry
                     .mark_authenticated_inbound_liveness(
                         sender_socket_addr,
                         &sender_peer_id,
                         session_source,
                         crate::current_timestamp_millis(),
                     )
-                    .await;
+                    .await
+                {
+                    debug!(
+                        peer = %sender_socket_addr,
+                        "ignoring FullSyncRequest from a superseded authenticated session"
+                    );
+                    return Ok(());
+                }
 
                 {
                     let mut gossip_state = registry.gossip_state.lock().await;

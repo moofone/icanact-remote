@@ -718,12 +718,12 @@ enum OwnerCommand {
     ReleaseDeadPeer {
         peer_id: PeerId,
         addr: SocketAddr,
-        /// The Instant-equivalent of when the `GossipState` failure
-        /// evidence this reap is acting on was recorded, copied by the
+        /// The monotonic instant at which the `GossipState` failure evidence
+        /// this reap is acting on was recorded, copied directly by the
         /// caller from `PeerInfo::last_failure_instant` at selection time.
-        /// Fixed at submission time and never re-derived from "now" inside
-        /// the owner, so this fence cannot be satisfied merely by elapsed
-        /// wall-clock delay before the command runs.
+        /// It is fixed at submission time and never reconstructed from the
+        /// wall-clock `last_failure_time` or re-derived from `now` inside the
+        /// owner, so queueing delay cannot move this causal fence.
         evidence_before: std::time::Instant,
         reply: oneshot::Sender<DeadPeerReleaseOutcome>,
     },
@@ -1026,6 +1026,29 @@ impl RegistryOwnerHandle {
             .tx
             .send(OwnerCommand::NoteLivenessEvidence { addr, at })
             .await;
+    }
+
+    /// Enqueue direct liveness without an await point. Critical receive paths
+    /// use this while holding their validated registry-state guard so the
+    /// owner fence is ordered before a concurrent reap can consume its
+    /// destructive authorization. A full or closed mailbox is fail-closed:
+    /// the caller must not publish volatile liveness when the authoritative
+    /// owner could not be told about it.
+    pub(crate) fn try_note_liveness_evidence(
+        &self,
+        addr: SocketAddr,
+        at: std::time::Instant,
+    ) -> bool {
+        self.ensure_started();
+        match self
+            .shared
+            .tx
+            .try_send(OwnerCommand::NoteLivenessEvidence { addr, at })
+        {
+            Ok(()) => true,
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => false,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+        }
     }
 
     /// Current lock-free ownership/routing snapshot.

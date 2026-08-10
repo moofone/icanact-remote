@@ -3343,10 +3343,15 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
                         let future = tokio::spawn(async move {
                             // Send the message using zero-copy persistent connections
                             let outcome = send_gossip_message_zero_copy(task, registry_clone).await;
+                            let session_instance_id = match &outcome {
+                                Ok(Some(instance_id)) => Some(*instance_id),
+                                Ok(None) | Err(_) => None,
+                            };
                             GossipResult {
                                 peer_addr,
                                 sent_sequence,
                                 session_source,
+                                session_instance_id,
                                 outcome: gossip_send_outcome_to_result(outcome),
                             }
                         });
@@ -5917,7 +5922,7 @@ mod keepalive_apply_tests {
 /// `handle_incoming_message` -- which threads that connection's real,
 /// per-socket `session_source` correctly (see `ReadContext::session_source`).
 ///
-/// `send_gossip_message_zero_copy`'s `Result<()>` return type makes this the
+/// `send_gossip_message_zero_copy`'s `Result<Option<u64>>` return type makes this the
 /// ONLY possible mapping to `GossipResult::outcome`: there is no response to
 /// carry. `apply_gossip_results`' `handle_gossip_response` call for a
 /// `FullSyncResponse` is therefore unreachable for real wire traffic --
@@ -5932,7 +5937,7 @@ mod keepalive_apply_tests {
 /// not match `current_session_source`, which for an outbound session is the
 /// dialling socket's own local ephemeral port).
 fn gossip_send_outcome_to_result(
-    outcome: Result<()>,
+    outcome: Result<Option<u64>>,
 ) -> Result<Option<crate::registry::RegistryMessage>> {
     outcome.map(|_| None)
 }
@@ -5951,7 +5956,7 @@ mod gossip_send_outcome_tests {
     /// threading).
     #[test]
     fn gossip_send_outcome_never_carries_a_response_on_success() {
-        assert!(gossip_send_outcome_to_result(Ok(())).unwrap().is_none());
+        assert!(gossip_send_outcome_to_result(Ok(Some(42))).unwrap().is_none());
     }
 
     #[test]
@@ -5968,7 +5973,7 @@ mod gossip_send_outcome_tests {
 async fn send_gossip_message_zero_copy(
     mut task: GossipTask,
     registry: Arc<GossipRegistry>,
-) -> Result<()> {
+) -> Result<Option<u64>> {
     let mut conn = registry
         .connection_pool
         .get_existing_connection(task.peer_addr);
@@ -5977,7 +5982,7 @@ async fn send_gossip_message_zero_copy(
             peer = %task.peer_addr,
             "Skipping outbound dial for inbound-only undialable peer; waiting for remote-side reconnect"
         );
-        return Ok(());
+        return Ok(None);
     }
 
     // Check if this is a retry attempt and if DNS refresh is needed
@@ -6052,7 +6057,7 @@ async fn send_gossip_message_zero_copy(
             peer = %task.peer_addr,
             "Skipping PeerListGossip send - peer lacks negotiated capability"
         );
-        return Ok(());
+        return Ok(None);
     }
 
     // Set transport timing immediately before the write. Actor-location
@@ -6088,10 +6093,11 @@ async fn send_gossip_message_zero_copy(
     // Use zero-copy tell() which uses try_send() internally for max performance
     // This completely bypasses async overhead when the channel has capacity
     let tcp_start = std::time::Instant::now();
+    let instance_id = conn.instance_id();
     conn.tell(bytes::Bytes::from(msg_with_type)).await?;
     let _tcp_elapsed = tcp_start.elapsed();
     // eprintln!("🔍 TCP_WRITE_TIME: {:?}", tcp_elapsed);
-    Ok(())
+    Ok(instance_id)
 }
 #[cfg(test)]
 mod inbound_tls_identity_tests {
