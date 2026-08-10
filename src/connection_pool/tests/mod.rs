@@ -1030,6 +1030,30 @@ async fn stale_outbound_completion_cannot_replace_a_newer_reservation() {
     );
 }
 
+#[tokio::test]
+async fn connection_published_after_retry_claim_is_reused_before_dial() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let peer = crate::KeyPair::new_for_testing("retry_claim_publish_race").peer_id();
+    let addr: SocketAddr = "127.0.0.1:7314".parse().unwrap();
+    pool.add_addr_to_peer_id(addr, peer.clone());
+    let session = pool.get_or_create_peer_session(&peer);
+    let attempt = session
+        .outbound_dial_retry
+        .try_claim_attempt()
+        .expect("retry attempt must be claimed before publication");
+
+    let (io, _keep) = tokio::io::duplex(1024);
+    pool.finalize_new_outbound_connection(addr, io, std::sync::Weak::new(), None)
+        .await
+        .expect("publish outbound connection");
+
+    assert!(
+        pool.reuse_published_connection_after_retry_claim(&session, attempt)
+            .is_some(),
+        "a connection published after the initial lookup must be reused before dialing"
+    );
+}
+
 #[test]
 fn outbound_retry_claim_is_atomic_per_peer() {
     const CALLERS: usize = 8;
@@ -1061,9 +1085,9 @@ fn outbound_retry_claim_is_atomic_per_peer() {
     );
 }
 
-#[test]
-fn outbound_retry_failure_streak_never_wraps_to_an_immediate_retry() {
-    let retry = OutboundDialRetry::with_retry_floor(Duration::from_secs(1));
+#[tokio::test]
+async fn outbound_retry_failure_streak_never_wraps_to_an_immediate_retry() {
+    let retry = OutboundDialRetry::with_retry_floor(Duration::from_millis(1));
 
     let attempt = retry
         .try_claim_attempt()
@@ -1073,6 +1097,12 @@ fn outbound_retry_failure_streak_never_wraps_to_an_immediate_retry() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .consecutive_failures = u8::MAX;
+    retry.record_failure(attempt);
+
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let attempt = retry
+        .try_claim_attempt()
+        .expect("the retry floor must eventually reopen");
     retry.record_failure(attempt);
 
     assert!(

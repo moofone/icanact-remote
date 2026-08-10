@@ -144,6 +144,18 @@ impl<T> ConnectionPool<T> {
         None
     }
 
+    fn reuse_published_connection_after_retry_claim(
+        &self,
+        session: &Arc<PeerSession>,
+        attempt: OutboundDialAttempt,
+    ) -> Option<ConnectionHandle<T>> {
+        let connection = session.current_connection()?;
+        connection.update_last_used();
+        let handle = self.make_connection_handle(connection.addr, &connection)?;
+        session.outbound_dial_retry.record_success(attempt);
+        Some(handle)
+    }
+
     fn get_or_create_peer_session(&self, peer_id: &crate::PeerId) -> Arc<PeerSession> {
         self.peer_sessions
             .entry_sync(peer_id.clone())
@@ -1689,6 +1701,15 @@ impl<T> ConnectionPool<T> {
                             std::io::ErrorKind::WouldBlock,
                             "outbound retry floor active",
                         )));
+                    }
+                    if let (Some(session), Some(attempt)) = (
+                        retry_session.as_ref(),
+                        retry_attempt.as_ref().copied().flatten(),
+                    ) && let Some(handle) =
+                        self.reuse_published_connection_after_retry_claim(session, attempt)
+                    {
+                        gate_completion.finish(true);
+                        return Ok(handle);
                     }
                     let result = self
                         .connect_via_stream(
