@@ -619,11 +619,12 @@ impl<T> RemoteActorRef<T> {
     async fn reheal_connection(
         &self,
         failed: &Arc<RemoteConnection>,
+        deadline: Option<tokio::time::Instant>,
     ) -> crate::Result<Arc<RemoteConnection>> {
         let Some(registry) = self.registry.upgrade() else {
             return Err(crate::GossipError::Shutdown);
         };
-        if registry.shutdown.load(Ordering::Relaxed) {
+        if registry.shutdown.load(Ordering::Acquire) {
             // Don't attempt to re-resolve against a registry that is already
             // tearing down - the peer's own listener may already be gone too,
             // which would otherwise surface as a raw dial error (e.g.
@@ -650,7 +651,7 @@ impl<T> RemoteActorRef<T> {
                 .connection_pool
                 .remove_connection_instance_for_peer(&peer_id, failed.addr, instance_id);
         }
-        let fresh = Self::dial_replacement(&registry, &peer_id, failed, None).await?;
+        let fresh = Self::dial_replacement(&registry, &peer_id, failed, deadline).await?;
 
         Ok(
             match self.compare_and_set_connection(Some(failed), fresh.clone()) {
@@ -674,21 +675,22 @@ impl<T> RemoteActorRef<T> {
         &self,
         failed: &Arc<RemoteConnection>,
         err: crate::GossipError,
+        deadline: Option<tokio::time::Instant>,
     ) -> crate::GossipError {
         let Some(registry) = self.registry.upgrade() else {
             return err;
         };
-        let recovery_timeout = registry.config.connection_timeout;
-        let repair = tokio::time::timeout(recovery_timeout, self.reheal_connection(failed)).await;
-        match repair {
-            Ok(Ok(_)) => {}
-            Ok(Err(repair_err)) => {
-                tracing::debug!(error = ?repair_err, "failed to repair cached connection after ambiguous ask failure");
-            }
-            Err(_) => {
+        let recovery_deadline = deadline
+            .unwrap_or_else(|| tokio::time::Instant::now() + registry.config.connection_timeout);
+        match self
+            .reheal_connection(failed, Some(recovery_deadline))
+            .await
+        {
+            Ok(_) => {}
+            Err(repair_err) => {
                 tracing::debug!(
-                    timeout = ?recovery_timeout,
-                    "timed out repairing cached connection after ambiguous ask failure"
+                    error = ?repair_err,
+                    "failed to repair cached connection after ambiguous ask failure"
                 );
             }
         }
@@ -756,7 +758,7 @@ impl<T> RemoteActorRef<T> {
         let Some(registry) = self.registry.upgrade() else {
             return Err(crate::GossipError::Shutdown);
         };
-        if registry.shutdown.load(Ordering::Relaxed) {
+        if registry.shutdown.load(Ordering::Acquire) {
             return Err(crate::GossipError::Shutdown);
         }
         let policy = registry.config.connection_recovery;
@@ -832,7 +834,7 @@ impl<T> RemoteActorRef<T> {
         // ConnectionHandle.tell_bytes() avoids an extra payload clone.
         match conn.tell_bytes(message).await {
             Err(err) if Self::is_transport_failure(&err) => {
-                Err(self.preserve_ambiguous_ask_error(&conn, err).await)
+                Err(self.preserve_ambiguous_ask_error(&conn, err, None).await)
             }
             other => other,
         }
@@ -860,7 +862,7 @@ impl<T> RemoteActorRef<T> {
         let conn = self.current_connection_or_not_listening()?;
         match conn.tell_actor_frame(actor_id, type_hash, payload).await {
             Err(err) if Self::is_transport_failure(&err) => {
-                Err(self.preserve_ambiguous_ask_error(&conn, err).await)
+                Err(self.preserve_ambiguous_ask_error(&conn, err, None).await)
             }
             other => other,
         }
@@ -915,8 +917,8 @@ impl<T> RemoteActorRef<T> {
                     .await
                 {
                     Ok(Some(reconnected)) => {
-                        let mut retry_guard = self.actor_ask_cancellation_guard(&reconnected);
                         let remaining = Self::remaining_until(recovery_deadline)?;
+                        let mut retry_guard = self.actor_ask_cancellation_guard(&reconnected);
                         let retry_result = Self::ask_actor_frame_with_deadline(
                             &reconnected,
                             actor_id,
@@ -937,9 +939,9 @@ impl<T> RemoteActorRef<T> {
                     }
                 }
             }
-            Err(err) if Self::is_transport_failure(&err) => {
-                Err(self.preserve_ambiguous_ask_error(&conn, err).await)
-            }
+            Err(err) if Self::is_transport_failure(&err) => Err(self
+                .preserve_ambiguous_ask_error(&conn, err, Some(deadline))
+                .await),
             result => result,
         }
     }
@@ -957,7 +959,7 @@ impl<T> RemoteActorRef<T> {
             .await
         {
             Err(err) if Self::is_transport_failure(&err) => {
-                Err(self.preserve_ambiguous_ask_error(&conn, err).await)
+                Err(self.preserve_ambiguous_ask_error(&conn, err, None).await)
             }
             other => other,
         }
@@ -975,7 +977,7 @@ impl<T> RemoteActorRef<T> {
         // Direct call - ZERO LOCKS
         match conn.ask(request).await {
             Err(err) if Self::is_transport_failure(&err) => {
-                Err(self.preserve_ambiguous_ask_error(&conn, err).await)
+                Err(self.preserve_ambiguous_ask_error(&conn, err, None).await)
             }
             other => other,
         }
@@ -991,10 +993,11 @@ impl<T> RemoteActorRef<T> {
         timeout: std::time::Duration,
     ) -> crate::Result<bytes::Bytes> {
         let conn = self.current_connection_or_not_listening()?;
+        let deadline = tokio::time::Instant::now() + timeout;
         match conn.ask_with_timeout_bytes(request, timeout).await {
-            Err(err) if Self::is_transport_failure(&err) => {
-                Err(self.preserve_ambiguous_ask_error(&conn, err).await)
-            }
+            Err(err) if Self::is_transport_failure(&err) => Err(self
+                .preserve_ambiguous_ask_error(&conn, err, Some(deadline))
+                .await),
             other => other,
         }
     }
@@ -1006,10 +1009,11 @@ impl<T> RemoteActorRef<T> {
         timeout: std::time::Duration,
     ) -> crate::Result<bytes::Bytes> {
         let conn = self.current_connection_or_not_listening()?;
+        let deadline = tokio::time::Instant::now() + timeout;
         match conn.ask_direct(request, timeout).await {
-            Err(err) if Self::is_transport_failure(&err) => {
-                Err(self.preserve_ambiguous_ask_error(&conn, err).await)
-            }
+            Err(err) if Self::is_transport_failure(&err) => Err(self
+                .preserve_ambiguous_ask_error(&conn, err, Some(deadline))
+                .await),
             other => other,
         }
     }
@@ -1022,7 +1026,7 @@ impl<T> RemoteActorRef<T> {
         let conn = self.current_connection_or_not_listening()?;
         match conn.ask_direct_no_timeout(request).await {
             Err(err) if Self::is_transport_failure(&err) => {
-                Err(self.preserve_ambiguous_ask_error(&conn, err).await)
+                Err(self.preserve_ambiguous_ask_error(&conn, err, None).await)
             }
             other => other,
         }
@@ -1037,7 +1041,7 @@ impl<T> RemoteActorRef<T> {
         let conn = self.current_connection_or_not_listening()?;
         match conn.ask_deferred(request).await {
             Err(err) if Self::is_transport_failure(&err) => {
-                Err(self.preserve_ambiguous_ask_error(&conn, err).await)
+                Err(self.preserve_ambiguous_ask_error(&conn, err, None).await)
             }
             other => other,
         }
@@ -1060,7 +1064,7 @@ impl<T> RemoteActorRef<T> {
         let conn = self.current_connection_or_not_listening()?;
         match conn.tell_typed(message).await {
             Err(err) if Self::is_transport_failure(&err) => {
-                Err(self.preserve_ambiguous_ask_error(&conn, err).await)
+                Err(self.preserve_ambiguous_ask_error(&conn, err, None).await)
             }
             other => other,
         }
@@ -1084,7 +1088,7 @@ impl<T> RemoteActorRef<T> {
         let conn = self.current_connection_or_not_listening()?;
         match conn.ask_typed(request).await {
             Err(err) if Self::is_transport_failure(&err) => {
-                Err(self.preserve_ambiguous_ask_error(&conn, err).await)
+                Err(self.preserve_ambiguous_ask_error(&conn, err, None).await)
             }
             other => other,
         }
@@ -1112,7 +1116,7 @@ impl<T> RemoteActorRef<T> {
         let conn = self.current_connection_or_not_listening()?;
         match conn.ask_typed_archived(request).await {
             Err(err) if Self::is_transport_failure(&err) => {
-                Err(self.preserve_ambiguous_ask_error(&conn, err).await)
+                Err(self.preserve_ambiguous_ask_error(&conn, err, None).await)
             }
             other => other,
         }
@@ -1139,10 +1143,11 @@ impl<T> RemoteActorRef<T> {
             >,
     {
         let conn = self.current_connection_or_not_listening()?;
+        let deadline = tokio::time::Instant::now() + timeout;
         match conn.ask_typed_archived_with_timeout(request, timeout).await {
-            Err(err) if Self::is_transport_failure(&err) => {
-                Err(self.preserve_ambiguous_ask_error(&conn, err).await)
-            }
+            Err(err) if Self::is_transport_failure(&err) => Err(self
+                .preserve_ambiguous_ask_error(&conn, err, Some(deadline))
+                .await),
             other => other,
         }
     }
@@ -1161,14 +1166,15 @@ impl<T> RemoteActorRef<T> {
         timeout: std::time::Duration,
     ) -> crate::Result<bytes::Bytes> {
         let conn = self.current_connection_or_not_listening()?;
+        let deadline = tokio::time::Instant::now() + timeout;
         // Direct call - ZERO LOCKS
         match conn
             .ask_streaming_bytes(payload, type_hash, actor_id, timeout)
             .await
         {
-            Err(err) if Self::is_transport_failure(&err) => {
-                Err(self.preserve_ambiguous_ask_error(&conn, err).await)
-            }
+            Err(err) if Self::is_transport_failure(&err) => Err(self
+                .preserve_ambiguous_ask_error(&conn, err, Some(deadline))
+                .await),
             other => other,
         }
     }
@@ -1291,7 +1297,7 @@ mod tests {
             .expect("connection should be cached");
 
         let healed = remote_actor
-            .reheal_connection(&current)
+            .reheal_connection(&current, None)
             .await
             .expect("reheal should still resolve a connection");
 
