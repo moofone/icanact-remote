@@ -1,7 +1,8 @@
 use crate::RemoteActorLocation;
+use arc_swap::ArcSwapOption;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -327,7 +328,7 @@ impl RemoteConnection {
 ///
 /// `RemoteActorRef` uses weak references to prevent memory leaks:
 /// - `registry: Weak<GossipRegistry>` - doesn't prevent registry cleanup
-/// - `connection: Option<Arc<Mutex<ConnectionHandle>>>` - optional strong ref
+/// - `connection: Arc<ArcSwapOption<RemoteConnection>>` - live shared slot
 ///
 /// When the registry shuts down, `tell()`/`ask()` will fail on the next use.
 /// Cached connections may observe `ConnectionClosed` before weak-registry shutdown is noticed.
@@ -339,15 +340,25 @@ impl RemoteConnection {
 /// `connection` may be `None`. In this case, `tell()`/`ask()` will attempt to
 /// establish the connection lazily on first use.
 ///
-/// # DNS Reconnection (Kubernetes Pod Restarts)
+/// # Self-Healing Reconnection
 ///
-/// When a peer's IP changes due to DNS refresh (e.g., Kubernetes pod restart):
-/// - The old TCP connection dies and is removed from the connection pool
-/// - `RemoteActorRef` detects this on the next `tell()`/`ask()` call
-/// - It automatically reconnects to the peer using the updated peer_id→addr mapping
-/// - Subsequent messages use the fresh connection (zero additional lookups)
+/// The cached connection lives in a lock-free swappable slot
+/// (`ArcSwapOption<RemoteConnection>`), not a fixed field set once at
+/// construction. When a transport-level failure is observed on `tell()`/
+/// `ask()` (connection reset, broken pipe, or an already-closed handle) —
+/// or an actor-ask times out, subject to `ConnectionRecoveryPolicy` — the
+/// ref re-resolves the peer through the registry's connection pool
+/// (`peer_id` → address, refreshing DNS as needed), and **persists** the
+/// healed connection back into the slot so every subsequent call on this ref
+/// (and on any of its clones, which share the same slot) uses it directly
+/// with zero additional lookups. The failed operation is not replayed because
+/// a transport error is ambiguous; an actor ask is retried only when the
+/// caller explicitly enables the timeout-retry policy.
 ///
 /// This provides **self-healing** behavior - no manual re-lookup needed!
+/// A failed re-resolution (e.g. the peer is genuinely unreachable, or the
+/// registry has shut down) still returns a normal error rather than
+/// retrying indefinitely.
 ///
 /// # Example
 /// ```no_run
@@ -372,17 +383,21 @@ impl RemoteConnection {
 pub struct RemoteActorRef<T = ()> {
     /// The actor location information
     pub location: RemoteActorLocation,
-    /// Cached connection handle - set during lookup(), used for direct zero-lookup sending
-    /// Lock-free access - ConnectionHandle uses lock-free stream operations
-    /// None for actors that aren't listening yet (will be established on first use)
-    ///
+    /// Initial cached connection snapshot retained for source compatibility
+    /// with the former public debug/test field. Use [`Self::connection_ref`]
+    /// for the live self-healing connection; this snapshot is not updated by
+    /// later repairs.
     #[cfg(any(test, feature = "test-helpers", debug_assertions))]
     pub connection: Option<RemoteConnection>,
     #[cfg(not(any(test, feature = "test-helpers", debug_assertions)))]
     connection: Option<RemoteConnection>,
+    /// Lock-free live slot shared by every clone of this ref. A transport
+    /// failure or actor-ask timeout replaces this slot atomically.
+    connection_slot: Arc<ArcSwapOption<RemoteConnection>>,
     /// Registry weak reference - doesn't prevent registry shutdown/cleanup
     /// Used for reconnection after DNS changes
     registry: Weak<crate::registry::GossipRegistry>,
+    recovery_in_flight: Arc<AtomicBool>,
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -434,6 +449,14 @@ impl Drop for ActorAskCancellationGuard {
     }
 }
 
+struct AmbiguousRecoveryGuard(Arc<AtomicBool>);
+
+impl Drop for AmbiguousRecoveryGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 impl<T> RemoteActorRef<T> {
     fn remaining_until(deadline: tokio::time::Instant) -> crate::Result<std::time::Duration> {
         deadline
@@ -461,13 +484,330 @@ impl<T> RemoteActorRef<T> {
     }
 
     #[inline]
-    fn connection_or_not_listening(&self) -> crate::Result<&RemoteConnection> {
-        self.connection.as_ref().ok_or_else(|| {
+    fn current_connection_or_not_listening(&self) -> crate::Result<Arc<RemoteConnection>> {
+        self.connection_slot.load_full().ok_or_else(|| {
             crate::GossipError::ActorNotFound(format!(
                 "'{}' - not listening yet",
                 self.location.address
             ))
         })
+    }
+
+    /// Classify whether `err` indicates a dead/broken transport session (as
+    /// opposed to e.g. an application-level error, `Timeout`, or
+    /// `ActorNotFound`) that warrants re-resolving the connection through
+    /// the registry rather than surfacing it as-is.
+    fn is_transport_failure(err: &crate::GossipError) -> bool {
+        match err {
+            crate::GossipError::ConnectionClosed(_) | crate::GossipError::ConnectionDropped => true,
+            crate::GossipError::Network(io_err) => matches!(
+                io_err.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::UnexpectedEof
+            ),
+            _ => false,
+        }
+    }
+
+    /// Atomically install `new` as the cached connection iff the slot is
+    /// still exactly `expected` (`None` meaning "still empty", `Some(arc)`
+    /// meaning "still holding that exact `Arc`") - a single lock-free CAS on
+    /// the underlying `ArcSwapOption`, mirroring
+    /// `ConnectionPool::compare_and_set_current_connection`.
+    ///
+    /// This closes the check-then-act gap: a repair computed against a
+    /// snapshot (`expected`) taken before this call must never blindly
+    /// clobber whatever another concurrent repair already installed. Either
+    /// the slot still holds `expected` and is atomically swapped for `new`,
+    /// or it holds something else and is left untouched (the caller gets
+    /// that "something else" back to reuse instead of wastefully dialing
+    /// twice).
+    fn compare_and_set_connection(
+        &self,
+        expected: Option<&Arc<RemoteConnection>>,
+        new: Arc<RemoteConnection>,
+    ) -> std::result::Result<(), Option<Arc<RemoteConnection>>> {
+        let expected_owned: Option<Arc<RemoteConnection>> = expected.cloned();
+        let previous = self
+            .connection_slot
+            .compare_and_swap(&expected_owned, Some(new));
+        let matched = match (&expected_owned, &*previous) {
+            (None, None) => true,
+            (Some(exp), Some(prev)) => Arc::ptr_eq(exp, prev),
+            _ => false,
+        };
+        if matched {
+            Ok(())
+        } else {
+            Err((*previous).clone())
+        }
+    }
+
+    /// A `get_connection_to_peer` candidate is not a usable replacement for
+    /// `failed` if it is literally the same transport instance - the pool's
+    /// own index simply has not retired it yet - or is already closed.
+    /// Either way, accepting it would just wrap an identical or dead session
+    /// in a fresh `Arc`: a caller's CAS against it "succeeds" without the
+    /// underlying connection having actually changed. Checked by instance
+    /// identity, never by address: identity is the only signal that stays
+    /// correct no matter how the pool's index happens to be ordered at the
+    /// moment of the call.
+    fn is_unhealed_candidate(candidate: &RemoteConnection, failed: &Arc<RemoteConnection>) -> bool {
+        if candidate.is_closed() {
+            return true;
+        }
+
+        match (candidate.instance_id(), failed.instance_id()) {
+            (Some(candidate_id), Some(failed_id)) => candidate_id == failed_id,
+            // A handle without a stream instance cannot be a usable replacement. It may have
+            // lost its stream between pool lookup and this check, so reject it regardless of
+            // whether the failed handle had an instance of its own.
+            (None, _) => true,
+            (Some(_), None) => false,
+        }
+    }
+
+    /// Dial (or reuse) a connection to `peer_id`, respecting `deadline` when
+    /// the caller has its own budget to enforce (`None` lets the pool's own
+    /// connection timeout govern instead, for a caller whose outer timeout
+    /// already wraps the whole repair).
+    async fn dial_connection_to_peer(
+        registry: &Arc<crate::registry::GossipRegistry>,
+        peer_id: &crate::PeerId,
+        deadline: Option<tokio::time::Instant>,
+    ) -> crate::Result<crate::connection_pool::ConnectionHandle> {
+        match deadline {
+            Some(deadline) => {
+                let remaining = Self::remaining_until(deadline)?;
+                tokio::time::timeout(
+                    remaining,
+                    registry.connection_pool.get_connection_to_peer(peer_id),
+                )
+                .await
+                .map_err(|_| crate::GossipError::Timeout)?
+            }
+            None => {
+                registry
+                    .connection_pool
+                    .get_connection_to_peer(peer_id)
+                    .await
+            }
+        }
+    }
+
+    /// Dial a replacement for `failed` and reject it via
+    /// [`Self::is_unhealed_candidate`] if the pool's own get-or-create just
+    /// handed the identical (or already-dead) instance back. On rejection,
+    /// evict that specific instance by identity - never by address, which
+    /// could collaterally take out an unrelated concurrent reconnection -
+    /// and dial exactly once more; bounded to a single extra attempt, the
+    /// same "self-healing never loops" contract the callers of this
+    /// document.
+    async fn dial_replacement(
+        registry: &Arc<crate::registry::GossipRegistry>,
+        peer_id: &crate::PeerId,
+        failed: &Arc<RemoteConnection>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> crate::Result<Arc<RemoteConnection>> {
+        let candidate = RemoteConnection::from_handle(
+            Self::dial_connection_to_peer(registry, peer_id, deadline).await?,
+        );
+        if !Self::is_unhealed_candidate(&candidate, failed) {
+            return Ok(Arc::new(candidate));
+        }
+        // Evict the candidate that was actually rejected. It may be a different closed
+        // instance from `failed`; removing `failed` here leaves that candidate indexed and lets
+        // the next pool lookup return the same dead handle again.
+        if let Some(instance_id) = candidate.instance_id() {
+            registry
+                .connection_pool
+                .remove_connection_instance_for_peer(peer_id, candidate.addr, instance_id);
+        }
+        let redial = RemoteConnection::from_handle(
+            Self::dial_connection_to_peer(registry, peer_id, deadline).await?,
+        );
+        if Self::is_unhealed_candidate(&redial, failed) {
+            if let Some(instance_id) = redial.instance_id() {
+                registry
+                    .connection_pool
+                    .remove_connection_instance_for_peer(peer_id, redial.addr, instance_id);
+            }
+            return Err(crate::GossipError::ConnectionClosed(redial.addr));
+        }
+        Ok(Arc::new(redial))
+    }
+
+    /// Re-resolve the peer through the registry's connection pool and
+    /// persist the freshly dialed (or reused) connection into the shared
+    /// slot, so every subsequent call on this ref - and any of its clones -
+    /// observes the healed connection with zero additional lookups.
+    ///
+    /// If another concurrent caller already healed this ref past `failed`,
+    /// this returns that connection directly without dialing again.
+    /// Returns `Err(GossipError::Shutdown)` if the registry is gone, or
+    /// whatever error the pool's dial attempt produced - self-healing never
+    /// loops, it retries exactly once per failed call.
+    async fn reheal_connection(
+        &self,
+        failed: &Arc<RemoteConnection>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> crate::Result<Arc<RemoteConnection>> {
+        let Some(registry) = self.registry.upgrade() else {
+            return Err(crate::GossipError::Shutdown);
+        };
+        if registry.shutdown.load(Ordering::Acquire) {
+            // Don't attempt to re-resolve against a registry that is already
+            // tearing down - the peer's own listener may already be gone too,
+            // which would otherwise surface as a raw dial error (e.g.
+            // `ConnectionRefused`) instead of the expected `Shutdown`.
+            return Err(crate::GossipError::Shutdown);
+        }
+
+        // Somebody else may have already repaired this ref concurrently -
+        // if the live slot no longer points at the instance that just
+        // failed, reuse it only when that replacement is still healthy.
+        // A closed replacement is not a heal: retain it as the CAS expected
+        // value below so this repair can replace that exact stale pointer.
+        let expected = self.connection_slot.load_full();
+        if let Some(current) = expected.as_ref() {
+            if !Arc::ptr_eq(current, failed) && !current.is_closed() {
+                return Ok(current.clone());
+            }
+        }
+
+        let peer_id = self.location.peer_id.clone();
+        // Retire the exact failed instance before asking the pool for a replacement. The pool's
+        // get-or-create path may still have that session indexed briefly after the transport
+        // reports its error; resolving first can return the same dead instance and make the CAS
+        // below appear to heal while changing nothing underneath.
+        if let Some(current) = expected.as_ref() {
+            if let Some(instance_id) = current.instance_id() {
+                registry
+                    .connection_pool
+                    .remove_connection_instance_for_peer(&peer_id, current.addr, instance_id);
+            }
+        } else if let Some(instance_id) = failed.instance_id() {
+            registry
+                .connection_pool
+                .remove_connection_instance_for_peer(&peer_id, failed.addr, instance_id);
+        }
+        let fresh = Self::dial_replacement(&registry, &peer_id, failed, deadline).await?;
+
+        Ok(
+            match self.compare_and_set_connection(expected.as_ref(), fresh.clone()) {
+                Ok(()) => fresh,
+                Err(Some(other)) if !other.is_closed() => other,
+                Err(Some(other)) => {
+                    if let Some(instance_id) = other.instance_id() {
+                        registry
+                            .connection_pool
+                            .remove_connection_instance_for_peer(&peer_id, other.addr, instance_id);
+                    }
+                    match self.compare_and_set_connection(Some(&other), fresh.clone()) {
+                        Ok(()) => fresh,
+                        Err(Some(current)) if !current.is_closed() => current,
+                        Err(Some(current)) => {
+                            return Err(crate::GossipError::ConnectionClosed(current.addr));
+                        }
+                        Err(None) => {
+                            self.connection_slot.store(Some(fresh.clone()));
+                            fresh
+                        }
+                    }
+                }
+                Err(None) => {
+                    // Slot had already been cleared out from under us; nothing
+                    // better than our own fresh dial is available.
+                    self.connection_slot.store(Some(fresh.clone()));
+                    fresh
+                }
+            },
+        )
+    }
+
+    /// Repair the cached transport after an ask failed, without replaying the
+    /// request. A write-side transport error is ambiguous: the remote actor
+    /// may already have received and processed the request, so retrying it
+    /// could duplicate a non-idempotent operation.
+    async fn preserve_ambiguous_ask_error(
+        &self,
+        failed: &Arc<RemoteConnection>,
+        err: crate::GossipError,
+        deadline: Option<tokio::time::Instant>,
+    ) -> crate::GossipError {
+        let Some(registry) = self.registry.upgrade() else {
+            return err;
+        };
+        let Some(claim) = self.claim_ambiguous_ask_recovery() else {
+            return err;
+        };
+        let recovery_deadline = tokio::time::Instant::now() + registry.config.connection_timeout;
+        let repair = self.reheal_connection(failed, Some(recovery_deadline));
+
+        if let Some(operation_deadline) = deadline {
+            match Self::remaining_until(operation_deadline) {
+                Ok(remaining) => match tokio::time::timeout(remaining, repair).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(repair_err)) => {
+                        tracing::debug!(
+                            error = ?repair_err,
+                            "failed to repair cached connection after ambiguous ask failure"
+                        );
+                    }
+                    Err(_) => {
+                        self.spawn_ambiguous_ask_recovery(
+                            Arc::clone(failed),
+                            recovery_deadline,
+                            claim,
+                        );
+                    }
+                },
+                Err(_) => {
+                    self.spawn_ambiguous_ask_recovery(Arc::clone(failed), recovery_deadline, claim);
+                }
+            }
+        } else if let Err(repair_err) = repair.await {
+            tracing::debug!(
+                error = ?repair_err,
+                "failed to repair cached connection after ambiguous ask failure"
+            );
+        }
+        err
+    }
+
+    fn claim_ambiguous_ask_recovery(&self) -> Option<AmbiguousRecoveryGuard> {
+        self.recovery_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| AmbiguousRecoveryGuard(Arc::clone(&self.recovery_in_flight)))
+    }
+
+    fn spawn_ambiguous_ask_recovery(
+        &self,
+        failed: Arc<RemoteConnection>,
+        deadline: tokio::time::Instant,
+        claim: AmbiguousRecoveryGuard,
+    ) {
+        let remote = RemoteActorRef::<()> {
+            location: self.location.clone(),
+            connection: self.connection.clone(),
+            connection_slot: Arc::clone(&self.connection_slot),
+            registry: self.registry.clone(),
+            recovery_in_flight: Arc::clone(&self.recovery_in_flight),
+            _marker: PhantomData,
+        };
+        tokio::spawn(async move {
+            let _claim = claim;
+            if let Err(repair_err) = remote.reheal_connection(&failed, Some(deadline)).await {
+                tracing::debug!(
+                    error = ?repair_err,
+                    "failed to repair cached connection after ambiguous ask failure"
+                );
+            }
+        });
     }
 
     /// Create a new RemoteActorRef with optional connection and registry reference (for auto-reconnection)
@@ -477,10 +817,13 @@ impl<T> RemoteActorRef<T> {
         connection: Option<crate::connection_pool::ConnectionHandle>,
         registry: Arc<crate::registry::GossipRegistry>,
     ) -> Self {
+        let connection = connection.map(RemoteConnection::from_handle);
         Self {
             location,
-            connection: connection.map(RemoteConnection::from_handle),
+            connection: connection.clone(),
+            connection_slot: Arc::new(ArcSwapOption::from(connection.map(Arc::new))),
             registry: Arc::downgrade(&registry), // Weak reference - prevents cycle
+            recovery_in_flight: Arc::new(AtomicBool::new(false)),
             _marker: PhantomData,
         }
     }
@@ -502,7 +845,7 @@ impl<T> RemoteActorRef<T> {
     ///
     /// Returns None if no connection is established yet.
     pub fn connection_ref(&self) -> Option<RemoteConnection> {
-        self.connection.clone()
+        self.connection_slot.load_full().map(|arc| (*arc).clone())
     }
 
     fn actor_ask_cancellation_guard(
@@ -525,11 +868,14 @@ impl<T> RemoteActorRef<T> {
     async fn recover_connection_after_actor_ask_timeout(
         &self,
         deadline: tokio::time::Instant,
-        failed_conn: &RemoteConnection,
-    ) -> crate::Result<Option<RemoteConnection>> {
+        failed_conn: &Arc<RemoteConnection>,
+    ) -> crate::Result<Option<Arc<RemoteConnection>>> {
         let Some(registry) = self.registry.upgrade() else {
             return Err(crate::GossipError::Shutdown);
         };
+        if registry.shutdown.load(Ordering::Acquire) {
+            return Err(crate::GossipError::Shutdown);
+        }
         let policy = registry.config.connection_recovery;
         if !policy.evict_peer_on_ask_timeout {
             return Ok(None);
@@ -560,18 +906,47 @@ impl<T> RemoteActorRef<T> {
             "actor ask timed out; evicted the specific peer transport session instance it ran on"
         );
 
+        // Dial and persist a replacement unconditionally once eviction is
+        // enabled - whether the CALLER replays the timed-out ask onto it is
+        // an entirely separate decision, gated below by
+        // `retry_actor_ask_once_after_timeout`. Conflating the two left the
+        // safety-oriented combination (evict on timeout, never replay)
+        // stuck holding the just-evicted connection forever: the eviction
+        // above ran, but nothing ever replaced what this ref itself was
+        // still caching, so the next call on it hit the identical dead
+        // handle again.
+        let fresh = Self::dial_replacement(&registry, peer_id, failed_conn, Some(deadline)).await?;
+        let healed = match self.compare_and_set_connection(Some(failed_conn), fresh.clone()) {
+            Ok(()) => fresh,
+            Err(Some(other)) if !other.is_closed() => other,
+            Err(Some(other)) => {
+                if let Some(instance_id) = other.instance_id() {
+                    registry
+                        .connection_pool
+                        .remove_connection_instance_for_peer(peer_id, other.addr, instance_id);
+                }
+                match self.compare_and_set_connection(Some(&other), fresh.clone()) {
+                    Ok(()) => fresh,
+                    Err(Some(current)) if !current.is_closed() => current,
+                    Err(Some(current)) => {
+                        return Err(crate::GossipError::ConnectionClosed(current.addr));
+                    }
+                    Err(None) => {
+                        self.connection_slot.store(Some(fresh.clone()));
+                        fresh
+                    }
+                }
+            }
+            Err(None) => {
+                self.connection_slot.store(Some(fresh.clone()));
+                fresh
+            }
+        };
+
         if !policy.retry_actor_ask_once_after_timeout {
             return Ok(None);
         }
-
-        let remaining = Self::remaining_until(deadline)?;
-        let handle = tokio::time::timeout(
-            remaining,
-            registry.connection_pool.get_connection_to_peer(peer_id),
-        )
-        .await
-        .map_err(|_| crate::GossipError::Timeout)??;
-        Ok(Some(RemoteConnection::from_handle(handle)))
+        Ok(Some(healed))
     }
 
     /// Send a fire-and-forget message to the remote actor.
@@ -586,18 +961,27 @@ impl<T> RemoteActorRef<T> {
 
     /// Send a fire-and-forget message using owned bytes (no payload copy at this layer).
     pub async fn tell_bytes(&self, message: bytes::Bytes) -> crate::Result<()> {
-        let conn = self.connection_or_not_listening()?;
+        let conn = self.current_connection_or_not_listening()?;
 
         // Direct call - ZERO LOCKS
         // ConnectionHandle.tell_bytes() avoids an extra payload clone.
-        conn.tell_bytes(message).await
+        match conn.tell_bytes(message).await {
+            Err(err) if Self::is_transport_failure(&err) => {
+                Err(self.preserve_ambiguous_ask_error(&conn, err, None).await)
+            }
+            other => other,
+        }
     }
 
     /// Non-blocking tell using owned bytes.
     ///
     /// Returns `GossipError::WriteQueueFull` when the connection write queue is saturated.
+    ///
+    /// This is synchronous and cannot perform the async re-resolution self-healing
+    /// relies on, so it benefits from a healed connection only if a previous
+    /// `async` call on this ref already repaired the slot.
     pub fn try_tell_bytes(&self, message: bytes::Bytes) -> crate::Result<()> {
-        let conn = self.connection_or_not_listening()?;
+        let conn = self.current_connection_or_not_listening()?;
         conn.try_tell_bytes(message)
     }
 
@@ -608,18 +992,25 @@ impl<T> RemoteActorRef<T> {
         type_hash: u32,
         payload: bytes::Bytes,
     ) -> crate::Result<()> {
-        let conn = self.connection_or_not_listening()?;
-        conn.tell_actor_frame(actor_id, type_hash, payload).await
+        let conn = self.current_connection_or_not_listening()?;
+        match conn.tell_actor_frame(actor_id, type_hash, payload).await {
+            Err(err) if Self::is_transport_failure(&err) => {
+                Err(self.preserve_ambiguous_ask_error(&conn, err, None).await)
+            }
+            other => other,
+        }
     }
 
     /// Non-blocking actor-routed tell. Returns `GossipError::WriteQueueFull` on backpressure.
+    ///
+    /// See `try_tell_bytes` for why this cannot self-heal synchronously.
     pub fn try_tell_actor_frame(
         &self,
         actor_id: u64,
         type_hash: u32,
         payload: bytes::Bytes,
     ) -> crate::Result<()> {
-        let conn = self.connection_or_not_listening()?;
+        let conn = self.current_connection_or_not_listening()?;
         conn.try_tell_actor_frame(actor_id, type_hash, payload)
     }
 
@@ -631,12 +1022,12 @@ impl<T> RemoteActorRef<T> {
         payload: bytes::Bytes,
         timeout: std::time::Duration,
     ) -> crate::Result<bytes::Bytes> {
-        let conn = self.connection_or_not_listening()?;
+        let conn = self.current_connection_or_not_listening()?;
         let deadline = tokio::time::Instant::now() + timeout;
-        let mut guard = self.actor_ask_cancellation_guard(conn);
+        let mut guard = self.actor_ask_cancellation_guard(&conn);
         let remaining = Self::remaining_until(deadline)?;
         let result = Self::ask_actor_frame_with_deadline(
-            conn,
+            &conn,
             actor_id,
             type_hash,
             payload.clone(),
@@ -648,38 +1039,42 @@ impl<T> RemoteActorRef<T> {
         }
         match result {
             Err(crate::GossipError::Timeout) => {
-                // ACTOR_REM_2 R11: the first ask consumed the entire budget, so
-                // the original `deadline` is already in the past. Running the
-                // evict+reconnect+retry recovery against it makes every
-                // `remaining_until(deadline)` return `Timeout`, so the retry was
-                // dead code and the documented `retry_actor_ask_once_after_timeout`
-                // never fired. Give the single retry a FRESH budget (the same
-                // configured `timeout`) so the reconnect and retry can actually
-                // run. (Note: the reconnected handle serves only this retry; it
-                // is not written back into the ref — persisting it across future
-                // calls is a separate change, F3.)
-                let retry_deadline = tokio::time::Instant::now() + timeout;
-                if let Some(reconnected) = self
-                    .recover_connection_after_actor_ask_timeout(retry_deadline, conn)
-                    .await?
+                // The remote may have received the request before the local
+                // timeout fired. By default, repair the cached connection for
+                // the next operation but do not replay this potentially
+                // non-idempotent ask. The timeout-retry policy is the explicit
+                // caller opt-in to one replay after recovery.
+                let recovery_deadline = tokio::time::Instant::now() + timeout;
+                match self
+                    .recover_connection_after_actor_ask_timeout(recovery_deadline, &conn)
+                    .await
                 {
-                    let mut retry_guard = self.actor_ask_cancellation_guard(&reconnected);
-                    let remaining = Self::remaining_until(retry_deadline)?;
-                    let retry_result = Self::ask_actor_frame_with_deadline(
-                        &reconnected,
-                        actor_id,
-                        type_hash,
-                        payload,
-                        remaining,
-                    )
-                    .await;
-                    if let Some(guard) = retry_guard.as_mut() {
-                        guard.disarm();
+                    Ok(Some(reconnected)) => {
+                        let remaining = Self::remaining_until(recovery_deadline)?;
+                        let mut retry_guard = self.actor_ask_cancellation_guard(&reconnected);
+                        let retry_result = Self::ask_actor_frame_with_deadline(
+                            &reconnected,
+                            actor_id,
+                            type_hash,
+                            payload,
+                            remaining,
+                        )
+                        .await;
+                        if let Some(guard) = retry_guard.as_mut() {
+                            guard.disarm();
+                        }
+                        retry_result
                     }
-                    return retry_result;
+                    Ok(None) => Err(crate::GossipError::Timeout),
+                    Err(repair_err) => {
+                        tracing::debug!(error = ?repair_err, "failed to repair cached connection after timed-out ask");
+                        Err(repair_err)
+                    }
                 }
-                Err(crate::GossipError::Timeout)
             }
+            Err(err) if Self::is_transport_failure(&err) => Err(self
+                .preserve_ambiguous_ask_error(&conn, err, Some(deadline))
+                .await),
             result => result,
         }
     }
@@ -691,9 +1086,16 @@ impl<T> RemoteActorRef<T> {
         type_hash: u32,
         payload: bytes::Bytes,
     ) -> crate::Result<bytes::Bytes> {
-        let conn = self.connection_or_not_listening()?;
-        conn.ask_actor_frame_no_timeout(actor_id, type_hash, payload)
+        let conn = self.current_connection_or_not_listening()?;
+        match conn
+            .ask_actor_frame_no_timeout(actor_id, type_hash, payload)
             .await
+        {
+            Err(err) if Self::is_transport_failure(&err) => {
+                Err(self.preserve_ambiguous_ask_error(&conn, err, None).await)
+            }
+            other => other,
+        }
     }
 
     /// Send a request and wait for a response.
@@ -704,9 +1106,14 @@ impl<T> RemoteActorRef<T> {
     ///
     /// Returns error if registry has shut down or no connection is available.
     pub async fn ask(&self, request: bytes::Bytes) -> crate::Result<bytes::Bytes> {
-        let conn = self.connection_or_not_listening()?;
+        let conn = self.current_connection_or_not_listening()?;
         // Direct call - ZERO LOCKS
-        conn.ask(request).await
+        match conn.ask(request).await {
+            Err(err) if Self::is_transport_failure(&err) => {
+                Err(self.preserve_ambiguous_ask_error(&conn, err, None).await)
+            }
+            other => other,
+        }
     }
 
     /// Send a request with timeout and wait for response
@@ -718,8 +1125,14 @@ impl<T> RemoteActorRef<T> {
         request: bytes::Bytes,
         timeout: std::time::Duration,
     ) -> crate::Result<bytes::Bytes> {
-        let conn = self.connection_or_not_listening()?;
-        conn.ask_with_timeout_bytes(request, timeout).await
+        let conn = self.current_connection_or_not_listening()?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        match conn.ask_with_timeout_bytes(request, timeout).await {
+            Err(err) if Self::is_transport_failure(&err) => Err(self
+                .preserve_ambiguous_ask_error(&conn, err, Some(deadline))
+                .await),
+            other => other,
+        }
     }
 
     /// Send a direct request and wait for a direct response.
@@ -728,8 +1141,14 @@ impl<T> RemoteActorRef<T> {
         request: bytes::Bytes,
         timeout: std::time::Duration,
     ) -> crate::Result<bytes::Bytes> {
-        let conn = self.connection_or_not_listening()?;
-        conn.ask_direct(request, timeout).await
+        let conn = self.current_connection_or_not_listening()?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        match conn.ask_direct(request, timeout).await {
+            Err(err) if Self::is_transport_failure(&err) => Err(self
+                .preserve_ambiguous_ask_error(&conn, err, Some(deadline))
+                .await),
+            other => other,
+        }
     }
 
     /// Send a direct request and wait without timeout allocation.
@@ -737,8 +1156,13 @@ impl<T> RemoteActorRef<T> {
         &self,
         request: bytes::Bytes,
     ) -> crate::Result<bytes::Bytes> {
-        let conn = self.connection_or_not_listening()?;
-        conn.ask_direct_no_timeout(request).await
+        let conn = self.current_connection_or_not_listening()?;
+        match conn.ask_direct_no_timeout(request).await {
+            Err(err) if Self::is_transport_failure(&err) => {
+                Err(self.preserve_ambiguous_ask_error(&conn, err, None).await)
+            }
+            other => other,
+        }
     }
 
     /// Send a request and return a deferred handle that can be awaited later.
@@ -747,8 +1171,13 @@ impl<T> RemoteActorRef<T> {
     ///
     /// ZERO-LOCK: Uses cached connection directly with no mutex overhead.
     pub async fn ask_deferred(&self, request: bytes::Bytes) -> crate::Result<crate::DeferredAsk> {
-        let conn = self.connection_or_not_listening()?;
-        conn.ask_deferred(request).await
+        let conn = self.current_connection_or_not_listening()?;
+        match conn.ask_deferred(request).await {
+            Err(err) if Self::is_transport_failure(&err) => {
+                Err(self.preserve_ambiguous_ask_error(&conn, err, None).await)
+            }
+            other => other,
+        }
     }
 
     /// Send a typed fire-and-forget message
@@ -758,21 +1187,20 @@ impl<T> RemoteActorRef<T> {
     {
         // Check if registry has been shut down
         if let Some(registry) = self.registry.upgrade() {
-            if registry.shutdown.load(Ordering::Relaxed) {
+            if registry.shutdown.load(Ordering::Acquire) {
                 return Err(crate::GossipError::Shutdown);
             }
         } else {
             return Err(crate::GossipError::Shutdown);
         }
 
-        let conn = self.connection.as_ref().ok_or_else(|| {
-            crate::GossipError::ActorNotFound(format!(
-                "'{}' - not listening yet",
-                self.location.address
-            ))
-        })?;
-
-        conn.tell_typed(message).await
+        let conn = self.current_connection_or_not_listening()?;
+        match conn.tell_typed(message).await {
+            Err(err) if Self::is_transport_failure(&err) => {
+                Err(self.preserve_ambiguous_ask_error(&conn, err, None).await)
+            }
+            other => other,
+        }
     }
 
     /// Send a typed request and wait for a typed response
@@ -790,13 +1218,13 @@ impl<T> RemoteActorRef<T> {
                 >,
             > + rkyv::Deserialize<R, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>>,
     {
-        let conn = self.connection.as_ref().ok_or_else(|| {
-            crate::GossipError::ActorNotFound(format!(
-                "'{}' - not listening yet",
-                self.location.address
-            ))
-        })?;
-        conn.ask_typed(request).await
+        let conn = self.current_connection_or_not_listening()?;
+        match conn.ask_typed(request).await {
+            Err(err) if Self::is_transport_failure(&err) => {
+                Err(self.preserve_ambiguous_ask_error(&conn, err, None).await)
+            }
+            other => other,
+        }
     }
 
     /// Send a typed request and keep the reply as an archived zero-copy view.
@@ -818,13 +1246,13 @@ impl<T> RemoteActorRef<T> {
                 >,
             >,
     {
-        let conn = self.connection.as_ref().ok_or_else(|| {
-            crate::GossipError::ActorNotFound(format!(
-                "'{}' - not listening yet",
-                self.location.address
-            ))
-        })?;
-        conn.ask_typed_archived(request).await
+        let conn = self.current_connection_or_not_listening()?;
+        match conn.ask_typed_archived(request).await {
+            Err(err) if Self::is_transport_failure(&err) => {
+                Err(self.preserve_ambiguous_ask_error(&conn, err, None).await)
+            }
+            other => other,
+        }
     }
 
     /// Send a typed request and keep the reply as an archived zero-copy view.
@@ -847,13 +1275,14 @@ impl<T> RemoteActorRef<T> {
                 >,
             >,
     {
-        let conn = self.connection.as_ref().ok_or_else(|| {
-            crate::GossipError::ActorNotFound(format!(
-                "'{}' - not listening yet",
-                self.location.address
-            ))
-        })?;
-        conn.ask_typed_archived_with_timeout(request, timeout).await
+        let conn = self.current_connection_or_not_listening()?;
+        let deadline = tokio::time::Instant::now() + timeout;
+        match conn.ask_typed_archived_with_timeout(request, timeout).await {
+            Err(err) if Self::is_transport_failure(&err) => Err(self
+                .preserve_ambiguous_ask_error(&conn, err, Some(deadline))
+                .await),
+            other => other,
+        }
     }
 
     /// Send a large request using streaming (for payloads > 1MB)
@@ -869,10 +1298,18 @@ impl<T> RemoteActorRef<T> {
         type_hash: u32,
         timeout: std::time::Duration,
     ) -> crate::Result<bytes::Bytes> {
-        let conn = self.connection_or_not_listening()?;
+        let conn = self.current_connection_or_not_listening()?;
+        let deadline = tokio::time::Instant::now() + timeout;
         // Direct call - ZERO LOCKS
-        conn.ask_streaming_bytes(payload, type_hash, actor_id, timeout)
+        match conn
+            .ask_streaming_bytes(payload, type_hash, actor_id, timeout)
             .await
+        {
+            Err(err) if Self::is_transport_failure(&err) => Err(self
+                .preserve_ambiguous_ask_error(&conn, err, Some(deadline))
+                .await),
+            other => other,
+        }
     }
 
     /// Get the streaming threshold for this connection
@@ -889,5 +1326,201 @@ impl<T> std::fmt::Debug for RemoteActorRef<T> {
             .field("connection", &"<connection>")
             .field("registry_alive", &self.is_registry_alive())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::{ActorMessageFuture, ActorMessageHandler};
+    use crate::{GossipConfig, GossipRegistryHandle, KeyPair};
+    use tokio::time::{sleep, Duration};
+
+    struct NeverRespondsHandler;
+
+    impl ActorMessageHandler for NeverRespondsHandler {
+        fn handle_actor_message(
+            &self,
+            _actor_id: u64,
+            _type_hash: u32,
+            _payload: crate::AlignedBytes,
+            _correlation_id: Option<u32>,
+        ) -> ActorMessageFuture<'_> {
+            Box::pin(async move {
+                sleep(Duration::from_secs(30)).await;
+                Ok(None)
+            })
+        }
+    }
+
+    /// `add_peer`/`connect` dial in one fixed direction; order the pair so
+    /// the lower `NodeId` always dials out, matching every other two-node
+    /// test in this crate.
+    fn ordered_pair(seed_a: &str, seed_b: &str) -> (KeyPair, KeyPair) {
+        let first = KeyPair::new_for_testing(seed_a);
+        let second = KeyPair::new_for_testing(seed_b);
+        if first
+            .peer_id()
+            .to_node_id()
+            .as_bytes()
+            .cmp(second.peer_id().to_node_id().as_bytes())
+            .is_lt()
+        {
+            (first, second)
+        } else {
+            (second, first)
+        }
+    }
+
+    /// `reheal_connection` must never accept the pool's own `get_connection_to_peer`
+    /// handing back the exact instance passed in as `failed`: wrapping that
+    /// same instance in a fresh `Arc<RemoteConnection>` would make the
+    /// caller's CAS succeed while the slot still points at a connection that
+    /// is no better than the one that just failed. Calling the repair path
+    /// directly with the ref's own live connection as `failed` reproduces
+    /// exactly the shape the pool exhibits when it has not yet retired the
+    /// instance a caller is repairing away from: `get_connection_to_peer`
+    /// legitimately has nothing else to offer but that same instance.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reheal_connection_never_returns_the_instance_passed_in_as_failed() {
+        let addr_a: SocketAddr = "127.0.0.1:28491".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:28492".parse().unwrap();
+        let (key_pair_a, key_pair_b) = ordered_pair("reheal_identity_a", "reheal_identity_b");
+        let peer_id_a = key_pair_a.peer_id();
+        let peer_id_b = key_pair_b.peer_id();
+        assert_ne!(
+            peer_id_a, peer_id_b,
+            "distinct test seeds must not collapse to the same PeerId"
+        );
+
+        let config = GossipConfig {
+            gossip_interval: Duration::from_secs(300),
+            peer_supervisor_interval: Duration::from_secs(300),
+            ..Default::default()
+        };
+
+        let handle_a = GossipRegistryHandle::new_with_transport_stack(
+            addr_a,
+            key_pair_a.to_secret_key(),
+            Some(config.clone()),
+            crate::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(
+            addr_b,
+            key_pair_b.to_secret_key(),
+            Some(config),
+            crate::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
+
+        let peer_b = handle_a.add_peer(&peer_id_b).await;
+        peer_b.connect(&addr_b).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+
+        let remote_actor = handle_a
+            .lookup_peer(&peer_id_b)
+            .await
+            .expect("lookup should succeed");
+        let current = remote_actor
+            .connection_slot
+            .load_full()
+            .expect("connection should be cached");
+
+        let healed = remote_actor
+            .reheal_connection(&current, None)
+            .await
+            .expect("reheal should still resolve a connection");
+
+        assert_ne!(
+            healed.instance_id(),
+            current.instance_id(),
+            "reheal must not accept the same instance that was passed in as failed, even when \
+             the pool's own get-or-create still has it indexed"
+        );
+
+        handle_a.shutdown().await;
+        handle_b.shutdown().await;
+    }
+
+    /// A timeout-recovery failure is a distinct caller-visible outcome from the original ask
+    /// timing out. In particular, a registry that is already shutting down must not be reported
+    /// as a peer timeout: callers use `Shutdown` to stop issuing work and `Timeout` to consider a
+    /// bounded retry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn timeout_recovery_propagates_registry_shutdown() {
+        let addr_a: SocketAddr = "127.0.0.1:28493".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:28494".parse().unwrap();
+        let (key_pair_a, key_pair_b) = ordered_pair("timeout_shutdown_a", "timeout_shutdown_b");
+        let peer_id_b = key_pair_b.peer_id();
+        let config = GossipConfig {
+            gossip_interval: Duration::from_secs(300),
+            peer_supervisor_interval: Duration::from_secs(300),
+            connection_recovery: crate::ConnectionRecoveryPolicy {
+                evict_peer_on_ask_timeout: true,
+                evict_peer_on_ask_cancel: false,
+                retry_actor_ask_once_after_timeout: false,
+                consecutive_timeout_threshold: 0,
+            },
+            ..Default::default()
+        };
+
+        let handle_a = GossipRegistryHandle::new_with_transport_stack(
+            addr_a,
+            key_pair_a.to_secret_key(),
+            Some(config.clone()),
+            crate::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(
+            addr_b,
+            key_pair_b.to_secret_key(),
+            Some(config),
+            crate::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
+        handle_b
+            .registry
+            .set_actor_message_handler(Arc::new(NeverRespondsHandler))
+            .await;
+
+        handle_a
+            .add_peer(&peer_id_b)
+            .await
+            .connect(&addr_b)
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(300)).await;
+        let remote_actor = handle_a
+            .lookup_peer(&peer_id_b)
+            .await
+            .expect("lookup should succeed");
+
+        // Keep the cached connection alive long enough for the first ask to time out, then make
+        // the recovery boundary observe shutdown. The old implementation converted this precise
+        // `Shutdown` into `Timeout`.
+        handle_a
+            .registry
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        let result = remote_actor
+            .ask_actor_frame(
+                0x5E1F_4EA1,
+                0xC0DE_CAFE,
+                bytes::Bytes::from_static(b"shutdown"),
+                Duration::from_millis(50),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(crate::GossipError::Shutdown)),
+            "timeout recovery must preserve Shutdown, got {result:?}"
+        );
+
+        handle_a.shutdown().await;
+        handle_b.shutdown().await;
     }
 }

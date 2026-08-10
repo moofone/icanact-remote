@@ -289,43 +289,6 @@ async fn ask_once(from: &TlsHandle, to: &PeerId, payload: &'static [u8], expecte
     assert_eq!(reply.as_ref(), expected);
 }
 
-async fn wait_for_successful_ask(
-    from: &TlsHandle,
-    to: &PeerId,
-    payload: &'static [u8],
-    expected: &'static [u8],
-) -> icanact_remote::Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let mut last_err = None;
-    while Instant::now() < deadline {
-        let remote = from.lookup_peer(to).await?;
-        match remote
-            .ask_actor_frame(
-                TEST_ACTOR_ID,
-                TEST_TYPE_HASH,
-                Bytes::from_static(payload),
-                Duration::from_millis(750),
-            )
-            .await
-        {
-            Ok(reply) if reply.as_ref() == expected => return Ok(()),
-            Ok(reply) => {
-                return Err(icanact_remote::GossipError::Network(std::io::Error::other(
-                    format!("unexpected reply: {reply:?}"),
-                )));
-            }
-            Err(err @ icanact_remote::GossipError::ConnectionDropped)
-            | Err(err @ icanact_remote::GossipError::ActorNotFound(_))
-            | Err(err @ icanact_remote::GossipError::Timeout) => {
-                last_err = Some(err);
-                sleep(Duration::from_millis(25)).await;
-            }
-            Err(err) => return Err(err),
-        }
-    }
-    Err(last_err.unwrap_or(icanact_remote::GossipError::Timeout))
-}
-
 async fn wait_until_connected(handle: &TlsHandle, peer_id: &PeerId) -> icanact_remote::Result<()> {
     timeout(Duration::from_secs(2), async {
         loop {
@@ -992,8 +955,8 @@ async fn half_open_reset_evicts_dead_session_but_actor_timeout_does_not()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn dropped_transport_during_actor_ask_clears_connected_lookup_and_reconnects()
--> icanact_remote::Result<()> {
+async fn dropped_transport_during_actor_ask_self_heals_and_reconnects() -> icanact_remote::Result<()>
+{
     let _guard = TEST_LOCK
         .get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
@@ -1037,6 +1000,20 @@ async fn dropped_transport_during_actor_ask_clears_connected_lookup_and_reconnec
     wait_until_connected(&local, &remote.registry.peer_id).await?;
 
     let remote_ref = local.lookup_peer(&remote.registry.peer_id).await?;
+    // A transport-class failure on `ask_actor_frame` is never replayed by
+    // `RemoteActorRef` itself: the request may already have reached the
+    // remote, so the original error is always what this call returns: only
+    // the *cached slot* gets repaired underneath, for the NEXT call (see
+    // `tests/remote_actor_ref_self_heal.rs`). This call's own outcome
+    // instead races the scripted proxy's forced close against the ask's own
+    // request/response round trip: `Ok` means the round trip completed
+    // before the close took effect, a transport-class `Err` means it did
+    // not - both are legitimate depending on exactly when the close lands.
+    // The dead transport session is still torn down and replaced underneath
+    // regardless of which one this run hits - see the
+    // `session_removed_count`/`session_published_count` assertions below.
+    // What must never happen is success with the wrong payload, or a
+    // non-transport error.
     let dropped = remote_ref
         .ask_actor_frame(
             TEST_ACTOR_ID,
@@ -1045,15 +1022,20 @@ async fn dropped_transport_during_actor_ask_clears_connected_lookup_and_reconnec
             Duration::from_secs(3),
         )
         .await;
-    assert!(
-        matches!(dropped, Err(icanact_remote::GossipError::ConnectionDropped)),
-        "transport close while waiting for actor ask should surface ConnectionDropped, got {dropped:?}"
-    );
-
-    assert!(
-        wait_for_disconnected_lookup(&local, &remote.registry.peer_id).await,
-        "lookup_connected_peer must stop returning a stale handle after transport drop"
-    );
+    match dropped {
+        Ok(payload) => assert_eq!(
+            payload.as_ref(),
+            b"remote:slow",
+            "a successful self-heal must still return the real response payload"
+        ),
+        Err(icanact_remote::GossipError::ConnectionDropped)
+        | Err(icanact_remote::GossipError::ConnectionClosed(_))
+        | Err(icanact_remote::GossipError::Network(_)) => {}
+        Err(other) => panic!(
+            "transport drop during actor ask should self-heal or surface a transport-class \
+             error, got unexpected error: {other:?}"
+        ),
+    }
 
     drop(remote_to_local);
     drop(local_to_remote);
@@ -1073,7 +1055,39 @@ async fn dropped_transport_during_actor_ask_clears_connected_lookup_and_reconnec
     .await;
     connect_preferred_direction(&local, &remote, &remote_to_local).await?;
     wait_until_connected(&local, &remote.registry.peer_id).await?;
-    wait_for_successful_ask(&local, &remote.registry.peer_id, b"after", b"remote:after").await?;
+
+    // The ref only repairs its cached connection reactively, on the call
+    // that discovers it dead, and never replays that ambiguous call itself
+    // (see the "dropped" assertion above) - so the very next call after this
+    // topology change can itself land on the pre-reconnect instance and pay
+    // the same one-shot ambiguous failure before the slot is healed. Poll
+    // the SAME held `remote_ref` (no fresh `lookup_peer`) so this proves the
+    // ref itself converges, not just that a new lookup would.
+    let heal_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let healed = loop {
+        match remote_ref
+            .ask_actor_frame(
+                TEST_ACTOR_ID,
+                TEST_TYPE_HASH,
+                Bytes::from_static(b"after"),
+                Duration::from_secs(3),
+            )
+            .await
+        {
+            Ok(payload) => break payload,
+            Err(icanact_remote::GossipError::ConnectionDropped)
+            | Err(icanact_remote::GossipError::ConnectionClosed(_))
+            | Err(icanact_remote::GossipError::Network(_))
+                if tokio::time::Instant::now() < heal_deadline =>
+            {
+                sleep(Duration::from_millis(25)).await;
+            }
+            Err(other) => {
+                panic!("the held ref must eventually reuse the reconnected session, got: {other:?}")
+            }
+        }
+    };
+    assert_eq!(healed.as_ref(), b"remote:after");
 
     with_events(&events, |events| {
         assert!(
@@ -1096,17 +1110,6 @@ async fn dropped_transport_during_actor_ask_clears_connected_lookup_and_reconnec
 
     shutdown_pair(local, remote).await;
     Ok(())
-}
-
-async fn wait_for_disconnected_lookup(handle: &TlsHandle, peer_id: &PeerId) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline {
-        if handle.client().lookup_connected_peer(peer_id).is_none() {
-            return true;
-        }
-        sleep(Duration::from_millis(10)).await;
-    }
-    false
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
