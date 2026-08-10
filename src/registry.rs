@@ -7540,8 +7540,11 @@ impl<T: 'static> GossipRegistry<T> {
     /// Record direct liveness from an authenticated inbound message on the
     /// connection's current session. A stale, superseded connection must not
     /// clear transport failures or refresh the owner fence for its successor;
-    /// the session check and the peer-state update therefore happen under one
-    /// `gossip_state` lock before the owner marker is enqueued.
+    /// the session check, evidence timestamp capture, and peer-state update
+    /// therefore happen under one `gossip_state` lock before the owner marker
+    /// is enqueued. Capturing the monotonic instant after releasing that lock
+    /// would let a replacement session's failure commit in between and make
+    /// stale traffic look causally newer than the failure it must not clear.
     pub(crate) async fn mark_authenticated_inbound_liveness(
         &self,
         peer_addr: SocketAddr,
@@ -7549,18 +7552,25 @@ impl<T: 'static> GossipRegistry<T> {
         session_source: SocketAddr,
         now: u64,
     ) -> bool {
-        let accepted = {
+        let evidence_at = {
             let mut gossip_state = self.gossip_state.lock().await;
             match gossip_state.peers.get_mut(&peer_addr) {
-                None => true,
+                None => Some(std::time::Instant::now()),
                 Some(peer_info) => {
                     if !self.peer_info_is_from_current_session(
                         peer_id,
                         peer_info,
                         Some(session_source),
                     ) {
-                        false
+                        None
                     } else {
+                        // Take the evidence instant only after the current
+                        // session has validated, and while the same lock
+                        // still protects that verdict. Capturing it after
+                        // this guard is released lets a replacement session
+                        // fail in the gap and makes superseded traffic look
+                        // causally newer than that failure.
+                        let evidence_at = std::time::Instant::now();
                         peer_info.last_response_received_ms =
                             peer_info.last_response_received_ms.max(now);
                         peer_info.last_success = peer_info.last_success.max(current_timestamp());
@@ -7569,18 +7579,20 @@ impl<T: 'static> GossipRegistry<T> {
                             peer_info.last_failure_time = None;
                             peer_info.last_failure_instant = None;
                         }
-                        true
+                        Some(evidence_at)
                     }
                 }
             }
         };
 
-        if accepted {
+        if let Some(evidence_at) = evidence_at {
             self.registry_owner
-                .note_liveness_evidence(peer_addr, std::time::Instant::now())
+                .note_liveness_evidence(peer_addr, evidence_at)
                 .await;
+            true
+        } else {
+            false
         }
-        accepted
     }
 
     /// Handle gossip response with vector clock updates
@@ -8542,46 +8554,31 @@ impl<T: 'static> GossipRegistry<T> {
     /// reservation is an OWNER-side fact. It blocks every NEW
     /// address-ownership claim for the reserved address outright
     /// (`claim`/`claim_connection_scoped` refuse unconditionally while a
-    /// reservation is held -- see `PeerRegistryOwner::reap_reserved`'s doc
-    /// comment) and it is atomically revalidated, at the moment it is
-    /// granted, against the exact owner-side identity (ownership token +
-    /// pin) selection observed. It does NOT, on its own, block an
-    /// already-connected peer delivering ordinary liveness evidence -- no
-    /// new claim or ownership change involved at all. `mark_response_received`
-    /// records that evidence both in `GossipState` (used only by this
-    /// function's own, earlier selection pass, and unrelated consumers)
-    /// and, separately, in the owner's own `liveness_evidence_at`
-    /// (`PeerRegistryOwner`-internal, updated only via
-    /// `OwnerCommand::NoteLivenessEvidence`). `reap_reserved_candidates`
-    /// below asks the owner about ONLY the second of those, atomically,
-    /// immediately before doing anything destructive: the reservation
-    /// alone proves identity didn't move, never that liveness evidence
-    /// didn't change, and `GossipState`'s own failure fields are stale the
-    /// moment selection reads them.
+    /// reservation is held) and is atomically revalidated, when granted,
+    /// against the exact owner-side identity (ownership token + pin) the
+    /// selection observed. `ReapReservation::try_consume` is the closing
+    /// authorization for the destructive phase. Once consumed, ordinary
+    /// authenticated liveness is held in the owner entry until release, so
+    /// it cannot commit between authorization and actor/tombstone cleanup.
+    /// Claims and operator reconfiguration are refused for the same interval.
     ///
-    /// DESTRUCTIVE ACTIONS, and their single gate: `reap_reserved_candidates`
-    /// asks the owner for ONE outcome per candidate
-    /// (`PeerRegistryOwner::release_dead_peer`, via
-    /// `release_dead_peer_ownership`) and every destructive step for that
-    /// candidate is downstream of it -- none run independently, none run
-    /// on an earlier or separately-timed check:
+    /// DESTRUCTIVE ACTIONS, and their single closing gate:
+    /// `reap_reserved_candidates` consumes the reservation once before any
+    /// candidate state is touched:
     /// - actor removal (`known_actors.remove_sync`) and the `ActorRemoved`
     ///   tombstone/gossip change it emits -- the step that matters most,
     ///   since a tombstone already gossiped to another node cannot be
     ///   recalled;
     /// - capability side tables (`clear_peer_capabilities`);
     /// - clock-calibration side tables (`remove_clock_state_for_addr`);
-    /// - connection-scoped receipts and address ownership itself, plus
-    ///   its own ownership-tombstone projection -- all three inside
-    ///   `PeerRegistryOwner::release_dead_peer`/`release_dead_peer_ownership`,
-    ///   already committed by the time the outcome is returned, so
-    ///   ownership release is not merely gated BY the decision, it IS the
-    ///   decision.
+    /// - connection-scoped receipts and address ownership itself, plus its
+    ///   own ownership-tombstone projection -- committed by the final owner
+    ///   release command while the reservation is still held.
     ///
-    /// A `DeadPeerReleaseOutcome::ProvenAlive` outcome skips every one of
-    /// these for that candidate; only its `ReapReservation` is still
-    /// released (unconditionally, for every candidate, to avoid leaking
-    /// it) and nothing else.
+    /// A candidate that fails the pre-reservation causal fence skips every
+    /// destructive step. After consume, the owner reservation is the
+    /// authority; it is released unconditionally for every candidate so a
+    /// failed or completed sweep cannot leak a claim-blocking reservation.
     pub async fn cleanup_dead_peers(&self) {
         let dead_peer_timeout = self.config.dead_peer_timeout;
         let now_instant = std::time::Instant::now();
@@ -8775,94 +8772,26 @@ impl<T: 'static> GossipRegistry<T> {
     /// call separately, injecting a liveness update between them without
     /// needing genuine thread-level concurrency to land it deterministically.
     ///
-    /// Every destructive step for a candidate is downstream of exactly ONE
-    /// decision, obtained ONCE: the owner's own atomic state
-    /// (`claim_committed_at` AND `liveness_evidence_at`, both written only
-    /// from within the owner's own command processing). This matters
-    /// because `ActorRemoved` tombstones, once enqueued, propagate to
-    /// other nodes and cannot be recalled -- the step that produces one
-    /// must never run ahead of, or independently of, the same verdict that
-    /// gates ownership release. A candidate with no resolved identity
-    /// (`PeerInfo::node_id` is `None` for a PRE-HANDSHAKE address the node
-    /// has merely learned of -- discovery, DNS, an operator `configure_peer`
-    /// call naming an address before any identity is confirmed -- see
-    /// `PeerDispatchKey`'s own doc comment) has no owner-side ownership to
-    /// check or release, and no verdict `release_dead_peer_ownership`
-    /// could possibly return either; "cannot obtain a verdict" means "do
-    /// not destroy" here, the same fail-closed direction every other
-    /// unreachable/ambiguous case in this file takes.
+    /// Every destructive step for a candidate is downstream of one
+    /// owner-serialized closing authorization: `ReapReservation::try_consume`.
+    /// The earlier `has_newer_liveness_evidence` read only decides whether
+    /// the candidate is worth reserving; it is not trusted as a check-and-act
+    /// verdict. The owner reservation revalidates identity and the causal
+    /// fence, blocks claims/reconfiguration while held, and then consumes
+    /// exactly once. After consume, direct liveness evidence is retained in
+    /// the reservation and committed when `release` runs, so it cannot land
+    /// between authorization and actor/tombstone destruction.
     ///
-    /// Destructive steps run in a strictly ascending order by how
-    /// exploitable getting that specific step wrong on a live peer
-    /// actually is: side tables (capabilities, clock state) FIRST --
-    /// silently self-repopulated by the next capability/clock probe, never
-    /// gossiped, the least harmful to get wrong -- then actors and their
-    /// `ActorRemoved` tombstones, then address ownership LAST, since a
-    /// released address can be claimed by another identity while the real
-    /// owner is still alive. Every candidate's reservation is consumed
-    /// exactly once, via `ReapReservation::try_consume` (an owner round
-    /// trip, not a second read of a plain `load()`), immediately after the
-    /// verdict and before any of these steps: a plain `load()`, no matter
-    /// how close to the mutation it guards, cannot close a check-then-act
-    /// gap, since nothing stops an invalidating owner command from landing
-    /// in the interval between the load and the write that follows it.
-    /// `try_consume`'s owner-coordinated consumption closes that by
-    /// construction -- see `ReapReservation`'s own doc comment. A
-    /// successful `try_consume` IS the commit point for the whole
-    /// reservation-gated batch: liveness evidence or a reconfiguration
-    /// arriving after it loses deterministically, the correct trade for a
-    /// concurrent system that has to pick some linearization point. The
-    /// conceded window is narrow in practice: a candidate only reaches
-    /// `try_consume` after already being past both `dead_peer_timeout` and
-    /// the owner's own causal fence (`has_newer_liveness_evidence`).
+    /// Destructive steps run in ascending order of recoverability: address
+    /// side tables first, then actors and their `ActorRemoved` tombstones,
+    /// then address ownership last. A candidate with no resolved identity
+    /// (`PeerInfo::node_id` is `None`) has no owner-side verdict to release;
+    /// it fails closed before any state is touched.
     ///
-    /// Address ownership is NOT covered by `try_consume` and keeps its
-    /// own, separate, always-fresh gate: `release_dead_peer_ownership`
-    /// (wrapping `PeerRegistryOwner::release_dead_peer`) performs its own
-    /// internal causal-fence check, via a genuine owner round trip,
-    /// immediately before the retraction it performs -- deliberately
-    /// independent of the reservation, because ownership is the one
-    /// destructive step whose absence is directly exploitable and earns
-    /// the freshest, independently-verified check available. A
-    /// consequence worth stating plainly: evidence arriving after
-    /// `try_consume` succeeds but before ownership release runs can still
-    /// cause actors to be destroyed while ownership itself survives, for
-    /// the SAME candidate. This is tracked below as **Gap B**.
-    ///
-    /// ## Known residual gaps (stated plainly, not narrowed away in prose)
-    ///
-    /// **Gap A** -- `reap_baseline_activity_detected` (called just before
-    /// actor/tombstone destruction, below) is a best-effort MITIGATION, not
-    /// a closing check: it is a plain owner read taken as close as
-    /// practical to the destructive mutation, not a step inside the same
-    /// serialized commit as that mutation, so activity committing after it
-    /// returns but before the mutation runs is invisible to it. Closing
-    /// this for real requires moving the destructive mutation itself into
-    /// the owner's serialized command stream -- confirmed NOT a narrow
-    /// fix: most of what that mutation touches (`peer_to_actors`, the
-    /// `peers` read, the admission tables, and the tombstone-producing
-    /// change queues) lives behind `GossipState`'s `tokio::sync::Mutex`,
-    /// which this actor's synchronous `handle()` loop cannot take without
-    /// becoming a second, cross-domain contended lock -- exactly what the
-    /// single-owner design exists to avoid. See the call site's own doc
-    /// comment for the full accounting of what is and is not lock-free.
-    /// Tracked as separate, scoped structural follow-up work.
-    ///
-    /// **Gap B** -- the split described immediately above: ownership
-    /// release keeps its own always-fresh, genuinely atomic gate
-    /// (`release_dead_peer`), independent of Gap A and unaffected by it,
-    /// so an address can never be hijacked by this window. But actors and
-    /// their tombstones can still be destroyed for a candidate that turns
-    /// out, moments later, to have proven itself alive or been
-    /// reconfigured -- self-healing via the peer's own next reconnect/
-    /// full-sync (a causally-newer `ActorAdded` overrides an existing
-    /// tombstone), and surfaced operator-side via the `ProvenAlive` warn!
-    /// below when ownership release's own fence catches it after the fact.
-    ///
-    /// Neither gap allows an address to be claimed by the wrong identity.
-    /// Both are strictly narrower than `main`, which has no reservation, no
-    /// liveness re-check, no generation fence, and no ownership-release
-    /// mechanism for dead peers at all.
+    /// Address ownership is released by the final owner command after the
+    /// actor batch. The reservation remains held until that command and its
+    /// tombstone projection complete, and its release publishes any deferred
+    /// liveness before allowing a subsequent claim.
     async fn reap_reserved_candidates(
         &self,
         peers_to_cleanup: Vec<(
@@ -8911,37 +8840,14 @@ impl<T: 'static> GossipRegistry<T> {
                 continue;
             }
 
-            // This baseline must be captured BEFORE `try_consume()`, not
-            // after: `configure_peer_generation_of` is an owner round trip
-            // (an `.await`), not instantaneous, so a CONCURRENT
-            // `configure_peer` call for this SAME peer could complete
-            // inside that window -- after `try_consume` (so the
-            // reservation's own invalidation, which only fires when the
-            // reconfiguration actually EVICTS this reserved address, may
-            // not apply) but before this baseline read resolves. That
-            // call's own increment would then become the baseline ITSELF,
-            // so the later `reap_baseline_activity_detected` comparison
-            // would see no further change and proceed to destroy actors
-            // for a peer that had just been reconfigured moments earlier.
-            // Capturing it BEFORE `try_consume` means ANY `configure_peer`
-            // call for this peer from this point forward -- including
-            // everything between here and `try_consume` itself -- is what
-            // the later comparison against this baseline will correctly
-            // detect as an advance.
-            let baseline_configure_peer_generation = self
-                .registry_owner
-                .configure_peer_generation_of(peer_id.clone())
-                .await;
-
-            // From here on, the RESERVATION -- not the verdict above -- is
-            // the live authority. `try_consume` is the ONE, irrevocable
-            // authorization for this candidate's ENTIRE destructive
-            // sequence below, obtained here and never re-checked again --
-            // see `ReapReservation`'s own doc comment for why an owner
-            // round trip, not a client-side compare-and-swap, is what
-            // closes the check-then-act gap a plain read cannot, no matter
-            // how many times, or how close to each mutation, it is
-            // repeated.
+            // From here on, the owner-held RESERVATION -- not the verdict
+            // above -- is the live authority. `try_consume` is the ONE,
+            // owner-serialized closing authorization for this candidate's
+            // ENTIRE destructive sequence below. A successful consume also
+            // makes later direct liveness evidence wait in the reservation
+            // entry until `release`, so no evidence can commit between this
+            // authorization and actor/tombstone destruction. Claims and
+            // reconfiguration are refused while the reservation is held.
             if !reservation.try_consume().await {
                 debug!(
                     peer = %peer_addr,
@@ -8956,94 +8862,17 @@ impl<T: 'static> GossipRegistry<T> {
             // IMPORTANT: We do NOT remove the peer itself - it stays in the peer list
             // This allows us to reconnect when the peer comes back online
 
-            // Actors, and their ActorRemoved tombstones, SECOND. Re-check
-            // current ownership first because peer_to_actors is a side table and
-            // may still contain a stale entry after the actor moved to another peer.
-            //
-            // No per-actor validity re-check, and no partial-abandon path:
-            // `try_consume` above is this candidate's one
-            // irrevocable authorization, covering every actor in this
-            // batch and the tombstone each removal produces -- strictly
-            // all-or-nothing.
+            // Actors, and their ActorRemoved tombstones, SECOND. No
+            // per-actor validity re-check or partial-abandon path: the
+            // owner-side consume above authorizes this candidate's complete
+            // batch, including every tombstone it produces.
             {
                 let mut gossip_state = self.gossip_state.lock().await;
-
-                // `DeadPeerReleaseOutcome::ProvenAlive`'s
-                // own doc comment requires "no destructive cleanup of ANY
-                // kind for this candidate" once evidence proves it alive.
-                // `release_dead_peer_ownership`'s own fresh check runs
-                // deliberately LAST (see this function's own doc comment
-                // for why ownership earns the freshest check), so evidence
-                // committing after `try_consume` above but before actor
-                // destruction below would otherwise go completely
-                // undetected until that final check, by which point actors
-                // and their
-                // cluster-visible `ActorRemoved` tombstones are already
-                // gone. This independent, additional read,
-                // immediately before the FIRST actually irreversible step
-                // (the tombstone this block is about to enqueue, once
-                // gossiped, cannot be recalled; side tables above, by
-                // contrast, self-repopulate, so this check is deliberately
-                // placed after them, not before), is what actually
-                // PREVENTS this candidate's destruction rather than only,
-                // later,
-                // noticing it happened anyway. Placed INSIDE this same
-                // `gossip_state` critical section, immediately after
-                // acquiring the lock and before reading `peer_to_actors`,
-                // rather than before it: acquiring this widely shared,
-                // frequently contended lock can itself take a while, and
-                // anything invalidating this reap during THAT wait is
-                // exactly as disqualifying as it happening before the wait
-                // began.
-                //
-                // Checks `peer_id`'s `configure_peer_generation`
-                // against `baseline_configure_peer_generation` (captured
-                // fresh, BEFORE `try_consume` above) rather than raw
-                // ownership (`addr_ownership.get(&addr)`), which produces
-                // false positives for
-                // every candidate that was never owner-claimed in the
-                // first place (a `GossipState`-only entry -- the ordinary
-                // case for dead-peer selection, which does not require an
-                // owner-level claim to exist at all). The generation
-                // counter has no such ambiguity: it only ever advances on
-                // an actual `configure_peer` call for this exact peer.
-                //
-                // See `OwnerCommand::ReapBaselineActivityDetected`'s own
-                // doc comment, and Gap A above, for why this call is a
-                // best-effort mitigation rather than a closing
-                // authorization.
-                if self
-                    .registry_owner
-                    .reap_baseline_activity_detected(
-                        peer_addr,
-                        peer_id.clone(),
-                        evidence_before,
-                        baseline_configure_peer_generation,
-                    )
-                    .await
-                {
-                    warn!(
-                        peer = %peer_addr,
-                        "cleanup_dead_peers: a best-effort mitigation check (NOT a closing \
-                         authorization -- see Gap A in this function's own doc comment) \
-                         detected activity for this peer since the reap baseline was captured \
-                         (newer liveness evidence, or the peer's pin was reconfigured \
-                         elsewhere) -- nothing destroyed for this candidate this sweep"
-                    );
-                    drop(gossip_state);
-                    reservation.release().await;
-                    continue;
-                }
-
-                // The fresh activity check above is the last point at which
-                // this candidate can be abandoned without touching any
-                // state. Keep the address-keyed capability and clock tables
-                // behind it: an authenticated liveness update or
-                // reconfiguration that lands after `try_consume` but before
-                // this check must leave a still-connected peer's side state
-                // intact. These tables are self-repopulating, but a live
-                // session may not perform another handshake before it needs
-                // them (notably for peer-list gossip).
+                // The closing authorization is already held by the owner,
+                // so these address-keyed tables are part of the same
+                // authorized destructive batch. They self-repopulate on a
+                // later reconnect, and the reservation prevents that
+                // reconnect from committing until this batch releases.
                 self.clear_peer_capabilities(&peer_addr);
                 self.remove_clock_state_for_addr(&peer_addr);
 
@@ -9142,43 +8971,28 @@ impl<T: 'static> GossipRegistry<T> {
             // throughout so a genuine reconnect is still recognized.
             //
             // No `is_still_valid()` check here either: `try_consume`
-            // already authorized this candidate's entire sequence,
+            // already authorized this candidate's complete sequence,
             // ownership included. `release_dead_peer_ownership` still
-            // performs its OWN, separate atomic causal-fence check
-            // internally (`PeerRegistryOwner::release_dead_peer`,
-            // unchanged) immediately before the retraction it performs --
-            // that check is unrelated to the reap reservation entirely (it
-            // is the owner's own `claim_committed_at`/`liveness_evidence_
-            // at` fence). `Released`, `ProvenAlive`,
-            // and `NotApplicable` all lead to the same next action here --
-            // releasing the reservation -- since
-            // `release_dead_peer_ownership`'s own internals already do the
-            // right thing for each.
+            // performs the owner's causal-fence check immediately before
+            // retracting receipts/ownership, and its outcome is projected
+            // before the reservation is released. Any liveness that arrived
+            // after consume is deferred by the reservation and is committed
+            // by that release; `Released`, `ProvenAlive`, and
+            // `NotApplicable` all release the guard unconditionally.
             let outcome = self
                 .release_dead_peer_ownership(peer_id, peer_addr, evidence_before)
                 .await;
-            // `ProvenAlive` reaching here means the fresh
-            // re-check above (and every earlier one) still missed evidence
-            // that arrived in the narrow remaining window between it and
-            // this call -- distinguished from the two routine outcomes
-            // (`debug!`) with a `warn!`, since by this point actor
-            // destruction and tombstone emission for this candidate have
-            // already happened (see the re-check above) and cannot be
-            // undone here -- an operator or alert on this line is the
-            // remaining signal that this peer's actors may need to
-            // re-register (its own next reconnect/full-sync naturally
-            // does this: a causally-newer `ActorAdded` from the peer
-            // itself overrides an existing tombstone -- see
-            // `current_actor_upsert_plan`) rather than waiting out the
-            // 24h `actor_ttl` backstop.
+            // A ProvenAlive result is retained as a warning for an
+            // unexpected owner-side state change that predated the closing
+            // authorization. The normal post-consume liveness race cannot
+            // reach this branch: its evidence is deferred until release.
             if outcome == crate::registry_owner::DeadPeerReleaseOutcome::ProvenAlive {
                 warn!(
                     peer = %peer_addr,
                     ?outcome,
-                    "cleanup_dead_peers: ownership release found this candidate proven alive \
-                     AFTER actor destruction and tombstone emission already ran for it -- \
-                     ownership itself was correctly preserved, but this peer's actors may need \
-                     to re-register via its own next reconnect/full-sync"
+                    "cleanup_dead_peers: owner-side release found evidence that predated the \
+                     reap closing authorization; actor cleanup already ran, so the peer must \
+                     re-register through its next reconnect/full-sync"
                 );
             } else {
                 debug!(peer = %peer_addr, ?outcome, "cleanup_dead_peers: ownership release outcome");
@@ -22355,43 +22169,20 @@ mod tests {
         }
     }
 
-    /// Evidence delivered strictly before `try_consume` completes is the
-    /// already-covered, unremarkable case (see
-    /// `reap_reserved_candidates_skips_a_candidate_whose_liveness_evidence_changed_since_reservation`).
-    /// This test targets the narrower window after `try_consume` succeeds
-    /// but before the first irreversible step: an additional, independent
-    /// read of `has_newer_liveness_evidence` -- the same pure fence, not
-    /// the reservation's own flag -- runs immediately after acquiring
-    /// `gossip_state`'s lock and immediately before the first genuinely
-    /// irreversible step (the tombstone actor removal would otherwise
-    /// enqueue), so evidence landing in exactly this window still stands
-    /// the candidate down instead of letting destruction complete.
+    /// Evidence delivered after `try_consume` succeeds is the closing
+    /// authorization's linearization case. The owner must defer that
+    /// evidence until the reservation is released, allowing the authorized
+    /// actor/tombstone batch to complete without a mid-flight read that can
+    /// race it. Release then commits the evidence before another claimant can
+    /// observe the address as available.
     ///
-    /// Ownership is the deliberate exception, and this test proves that
-    /// too: it is not covered by `try_consume` or by the fresh
-    /// pre-destruction re-check above, and keeps its own, separate,
-    /// always-fresh causal fence -- `release_dead_peer_ownership`'s
-    /// internal check, re-verified via a genuine owner round trip
-    /// immediately before the retraction it performs. See
-    /// `reap_reserved_candidates`'s own doc comment for why this split
-    /// (actors/tombstones protected by the fresh re-check, ownership by
-    /// its own separate fence) is correct rather than a bug.
-    ///
-    /// Reproduced with genuine concurrency, not a hand-driven sequential
-    /// construction: the test holds `gossip_state`'s own lock before
-    /// spawning `reap_reserved_candidates`, guaranteeing the spawned sweep
-    /// cannot progress past the verdict-and-consume (neither needs the
-    /// lock) to reach the fresh re-check -- which itself runs inside the
-    /// same `gossip_state` critical section, immediately after acquiring
-    /// it -- its own next real suspension point. A generous `yield_now`
-    /// loop lets the verdict and the consume run to completion while
-    /// evidence has not yet been delivered. Evidence is then delivered
-    /// while the sweep is still provably blocked acquiring `gossip_state`
-    /// -- in time for both the fresh re-check and ownership's own separate
-    /// fence -- and the guard is dropped, letting the sweep run the rest
-    /// of its sequence, standing down for this candidate entirely.
+    /// Reproduced with genuine concurrency: hold `gossip_state` before
+    /// spawning the destructive phase, wait for the owner consume to run,
+    /// deliver liveness while actor cleanup is blocked, and then release the
+    /// lock. The test proves the complete ordering, including the deferred
+    /// owner fence after the reservation is gone.
     #[tokio::test]
-    async fn reap_reserved_candidates_skips_actor_destruction_when_liveness_arrives_after_try_consume()
+    async fn reap_reserved_candidates_defers_liveness_arriving_after_try_consume()
      {
         let mut config = test_config();
         config.dead_peer_timeout = Duration::from_millis(50);
@@ -22453,7 +22244,7 @@ mod tests {
             .upsert_sync(actor_name.to_string(), location);
 
         // Keep the address-keyed side tables populated so the test proves
-        // the fresh liveness check protects them too, not only actors and
+        // the authorized cleanup clears them too, not only actors and
         // ownership. These are the exact tables a live session may still
         // need before another capability handshake or clock probe occurs.
         let _ = registry
@@ -22502,12 +22293,11 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        // TOO LATE for `try_consume` (already succeeded above), but IN
-        // TIME for the fresh re-check: evidence commits here, after the
-        // sweep has had every opportunity to reach its verdict and consume
-        // the reservation, but while it is still provably unable to have
-        // removed the actor (blocked on `gossip_state`, held by this
-        // guard, which the fresh re-check also runs behind).
+        // TOO LATE to cancel `try_consume`: evidence is delivered while the
+        // sweep is blocked on `gossip_state`, after the owner has granted the
+        // closing authorization but before actor cleanup can run. The owner
+        // must retain it in the consumed reservation rather than committing
+        // it into the ordinary fence immediately.
         registry
             .registry_owner
             .note_liveness_evidence(peer_addr, std::time::Instant::now())
@@ -22516,119 +22306,76 @@ mod tests {
         drop(guard);
         sweep_task.await.expect("sweep task panicked");
 
-        // The reservation-gated work: `try_consume`'s authorization alone
-        // is not sufficient to complete it -- the additional fresh
-        // re-check, taken immediately after acquiring `gossip_state` and
-        // immediately before touching `peer_to_actors`, sees the same
-        // evidence and stands the candidate down instead of proceeding.
+        // The reservation-gated work: `try_consume` is the closing
+        // authorization, so the actor/tombstone batch completes. The
+        // deferred evidence is made visible only as the reservation releases.
         assert!(
-            registry.actor_state.known_actors.contains_sync(actor_name),
-            "the actor must survive -- the fresh liveness re-check must catch evidence \
-             delivered before actor destruction and prevent it entirely, not merely notice \
-             it happened too late"
+            !registry.actor_state.known_actors.contains_sync(actor_name),
+            "the authorized actor cleanup must complete even when liveness arrives after consume"
         );
         assert!(
             registry
                 .actor_state
                 .removed_actors
                 .read_sync(actor_name, |_, _| ())
-                .is_none(),
-            "no RemovedActorTombstone may be recorded -- nothing was destroyed for this \
-             candidate"
+                .is_some(),
+            "the authorized cleanup must emit the actor tombstone"
         );
         assert!(
-            registry
+            !registry
                 .peer_capability_addr_to_node
                 .contains_sync(&peer_addr),
-            "capability state must survive when fresh liveness abandons the reap"
+            "authorized cleanup must clear the capability side table"
         );
         assert!(
-            registry.clock_probe_state.contains_sync(&peer_addr),
-            "clock-calibration state must survive when fresh liveness abandons the reap"
+            !registry.clock_probe_state.contains_sync(&peer_addr),
+            "authorized cleanup must clear the clock side table"
         );
         {
             let gossip_state = registry.gossip_state.lock().await;
-            assert!(
-                gossip_state.peer_to_actors.contains_key(&peer_addr),
-                "peer_to_actors must survive untouched -- the fresh re-check runs BEFORE it is \
-                 ever read, so a stand-down here must leave it exactly as this test set it up"
-            );
+            assert!(!gossip_state.peer_to_actors.contains_key(&peer_addr));
             let enqueued = gossip_state
                 .pending_changes
                 .iter()
                 .chain(gossip_state.urgent_changes.iter())
                 .any(|change| matches!(change, RegistryChange::ActorRemoved { name, .. } if name == actor_name));
             assert!(
-                !enqueued,
-                "no ActorRemoved change may be enqueued for gossip -- this candidate's \
-                 destructive sequence never ran"
+                enqueued,
+                "authorized cleanup must enqueue an ActorRemoved change"
             );
         }
 
-        // Ownership: covered by its own, separate, always-fresh causal
-        // fence (`release_dead_peer_ownership`'s internal check), still
-        // correctly seeing the same evidence, though now for a candidate
-        // that never even reached that far: the fresh re-check just
-        // proven above already stood it down before ownership's own
-        // release was ever attempted.
-        assert_eq!(
-            registry.registry_owner.routes_to(&peer_addr),
-            Some(peer_id.clone()),
-            "ownership must survive -- this candidate's destructive sequence, ownership \
-             included, never ran at all once the fresh re-check stood it down"
-        );
-
-        // The connection-scoped receipt (session_source) must survive too,
-        // for the same reason ownership does -- proven by the SAME
-        // session's own later, legitimate teardown still finding it and
-        // correctly releasing ownership.
-        registry
-            .release_connection_scoped_claims(&peer_id, session_source)
-            .await;
+        // The owner release runs while the reservation still holds the
+        // deferred marker, then the reservation release publishes that
+        // marker. The address is therefore released, but the evidence is
+        // still visible to any later reaper.
         assert_eq!(
             registry.registry_owner.routes_to(&peer_addr),
             None,
-            "the receipt must have survived the sweep for the session's own later teardown to \
-             find and release"
+            "the authorized cleanup must release the dead peer's ownership"
         );
+        assert!(
+            registry
+                .registry_owner
+                .has_newer_liveness_evidence(peer_addr, evidence_before)
+                .await,
+            "liveness delivered after consume must be committed before the reservation disappears"
+        );
+
+        // The connection-scoped receipt was consumed by the owner's final
+        // release command, so a stale teardown cannot affect another owner.
+        registry
+            .release_connection_scoped_claims(&peer_id, session_source)
+            .await;
     }
 
-    /// The fresh pre-destruction re-check added for the liveness case
-    /// above only reads `has_newer_liveness_evidence` -- catching direct/
-    /// ordinary liveness evidence, but not an OPERATOR reconfiguring this
-    /// SAME peer's pin to a DIFFERENT address in the same window.
-    /// `configure_peer` atomically releases `peer_addr`'s ownership as
-    /// part of installing the new pin, entirely independent of liveness
-    /// evidence -- the peer may still be genuinely unreachable; the
-    /// operator is simply repointing it. Nothing about that touches
-    /// `claim_committed_at`/`liveness_evidence_at`, so the liveness-only
-    /// check cannot see it, and actor destruction (plus its irreversible
-    /// `ActorRemoved` tombstone) would proceed for a candidate whose
-    /// authorization had already moved out from under it.
-    ///
-    /// Mitigated by `reap_baseline_activity_detected`, which also checks,
-    /// fresh, whether `peer_id`'s `configure_peer_generation` has advanced
-    /// since this sweep's baseline -- see that command's own doc comment,
-    /// and Gap A on `reap_reserved_candidates`'s own doc comment for why
-    /// this narrows rather than closes the window.
-    ///
-    /// Reproduced with the same genuine-concurrency technique as the
-    /// sibling liveness test above, adapted for the deadlock this
-    /// scenario would otherwise risk: `configure_peer`'s own tail touches
-    /// `gossip_state` too (evicted-release tombstoning), so it cannot be
-    /// awaited directly from a test task that is itself holding
-    /// `gossip_state`'s lock as the sweep's barrier -- that would be a
-    /// self-deadlock, not a race. Instead, the reconfiguration is spawned
-    /// as its own task and given a generous `yield_now` window (like the
-    /// sweep, it makes progress up to and blocks on `gossip_state`) --
-    /// enough to complete its owner-level eviction of `peer_addr`, which
-    /// needs no `gossip_state` access at all and is the only part this
-    /// test's assertions depend on -- before the guard is ever dropped.
-    /// Once dropped, it does not matter which of the two spawned tasks
-    /// wins the race for `gossip_state` next: the eviction this test
-    /// cares about already committed at the owner before that point.
+    /// A reconfiguration arriving after the owner has granted the closing
+    /// authorization must not race actor/tombstone cleanup. The consumed
+    /// reservation refuses the configuration while the destructive phase is
+    /// in flight; the operator request is retried after release and then
+    /// applies normally at its new address.
     #[tokio::test]
-    async fn reap_reserved_candidates_skips_actor_destruction_when_peer_is_reconfigured_after_try_consume()
+    async fn reap_reserved_candidates_blocks_reconfiguration_after_try_consume()
      {
         let mut config = test_config();
         config.dead_peer_timeout = Duration::from_millis(50);
@@ -22723,11 +22470,10 @@ mod tests {
             tokio::task::yield_now().await;
         }
 
-        // TOO LATE for `try_consume` (already succeeded above), but IN
-        // TIME for the fresh re-check: the operator reconfigures this
-        // SAME peer to a DIFFERENT address while the sweep is still
-        // provably blocked acquiring `gossip_state`. No liveness evidence
-        // is involved at all -- this is purely an ownership move.
+        // TOO LATE to cancel `try_consume`: the operator reconfigures this
+        // SAME peer to a DIFFERENT address while the sweep is still blocked
+        // acquiring `gossip_state`. The consumed reservation must reject it
+        // until the destructive batch releases.
         let registry_for_reconfigure = registry.clone();
         let peer_id_for_reconfigure = peer_id.clone();
         let reconfigure_task = tokio::spawn(async move {
@@ -22744,42 +22490,34 @@ mod tests {
         reconfigure_task.await.expect("reconfigure task panicked");
 
         assert!(
-            registry.actor_state.known_actors.contains_sync(actor_name),
-            "the actor must survive -- the fresh reap-authorization re-check must catch an \
-             operator reconfiguring this peer's pin, even with no liveness evidence involved, \
-             and prevent actor destruction entirely"
+            !registry.actor_state.known_actors.contains_sync(actor_name),
+            "the closing authorization must remain authoritative: a late operator \
+             reconfiguration cannot cancel actor cleanup"
         );
         assert!(
             registry
                 .actor_state
                 .removed_actors
                 .read_sync(actor_name, |_, _| ())
-                .is_none(),
-            "no RemovedActorTombstone may be recorded -- nothing was destroyed for this \
-             candidate"
+                .is_some(),
+            "the authorized actor cleanup must emit its tombstone"
         );
         {
             let gossip_state = registry.gossip_state.lock().await;
-            assert!(
-                gossip_state.peer_to_actors.contains_key(&peer_addr),
-                "peer_to_actors must survive untouched -- the fresh re-check runs BEFORE it is \
-                 ever read"
-            );
+            assert!(!gossip_state.peer_to_actors.contains_key(&peer_addr));
             let enqueued = gossip_state
                 .pending_changes
                 .iter()
                 .chain(gossip_state.urgent_changes.iter())
                 .any(|change| matches!(change, RegistryChange::ActorRemoved { name, .. } if name == actor_name));
             assert!(
-                !enqueued,
-                "no ActorRemoved change may be enqueued for gossip -- this candidate's \
-                 destructive sequence never ran"
+                enqueued,
+                "the authorized actor cleanup must enqueue an ActorRemoved change"
             );
         }
 
-        // The operator's own reconfiguration is the authoritative outcome
-        // for `peer_addr`'s ownership now -- it moved to `other_addr`,
-        // entirely independent of anything the sweep did or did not do.
+        // The operator request was held behind the reservation and applies
+        // after release. It must not have been lost or partially applied.
         assert_eq!(
             registry.registry_owner.routes_to(&other_addr),
             Some(peer_id.clone()),

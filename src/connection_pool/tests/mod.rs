@@ -7085,14 +7085,14 @@ async fn delta_gossip_updates_last_response_received_ms() {
 /// A current-session `DeltaGossip` already clears `gossip_state`'s own
 /// failure bookkeeping (proven by the sibling test above), but that alone
 /// does not reach the owner's own `liveness_evidence_at` fence --
-/// `reap_reserved_candidates`'s selection, early verdict, and fresh
-/// pre-destruction `reap_baseline_activity_detected` re-check all read
-/// that fence directly, not `gossip_state`. Since `cleanup_dead_peers`
-/// deliberately stopped re-deriving liveness from `gossip_state` for its
-/// own destructive decision, a delta arriving after a peer was already
-/// selected as a dead-peer candidate must still update the owner's fence,
-/// or the sweep could destroy and irreversibly tombstone that peer's
-/// actors moments after it proved itself alive.
+/// `reap_reserved_candidates`'s selection and owner-side closing
+/// authorization read that fence directly, not `gossip_state`. Since
+/// `cleanup_dead_peers` deliberately stopped re-deriving liveness from
+/// `gossip_state` for its destructive decision, a delta arriving after a
+/// peer was already selected as a dead-peer candidate must still update the
+/// owner's fence before the reservation is consumed, or the sweep could
+/// destroy and irreversibly tombstone that peer's actors moments after it
+/// proved itself alive.
 ///
 /// Proves the fix directly against the owner's own fence, mirroring
 /// `mark_response_received`'s pattern for gossip responses: captures
@@ -7166,8 +7166,78 @@ async fn delta_gossip_records_owner_side_liveness_evidence() {
             .has_newer_liveness_evidence(peer_addr, evidence_before)
             .await,
         "a current-session DeltaGossip must record owner-side liveness evidence -- \
-         reap_reserved_candidates' own fresh pre-destruction check reads ONLY the owner's \
-         fence, not gossip_state, so evidence that never reaches the owner is invisible to it"
+         reap_reserved_candidates' owner-side authorization reads ONLY the owner's fence, \
+         not gossip_state, so evidence that never reaches the owner is invisible to it"
+    );
+}
+
+/// `DeltaGossipResponse` has the same authenticated-session liveness contract
+/// as `DeltaGossip`. Keep a positive-path regression alongside the forged
+/// sender test below: a valid response must refresh the owner's causal fence,
+/// while `mark_authenticated_inbound_liveness` captures its evidence instant
+/// under the session-validation lock before publishing it to the owner.
+#[tokio::test]
+async fn delta_gossip_response_records_owner_side_liveness_evidence() {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing(
+                "lrr_delta_response_owner_local",
+            )),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let peer_id = crate::KeyPair::new_for_testing("lrr_delta_response_owner_remote").peer_id();
+    let peer_addr: SocketAddr = "10.77.0.73:9309".parse().unwrap();
+    let stale_time = crate::current_timestamp_millis().saturating_sub(3_600_000);
+    {
+        let mut state = registry.gossip_state.lock().await;
+        state
+            .peers
+            .insert(peer_addr, stale_peer_info(peer_addr, stale_time));
+    }
+
+    let evidence_before = std::time::Instant::now();
+    let msg = crate::registry::RegistryMessage::DeltaGossipResponse {
+        delta: crate::registry::RegistryDelta {
+            since_sequence: 0,
+            current_sequence: 1,
+            changes: Vec::new(),
+            sender_peer_id: peer_id.clone(),
+            wall_clock_time: crate::current_timestamp(),
+            precise_timing_nanos: crate::current_timestamp_nanos(),
+        },
+        extensions: None,
+    };
+
+    super::handle_incoming_message(
+        registry.clone(),
+        peer_addr,
+        peer_addr,
+        Some(peer_id),
+        msg,
+    )
+    .await
+    .expect("an authenticated DeltaGossipResponse should be accepted");
+
+    assert!(
+        registry
+            .registry_owner
+            .has_newer_liveness_evidence(peer_addr, evidence_before)
+            .await,
+        "a valid DeltaGossipResponse must refresh the owner-side liveness fence"
+    );
+    let state = registry.gossip_state.lock().await;
+    let info = state
+        .peers
+        .get(&peer_addr)
+        .expect("peer should remain in gossip state after DeltaGossipResponse");
+    assert_eq!(info.failures, 0, "a valid response must clear failures");
+    assert!(
+        info.last_response_received_ms > stale_time,
+        "a valid response must refresh response bookkeeping"
     );
 }
 
