@@ -2143,6 +2143,7 @@ impl GossipState {
                         last_sent_sequence: _,
                         consecutive_deltas: existing_consecutive_deltas,
                         last_failure_time: existing_last_failure_time,
+                        last_failure_instant: existing_last_failure_instant,
                         last_dns_refresh_attempt: existing_last_dns_refresh_attempt,
                         last_response_received_ms: existing_last_response_received_ms,
                         accept_lower_sequence_from: _,
@@ -2185,6 +2186,7 @@ impl GossipState {
                     if existing_last_attempt > moved.last_attempt {
                         moved.failures = existing_failures;
                         moved.last_failure_time = existing_last_failure_time;
+                        moved.last_failure_instant = existing_last_failure_instant;
                     }
                     moved.last_attempt = moved.last_attempt.max(existing_last_attempt);
                     moved.last_success = moved.last_success.max(existing_last_success);
@@ -2488,6 +2490,7 @@ impl<T> Clone for GossipRegistry<T> {
             addr_substitutions: self.addr_substitutions.clone(),
             relayed_unusable_addr_kept: self.relayed_unusable_addr_kept.clone(),
             tie_break_evictions: self.tie_break_evictions.clone(),
+            unmatched_responses: self.unmatched_responses.clone(),
             actor_message_handler: self.actor_message_handler.clone(),
             actor_tell_handler_sync: self.actor_tell_handler_sync.clone(),
             actor_tell_handler_sync_context: self.actor_tell_handler_sync_context.clone(),
@@ -8278,6 +8281,7 @@ impl<T: 'static> GossipRegistry<T> {
     /// been relayed.  The ownership watermark is intentionally not involved
     /// in this convenience path, which is used by the authenticated session
     /// handler before its address projection is finalized.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn merge_full_sync_from_authenticated(
         &self,
