@@ -1883,17 +1883,28 @@ async fn preferred_connection_publication_wakes_wait_without_advancing_time() {
         ConnectionDirection::Inbound
     };
     let addr: SocketAddr = "127.0.0.1:40555".parse().unwrap();
-    let connection = Arc::new(LockFreeConnection::new(addr, direction));
+    let (io, _peer_io) = tokio::io::duplex(1024);
+    let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
+        io,
+        addr,
+        ChannelId::Global,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut connection = LockFreeConnection::new(addr, direction);
+    connection.stream_handle = Some(Arc::new(stream_handle));
+    let connection = Arc::new(connection);
     connection.set_state(ConnectionState::Connected);
     assert!(pool.add_connection_by_peer_id(remote, addr, connection));
-    tokio::task::yield_now().await;
-    tokio::task::yield_now().await;
-
+    let resolved = tokio::time::timeout(Duration::from_millis(10), waiter)
+        .await
+        .expect("connection publication must wake waiter without advancing time")
+        .expect("preferred-connection waiter must not panic");
     assert!(
-        pool.preferred_connection_checks.load(Ordering::Relaxed) >= 2,
-        "connection publication did not wake waiter"
+        resolved.is_some(),
+        "published connection must satisfy waiter"
     );
-    waiter.abort();
 }
 
 #[tokio::test]
@@ -1992,7 +2003,12 @@ async fn get_connection_by_peer_id_recovers_live_alias_connection() {
         pool.routing_revision() > routing_revision,
         "address-only connection publication must wake route consumers"
     );
+    let address_index_revision = pool.routing_revision();
     pool.add_addr_to_peer_id(alias_addr, peer_id.clone());
+    assert!(
+        pool.routing_revision() > address_index_revision,
+        "alias ownership publication must wake route consumers after the alias is resolvable"
+    );
 
     let resolved = pool
         .get_connection_by_peer_id(&peer_id)

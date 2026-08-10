@@ -2139,6 +2139,11 @@ impl<T> ConnectionPool<T> {
             addr, peer_id
         );
         let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id);
+        // An address-indexed connection is not peer-routable until this
+        // ownership mapping is visible. Publish another routing revision after
+        // the mapping so a waiter that observed the earlier address-index
+        // notification cannot park with an unresolved alias.
+        self.mark_routing_changed();
     }
 
     /// Get the shared correlation tracker for a peer ID
