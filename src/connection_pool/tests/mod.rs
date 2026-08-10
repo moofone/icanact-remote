@@ -1986,7 +1986,12 @@ async fn get_connection_by_peer_id_recovers_live_alias_connection() {
     connection.set_state(ConnectionState::Connected);
     let connection = Arc::new(connection);
 
+    let routing_revision = pool.routing_revision();
     pool.index_connection_by_addr(alias_addr, connection.clone());
+    assert!(
+        pool.routing_revision() > routing_revision,
+        "address-only connection publication must wake route consumers"
+    );
     pool.add_addr_to_peer_id(alias_addr, peer_id.clone());
 
     let resolved = pool

@@ -29,6 +29,23 @@ const SUBSCRIBER_QUEUE_CAPACITY: usize = 64;
 #[cfg(test)]
 const UDP_MAX_DATAGRAM_SIZE: usize = 65_507;
 
+async fn wait_for_route_provider_change(
+    revision: &AtomicU64,
+    notify: &tokio::sync::Notify,
+    after: u64,
+) -> u64 {
+    loop {
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let current = revision.load(Ordering::Acquire);
+        if current != after {
+            return current;
+        }
+        notified.await;
+    }
+}
+
 type TopicKey = u64;
 type TypeHash = u64;
 type SubscriberKey = (TopicKey, TypeHash);
@@ -467,7 +484,7 @@ pub struct RoutedPubSub {
     msg_id_epoch: u64,
     next_msg_id: AtomicU64,
     route_provider: ArcSwap<Option<Arc<dyn PubSubRouteProvider>>>,
-    route_provider_revision: AtomicU64,
+    route_provider_revision: Arc<AtomicU64>,
     route_provider_change_notify: Arc<tokio::sync::Notify>,
     /// Serializes route-snapshot rebuilds. This is control-plane only;
     /// publish and ingress never acquire it.
@@ -530,7 +547,7 @@ impl RoutedPubSub {
             msg_id_epoch,
             next_msg_id: AtomicU64::new(1),
             route_provider: ArcSwap::from_pointee(None),
-            route_provider_revision: AtomicU64::new(0),
+            route_provider_revision: Arc::new(AtomicU64::new(0)),
             route_provider_change_notify: Arc::new(tokio::sync::Notify::new()),
             control_plane_refresh_lock: AsyncMutex::new(()),
             last_actor_routing_revision: AtomicU64::new(u64::MAX),
@@ -1549,6 +1566,7 @@ impl RoutedPubSub {
         let weak = Arc::downgrade(this);
         let actor_state = Arc::clone(&this.registry.actor_state);
         let connection_pool = Arc::clone(&this.registry.connection_pool);
+        let provider_revision_signal = Arc::clone(&this.route_provider_revision);
         let provider_changed = Arc::clone(&this.route_provider_change_notify);
         tokio::spawn(async move {
             let Some(initial) = weak.upgrade() else {
@@ -1560,13 +1578,19 @@ impl RoutedPubSub {
             let mut connection_revision = initial
                 .last_connection_routing_revision
                 .load(Ordering::Acquire);
+            let mut provider_revision =
+                initial.last_route_provider_revision.load(Ordering::Acquire);
             drop(initial);
 
             loop {
                 let force_provider_refresh = tokio::select! {
                     _ = actor_state.wait_for_pubsub_routing_change(actor_revision) => false,
                     _ = connection_pool.wait_for_routing_change(connection_revision) => false,
-                    _ = provider_changed.notified() => false,
+                    _ = wait_for_route_provider_change(
+                        provider_revision_signal.as_ref(),
+                        provider_changed.as_ref(),
+                        provider_revision,
+                    ) => false,
                     _ = tokio::time::sleep(CONTROL_PLANE_FALLBACK_INTERVAL) => true,
                 };
                 let Some(this) = weak.upgrade() else {
@@ -1581,6 +1605,7 @@ impl RoutedPubSub {
                 connection_revision = this
                     .last_connection_routing_revision
                     .load(Ordering::Acquire);
+                provider_revision = this.last_route_provider_revision.load(Ordering::Acquire);
             }
         });
     }
@@ -2058,7 +2083,7 @@ mod tests {
             msg_id_epoch,
             next_msg_id: AtomicU64::new(1),
             route_provider: ArcSwap::from_pointee(None),
-            route_provider_revision: AtomicU64::new(0),
+            route_provider_revision: Arc::new(AtomicU64::new(0)),
             route_provider_change_notify: Arc::new(tokio::sync::Notify::new()),
             control_plane_refresh_lock: AsyncMutex::new(()),
             last_actor_routing_revision: AtomicU64::new(u64::MAX),
@@ -2253,6 +2278,30 @@ mod tests {
             2,
             "explicit/fallback refresh must re-evaluate provider interior state"
         );
+    }
+
+    #[tokio::test]
+    async fn route_provider_revision_wait_survives_a_consumed_notification() {
+        let pubsub = test_pubsub("pubsub-provider-revision-wait");
+        let after = pubsub.route_provider_revision.load(Ordering::Acquire);
+        pubsub.set_route_provider(Arc::new(CountingRouteProvider {
+            calls: AtomicU64::new(0),
+        }));
+
+        // Model another select branch consuming the single Notify permit.
+        pubsub.route_provider_change_notify.notified().await;
+
+        let observed = tokio::time::timeout(
+            Duration::from_millis(10),
+            wait_for_route_provider_change(
+                pubsub.route_provider_revision.as_ref(),
+                pubsub.route_provider_change_notify.as_ref(),
+                after,
+            ),
+        )
+        .await
+        .expect("the revision check must recover a consumed provider notification");
+        assert_ne!(observed, after);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -2224,6 +2224,7 @@ impl<T> ConnectionPool<T> {
             addr
         );
         let _ = self.connections_by_addr.upsert_sync(addr, connection);
+        self.mark_routing_changed();
     }
 
     /// Send header + payload to a peer by ID without concatenating payload bytes.
