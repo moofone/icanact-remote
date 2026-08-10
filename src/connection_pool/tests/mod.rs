@@ -7305,6 +7305,87 @@ async fn delta_gossip_response_is_dropped_when_owner_liveness_fence_fails() {
     );
 }
 
+/// Once the owner has granted a reap's closing authorization, inbound
+/// liveness must not clear the local failure state and continue as if cleanup
+/// had not started. The owner defers the evidence until the reservation is
+/// released, while the receive path gets a rejecting verdict immediately.
+#[tokio::test]
+async fn inbound_liveness_is_rejected_after_reap_authorization() {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing(
+                "lrr_reap_authorization_inbound_local",
+            )),
+            ..crate::GossipConfig::default()
+        },
+    ));
+    let peer_id = crate::KeyPair::new_for_testing("lrr_reap_authorization_inbound_remote")
+        .peer_id();
+    let peer_addr: SocketAddr = "10.77.0.77:9313".parse().unwrap();
+    let stale_time = crate::current_timestamp_millis().saturating_sub(3_600_000);
+    {
+        let mut state = registry.gossip_state.lock().await;
+        state
+            .peers
+            .insert(peer_addr, stale_peer_info(peer_addr, stale_time));
+    }
+
+    let reservation = registry
+        .registry_owner
+        .reserve_for_reap(
+            peer_addr,
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("an unclaimed address must be reservable");
+    assert!(
+        reservation.try_consume().await,
+        "the owner must grant the closing authorization exactly once"
+    );
+
+    let evidence_before = std::time::Instant::now();
+    assert!(
+        !registry
+            .mark_authenticated_inbound_liveness(
+                peer_addr,
+                &peer_id,
+                peer_addr,
+                crate::current_timestamp_millis(),
+            )
+            .await,
+        "inbound liveness must be rejected once cleanup has won authorization"
+    );
+
+    let state = registry.gossip_state.lock().await;
+    let peer_info = state
+        .peers
+        .get(&peer_addr)
+        .expect("peer entry must remain available for the in-flight reap");
+    assert_eq!(
+        peer_info.failures, 1,
+        "a rejected inbound payload must not clear failure bookkeeping"
+    );
+    assert_eq!(
+        peer_info.last_response_received_ms, stale_time,
+        "a rejected inbound payload must not refresh response bookkeeping"
+    );
+    drop(state);
+
+    reservation.release().await;
+    assert!(
+        registry
+            .registry_owner
+            .has_newer_liveness_evidence(peer_addr, evidence_before)
+            .await,
+        "deferred evidence must be committed when the consumed reservation releases"
+    );
+}
+
 /// A `FullSyncRequest` is authenticated inbound traffic just like a delta, but
 /// it does not carry an actor update that would otherwise touch the normal
 /// gossip bookkeeping.  It must still refresh the owner's causal liveness

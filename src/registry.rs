@@ -7665,11 +7665,14 @@ impl<T: 'static> GossipRegistry<T> {
         // held. A reap that reaches the owner after this response began must
         // observe the evidence before it can consume destructive authority.
         let evidence_at = std::time::Instant::now();
-        if !self
+        match self
             .registry_owner
             .try_note_liveness_evidence(peer_addr, evidence_at)
+            .await
         {
-            return false;
+            Some(crate::registry_owner::LivenessEvidenceOutcome::Recorded) => {}
+            Some(crate::registry_owner::LivenessEvidenceOutcome::ReapAlreadyAuthorized)
+            | None => return false,
         }
         peer_info.last_response_received_ms = peer_info.last_response_received_ms.max(now);
         peer_info.last_success = peer_info.last_success.max(current_timestamp());
@@ -7720,11 +7723,14 @@ impl<T: 'static> GossipRegistry<T> {
         let Some(evidence_at) = evidence_at else {
             return false;
         };
-        if !self
+        match self
             .registry_owner
             .try_note_liveness_evidence(peer_addr, evidence_at)
+            .await
         {
-            return false;
+            Some(crate::registry_owner::LivenessEvidenceOutcome::Recorded) => {}
+            Some(crate::registry_owner::LivenessEvidenceOutcome::ReapAlreadyAuthorized)
+            | None => return false,
         }
         if let Some(peer_info) = gossip_state.peers.get_mut(&peer_addr) {
             peer_info.last_response_received_ms = peer_info.last_response_received_ms.max(now);

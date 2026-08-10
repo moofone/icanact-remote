@@ -3230,7 +3230,7 @@ async fn send_peer_list_gossip_round(registry: Arc<GossipRegistry>, immediate: b
         let registry_clone = registry.clone();
         let future = tokio::spawn(async move {
             if let Err(err) = send_gossip_message_zero_copy(task, registry_clone).await {
-                warn!(error = %err, immediate, "peer list gossip send failed");
+                warn!(error = %err.error, immediate, "peer list gossip send failed");
             }
         });
         futures.push(future);
@@ -3340,18 +3340,18 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
                         let peer_addr = task.peer_addr;
                         let sent_sequence = task.current_sequence;
                         let session_source = task.session_source;
-                        let task_session_instance_id = task.session_instance_id;
                         let future = tokio::spawn(async move {
                             // Send the message using zero-copy persistent connections
-                            let outcome = send_gossip_message_zero_copy(task, registry_clone).await;
-                            let session_instance_id =
-                                gossip_result_session_instance_id(task_session_instance_id, &outcome);
+                            let send_outcome =
+                                send_gossip_message_zero_copy(task, registry_clone).await;
+                            let (session_instance_id, outcome) =
+                                gossip_send_outcome_to_result(send_outcome);
                             GossipResult {
                                 peer_addr,
                                 sent_sequence,
                                 session_source,
                                 session_instance_id,
-                                outcome: gossip_send_outcome_to_result(outcome),
+                                outcome,
                             }
                         });
                         futures.push(future);
@@ -5921,9 +5921,11 @@ mod keepalive_apply_tests {
 /// `handle_incoming_message` -- which threads that connection's real,
 /// per-socket `session_source` correctly (see `ReadContext::session_source`).
 ///
-/// `send_gossip_message_zero_copy`'s `Result<Option<u64>>` return type makes this the
+/// `send_gossip_message_zero_copy`'s fire-and-forget send result makes this the
 /// ONLY possible mapping to `GossipResult::outcome`: there is no response to
-/// carry. `apply_gossip_results`' `handle_gossip_response` call for a
+/// carry. Its concrete stream instance is kept separately so both success and
+/// failure bookkeeping use the connection that actually attempted the write.
+/// `apply_gossip_results`' `handle_gossip_response` call for a
 /// `FullSyncResponse` is therefore unreachable for real wire traffic --
 /// `response_opt` is always `None` here. If `send_gossip_message_zero_copy`
 /// is ever changed to synchronously return a genuine response, this mapping
@@ -5935,55 +5937,54 @@ mod keepalive_apply_tests {
 /// `verified_sender_addr` -- the peer's fixed dial-target address -- will
 /// not match `current_session_source`, which for an outbound session is the
 /// dialling socket's own local ephemeral port).
-fn gossip_send_outcome_to_result(
-    outcome: Result<Option<u64>>,
-) -> Result<Option<crate::registry::RegistryMessage>> {
-    outcome.map(|_| None)
+#[derive(Debug)]
+struct GossipSendFailure {
+    instance_id: Option<u64>,
+    error: crate::GossipError,
 }
 
-fn gossip_result_session_instance_id(
-    task_session_instance_id: Option<u64>,
-    outcome: &Result<Option<u64>>,
-) -> Option<u64> {
+type GossipSendResult<T> = std::result::Result<T, GossipSendFailure>;
+
+fn gossip_send_outcome_to_result(
+    outcome: GossipSendResult<Option<u64>>,
+) -> (
+    Option<u64>,
+    Result<Option<crate::registry::RegistryMessage>>,
+) {
     match outcome {
-        Ok(Some(instance_id)) => Some(*instance_id),
-        Ok(None) | Err(_) => task_session_instance_id,
+        Ok(instance_id) => (instance_id, Ok(None)),
+        Err(failure) => (failure.instance_id, Err(failure.error)),
     }
 }
 
 #[cfg(test)]
 mod gossip_send_outcome_tests {
-    use super::{gossip_result_session_instance_id, gossip_send_outcome_to_result};
+    use super::{gossip_send_outcome_to_result, GossipSendFailure};
 
     /// Pins the invariant `handle_gossip_response`'s `FullSyncResponse` arm
     /// relies on: the periodic gossip loop can never observe a real
     /// response through `GossipResult::outcome`, because the only thing it
     /// ever sends is a fire-and-forget write outcome. If this ever starts
-    /// returning `Ok(Some(_))`, `send_gossip_message_zero_copy`'s return
-    /// type had to change to carry a response too -- see this function's
-    /// doc comment for what must be fixed alongside that (`session_source`
+    /// returning `Ok(Some(_))`, `send_gossip_message_zero_copy`'s result
+    /// would need a response-bearing variant too -- see this function's doc
+    /// comment for what must be fixed alongside that (`session_source`
     /// threading).
     #[test]
     fn gossip_send_outcome_never_carries_a_response_on_success() {
-        assert!(gossip_send_outcome_to_result(Ok(Some(42))).unwrap().is_none());
+        let (instance_id, outcome) = gossip_send_outcome_to_result(Ok(Some(42)));
+        assert_eq!(instance_id, Some(42));
+        assert!(outcome.unwrap().is_none());
     }
 
     #[test]
     fn gossip_send_outcome_still_propagates_send_errors() {
         let err = crate::GossipError::Shutdown;
-        assert!(matches!(
-            gossip_send_outcome_to_result(Err(err)),
-            Err(crate::GossipError::Shutdown)
-        ));
-    }
-
-    #[test]
-    fn gossip_error_preserves_task_session_instance_id() {
-        let outcome = Err(crate::GossipError::Timeout);
-        assert_eq!(
-            gossip_result_session_instance_id(Some(42), &outcome),
-            Some(42)
-        );
+        let (instance_id, outcome) = gossip_send_outcome_to_result(Err(GossipSendFailure {
+            instance_id: Some(42),
+            error: err,
+        }));
+        assert_eq!(instance_id, Some(42));
+        assert!(matches!(outcome, Err(crate::GossipError::Shutdown)));
     }
 }
 
@@ -5991,7 +5992,7 @@ mod gossip_send_outcome_tests {
 async fn send_gossip_message_zero_copy(
     mut task: GossipTask,
     registry: Arc<GossipRegistry>,
-) -> Result<Option<u64>> {
+) -> GossipSendResult<Option<u64>> {
     let mut conn = registry
         .connection_pool
         .get_existing_connection(task.peer_addr);
@@ -6061,10 +6062,15 @@ async fn send_gossip_message_zero_copy(
                         "❌ GOSSIP RETRY: Failed to reconnect to peer"
                     );
                 }
-                return Err(e);
+                return Err(GossipSendFailure {
+                    instance_id: None,
+                    error: e,
+                });
             }
         }
     };
+
+    let instance_id = conn.instance_id();
 
     if matches!(
         task.message,
@@ -6075,7 +6081,7 @@ async fn send_gossip_message_zero_copy(
             peer = %task.peer_addr,
             "Skipping PeerListGossip send - peer lacks negotiated capability"
         );
-        return Ok(None);
+        return Ok(instance_id);
     }
 
     // Set transport timing immediately before the write. Actor-location
@@ -6100,7 +6106,15 @@ async fn send_gossip_message_zero_copy(
     }
 
     // Serialize the message AFTER updating timing
-    let data = rkyv::to_bytes::<rkyv::rancor::Error>(&task.message)?;
+    let data = match rkyv::to_bytes::<rkyv::rancor::Error>(&task.message) {
+        Ok(data) => data,
+        Err(error) => {
+            return Err(GossipSendFailure {
+                instance_id,
+                error: error.into(),
+            });
+        }
+    };
 
     // Create message with Gossip type prefix
     let mut msg_with_type = Vec::with_capacity(crate::framing::GOSSIP_HEADER_LEN + data.len());
@@ -6111,8 +6125,12 @@ async fn send_gossip_message_zero_copy(
     // Use zero-copy tell() which uses try_send() internally for max performance
     // This completely bypasses async overhead when the channel has capacity
     let tcp_start = std::time::Instant::now();
-    let instance_id = conn.instance_id();
-    conn.tell(bytes::Bytes::from(msg_with_type)).await?;
+    if let Err(error) = conn.tell(bytes::Bytes::from(msg_with_type)).await {
+        return Err(GossipSendFailure {
+            instance_id,
+            error,
+        });
+    }
     let _tcp_elapsed = tcp_start.elapsed();
     // eprintln!("🔍 TCP_WRITE_TIME: {:?}", tcp_elapsed);
     Ok(instance_id)

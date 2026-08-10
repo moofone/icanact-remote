@@ -4684,6 +4684,26 @@ pub(crate) fn handle_incoming_message(
                     return Ok(());
                 };
 
+                // Publish and receive the owner verdict before any
+                // address-keyed projection. If a reap has already consumed
+                // its closing authorization, the frame must be discarded
+                // before it can mutate peer, extension, or actor state.
+                if !registry
+                    .mark_authenticated_inbound_liveness(
+                        sender_socket_addr,
+                        &sender_peer_id,
+                        session_source,
+                        crate::current_timestamp_millis(),
+                    )
+                    .await
+                {
+                    debug!(
+                        peer = %sender_socket_addr,
+                        "ignoring FullSync after authenticated liveness admission failed"
+                    );
+                    return Ok(());
+                }
+
                 // Note: sender_peer_id is now a PeerId (e.g., "node_a"), not an address
                 debug!(
                     "Received FullSync from node '{}' at bind_addr {} (tcp_source={})",
@@ -4782,26 +4802,6 @@ pub(crate) fn handle_incoming_message(
                     // an old, still-draining connection's in-flight FullSync
                     // must not be able to mask real unresponsiveness or
                     // perturb `should_use_delta_state`'s strategy choice.
-                }
-
-                // Publish the authoritative liveness fence before merging
-                // actor state. A full/closed owner mailbox is a hard failure:
-                // do not accept a FullSync that cleanup cannot observe as
-                // live, and do not clear any failure bookkeeping first.
-                if !registry
-                    .mark_authenticated_inbound_liveness(
-                        sender_socket_addr,
-                        &sender_peer_id,
-                        session_source,
-                        crate::current_timestamp_millis(),
-                    )
-                    .await
-                {
-                    debug!(
-                        peer = %sender_socket_addr,
-                        "ignoring FullSync after authenticated liveness fence publication failed"
-                    );
-                    return Ok(());
                 }
 
                 debug!(
@@ -5266,6 +5266,26 @@ pub(crate) fn handle_incoming_message(
                     return Ok(());
                 };
 
+                // Publish and receive the owner verdict before any
+                // address-keyed projection. If cleanup already owns its
+                // closing authorization, discard the response before it can
+                // mutate extensions, peer state, or actor state.
+                if !registry
+                    .mark_authenticated_inbound_liveness(
+                        sender_socket_addr,
+                        &sender_peer_id,
+                        session_source,
+                        crate::current_timestamp_millis(),
+                    )
+                    .await
+                {
+                    debug!(
+                        peer = %sender_socket_addr,
+                        "ignoring FullSyncResponse after authenticated liveness admission failed"
+                    );
+                    return Ok(());
+                }
+
                 {
                     // Extension/clock state is address-keyed, so it is
                     // admitted and written under the same `gossip_state`
@@ -5289,26 +5309,6 @@ pub(crate) fn handle_incoming_message(
                         extensions,
                         crate::current_timestamp_nanos(),
                     );
-                }
-
-                // Publish the owner-side liveness fence before merging the
-                // response's actor state. If this fallible publication fails,
-                // the response must be discarded rather than accepted while
-                // cleanup still sees an unfenced peer.
-                if !registry
-                    .mark_authenticated_inbound_liveness(
-                        sender_socket_addr,
-                        &sender_peer_id,
-                        session_source,
-                        crate::current_timestamp_millis(),
-                    )
-                    .await
-                {
-                    debug!(
-                        peer = %sender_socket_addr,
-                        "ignoring FullSyncResponse after authenticated liveness fence publication failed"
-                    );
-                    return Ok(());
                 }
 
                 debug!(

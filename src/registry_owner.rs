@@ -322,6 +322,15 @@ pub enum DeadPeerReleaseOutcome {
     NotApplicable,
 }
 
+/// Result of trying to publish direct liveness while a reap may be in flight.
+/// `ReapAlreadyAuthorized` tells the inbound path that cleanup has won and the
+/// payload must be rejected before it mutates local state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LivenessEvidenceOutcome {
+    Recorded,
+    ReapAlreadyAuthorized,
+}
+
 /// Lifecycle receipt for one accepted claim command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClaimReceipt {
@@ -911,6 +920,14 @@ enum OwnerCommand {
         addr: SocketAddr,
         at: std::time::Instant,
     },
+    /// Synchronous admission for direct liveness from a critical receive
+    /// path. The bounded send is non-blocking, while the reply tells the
+    /// caller whether a consumed reap already owns destructive authority.
+    TryNoteLivenessEvidence {
+        addr: SocketAddr,
+        at: std::time::Instant,
+        reply: oneshot::Sender<LivenessEvidenceOutcome>,
+    },
 }
 
 /// Shared state behind every [`RegistryOwnerHandle`] clone.
@@ -1028,26 +1045,31 @@ impl RegistryOwnerHandle {
             .await;
     }
 
-    /// Enqueue direct liveness without an await point. Critical receive paths
-    /// use this while holding their validated registry-state guard so the
-    /// owner fence is ordered before a concurrent reap can consume its
-    /// destructive authorization. A full or closed mailbox is fail-closed:
-    /// the caller must not publish volatile liveness when the authoritative
-    /// owner could not be told about it.
-    pub(crate) fn try_note_liveness_evidence(
+    /// Enqueue direct liveness without blocking mailbox admission. Critical
+    /// receive paths use this while holding their validated registry-state
+    /// guard so the owner fence is ordered before a concurrent reap can
+    /// consume destructive authority. The owner reply is required before
+    /// the caller may mutate volatile state: if cleanup already consumed the
+    /// reservation, the caller must discard the payload. A full/closed
+    /// mailbox or dropped reply is `None` and is fail-closed by callers.
+    pub(crate) async fn try_note_liveness_evidence(
         &self,
         addr: SocketAddr,
         at: std::time::Instant,
-    ) -> bool {
+    ) -> Option<LivenessEvidenceOutcome> {
         self.ensure_started();
+        let (reply, response) = oneshot::channel();
         match self
             .shared
             .tx
-            .try_send(OwnerCommand::NoteLivenessEvidence { addr, at })
+            .try_send(OwnerCommand::TryNoteLivenessEvidence { addr, at, reply })
         {
-            Ok(()) => true,
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => false,
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => false,
+            Ok(()) => match response.await {
+                Ok(outcome) => Some(outcome),
+                Err(_) => None,
+            },
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => None,
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => None,
         }
     }
 
@@ -2014,7 +2036,11 @@ impl PeerRegistryOwner {
                 let _ = reply.send(self.reap_reserved.contains_key(&addr));
             }
             OwnerCommand::NoteLivenessEvidence { addr, at } => {
-                self.note_liveness_evidence(addr, at);
+                let _ = self.note_liveness_evidence(addr, at);
+            }
+            OwnerCommand::TryNoteLivenessEvidence { addr, at, reply } => {
+                let outcome = self.note_liveness_evidence(addr, at);
+                let _ = reply.send(outcome);
             }
         }
     }
@@ -2292,7 +2318,11 @@ impl PeerRegistryOwner {
     /// final check and actor/tombstone destruction. Release commits any
     /// deferred evidence before removing the reservation, so the evidence
     /// is not lost and later commands observe the correct owner order.
-    fn note_liveness_evidence(&mut self, addr: SocketAddr, at: std::time::Instant) {
+    fn note_liveness_evidence(
+        &mut self,
+        addr: SocketAddr,
+        at: std::time::Instant,
+    ) -> LivenessEvidenceOutcome {
         if let Some(entry) = self.reap_reserved.get_mut(&addr) {
             if entry.consumed {
                 let deferred_at = match entry.deferred_liveness_at {
@@ -2300,12 +2330,13 @@ impl PeerRegistryOwner {
                     _ => at,
                 };
                 entry.deferred_liveness_at = Some(deferred_at);
-                return;
+                return LivenessEvidenceOutcome::ReapAlreadyAuthorized;
             }
         }
 
         self.commit_liveness_evidence(addr, at);
         self.invalidate_reap_reservation(addr, at);
+        LivenessEvidenceOutcome::Recorded
     }
 
     /// Commit direct liveness without consulting reap state. Used when the
