@@ -88,6 +88,12 @@ struct OutboundDialRetry {
 struct OutboundDialRetryState {
     consecutive_failures: u8,
     retry_not_before: Option<Instant>,
+    generation: u64,
+}
+
+#[derive(Clone, Copy)]
+struct OutboundDialAttempt {
+    generation: u64,
 }
 
 impl OutboundDialRetry {
@@ -100,12 +106,13 @@ impl OutboundDialRetry {
             state: std::sync::Mutex::new(OutboundDialRetryState {
                 consecutive_failures: 0,
                 retry_not_before: None,
+                generation: 0,
             }),
             retry_floor,
         }
     }
 
-    fn try_claim_attempt(&self) -> bool {
+    fn try_claim_attempt(&self) -> Option<OutboundDialAttempt> {
         let now = Instant::now();
         let mut state = self
             .state
@@ -115,20 +122,26 @@ impl OutboundDialRetry {
             .retry_not_before
             .is_some_and(|deadline| now < deadline)
         {
-            return false;
+            return None;
         }
 
         // Reserve this peer's slot while the socket attempt is in flight. If
         // the future is cancelled, the bounded reservation expires by itself.
+        state.generation = state.generation.wrapping_add(1);
         state.retry_not_before = Some(now + self.retry_floor);
-        true
+        Some(OutboundDialAttempt {
+            generation: state.generation,
+        })
     }
 
-    fn record_failure(&self) {
+    fn record_failure(&self, attempt: OutboundDialAttempt) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.generation != attempt.generation {
+            return;
+        }
         state.consecutive_failures = state.consecutive_failures.saturating_add(1);
         let delay = if state.consecutive_failures == 1 {
             Duration::ZERO
@@ -138,11 +151,27 @@ impl OutboundDialRetry {
         state.retry_not_before = Some(Instant::now() + delay);
     }
 
-    fn record_success(&self) {
+    fn record_success(&self, attempt: OutboundDialAttempt) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.generation != attempt.generation {
+            return;
+        }
+        state.generation = state.generation.wrapping_add(1);
+        state.consecutive_failures = 0;
+        state.retry_not_before = None;
+    }
+
+    fn record_published_connection(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Publication wins over every in-flight completion, including an
+        // older attempt whose bounded reservation has already expired.
+        state.generation = state.generation.wrapping_add(1);
         state.consecutive_failures = 0;
         state.retry_not_before = None;
     }
