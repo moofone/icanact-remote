@@ -596,7 +596,9 @@ impl<T> ConnectionPool<T> {
                 .as_ref()
                 .is_some_and(|cur| Arc::ptr_eq(cur, &connection))
             {
-                session.outbound_dial_retry.record_success();
+                session
+                    .outbound_dial_retry
+                    .record_published_connection();
                 let _ = self
                     .connections_by_peer
                     .upsert_sync(peer_id.clone(), connection);
@@ -605,7 +607,9 @@ impl<T> ConnectionPool<T> {
             return Err(current);
         }
 
-        session.outbound_dial_retry.record_success();
+        session
+            .outbound_dial_retry
+            .record_published_connection();
 
         let stream_instance_id = connection
             .stream_handle

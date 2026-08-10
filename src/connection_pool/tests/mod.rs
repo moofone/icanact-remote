@@ -4403,7 +4403,16 @@ async fn stale_outbound_completion_cannot_replace_a_newer_reservation() {
 
 #[tokio::test]
 async fn connection_published_after_retry_claim_is_reused_before_dial() {
-    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    use crate::{GossipConfig, registry::GossipRegistry};
+
+    let registry = Arc::new(GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("retry-claim-local")),
+            ..Default::default()
+        },
+    ));
+    let pool = registry.connection_pool.clone();
     let peer = crate::KeyPair::new_for_testing("retry_claim_publish_race").peer_id();
     let addr: SocketAddr = "127.0.0.1:7314".parse().unwrap();
     pool.add_addr_to_peer_id(addr, peer.clone());
@@ -4414,7 +4423,7 @@ async fn connection_published_after_retry_claim_is_reused_before_dial() {
         .expect("retry attempt must be claimed before publication");
 
     let (io, _keep) = tokio::io::duplex(1024);
-    pool.finalize_new_outbound_connection(addr, io, std::sync::Weak::new(), None)
+    pool.finalize_new_outbound_connection(addr, io, Arc::downgrade(&registry), None, addr, None)
         .await
         .expect("publish outbound connection");
 
