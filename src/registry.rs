@@ -1187,9 +1187,8 @@ pub struct RegistryStats {
 ///
 /// "An address some connection resolved to" is NOT, on its own, "an
 /// address we can dial" -- an INBOUND connection's `.addr` is its raw,
-/// ephemeral TCP source (a ConnectionHandle carries no direction of its
-/// own; the pool's OWN `LockFreeConnection` does), never a corroborated
-/// dial target, and #181's bug was exactly this address becoming
+/// ephemeral TCP source, never a corroborated dial target, and #181's bug
+/// was exactly this address becoming
 /// selectable/gossipable through a fresh, unflagged `PeerInfo`. This type
 /// therefore also carries whether IT was independently corroborated as
 /// dialable, so that fact cannot be dropped by a caller who forgets to ask
@@ -1206,10 +1205,9 @@ pub struct ResolvedRoute {
 }
 
 impl ResolvedRoute {
-    /// Build a `ResolvedRoute` from a live connection. `direction` MUST be
-    /// independently looked up from the connection pool's
-    /// `LockFreeConnection` (a bare `ConnectionHandle` has no direction of
-    /// its own) -- only a genuine OUTBOUND dial corroborates `addr` as
+    /// Build a `ResolvedRoute` from a live connection. Callers should pass
+    /// the direction captured by the resolved handle itself -- only a
+    /// genuine OUTBOUND dial corroborates `addr` as
     /// dialable; an INBOUND connection's own address is its raw, unproven
     /// transport source. `None` (direction unknown, or the connection was
     /// not found in the lock-free index at all) is treated the same as
@@ -5475,14 +5473,12 @@ impl<T: 'static> GossipRegistry<T> {
                 // -- this loop's own snapshot from `list_configured_peers()`
                 // above, which a concurrent `configure_peer` can move the
                 // pin away from between that snapshot and this check.
-                // Direction MUST be looked up independently
-                // (`ConnectionHandle` itself carries none): an INBOUND
-                // connection's `.addr` is its raw, unverified transport
-                // source, not evidence this address is dialable.
-                let direction = self
-                    .connection_pool
-                    .get_lock_free_connection(conn.addr)
-                    .map(|c| c.direction);
+                // Keep the direction captured by this already-resolved
+                // handle. The address index can be reassigned to another
+                // connection between resolution and this report; looking it
+                // up again would attribute that replacement's direction to
+                // the handle we actually connected through.
+                let direction = Some(conn.direction());
                 self.note_peer_reachable(
                     &peer_id,
                     ConnectOutcome::resolved(ResolvedRoute::from_connection(conn.addr, direction)),
@@ -6196,15 +6192,10 @@ impl<T: 'static> GossipRegistry<T> {
                 // the clear to `conn.addr` alone is not sufficient: it
                 // must also be evidence of an actual outbound dial, not
                 // merely "this function happened to resolve a connection
-                // at this address." `ConnectionHandle` itself carries no
-                // direction -- looked up once, here, from the pool's own
-                // `LockFreeConnection`, and reused for both `dialed_outbound`
-                // below and `conn_route`'s own dialability evidence, so
-                // there is exactly one source of truth for it.
-                let conn_direction = self
-                    .connection_pool
-                    .get_lock_free_connection(conn.addr)
-                    .map(|c| c.direction);
+                // at this address." Use the direction captured by this
+                // resolved handle; the address index may be reassigned to a
+                // different connection before this code runs.
+                let conn_direction = Some(conn.direction());
                 let dialed_outbound =
                     conn_direction == Some(crate::connection_pool::ConnectionDirection::Outbound);
 
