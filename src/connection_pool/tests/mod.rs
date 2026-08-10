@@ -7242,6 +7242,108 @@ async fn full_sync_request_records_owner_side_liveness_evidence() {
     );
 }
 
+/// `PeerListGossip` is accepted only after the authenticated connection and negotiated capability
+/// gates pass, but it carries no actor delta that would otherwise refresh the normal gossip state.
+/// It must still refresh the owner's causal liveness fence: dead-peer cleanup reads that fence
+/// before releasing address ownership.
+#[tokio::test]
+async fn peer_list_gossip_records_owner_side_liveness_evidence() {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("lrr_peer_list_local")),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let peer_keypair = crate::KeyPair::new_for_testing("lrr_peer_list_remote");
+    let peer_id = peer_keypair.peer_id();
+    let peer_addr: SocketAddr = "10.77.0.70:9306".parse().unwrap();
+    let stale_time = crate::current_timestamp_millis().saturating_sub(3_600_000);
+    {
+        let mut state = registry.gossip_state.lock().await;
+        state
+            .peers
+            .insert(peer_addr, stale_peer_info(peer_addr, stale_time));
+    }
+
+    // The handler deliberately requires a live pool connection and the negotiated discovery
+    // capability before it reaches the liveness marker. Publish the smallest real connected
+    // stream instance so this test exercises those production gates rather than bypassing them.
+    let (io, _peer_io) = tokio::io::duplex(1024);
+    let (stream_handle, _writer, _reader) = crate::connection_pool::LockFreeStreamHandle::new(
+        io,
+        peer_addr,
+        crate::connection_pool::ChannelId::Global,
+        crate::connection_pool::BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut connection = crate::connection_pool::LockFreeConnection::new(
+        peer_addr,
+        crate::connection_pool::ConnectionDirection::Inbound,
+    );
+    connection.stream_handle = Some(Arc::new(stream_handle));
+    connection.embedded_peer_id = Some(peer_id.clone());
+    connection.set_state(crate::connection_pool::ConnectionState::Connected);
+    let connection = Arc::new(connection);
+    assert!(registry.connection_pool.add_connection_by_peer_id(
+        peer_id.clone(),
+        peer_addr,
+        connection,
+    ));
+    registry.set_peer_capabilities(
+        peer_addr,
+        crate::handshake::PeerCapabilities::from_hello_exchange(
+            &crate::handshake::Hello::new(),
+            &crate::handshake::Hello::new(),
+        ),
+    );
+
+    let evidence_before = std::time::Instant::now();
+    assert!(
+        !registry
+            .registry_owner
+            .has_newer_liveness_evidence(peer_addr, evidence_before)
+            .await,
+        "sanity: no owner-side evidence exists before the gossip"
+    );
+
+    let msg = crate::registry::RegistryMessage::PeerListGossip {
+        peers: Vec::new(),
+        timestamp: crate::current_timestamp(),
+        sender_addr: "198.51.100.70:9306".to_string(),
+    };
+    super::handle_incoming_message(
+        registry.clone(),
+        peer_addr,
+        peer_addr,
+        Some(peer_id),
+        msg,
+    )
+    .await
+    .expect("authenticated PeerListGossip should be accepted");
+
+    assert!(
+        registry
+            .registry_owner
+            .has_newer_liveness_evidence(peer_addr, evidence_before)
+            .await,
+        "an accepted authenticated PeerListGossip must refresh the owner-side liveness fence"
+    );
+    let state = registry.gossip_state.lock().await;
+    let info = state
+        .peers
+        .get(&peer_addr)
+        .expect("peer should remain in gossip state after PeerListGossip");
+    assert_eq!(info.failures, 0, "authenticated gossip must clear failures");
+    assert!(
+        info.last_response_received_ms > stale_time,
+        "authenticated gossip must refresh response bookkeeping"
+    );
+}
+
 /// The `DeltaGossip` arm never verified `delta.sender_peer_id` -- a
 /// SELF-REPORTED wire field, not an authority for identity -- against the
 /// connection's actual authenticated identity, unlike the `FullSync` arm
