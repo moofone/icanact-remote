@@ -200,6 +200,17 @@ fn next_session_epoch() -> u64 {
     SESSION_EPOCH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Process-wide, never-reset counter for reannouncement-liveness lease
+/// generations. Wall-clock seconds intentionally remain the freshness value,
+/// but a generation is needed to identify the exact row a refresh wrote when
+/// rolling back after the actor disappears. A timestamp alone is ambiguous
+/// for every refresh that lands in the same second.
+static REANNOUNCEMENT_GENERATION_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn next_reannouncement_generation() -> u64 {
+    REANNOUNCEMENT_GENERATION_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Atomically re-validates, under an already-held `gossip_state` lock,
 /// that `expected_epoch` (captured earlier, at session-validation time,
 /// from `PeerInfo::current_session_epoch`) still matches this peer's
@@ -1857,7 +1868,10 @@ pub struct ActorState {
     /// actually recorded would let an earlier incarnation's last-known-
     /// reachable timestamp keep a replacement location looking fresh.
     /// `effective_actor_wall_clock_time` only honours a row whose owner and
-    /// vector-clock version still match the current entry.
+    /// vector-clock version still match the current entry. The final field is
+    /// a process-unique generation for exact compare-and-remove rollback; it
+    /// must not be inferred from `recorded_at`, whose whole-second precision
+    /// permits multiple writes in the same second.
     ///
     /// Entries are garbage-collected by `cleanup_stale_actors` for any name
     /// no longer present in `known_actors`, or whose recorded owner/version
@@ -1867,7 +1881,8 @@ pub struct ActorState {
     /// can make an actor look no less fresh than its own `wall_clock_time`,
     /// never falsely stale), and an owner-mismatched one is simply ignored
     /// on read rather than acted on.
-    reannouncement_liveness: SccHashMap<String, (crate::PeerId, crate::VectorClock, u64)>,
+    reannouncement_liveness:
+        SccHashMap<String, (crate::PeerId, crate::VectorClock, u64, u64)>,
     /// Test hook. Fired inside [`GossipRegistry::cleanup_stale_actors`] after
     /// it snapshots which actors look stale but before the removal loop
     /// re-validates and removes them, so a test can land a concurrent
@@ -1882,6 +1897,10 @@ pub struct ActorState {
     /// own independent scan-then-remove gap.
     #[cfg(test)]
     liveness_sweep_race_hook: std::sync::Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// Test hook fired after a liveness row is written and before the actor
+    /// revalidation that can trigger its rollback.
+    #[cfg(test)]
+    reannouncement_refresh_race_hook: std::sync::Mutex<Option<Box<dyn Fn(u64) + Send + Sync>>>,
 }
 
 #[cfg(test)]
@@ -1922,6 +1941,27 @@ impl ActorState {
             .take();
         if let Some(hook) = hook {
             hook();
+        }
+    }
+
+    pub(crate) fn set_reannouncement_refresh_race_hook(
+        &self,
+        hook: impl Fn(u64) + Send + Sync + 'static,
+    ) {
+        *self
+            .reannouncement_refresh_race_hook
+            .lock()
+            .expect("reannouncement-refresh race hook mutex poisoned") = Some(Box::new(hook));
+    }
+
+    fn fire_reannouncement_refresh_race_hook(&self, now: u64) {
+        let hook = self
+            .reannouncement_refresh_race_hook
+            .lock()
+            .expect("reannouncement-refresh race hook mutex poisoned")
+            .take();
+        if let Some(hook) = hook {
+            hook(now);
         }
     }
 }
@@ -7055,18 +7095,37 @@ impl<T: 'static> GossipRegistry<T> {
         }
 
         let now = current_timestamp();
+        let generation = next_reannouncement_generation();
         let owner = location.peer_id.clone();
         let owner_for_entry = owner.clone();
         let _ = self
             .actor_state
             .reannouncement_liveness
             .entry_sync(name.to_string())
-            .and_modify(|(recorded_owner, recorded_version, liveness)| {
-                *recorded_owner = owner_for_entry.clone();
-                *recorded_version = location.vector_clock.clone();
-                *liveness = (*liveness).max(now);
-            })
-            .or_insert((location.peer_id.clone(), location.vector_clock.clone(), now));
+            .and_modify(
+                |(recorded_owner, recorded_version, liveness, recorded_generation)| {
+                    // Generation order is the invocation order, not the
+                    // order in which concurrent lock-free writes happen to
+                    // reach this shard. Never let an older invocation
+                    // overwrite a newer lease and then remove it on rollback.
+                    if *recorded_generation < generation {
+                        *recorded_owner = owner_for_entry.clone();
+                        *recorded_version = location.vector_clock.clone();
+                        *liveness = (*liveness).max(now);
+                        *recorded_generation = generation;
+                    }
+                },
+            )
+            .or_insert((
+                location.peer_id.clone(),
+                location.vector_clock.clone(),
+                now,
+                generation,
+            ));
+
+        #[cfg(test)]
+        self.actor_state
+            .fire_reannouncement_refresh_race_hook(now);
 
         // The actor and liveness maps are independent lock-free maps. The
         // actor can be removed after the first read but before the side-table
@@ -7095,10 +7154,10 @@ impl<T: 'static> GossipRegistry<T> {
         // liveness shard.
         let _ = self.actor_state.reannouncement_liveness.remove_if_sync(
             name,
-            |(recorded_owner, recorded_version, recorded_at)| {
+            |(recorded_owner, recorded_version, _recorded_at, recorded_generation)| {
                 *recorded_owner == owner
                     && *recorded_version == location.vector_clock
-                    && *recorded_at <= now
+                    && *recorded_generation == generation
             },
         );
         false
@@ -8860,7 +8919,7 @@ impl<T: 'static> GossipRegistry<T> {
         let liveness = self
             .actor_state
             .reannouncement_liveness
-            .read_sync(name, |_, (owner, version, recorded)| {
+            .read_sync(name, |_, (owner, version, recorded, _generation)| {
                 (*owner == location.peer_id && *version == location.vector_clock)
                     .then_some(*recorded)
             })
@@ -8951,7 +9010,7 @@ impl<T: 'static> GossipRegistry<T> {
 
         let mut orphaned_liveness = Vec::new();
         self.actor_state.reannouncement_liveness.iter_sync(
-            |name, (recorded_owner, recorded_version, recorded_at)| {
+            |name, (recorded_owner, recorded_version, recorded_at, recorded_generation)| {
                 let owner_matches =
                     current_owners
                         .get(name)
@@ -8964,6 +9023,7 @@ impl<T: 'static> GossipRegistry<T> {
                         recorded_owner.clone(),
                         recorded_version.clone(),
                         *recorded_at,
+                        *recorded_generation,
                     ));
                 }
                 true
@@ -8971,7 +9031,9 @@ impl<T: 'static> GossipRegistry<T> {
         );
         #[cfg(test)]
         self.actor_state.fire_liveness_sweep_race_hook();
-        for (name, expected_owner, expected_version, expected_at) in orphaned_liveness {
+        for (name, expected_owner, expected_version, expected_at, expected_generation) in
+            orphaned_liveness
+        {
             // Re-check the same condition inside the atomic removal itself
             // rather than trusting the snapshot above: a concurrent
             // reannouncement or ownership transfer landing in the gap
@@ -8981,10 +9043,11 @@ impl<T: 'static> GossipRegistry<T> {
             // and only removes if the predicate still holds.
             let _ = self.actor_state.reannouncement_liveness.remove_if_sync(
                 name.as_str(),
-                |(recorded_owner, recorded_version, recorded_at)| {
+                |(recorded_owner, recorded_version, recorded_at, recorded_generation)| {
                     *recorded_owner == expected_owner
                         && *recorded_version == expected_version
                         && *recorded_at == expected_at
+                        && *recorded_generation == expected_generation
                 },
             );
         }
@@ -12685,6 +12748,7 @@ mod tests {
                 displaced_owner,
                 current_location.vector_clock.clone(),
                 current_timestamp(),
+                next_reannouncement_generation(),
             ),
         );
 
@@ -12702,7 +12766,12 @@ mod tests {
         previous_version.increment(current_owner.to_node_id());
         let _ = registry.actor_state.reannouncement_liveness.upsert_sync(
             actor_name.to_string(),
-            (current_owner, previous_version, current_timestamp()),
+            (
+                current_owner,
+                previous_version,
+                current_timestamp(),
+                next_reannouncement_generation(),
+            ),
         );
         let effective = registry.effective_actor_wall_clock_time(actor_name, &current_location);
         assert_eq!(
@@ -12874,6 +12943,57 @@ mod tests {
             "a relayed echo authenticated as sent by a peer OTHER than the actor's own owner \
              must not refresh liveness -- only the owner itself re-advertising can prove it is \
              still reachable"
+        );
+    }
+
+    /// A refresh can lose the actor between writing its lease and revalidating
+    /// the actor map. A newer lease may replace that row in the same wall-clock
+    /// second before the stale invocation rolls back. The rollback must remove
+    /// only the generation it wrote, not the newer valid lease.
+    #[test]
+    fn reannouncement_refresh_rollback_preserves_newer_same_second_lease() {
+        let registry = GossipRegistry::<()>::new(
+            test_addr(7427),
+            test_config_with_seed("wall-clock-refresh-generation"),
+        );
+        let owner = KeyPair::new_for_testing("wall-clock-refresh-generation-owner").peer_id();
+        let actor_name = "wall-clock-refresh-generation/service";
+        let location = RemoteActorLocation::new_with_peer(test_addr(9415), owner.clone());
+        let _ = registry
+            .actor_state
+            .known_actors
+            .upsert_sync(actor_name.to_owned(), location.clone());
+
+        let actor_state = registry.actor_state.clone();
+        let owner_for_hook = owner.clone();
+        let version_for_hook = location.vector_clock.clone();
+        registry
+            .actor_state
+            .set_reannouncement_refresh_race_hook(move |now| {
+                let _ = actor_state.known_actors.remove_sync(actor_name);
+                let _ = actor_state.reannouncement_liveness.upsert_sync(
+                    actor_name.to_owned(),
+                    (
+                        owner_for_hook.clone(),
+                        version_for_hook.clone(),
+                        now,
+                        next_reannouncement_generation(),
+                    ),
+                );
+            });
+
+        assert!(!registry.refresh_wall_clock_on_unchanged_reannouncement(
+            actor_name,
+            &location,
+            &owner,
+            Some(&owner),
+        ));
+        assert!(
+            registry
+                .actor_state
+                .reannouncement_liveness
+                .contains_sync(actor_name),
+            "a stale refresh rollback must not remove a newer lease written in the same second"
         );
     }
 
@@ -20012,7 +20132,12 @@ mod tests {
 
         let _ = registry.actor_state.reannouncement_liveness.upsert_sync(
             orphaned_actor.to_string(),
-            (stale_owner, crate::VectorClock::new(), current_timestamp()),
+            (
+                stale_owner,
+                crate::VectorClock::new(),
+                current_timestamp(),
+                next_reannouncement_generation(),
+            ),
         );
         assert!(
             !registry
@@ -20065,6 +20190,7 @@ mod tests {
                 displaced_owner,
                 current_location.vector_clock.clone(),
                 current_timestamp(),
+                next_reannouncement_generation(),
             ),
         );
 
@@ -20117,6 +20243,7 @@ mod tests {
                 stale_recorded_owner,
                 location.vector_clock.clone(),
                 current_timestamp(),
+                next_reannouncement_generation(),
             ),
         );
 
@@ -20134,6 +20261,7 @@ mod tests {
                     owner_for_hook.clone(),
                     version_for_hook.clone(),
                     current_timestamp(),
+                    next_reannouncement_generation(),
                 ),
             );
         });
@@ -20144,7 +20272,7 @@ mod tests {
             registry
                 .actor_state
                 .reannouncement_liveness
-                .read_sync(actor_name, |_, (recorded_owner, _, _)| {
+                .read_sync(actor_name, |_, (recorded_owner, _, _, _)| {
                     *recorded_owner == owner
                 })
                 .unwrap_or(false),
