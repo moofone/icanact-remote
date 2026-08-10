@@ -1610,6 +1610,34 @@ impl RoutedPubSub {
             drop(initial);
 
             loop {
+                // A provider notification can be consumed or lost while a
+                // refresh holds its serialization guard. Re-check every
+                // revision before constructing the next wait future so a
+                // mutation that landed between refresh completion and this
+                // loop iteration forces an immediate rebuild instead of
+                // parking until the fallback timer.
+                let current_actor_revision = actor_state.pubsub_routing_revision();
+                let current_connection_revision = connection_pool.routing_revision();
+                let current_provider_revision =
+                    provider_revision_signal.load(Ordering::Acquire);
+                if current_actor_revision != actor_revision
+                    || current_connection_revision != connection_revision
+                    || current_provider_revision != provider_revision
+                {
+                    let Some(this) = weak.upgrade() else {
+                        return;
+                    };
+                    this.refresh_control_plane_if_changed().await;
+                    actor_revision =
+                        this.last_actor_routing_revision.load(Ordering::Acquire);
+                    connection_revision = this
+                        .last_connection_routing_revision
+                        .load(Ordering::Acquire);
+                    provider_revision =
+                        this.last_route_provider_revision.load(Ordering::Acquire);
+                    continue;
+                }
+
                 tokio::select! {
                     _ = actor_state.wait_for_pubsub_routing_change(actor_revision) => false,
                     _ = connection_pool.wait_for_routing_change(connection_revision) => false,

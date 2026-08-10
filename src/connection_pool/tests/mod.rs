@@ -1798,6 +1798,7 @@ async fn concurrent_configure_peer_calls_always_reindex_the_current_pin_winner()
              have run, using that command's own, correct pin decision"
         );
     }
+}
 
 #[tokio::test]
 async fn routing_revision_tracks_connection_publish_and_removal() {
@@ -1999,14 +2000,14 @@ async fn get_connection_by_peer_id_recovers_live_alias_connection() {
 
     let routing_revision = pool.routing_revision();
     pool.index_connection_by_addr(alias_addr, connection.clone());
-    assert_eq!(
-        pool.routing_revision(),
-        routing_revision,
-        "an address index must not wake route consumers before its owner alias is resolvable"
+    let after_index = pool.routing_revision();
+    assert!(
+        after_index > routing_revision,
+        "an address-only connection index must wake route consumers"
     );
     pool.add_addr_to_peer_id(alias_addr, peer_id.clone());
     assert!(
-        pool.routing_revision() > routing_revision,
+        pool.routing_revision() > after_index,
         "the paired address/owner publication must wake route consumers after the alias is resolvable"
     );
 

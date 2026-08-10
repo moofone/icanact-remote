@@ -6133,9 +6133,17 @@ impl<T: 'static> GossipRegistry<T> {
             return Err(GossipError::ActorAlreadyExists(name));
         }
 
+        // The lock-free actor insertion is visible to route readers before
+        // the gossip-state commit below. Publish that visibility at the
+        // mutation boundary, and publish every compensating removal in the
+        // rollback paths below as well.
+        self.actor_state.mark_routing_changed_for_actor(&name);
+
         // If a remote actor raced in concurrently, roll back and preserve original semantics.
         if self.actor_state.known_actors.contains_sync(name.as_str()) {
-            let _ = self.actor_state.local_actors.remove_sync(name.as_str());
+            if self.actor_state.local_actors.remove_sync(name.as_str()).is_some() {
+                self.actor_state.mark_routing_changed_for_actor(&name);
+            }
             return Err(GossipError::ActorAlreadyExists(name));
         }
         let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
@@ -6149,7 +6157,9 @@ impl<T: 'static> GossipRegistry<T> {
             // legacy mutex bool is a redundant cache that lags the
             // atomic, so trust the atomic.
             if self.shutdown.load(Ordering::Acquire) {
-                let _ = self.actor_state.local_actors.remove_sync(name.as_str());
+                if self.actor_state.local_actors.remove_sync(name.as_str()).is_some() {
+                    self.actor_state.mark_routing_changed_for_actor(&name);
+                }
                 if let Some(tombstone) = previous_tombstone.clone() {
                     let _ = self
                         .actor_state
@@ -6176,7 +6186,6 @@ impl<T: 'static> GossipRegistry<T> {
                 false
             }
         };
-        self.actor_state.mark_routing_changed_for_actor(&name);
 
         if priority.should_trigger_immediate_gossip() {
             let gossip_trigger_time = crate::current_timestamp_nanos();
@@ -21634,6 +21643,10 @@ mod tests {
             .unwrap()
             .expect_err("registration should observe shutdown");
         assert!(matches!(err, GossipError::Shutdown));
+        assert!(
+            registry.actor_state.routing_revision() >= 2,
+            "registration insertion and shutdown rollback must both publish routing revisions"
+        );
         assert!(
             !registry.actor_state.local_actors.contains_sync(actor_name),
             "failed registration must not leave a local actor behind"

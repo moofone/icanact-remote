@@ -2234,28 +2234,12 @@ impl<T> ConnectionPool<T> {
             addr
         );
         let _ = self.connections_by_addr.upsert_sync(addr, connection);
-        // An address-indexed connection is not peer-routable until its
-        // ownership alias is published. Defer the wake when the owner is not
-        // present yet; `add_addr_to_peer_id` publishes the revision after the
-        // two indexes are resolvable as one route-visible state. A configured
-        // address whose connection already carries the authenticated peer id
-        // is resolvable without the alias map, so retain the immediate wake
-        // for that valid fallback path.
-        let owner_published = self
-            .addr_to_peer_id
-            .read_sync(&addr, |_, owner| owner.clone());
-        let configured_fallback = self
-            .connections_by_addr
-            .read_sync(&addr, |_, current| current.embedded_peer_id.clone())
-            .flatten()
-            .and_then(|peer_id| {
-                self.get_configured_peer_addr(&peer_id)
-                    .map(|configured| (peer_id, configured))
-            })
-            .is_some_and(|(_, configured)| configured == addr);
-        if owner_published.is_some() || configured_fallback {
-            self.mark_routing_changed();
-        }
+        // Address-only connections are a route-visible fallback as soon as
+        // their address index is installed. Wake consumers for this mutation
+        // itself; `add_addr_to_peer_id` emits a second revision when the
+        // authenticated owner alias is installed, so a waiter that observes
+        // this intermediate state cannot acknowledge the completed pair.
+        self.mark_routing_changed();
     }
 
     /// Send header + payload to a peer by ID without concatenating payload bytes.
