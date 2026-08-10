@@ -8754,21 +8754,21 @@ impl<T: 'static> GossipRegistry<T> {
     /// `ActorRemoved` tombstones, then address ownership LAST, since a
     /// released address can be claimed by another identity while the real
     /// owner is still alive. Every candidate's reservation is consumed
-    /// exactly once, via `ReapReservation::try_consume` (a compare-and-swap,
-    /// not a second read of a plain `load()`), immediately after the
+    /// exactly once, via `ReapReservation::try_consume` (an owner round
+    /// trip, not a second read of a plain `load()`), immediately after the
     /// verdict and before any of these steps: a plain `load()`, no matter
     /// how close to the mutation it guards, cannot close a check-then-act
-    /// gap, since nothing stops an invalidating `store(false)` from
-    /// landing in the interval between the load and the write that follows
-    /// it. `try_consume`'s CAS closes that by construction -- see
-    /// `ReapReservation`'s own doc comment. A successful `try_consume` IS
-    /// the commit point for the whole reservation-gated batch: liveness
-    /// evidence or a reconfiguration arriving after it loses
-    /// deterministically, the correct trade for a concurrent system that
-    /// has to pick some linearization point. The conceded window is
-    /// narrow in practice: a candidate only reaches `try_consume` after
-    /// already being past both `dead_peer_timeout` and the owner's own
-    /// causal fence (`has_newer_liveness_evidence`).
+    /// gap, since nothing stops an invalidating owner command from landing
+    /// in the interval between the load and the write that follows it.
+    /// `try_consume`'s owner-coordinated consumption closes that by
+    /// construction -- see `ReapReservation`'s own doc comment. A
+    /// successful `try_consume` IS the commit point for the whole
+    /// reservation-gated batch: liveness evidence or a reconfiguration
+    /// arriving after it loses deterministically, the correct trade for a
+    /// concurrent system that has to pick some linearization point. The
+    /// conceded window is narrow in practice: a candidate only reaches
+    /// `try_consume` after already being past both `dead_peer_timeout` and
+    /// the owner's own causal fence (`has_newer_liveness_evidence`).
     ///
     /// Address ownership is NOT covered by `try_consume` and keeps its
     /// own, separate, always-fresh gate: `release_dead_peer_ownership`
@@ -8891,11 +8891,12 @@ impl<T: 'static> GossipRegistry<T> {
             // the live authority. `try_consume` is the ONE, irrevocable
             // authorization for this candidate's ENTIRE destructive
             // sequence below, obtained here and never re-checked again --
-            // see `ReapReservation`'s own doc comment for why a
-            // compare-and-swap on this shared `Arc<AtomicBool>` closes the
-            // check-then-act gap a plain read cannot, no matter how many
-            // times, or how close to each mutation, it is repeated.
-            if !reservation.try_consume() {
+            // see `ReapReservation`'s own doc comment for why an owner
+            // round trip, not a client-side compare-and-swap, is what
+            // closes the check-then-act gap a plain read cannot, no matter
+            // how many times, or how close to each mutation, it is
+            // repeated.
+            if !reservation.try_consume().await {
                 debug!(
                     peer = %peer_addr,
                     "cleanup_dead_peers: reservation already invalidated by newer liveness \
@@ -22269,10 +22270,8 @@ mod tests {
         }
     }
 
-    /// `try_consume` runs synchronously, with no `.await` between the
-    /// verdict resolving and the consume itself, so evidence delivered
-    /// strictly before `try_consume` is the already-covered, unremarkable
-    /// case (see
+    /// Evidence delivered strictly before `try_consume` completes is the
+    /// already-covered, unremarkable case (see
     /// `reap_reserved_candidates_skips_a_candidate_whose_liveness_evidence_changed_since_reservation`).
     /// This test targets the narrower window after `try_consume` succeeds
     /// but before the first irreversible step: an additional, independent

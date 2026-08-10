@@ -2696,15 +2696,21 @@ impl PeerRegistryOwner {
 
     /// `OwnerCommand::ConsumeReapReservation`'s handler -- the owner round
     /// trip [`ReapReservation::try_consume`] performs instead of a
-    /// client-side CAS. `false` when there is no entry (already released
-    /// or invalidated) or it is already consumed (a second consume attempt
-    /// for the same reservation, which must never succeed twice). `true`
+    /// client-side CAS. `false` when there is no entry (already released),
+    /// it is already consumed (a second consume attempt for the same
+    /// reservation, which must never succeed twice), OR it was invalidated
+    /// without ever being consumed (`configure_peer` evicting a pin, or
+    /// `note_liveness_evidence` committing, before this call ran) -- `valid`
+    /// is checked here too, not just `consumed`, precisely because
+    /// invalidation only ever flips `valid`, never `consumed`, so a
+    /// same-instant-only check of `consumed` alone would let this
+    /// "consume" a reservation something already invalidated. `true`
     /// exactly once per reservation: sets `consumed` and mirrors the flip
     /// into `valid` so the guard's own external `is_still_valid()` peek
     /// stays accurate without a second round trip.
     fn consume_reap_reservation(&mut self, addr: SocketAddr) -> bool {
         match self.reap_reserved.get_mut(&addr) {
-            Some(entry) if !entry.consumed => {
+            Some(entry) if !entry.consumed && entry.valid.load(Ordering::Acquire) => {
                 entry.consumed = true;
                 entry.valid.store(false, Ordering::Release);
                 true
