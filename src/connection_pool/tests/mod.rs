@@ -274,8 +274,12 @@ fn simultaneous_multi_mib_asks_complete_over_constrained_duplex() {
             Some(read_ctx_a),
         );
         let writer_a = Arc::new(writer_a);
-        let conn_a =
-            ConnectionHandle::<()>::new_stream(addr_b, ConnectionDirection::Outbound, Arc::clone(&writer_a), correlation_a);
+        let conn_a = ConnectionHandle::<()>::new_stream(
+            addr_b,
+            ConnectionDirection::Outbound,
+            Arc::clone(&writer_a),
+            correlation_a,
+        );
         let (writer_b, task_b, _) = LockFreeStreamHandle::new(
             io_b,
             addr_a,
@@ -285,8 +289,12 @@ fn simultaneous_multi_mib_asks_complete_over_constrained_duplex() {
             Some(read_ctx_b),
         );
         let writer_b = Arc::new(writer_b);
-        let conn_b =
-            ConnectionHandle::<()>::new_stream(addr_a, ConnectionDirection::Outbound, Arc::clone(&writer_b), correlation_b);
+        let conn_b = ConnectionHandle::<()>::new_stream(
+            addr_a,
+            ConnectionDirection::Outbound,
+            Arc::clone(&writer_b),
+            correlation_b,
+        );
 
         let start = Arc::new(tokio::sync::Barrier::new(3));
         let start_a = Arc::clone(&start);
@@ -443,7 +451,8 @@ fn wedged_streaming_write_does_not_stop_the_io_task_from_processing_a_buffered_r
         );
         let writer_wedged = Arc::new(writer_wedged);
         let conn_wedged = ConnectionHandle::<()>::new_stream(
-            addr_peer, ConnectionDirection::Outbound,
+            addr_peer,
+            ConnectionDirection::Outbound,
             Arc::clone(&writer_wedged),
             correlation_wedged,
         );
@@ -458,7 +467,8 @@ fn wedged_streaming_write_does_not_stop_the_io_task_from_processing_a_buffered_r
         );
         let writer_peer = Arc::new(writer_peer);
         let conn_peer = ConnectionHandle::<()>::new_stream(
-            addr_wedged, ConnectionDirection::Outbound,
+            addr_wedged,
+            ConnectionDirection::Outbound,
             Arc::clone(&writer_peer),
             CorrelationTracker::new(),
         );
@@ -633,7 +643,8 @@ fn wedged_automatic_flush_does_not_stop_the_io_task_from_processing_a_buffered_r
         );
         let writer_wedged = Arc::new(writer_wedged);
         let conn_wedged = ConnectionHandle::<()>::new_stream(
-            addr_peer, ConnectionDirection::Outbound,
+            addr_peer,
+            ConnectionDirection::Outbound,
             Arc::clone(&writer_wedged),
             correlation_wedged,
         );
@@ -648,7 +659,8 @@ fn wedged_automatic_flush_does_not_stop_the_io_task_from_processing_a_buffered_r
         );
         let writer_peer = Arc::new(writer_peer);
         let conn_peer = ConnectionHandle::<()>::new_stream(
-            addr_wedged, ConnectionDirection::Outbound,
+            addr_wedged,
+            ConnectionDirection::Outbound,
             Arc::clone(&writer_peer),
             CorrelationTracker::new(),
         );
@@ -795,7 +807,8 @@ fn local_streaming_queue_full_does_not_stop_the_io_task_from_processing_a_later_
         // (`writer_peer`) writes normally onto the shared duplex; the wedged
         // side's transport (`writer_wedged`) never sends anything of its own.
         let conn_peer = ConnectionHandle::<()>::new_stream(
-            addr_wedged, ConnectionDirection::Outbound,
+            addr_wedged,
+            ConnectionDirection::Outbound,
             Arc::clone(&writer_peer),
             CorrelationTracker::new(),
         );
@@ -964,7 +977,8 @@ fn ask_dispatch_is_skipped_not_consumed_when_streaming_queue_has_no_room() {
         );
         let writer_peer = Arc::new(writer_peer);
         let conn_peer = ConnectionHandle::<()>::new_stream(
-            addr_wedged, ConnectionDirection::Outbound,
+            addr_wedged,
+            ConnectionDirection::Outbound,
             Arc::clone(&writer_peer),
             CorrelationTracker::new(),
         );
@@ -1279,7 +1293,8 @@ fn ask_backpressure_nack_never_splices_into_an_in_flight_streaming_frame() {
         );
         let writer_peer = Arc::new(writer_peer);
         let conn_peer = ConnectionHandle::<()>::new_stream(
-            addr_wedged, ConnectionDirection::Outbound,
+            addr_wedged,
+            ConnectionDirection::Outbound,
             Arc::clone(&writer_peer),
             correlation_peer,
         );
@@ -1701,7 +1716,9 @@ async fn a_caller_side_check_then_mutate_reindex_is_vulnerable_to_an_interleaved
     // agrees too, exactly as it would immediately after a real
     // `configure_peer(peer_id, losing_addr)` commit and BEFORE any later
     // command's eviction has retracted it.
-    let _ = pool.addr_to_peer_id.upsert_sync(losing_addr, peer_id.clone());
+    let _ = pool
+        .addr_to_peer_id
+        .upsert_sync(losing_addr, peer_id.clone());
     pool.set_configured_peer_addr(&peer_id, losing_addr);
     assert_eq!(pool.get_required_peer_addr(&peer_id), Some(losing_addr));
 
@@ -1764,8 +1781,8 @@ async fn concurrent_configure_peer_calls_always_reindex_the_current_pin_winner()
                 ..crate::GossipConfig::default()
             },
         ));
-        let peer_id = crate::KeyPair::new_for_testing(format!("concurrent-configure-{round}"))
-            .peer_id();
+        let peer_id =
+            crate::KeyPair::new_for_testing(format!("concurrent-configure-{round}")).peer_id();
         let addr_a: SocketAddr = format!("127.0.0.1:{}", 41_100 + round).parse().unwrap();
         let addr_b: SocketAddr = format!("127.0.0.1:{}", 41_200 + round).parse().unwrap();
 
@@ -2092,7 +2109,8 @@ fn deferred_actor_ask_sync_replies_via_responder() {
         );
         let client_writer = Arc::new(client_writer);
         let client_conn = ConnectionHandle::<()>::new_stream(
-            server_addr, ConnectionDirection::Outbound,
+            server_addr,
+            ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             correlation,
         );
@@ -2210,7 +2228,8 @@ fn ask_immediate_handler_sync_error_nacks_instead_of_letting_the_asker_time_out(
         );
         let client_writer = Arc::new(client_writer);
         let client_conn = ConnectionHandle::<()>::new_stream(
-            server_addr, ConnectionDirection::Outbound,
+            server_addr,
+            ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             correlation,
         );
@@ -2336,7 +2355,8 @@ fn ask_handler_sync_error_nacks_instead_of_letting_the_asker_time_out() {
         );
         let client_writer = Arc::new(client_writer);
         let client_conn = ConnectionHandle::<()>::new_stream(
-            server_addr, ConnectionDirection::Outbound,
+            server_addr,
+            ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             correlation,
         );
@@ -2459,7 +2479,8 @@ fn deferred_actor_ask_pending_wait_replies_repeatedly() {
         );
         let client_writer = Arc::new(client_writer);
         let client_conn = ConnectionHandle::<()>::new_stream(
-            server_addr, ConnectionDirection::Outbound,
+            server_addr,
+            ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             correlation,
         );
@@ -2577,7 +2598,8 @@ fn deferred_actor_ask_still_dispatches_when_immediate_handler_declines() {
         );
         let client_writer = Arc::new(client_writer);
         let client_conn = ConnectionHandle::<()>::new_stream(
-            server_addr, ConnectionDirection::Outbound,
+            server_addr,
+            ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             correlation,
         );
@@ -5018,7 +5040,8 @@ fn stream_direct_ask_throughput_bench() {
         );
         let client_writer = Arc::new(client_writer);
         let conn = ConnectionHandle::<()>::new_stream(
-            server_addr, ConnectionDirection::Outbound,
+            server_addr,
+            ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             correlation,
         );
@@ -5301,7 +5324,8 @@ fn stream_tell_throughput_bench() {
         );
         let client_writer = Arc::new(client_writer);
         let conn = ConnectionHandle::<()>::new_stream(
-            server_addr, ConnectionDirection::Outbound,
+            server_addr,
+            ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             CorrelationTracker::new(),
         );
@@ -5480,7 +5504,8 @@ fn stream_protocol_ask_throughput_bench() {
         );
         let client_writer = Arc::new(client_writer);
         let client_conn = ConnectionHandle::<()>::new_stream(
-            server_addr, ConnectionDirection::Outbound,
+            server_addr,
+            ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             correlation,
         );
@@ -5811,7 +5836,8 @@ fn stream_protocol_direct_ask_inflight64_bench() {
         );
         let client_writer = Arc::new(client_writer);
         let client_conn = ConnectionHandle::<()>::new_stream(
-            server_addr, ConnectionDirection::Outbound,
+            server_addr,
+            ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             correlation,
         );
@@ -5963,7 +5989,8 @@ fn stream_protocol_actor_ask_inflight64_bench() {
         );
         let client_writer = Arc::new(client_writer);
         let client_conn = ConnectionHandle::<()>::new_stream(
-            server_addr, ConnectionDirection::Outbound,
+            server_addr,
+            ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             correlation,
         );
@@ -6126,7 +6153,8 @@ fn stream_protocol_tell_throughput_bench() {
         );
         let client_writer = Arc::new(client_writer);
         let client_conn = ConnectionHandle::<()>::new_stream(
-            server_addr, ConnectionDirection::Outbound,
+            server_addr,
+            ConnectionDirection::Outbound,
             Arc::clone(&client_writer),
             CorrelationTracker::new(),
         );
@@ -7177,6 +7205,63 @@ async fn delta_gossip_updates_last_response_received_ms() {
     );
 }
 
+#[tokio::test]
+async fn delta_gossip_records_owner_side_liveness_evidence() {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing(
+                "lrr_delta_gossip_owner_local",
+            )),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let peer_keypair = crate::KeyPair::new_for_testing("lrr_delta_gossip_owner_remote");
+    let peer_id = peer_keypair.peer_id();
+    let peer_addr: SocketAddr = "10.77.0.66:9302".parse().unwrap();
+    let stale_time = crate::current_timestamp_millis().saturating_sub(3_600_000);
+    {
+        let mut state = registry.gossip_state.lock().await;
+        state
+            .peers
+            .insert(peer_addr, stale_peer_info(peer_addr, stale_time));
+    }
+
+    let evidence_before = std::time::Instant::now();
+    assert!(
+        !registry
+            .registry_owner
+            .has_newer_liveness_evidence(peer_addr, evidence_before)
+            .await
+    );
+
+    let delta = crate::registry::RegistryDelta {
+        since_sequence: 0,
+        current_sequence: 1,
+        changes: Vec::new(),
+        sender_peer_id: peer_id.clone(),
+        wall_clock_time: crate::current_timestamp(),
+        precise_timing_nanos: crate::current_timestamp_nanos(),
+    };
+    let msg = crate::registry::RegistryMessage::DeltaGossip {
+        delta,
+        extensions: None,
+    };
+
+    super::handle_incoming_message(registry.clone(), peer_addr, peer_addr, Some(peer_id), msg)
+        .await
+        .expect("handle_incoming_message should succeed");
+
+    assert!(
+        registry
+            .registry_owner
+            .has_newer_liveness_evidence(peer_addr, evidence_before)
+            .await
+    );
+}
+
 /// The `DeltaGossip` arm never
 /// verified `delta.sender_peer_id` -- a SELF-REPORTED wire field, not an
 /// authority for identity -- against the connection's actual authenticated
@@ -7199,7 +7284,9 @@ async fn delta_gossip_with_mismatched_sender_identity_is_ignored() {
     let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
         bind_addr,
         crate::GossipConfig {
-            key_pair: Some(crate::KeyPair::new_for_testing("lrr_delta_gossip_impersonation_local")),
+            key_pair: Some(crate::KeyPair::new_for_testing(
+                "lrr_delta_gossip_impersonation_local",
+            )),
             ..crate::GossipConfig::default()
         },
     ));

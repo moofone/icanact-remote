@@ -998,7 +998,10 @@ mod tests {
         let max = CONTROL_BODY_LEN_MASK as usize;
         assert!(try_encode_control(WireKind::Gossip, max).is_ok());
         match try_encode_control(WireKind::Gossip, max + 1) {
-            Err(GossipError::MessageTooLarge { size, max: reported }) => {
+            Err(GossipError::MessageTooLarge {
+                size,
+                max: reported,
+            }) => {
                 assert_eq!(size, max + 1);
                 assert_eq!(reported, max);
             }

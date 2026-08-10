@@ -2726,8 +2726,7 @@ impl PeerRegistryOwner {
             // is refreshed to "now" -- regardless of whether the address
             // ends up pinned below, so a currently-connected pinned peer's
             // address is never mistaken for one that has been untouched.
-            self.claim_committed_at
-                .insert(addr, evidence_at);
+            self.claim_committed_at.insert(addr, evidence_at);
         }
         // An operator-pinned address (`pin`, set only by `configure_peer`) is
         // a reservation that exists independently of any one connection: no
@@ -2928,7 +2927,11 @@ impl PeerRegistryOwner {
     /// `reap_reserved_candidates` decide whether a candidate is worth
     /// destroying at all WITHOUT that decision itself performing the
     /// first destructive step.
-    fn has_newer_liveness_evidence(&self, addr: SocketAddr, evidence_before: std::time::Instant) -> bool {
+    fn has_newer_liveness_evidence(
+        &self,
+        addr: SocketAddr,
+        evidence_before: std::time::Instant,
+    ) -> bool {
         self.claim_committed_at
             .get(&addr)
             .is_some_and(|committed_at| *committed_at > evidence_before)
@@ -3450,7 +3453,8 @@ impl PeerRegistryOwner {
             Some(expected) => expected,
             None => {
                 let bumped = current_generation + 1;
-                self.configure_peer_generation.insert(peer_id.clone(), bumped);
+                self.configure_peer_generation
+                    .insert(peer_id.clone(), bumped);
                 bumped
             }
         };
@@ -4320,7 +4324,10 @@ mod tests {
         // address WITHOUT ever going through the connection-scoped,
         // receipt-aware teardown path (`release_session`).
         assert!(
-            owner.release(target, node.clone(), generation).await.is_some(),
+            owner
+                .release(target, node.clone(), generation)
+                .await
+                .is_some(),
             "the generic release itself must succeed"
         );
 
@@ -4387,9 +4394,7 @@ mod tests {
         let failure_at = std::time::Instant::now();
         assert!(
             matches!(
-                owner
-                    .release_dead_peer(node, target, failure_at)
-                    .await,
+                owner.release_dead_peer(node, target, failure_at).await,
                 DeadPeerReleaseOutcome::Released(_)
             ),
             "evidence recorded before the failure must not be refreshed to the owner dequeue time"
@@ -4603,7 +4608,7 @@ mod tests {
     /// timing against an externally-mutable side table.
     #[tokio::test]
     async fn release_dead_peer_sees_liveness_evidence_committed_through_the_same_serialized_stream()
-     {
+    {
         let (owner, _publisher) = owner_handle();
         let node = peer("liveness-marker-owner-serialized");
         let target = addr(30_045);
@@ -4811,7 +4816,10 @@ mod tests {
         let refreshed = owner
             .claim(a, claim_of(node.clone(), ClaimKind::Verified), false)
             .await;
-        assert!(refreshed.is_accepted(), "the plain refresh must be accepted");
+        assert!(
+            refreshed.is_accepted(),
+            "the plain refresh must be accepted"
+        );
 
         // The connection's later, entirely legitimate teardown must still
         // find a receipt for its address, and must actually release that
@@ -5263,12 +5271,11 @@ mod tests {
 
         let owner_a = owner.clone();
         let owner_b = owner.clone();
-        let task_a =
-            tokio::spawn(async move {
-                owner_a
-                    .reserve_for_reap(contested_addr, std::time::Instant::now(), None, None, None)
-                    .await
-            });
+        let task_a = tokio::spawn(async move {
+            owner_a
+                .reserve_for_reap(contested_addr, std::time::Instant::now(), None, None, None)
+                .await
+        });
         let task_b = tokio::spawn(async move {
             owner_b
                 .reserve_for_reap(contested_addr, std::time::Instant::now(), None, None, None)
@@ -5886,7 +5893,11 @@ mod tests {
         let target = addr(30_062);
 
         let original = owner
-            .claim(target, claim_of(incumbent.clone(), ClaimKind::Verified), false)
+            .claim(
+                target,
+                claim_of(incumbent.clone(), ClaimKind::Verified),
+                false,
+            )
             .await;
         let original_generation = original.commit_seq().expect("original claim commits");
         let events_before = publisher.events();

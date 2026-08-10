@@ -5728,7 +5728,8 @@ mod framing_tests {
     async fn ask_raw_parses_with_padded_header() {
         let payload_bytes = b"hello";
         let header =
-            framing::try_write_ask_response_header(MessageType::Ask, 42, payload_bytes.len()).unwrap();
+            framing::try_write_ask_response_header(MessageType::Ask, 42, payload_bytes.len())
+                .unwrap();
         let mut frame = Vec::with_capacity(header.len() + payload_bytes.len());
         frame.extend_from_slice(&header);
         frame.extend_from_slice(payload_bytes);
@@ -5918,7 +5919,8 @@ mod framing_tests {
         ));
 
         let payload = b"routed payload";
-        let header = framing::try_write_routed_actor_ask_header(7, route_slot, payload.len()).unwrap();
+        let header =
+            framing::try_write_routed_actor_ask_header(7, route_slot, payload.len()).unwrap();
         let mut frame = header.to_vec();
         frame.extend_from_slice(payload);
         match parse_with_routes(&frame, &routes).unwrap() {

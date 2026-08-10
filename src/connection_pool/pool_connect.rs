@@ -304,6 +304,10 @@ impl<T> ConnectionPool<T> {
                 aligned_pool_size.max(crate::aligned::DEFAULT_ALIGNED_POOL_SIZE),
             )),
             connection_counter: AtomicIsize::new(0),
+            routing_revision: AtomicU64::new(0),
+            routing_change_notify: Arc::new(Notify::new()),
+            #[cfg(test)]
+            preferred_connection_checks: AtomicU64::new(0),
             _marker: PhantomData,
         };
 
@@ -313,6 +317,30 @@ impl<T> ConnectionPool<T> {
             &pool as *const _
         );
         pool
+    }
+
+    #[inline]
+    pub(crate) fn routing_revision(&self) -> u64 {
+        self.routing_revision.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn wait_for_routing_change(&self, after: u64) -> u64 {
+        loop {
+            let notified = self.routing_change_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let current = self.routing_revision();
+            if current != after {
+                return current;
+            }
+            notified.await;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn mark_routing_changed(&self) {
+        self.routing_revision.fetch_add(1, Ordering::AcqRel);
+        self.routing_change_notify.notify_waiters();
     }
 
     /// Set the registry reference for handling incoming messages
@@ -563,6 +591,7 @@ impl<T> ConnectionPool<T> {
         let _ = self
             .connections_by_peer
             .upsert_sync(peer_id.clone(), connection);
+        self.mark_routing_changed();
     }
 
     /// Compare-and-publish counterpart to `publish_current_peer_connection`:
@@ -609,6 +638,7 @@ impl<T> ConnectionPool<T> {
                 let _ = self
                     .connections_by_peer
                     .upsert_sync(peer_id.clone(), connection);
+                self.mark_routing_changed();
                 return Ok(());
             }
             return Err(current);
@@ -642,6 +672,7 @@ impl<T> ConnectionPool<T> {
         let _ = self
             .connections_by_peer
             .upsert_sync(peer_id.clone(), connection.clone());
+        self.mark_routing_changed();
 
         // The CAS above just displaced `expected` (if `Some`) from the
         // peer's current-connection slot in favor of `connection`. The
@@ -704,12 +735,14 @@ impl<T> ConnectionPool<T> {
             }
             true
         });
+        let mut routing_changed = false;
         for addr in alias_addrs {
             let removed = self
                 .connections_by_addr
                 .remove_if_sync(&addr, |v| Arc::ptr_eq(v, expected))
                 .is_some();
             if removed {
+                routing_changed = true;
                 let _ = self.addr_to_peer_id.remove_sync(&addr);
                 self.clear_capabilities_for_addr(&addr);
             }
@@ -729,6 +762,9 @@ impl<T> ConnectionPool<T> {
             expected.abort_tasks_keep_correlation();
         } else {
             expected.abort_tasks();
+        }
+        if routing_changed {
+            self.mark_routing_changed();
         }
     }
 
@@ -1583,8 +1619,14 @@ impl<T> ConnectionPool<T> {
     }
 
     pub(crate) fn clear_current_peer_connection(&self, peer_id: &crate::PeerId) {
-        self.set_current_peer_connection(peer_id, None);
-        let _ = self.connections_by_peer.remove_sync(peer_id);
+        let primary_removed = self
+            .get_or_create_peer_session(peer_id)
+            .take_current_connection()
+            .is_some();
+        let alias_removed = self.connections_by_peer.remove_sync(peer_id).is_some();
+        if primary_removed || alias_removed {
+            self.mark_routing_changed();
+        }
     }
 
     /// Check-then-unconditional-clear: reads `current_connection`,
@@ -1707,6 +1749,7 @@ impl<T> ConnectionPool<T> {
             let _ = self
                 .connections_by_peer
                 .remove_if_sync(peer_id, |v| Arc::ptr_eq(v, candidate));
+            self.mark_routing_changed();
         }
         cleared
     }
@@ -2110,6 +2153,7 @@ impl<T> ConnectionPool<T> {
             addr, peer_id
         );
         let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id);
+        self.mark_routing_changed();
     }
 
     /// Get the shared correlation tracker for a peer ID
@@ -2195,6 +2239,7 @@ impl<T> ConnectionPool<T> {
             addr
         );
         let _ = self.connections_by_addr.upsert_sync(addr, connection);
+        self.mark_routing_changed();
     }
 
     /// Send header + payload to a peer by ID without concatenating payload bytes.
@@ -2278,8 +2323,11 @@ impl<T> ConnectionPool<T> {
             if let Some((_, node_id)) = self.addr_to_peer_id.remove_sync(&addr) {
                 peer_ids.push(node_id);
             }
+            let mut routing_changed = true;
             for alias_addr in alias_addrs {
-                let _ = self.connections_by_addr.remove_sync(&alias_addr);
+                if self.connections_by_addr.remove_sync(&alias_addr).is_some() {
+                    routing_changed = true;
+                }
                 if let Some((_, node_id)) = self.addr_to_peer_id.remove_sync(&alias_addr)
                     && !peer_ids.contains(&node_id)
                 {
@@ -2301,6 +2349,9 @@ impl<T> ConnectionPool<T> {
 
             // H-004: Abort background tasks (writer, reader) to prevent resource leaks
             connection.abort_tasks();
+            if routing_changed {
+                self.mark_routing_changed();
+            }
 
             Some(connection)
         } else {
@@ -2483,6 +2534,7 @@ impl<T> ConnectionPool<T> {
 
             // H-004: Abort background tasks (writer, reader) to prevent resource leaks
             connection.abort_tasks();
+            self.mark_routing_changed();
 
             Some(connection)
         } else {
@@ -2620,6 +2672,7 @@ impl<T> ConnectionPool<T> {
         // deliberately no separate check-then-act pair here: a read
         // followed by an unconditional clear has a gap in which exactly
         // that concurrent publish can land and be clobbered.
+        let mut routing_changed = false;
         match self
             .peer_sessions
             .read_sync(peer_id, |_, session| {
@@ -2627,7 +2680,7 @@ impl<T> ConnectionPool<T> {
             })
             .unwrap_or(Err(None))
         {
-            Ok(()) => {}
+            Ok(()) => routing_changed = true,
             Err(Some(_other)) => {
                 debug!(
                     peer_id = %peer_id,
@@ -2685,9 +2738,10 @@ impl<T> ConnectionPool<T> {
         // compare-and-remove, never a blanket peer-id-keyed removal that
         // could delete a newer instance already reinserted under the same
         // `peer_id`.
-        let _ = self
+        routing_changed |= self
             .connections_by_peer
-            .remove_if_sync(peer_id, |v| Arc::ptr_eq(v, target));
+            .remove_if_sync(peer_id, |v| Arc::ptr_eq(v, target))
+            .is_some();
 
         // Remove EVERY `connections_by_addr` alias of THIS instance. An
         // accepted inbound is commonly indexed under both its
@@ -2716,6 +2770,7 @@ impl<T> ConnectionPool<T> {
                 .remove_if_sync(&addr, |v| Arc::ptr_eq(v, target))
                 .is_some();
             if removed {
+                routing_changed = true;
                 let _ = self.addr_to_peer_id.remove_sync(&addr);
                 self.clear_capabilities_for_addr(&addr);
             }
@@ -2725,6 +2780,9 @@ impl<T> ConnectionPool<T> {
 
         // H-004: Abort background tasks (writer, reader) to prevent resource leaks.
         target.abort_tasks();
+        if routing_changed {
+            self.mark_routing_changed();
+        }
         true
     }
 
@@ -2847,6 +2905,7 @@ impl<T> ConnectionPool<T> {
 
         self.release_counted_connection(&connection);
         connection.abort_tasks();
+        self.mark_routing_changed();
         Some(connection)
     }
 
@@ -5478,7 +5537,7 @@ pub(crate) fn handle_incoming_message_with_instance(
 
                 let registry_clone = registry.clone();
                 let discovery_handle = tokio::spawn(async move {
-                    for addr in candidates {
+                    for (addr, _claim_generation) in candidates {
                         // PeerListGossip is only a discovery hint. Keep its
                         // claimed identity in `known_peers` (where
                         // `on_peer_list_gossip` put it), but create no

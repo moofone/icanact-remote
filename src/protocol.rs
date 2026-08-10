@@ -773,7 +773,11 @@ impl StreamingState {
     /// finishes draining the chunk's remaining bytes off the wire. A no-op
     /// if no tombstone exists for `stream_id` (e.g. already superseded by
     /// a retry).
-    pub(crate) fn mark_reap_discarded_chunk_received(&mut self, stream_id: u64, chunk_index: usize) {
+    pub(crate) fn mark_reap_discarded_chunk_received(
+        &mut self,
+        stream_id: u64,
+        chunk_index: usize,
+    ) {
         if let Some(tombstone) = self.rejected_streams.get_mut(&stream_id) {
             tombstone.mark_chunk_received(chunk_index);
             if tombstone.is_complete() {
@@ -1467,8 +1471,12 @@ impl StreamingState {
             self.remove_tombstone(stream_id);
             return true;
         }
-        let tombstone =
-            RejectedStreamTombstone::reaped(total_size, chunk_stride, expected_chunks, received_chunks);
+        let tombstone = RejectedStreamTombstone::reaped(
+            total_size,
+            chunk_stride,
+            expected_chunks,
+            received_chunks,
+        );
         if tombstone.is_complete() {
             self.remove_tombstone(stream_id);
             return true;
@@ -3421,8 +3429,7 @@ mod tests {
     /// meant to prevent exactly that -- the exact hole the budget exists to
     /// close, just via a different field than `total_size`.
     #[test]
-    fn header_only_stream_start_is_fatal_even_when_capacity_pressure_would_otherwise_discard_it()
-     {
+    fn header_only_stream_start_is_fatal_even_when_capacity_pressure_would_otherwise_discard_it() {
         let mut state = StreamingState::new();
         let pool = Arc::new(crate::AlignedBytesPool::default());
 
