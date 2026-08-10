@@ -4691,6 +4691,9 @@ pub(crate) enum MessageReadResult {
         correlation_id: u32,
         actor_id: u64,
         type_hash: u32,
+        /// Optional stable caller-controlled identity carried in the
+        /// uncompact ActorAsk header. Tells and legacy asks carry `None`.
+        request_id: Option<u64>,
         schema_hash: Option<u64>,
         payload: AlignedBytes,
     },
@@ -5099,6 +5102,7 @@ pub(crate) fn parse_message_from_pooled_buffer_with_routes(
                 correlation_id: 0,
                 actor_id,
                 type_hash,
+                request_id: None,
                 schema_hash: None,
                 payload: aligned(
                     buffer,
@@ -5117,11 +5121,16 @@ pub(crate) fn parse_message_from_pooled_buffer_with_routes(
             }
             let actor_id = u64::from_be_bytes(body[4..12].try_into().unwrap());
             let type_hash = u32::from_be_bytes(body[12..16].try_into().unwrap());
+            if body[24..28].iter().any(|byte| *byte != 0) {
+                return Err(invalid_v5_frame("noncanonical actor ask padding"));
+            }
+            let request_id = u64::from_be_bytes(body[16..24].try_into().unwrap());
             Ok(MessageReadResult::Actor {
                 msg_type: crate::MessageType::ActorAsk as u8,
                 correlation_id,
                 actor_id,
                 type_hash,
+                request_id: (request_id != 0).then_some(request_id),
                 schema_hash: None,
                 payload: aligned(
                     buffer,
@@ -5175,6 +5184,7 @@ pub(crate) fn parse_message_from_pooled_buffer_with_routes(
                 correlation_id,
                 actor_id: route.actor_id,
                 type_hash: route.type_hash,
+                request_id: None,
                 schema_hash: None,
                 payload: aligned(
                     buffer,
@@ -5790,6 +5800,39 @@ mod framing_tests {
         assert!(parse_with_routes(&frame, &fresh_connection).is_err());
     }
 
+    #[tokio::test]
+    async fn actor_ask_request_id_is_parsed_out_of_band() {
+        let payload = b"opaque payload";
+        let header = framing::write_actor_ask_header_with_request_id(
+            7,
+            0x0102_0304_0506_0708,
+            0x1122_3344,
+            payload.len(),
+            Some(42),
+        );
+        let mut frame = header.to_vec();
+        frame.extend_from_slice(payload);
+        match read_frame(frame).await {
+            MessageReadResult::Actor {
+                msg_type,
+                correlation_id,
+                actor_id,
+                type_hash,
+                request_id,
+                payload: actual_payload,
+                ..
+            } => {
+                assert_eq!(msg_type, MessageType::ActorAsk as u8);
+                assert_eq!(correlation_id, 7);
+                assert_eq!(actor_id, 0x0102_0304_0506_0708);
+                assert_eq!(type_hash, 0x1122_3344);
+                assert_eq!(request_id, Some(42));
+                assert_eq!(actual_payload.as_ref(), payload);
+            }
+            other => panic!("expected actor ask, got {other:?}"),
+        }
+    }
+
     #[test]
     fn route_bind_conflicts_are_rejected() {
         let routes = crate::route_interning::RouteTable::new();
@@ -5840,6 +5883,7 @@ mod framing_tests {
                 correlation_id,
                 actor_id: parsed_actor_id,
                 type_hash: parsed_type_hash,
+                request_id,
                 schema_hash,
                 payload: body,
             } => {
@@ -5847,6 +5891,7 @@ mod framing_tests {
                 assert_eq!(correlation_id, 0);
                 assert_eq!(parsed_actor_id, actor_id);
                 assert_eq!(parsed_type_hash, type_hash);
+                assert_eq!(request_id, None);
                 assert_eq!(schema_hash, None);
                 assert_eq!(body.as_ref(), payload_bytes);
             }

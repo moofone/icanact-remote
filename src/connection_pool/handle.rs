@@ -213,6 +213,25 @@ impl<T> ConnectionHandle<T> {
             .await
     }
 
+    async fn write_routed_actor_ask_with_request_id(
+        &self,
+        correlation_id: u32,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+        request_id: u64,
+    ) -> Result<()> {
+        self.stream_handle()?
+            .write_routed_actor_ask_with_request_id(
+                correlation_id,
+                actor_id,
+                type_hash,
+                payload,
+                request_id,
+            )
+            .await
+    }
+
     async fn write_direct_ask_inline(&self, header: [u8; 16], payload: bytes::Bytes) -> Result<()> {
         if let Some(stream_handle) = self.stream_handle.as_ref() {
             stream_handle.write_direct_ask_inline(header, payload).await
@@ -664,13 +683,80 @@ impl<T> ConnectionHandle<T> {
         payload: bytes::Bytes,
         timeout: Duration,
     ) -> Result<crate::AlignedBytes> {
+        self.ask_actor_frame_aligned_with_optional_request_id(actor_id, type_hash, payload, timeout, None)
+            .await
+    }
+
+    /// Ask an actor using an uncompact ActorAsk frame with an out-of-band
+    /// caller-controlled request id. The id is exposed to the receiver's
+    /// [`AskContext`] and never enters the application payload.
+    pub async fn ask_actor_frame_with_request_id(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+        timeout: Duration,
+        request_id: u64,
+    ) -> Result<bytes::Bytes> {
+        let response = self
+            .ask_actor_frame_aligned_with_request_id(
+                actor_id,
+                type_hash,
+                payload,
+                timeout,
+                request_id,
+            )
+            .await?;
+        Ok(response.into_bytes())
+    }
+
+    /// Aligned response variant of [`Self::ask_actor_frame_with_request_id`].
+    pub async fn ask_actor_frame_aligned_with_request_id(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+        timeout: Duration,
+        request_id: u64,
+    ) -> Result<crate::AlignedBytes> {
+        self.ask_actor_frame_aligned_with_optional_request_id(
+            actor_id,
+            type_hash,
+            payload,
+            timeout,
+            Some(request_id),
+        )
+        .await
+    }
+
+    async fn ask_actor_frame_aligned_with_optional_request_id(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+        timeout: Duration,
+        request_id: Option<u64>,
+    ) -> Result<crate::AlignedBytes> {
         let started_at = Instant::now();
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
-        if let Err(e) = self
-            .write_routed_actor_ask(correlation_id, actor_id, type_hash, payload)
-            .await
-        {
+        let write_result = match request_id {
+            Some(request_id) => {
+                self.write_routed_actor_ask_with_request_id(
+                    correlation_id,
+                    actor_id,
+                    type_hash,
+                    payload,
+                    request_id,
+                )
+                .await
+            }
+            None => {
+                self.write_routed_actor_ask(correlation_id, actor_id, type_hash, payload)
+                    .await
+            }
+        };
+        if let Err(e) = write_result {
             // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
             warn!(
                 addr = %self.addr,

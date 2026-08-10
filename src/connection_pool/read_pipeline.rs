@@ -565,6 +565,7 @@ fn completed_v5_stream_result(
             correlation_id: completed.correlation_id,
             actor_id: completed.actor_id,
             type_hash: completed.type_hash,
+            request_id: None,
             schema_hash: None,
             payload: completed.payload,
         }
@@ -1754,10 +1755,18 @@ where
 fn ask_context_from_context(
     ctx: &ReadContext,
     correlation_id: u32,
+    request_id: Option<u64>,
 ) -> Option<crate::AskContext<'_>> {
     ctx.response_writer
         .as_ref()
-        .map(|writer| crate::AskContext::from_writer(correlation_id, writer, ctx.peer_id.as_ref()))
+        .map(|writer| {
+            crate::AskContext::from_writer_with_request_id(
+                correlation_id,
+                writer,
+                ctx.peer_id.as_ref(),
+                request_id,
+            )
+        })
 }
 
 async fn write_ask_disposition_io<S>(
@@ -2240,9 +2249,11 @@ where
             correlation_id,
             actor_id,
             type_hash,
+            request_id,
             schema_hash,
             payload,
         } => {
+            let _ = request_id;
             if let (Some(expected), Some(received)) = (registry.config.schema_hash, schema_hash) {
                 // V5 authenticates the schema during Hello, so normal V5
                 // actor frames intentionally carry no repeated schema hash.
@@ -2454,6 +2465,7 @@ where
         type_hash: u32,
         payload: crate::AlignedBytes,
         correlation_id: Option<u32>,
+        request_id: Option<u64>,
         stream: &mut S,
         bytes_written_counter: &Arc<AtomicUsize>,
         bytes_since_flush: &mut usize,
@@ -2570,7 +2582,7 @@ where
                 return Ok(());
             }
             if let Some(cell) = ctx.ask_handler_sync.as_ref()
-                && let Some(context) = ask_context_from_context(ctx, correlation_id)
+                && let Some(context) = ask_context_from_context(ctx, correlation_id, request_id)
             {
                 let handle_start = perf.map(|_| Instant::now());
                 // Same reasoning as the ask_immediate_handler_sync arm above.
@@ -2684,6 +2696,7 @@ where
                     correlation_id,
                     actor_id,
                     type_hash,
+                    request_id: None,
                     schema_hash: ctx.expected_schema_hash,
                     payload,
                 }));
@@ -2695,6 +2708,7 @@ where
                 type_hash,
                 payload,
                 Some(correlation_id),
+                None,
                 stream,
                 bytes_written_counter,
                 bytes_since_flush,
@@ -2712,6 +2726,7 @@ where
             actor_id,
             type_hash,
             schema_hash,
+            request_id,
             payload,
         }) => {
             let is_tell = msg_type == crate::MessageType::ActorTell as u8 && correlation_id == 0;
@@ -2728,6 +2743,7 @@ where
                     correlation_id,
                     actor_id,
                     type_hash,
+                    request_id,
                     schema_hash,
                     payload,
                 }));
@@ -2745,6 +2761,7 @@ where
                 type_hash,
                 payload,
                 if is_ask { Some(correlation_id) } else { None },
+                request_id,
                 stream,
                 bytes_written_counter,
                 bytes_since_flush,
