@@ -7171,6 +7171,77 @@ async fn delta_gossip_records_owner_side_liveness_evidence() {
     );
 }
 
+/// A `FullSyncRequest` is authenticated inbound traffic just like a delta, but
+/// it does not carry an actor update that would otherwise touch the normal
+/// gossip bookkeeping.  It must still refresh the owner's causal liveness
+/// fence: `cleanup_dead_peers` reads that fence, not the peer's volatile
+/// `gossip_state`, before releasing address ownership.
+#[tokio::test]
+async fn full_sync_request_records_owner_side_liveness_evidence() {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("lrr_full_sync_request_local")),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let peer_keypair = crate::KeyPair::new_for_testing("lrr_full_sync_request_remote");
+    let peer_id = peer_keypair.peer_id();
+    let peer_addr: SocketAddr = "10.77.0.69:9305".parse().unwrap();
+    let stale_time = crate::current_timestamp_millis().saturating_sub(3_600_000);
+    {
+        let mut state = registry.gossip_state.lock().await;
+        state
+            .peers
+            .insert(peer_addr, stale_peer_info(peer_addr, stale_time));
+    }
+
+    let evidence_before = std::time::Instant::now();
+    assert!(
+        !registry
+            .registry_owner
+            .has_newer_liveness_evidence(peer_addr, evidence_before)
+            .await,
+        "sanity: no owner-side evidence exists before the request"
+    );
+
+    let msg = crate::registry::RegistryMessage::FullSyncRequest {
+        sender_peer_id: peer_id.clone(),
+        sender_bind_addr: None,
+        sequence: 0,
+        wall_clock_time: crate::current_timestamp(),
+    };
+    super::handle_incoming_message(
+        registry.clone(),
+        peer_addr,
+        peer_addr,
+        Some(peer_id),
+        msg,
+    )
+    .await
+    .expect("authenticated FullSyncRequest should be accepted");
+
+    assert!(
+        registry
+            .registry_owner
+            .has_newer_liveness_evidence(peer_addr, evidence_before)
+            .await,
+        "an authenticated FullSyncRequest must refresh the owner-side liveness fence"
+    );
+    let state = registry.gossip_state.lock().await;
+    let info = state
+        .peers
+        .get(&peer_addr)
+        .expect("peer should remain in gossip state after FullSyncRequest");
+    assert_eq!(info.failures, 0, "authenticated request must clear failures");
+    assert!(
+        info.last_response_received_ms >= stale_time,
+        "authenticated request must refresh response bookkeeping"
+    );
+}
+
 /// The `DeltaGossip` arm never verified `delta.sender_peer_id` -- a
 /// SELF-REPORTED wire field, not an authority for identity -- against the
 /// connection's actual authenticated identity, unlike the `FullSync` arm
