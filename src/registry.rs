@@ -2713,7 +2713,10 @@ enum ClaimSubmission {
     Plain,
     /// An outbound dial or authenticated inbound session: commits the
     /// session's connection-scoped receipt atomically with the decision.
-    ConnectionScoped(SocketAddr),
+    ConnectionScoped {
+        session_source: SocketAddr,
+        evidence_at: std::time::Instant,
+    },
     /// `configure_peer`: commits the operator pin (and any evicted pin's
     /// release) atomically with the decision. `expected_generation` is
     /// `None` for a peer's first call, `Some(gen)` for a queued retry,
@@ -4255,12 +4258,16 @@ impl<T: 'static> GossipRegistry<T> {
         crate::addr_ownership::AddrClaimOutcome,
         Option<crate::registry_owner::ClaimReceipt>,
     ) {
+        let evidence_at = std::time::Instant::now();
         let (outcome, receipt, _evicted_release, _reap_in_progress, _generation, _superseded) = self
             .add_peer_with_node_id_generation_inner(
                 peer_addr,
                 Some(node_id),
                 claim_kind,
-                ClaimSubmission::ConnectionScoped(session_source),
+                ClaimSubmission::ConnectionScoped {
+                    session_source,
+                    evidence_at,
+                },
             )
             .await;
         (outcome, receipt)
@@ -4551,9 +4558,12 @@ impl<T: 'static> GossipRegistry<T> {
                 kind: claim_kind,
             };
             let commit = match claim_submission {
-                ClaimSubmission::ConnectionScoped(session_source) => {
+                ClaimSubmission::ConnectionScoped {
+                    session_source,
+                    evidence_at,
+                } => {
                     self.registry_owner
-                        .claim_connection_scoped(peer_addr, claim, session_source)
+                        .claim_connection_scoped_at(peer_addr, claim, session_source, evidence_at)
                         .await
                 }
                 ClaimSubmission::Plain => {

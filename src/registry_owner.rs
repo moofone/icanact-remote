@@ -657,6 +657,10 @@ enum OwnerCommand {
         addr: SocketAddr,
         claim: Claim,
         session_source: SocketAddr,
+        /// Monotonic instant when the authenticated transport supplied this
+        /// evidence. Capture it before mailbox queueing so delayed owner
+        /// processing cannot make old evidence appear fresh.
+        evidence_at: std::time::Instant,
         reply: oneshot::Sender<ClaimCommit>,
     },
     /// Atomically take every connection-scoped receipt `peer_id` holds for
@@ -780,6 +784,7 @@ enum OwnerCommand {
     /// map currently shows this peer pinned at -- not merely the address a
     /// caller last observed in `ConnectionPool`, which can be stale by the
     /// time this command runs. See `PeerRegistryOwner::pin`.
+    #[cfg(test)]
     Pin {
         addr: SocketAddr,
         peer_id: PeerId,
@@ -1027,12 +1032,26 @@ impl RegistryOwnerHandle {
         claim: Claim,
         session_source: SocketAddr,
     ) -> ClaimCommit {
+        self.claim_connection_scoped_at(addr, claim, session_source, std::time::Instant::now())
+            .await
+    }
+
+    /// Submit a connection-scoped claim with the transport evidence instant
+    /// captured before the owner mailbox can delay processing it.
+    pub(crate) async fn claim_connection_scoped_at(
+        &self,
+        addr: SocketAddr,
+        claim: Claim,
+        session_source: SocketAddr,
+        evidence_at: std::time::Instant,
+    ) -> ClaimCommit {
         self.ensure_started();
         let (reply, response) = oneshot::channel();
         let command = OwnerCommand::ClaimConnectionScoped {
             addr,
             claim,
             session_source,
+            evidence_at,
             reply,
         };
         if self.shared.tx.send(command).await.is_err() {
@@ -1254,7 +1273,8 @@ impl RegistryOwnerHandle {
     /// could otherwise each pin independently and leave both addresses
     /// pinned forever. Reading it here means whichever `pin` the owner
     /// serializes LAST always wins outright.
-    pub async fn pin(&self, addr: SocketAddr, peer_id: PeerId) -> Option<SocketAddr> {
+    #[cfg(test)]
+    pub(crate) async fn pin(&self, addr: SocketAddr, peer_id: PeerId) -> Option<SocketAddr> {
         self.ensure_started();
         let (reply, response) = oneshot::channel();
         let command = OwnerCommand::Pin {
@@ -1844,9 +1864,10 @@ impl PeerRegistryOwner {
                 addr,
                 claim,
                 session_source,
+                evidence_at,
                 reply,
             } => {
-                let commit = self.claim_connection_scoped(addr, claim, session_source);
+                let commit = self.claim_connection_scoped(addr, claim, session_source, evidence_at);
                 let _ = reply.send(commit);
             }
             OwnerCommand::ReleaseSession {
@@ -1930,6 +1951,7 @@ impl PeerRegistryOwner {
                 self.reap_reserved.remove(&addr);
                 let _ = reply.send(());
             }
+            #[cfg(test)]
             OwnerCommand::Pin {
                 addr,
                 peer_id,
@@ -2105,6 +2127,7 @@ impl PeerRegistryOwner {
         addr: SocketAddr,
         claim: Claim,
         session_source: SocketAddr,
+        evidence_at: std::time::Instant,
     ) -> ClaimCommit {
         let peer_id = claim.node_id.clone();
         let commit = self.claim(addr, claim, /* is_local_addr */ false);
@@ -2115,7 +2138,7 @@ impl PeerRegistryOwner {
             // is refreshed, regardless of whether the address ends up
             // pinned below.
             self.claim_committed_at
-                .insert(addr, std::time::Instant::now());
+                .insert(addr, evidence_at);
         }
         // An operator-pinned address (`pin`, set only by `configure_peer`) is
         // a reservation that exists independently of any one connection: no
@@ -2507,6 +2530,7 @@ impl PeerRegistryOwner {
     /// reverse-map invariant it guarantees on its own -- see
     /// `RegistryOwnerHandle::pin`'s doc comment for why a caller needing an
     /// ownership-backed pin must use `configure_peer` instead.
+    #[cfg(test)]
     fn pin(&mut self, addr: SocketAddr, peer_id: PeerId) -> Option<SocketAddr> {
         self.install_pin(addr, peer_id)
     }
@@ -3451,6 +3475,37 @@ mod tests {
             )
             .await;
         assert!(reclaim.is_accepted());
+    }
+
+    /// A connection claim's liveness timestamp belongs to the transport
+    /// event, not to the instant the owner happens to dequeue its command.
+    /// Keeping the captured instant prevents mailbox delay from making old
+    /// evidence look newer than a failure recorded while it waited.
+    #[tokio::test]
+    async fn connection_claim_preserves_evidence_time_across_owner_queueing() {
+        let (owner, _publisher) = owner_handle();
+        let node = peer("connection-claim-evidence-time");
+        let target = addr(30_216);
+        let session = addr(30_217);
+        let evidence_at = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("test clock supports a one-second history");
+
+        let claim = owner
+            .claim_connection_scoped_at(
+                target,
+                claim_of(node.clone(), ClaimKind::Verified),
+                session,
+                evidence_at,
+            )
+            .await;
+        assert!(claim.is_accepted());
+
+        let failure_at = std::time::Instant::now();
+        assert!(matches!(
+            owner.release_dead_peer(node, target, failure_at).await,
+            DeadPeerReleaseOutcome::Released(_)
+        ));
     }
 
     /// `release` -- the generic retraction path, not just
@@ -4850,6 +4905,32 @@ mod tests {
             "a rejected challenger claim must not leave `target` pinned against its \
              genuine, still-valid incumbent owner"
         );
+    }
+
+    /// Replacing an address pin must remove the displaced peer's reverse
+    /// mapping. Otherwise a later pin for that peer could consult the stale
+    /// reverse entry, evict the current owner's live pin, and leave the
+    /// address unprotected.
+    #[tokio::test]
+    async fn replacing_an_address_pin_clears_the_displaced_reverse_mapping() {
+        let (owner, _publisher) = owner_handle();
+        let first = peer("pin-reverse-first");
+        let second = peer("pin-reverse-second");
+        let addr_a = addr(49_000);
+        let addr_b = addr(49_001);
+
+        assert_eq!(owner.pin(addr_a, first.clone()).await, None);
+        assert_eq!(owner.pinned_addr_for(&first), Some(addr_a));
+
+        assert_eq!(owner.pin(addr_a, second.clone()).await, None);
+        assert_eq!(owner.pin_owner(&addr_a), Some(second.clone()));
+        assert_eq!(owner.pinned_addr_for(&first), None);
+        assert_eq!(owner.pinned_addr_for(&second), Some(addr_a));
+
+        assert_eq!(owner.pin(addr_b, first.clone()).await, None);
+        assert_eq!(owner.pin_owner(&addr_a), Some(second));
+        assert_eq!(owner.pin_owner(&addr_b), Some(first.clone()));
+        assert_eq!(owner.pinned_addr_for(&first), Some(addr_b));
     }
 
     /// If `pin` trusted a caller-supplied "previous address" instead of
