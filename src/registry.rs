@@ -9089,8 +9089,6 @@ impl<T: 'static> GossipRegistry<T> {
 
         // Clean up stale known actors (using wall clock time for TTL)
         {
-            let before_count = self.actor_state.known_actors.len();
-
             let mut to_remove = Vec::new();
             self.actor_state.known_actors.iter_sync(|k, location| {
                 if now.saturating_sub(self.effective_actor_wall_clock_time(k, location)) >= ttl_secs
@@ -9108,6 +9106,7 @@ impl<T: 'static> GossipRegistry<T> {
             self.actor_state.fire_cleanup_stale_actors_race_hook();
 
             let mut gossip_state = self.gossip_state.lock().await;
+            let mut removed_names = Vec::new();
             for name in &to_remove {
                 // Re-check the same staleness condition inside the atomic
                 // removal itself rather than trusting the snapshot above: a
@@ -9125,12 +9124,13 @@ impl<T: 'static> GossipRegistry<T> {
                         });
                 if removed.is_some() {
                     gossip_state.release_actor_admission(name);
+                    removed_names.push(name.clone());
                 }
             }
 
-            let removed = before_count.saturating_sub(self.actor_state.known_actors.len());
-            if removed > 0 {
-                let pubsub_changed = to_remove
+            let removed = removed_names.len();
+            if removed != 0 {
+                let pubsub_changed = removed_names
                     .iter()
                     .any(|name| crate::pubsub::is_interest_actor_name(name));
                 self.actor_state
@@ -20552,6 +20552,53 @@ mod tests {
             "a row that became owner-matching in the gap between the scan and the removal \
              loop must survive -- the sweep must re-validate at removal time, never remove \
              whatever the snapshot observed regardless of what changed since"
+        );
+    }
+
+    #[tokio::test]
+    async fn cleanup_stale_actors_publishes_revision_for_each_successful_removal() {
+        let mut config = test_config();
+        config.actor_ttl = Duration::from_millis(50);
+        let registry = Arc::new(GossipRegistry::<()>::new(test_addr(8083), config));
+
+        let stale_name = "icanact/pubsub/interest/v1/0000000000000001/peer";
+        let mut stale_location = test_location(test_addr(9003));
+        stale_location.wall_clock_time = current_timestamp().saturating_sub(100);
+        let _ = registry
+            .actor_state
+            .known_actors
+            .upsert_sync(stale_name.to_owned(), stale_location);
+        let before_revision = registry.actor_state.pubsub_routing_revision();
+
+        // Hold the gossip lock after cleanup has taken its snapshot. A
+        // concurrent map insertion then offsets the successful removal in
+        // `known_actors.len()`, which must not suppress the revision publish.
+        let held = registry.gossip_state.lock().await;
+        let cleanup_registry = Arc::clone(&registry);
+        let cleanup = tokio::spawn(async move {
+            cleanup_registry.cleanup_stale_actors().await;
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        let mut fresh_location = test_location(test_addr(9004));
+        fresh_location.wall_clock_time = current_timestamp();
+        let _ = registry
+            .actor_state
+            .known_actors
+            .upsert_sync("fresh_actor".to_owned(), fresh_location);
+        drop(held);
+        cleanup.await.unwrap();
+
+        assert!(!registry.actor_state.known_actors.contains_sync(stale_name));
+        assert!(registry
+            .actor_state
+            .known_actors
+            .contains_sync("fresh_actor"));
+        assert!(
+            registry.actor_state.pubsub_routing_revision() > before_revision,
+            "a successful stale pubsub-interest removal must publish a routing revision even when a concurrent insertion keeps the map length unchanged"
         );
     }
 
