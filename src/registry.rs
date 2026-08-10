@@ -7875,7 +7875,9 @@ impl<T: 'static> GossipRegistry<T> {
                 crate::ClockOrdering::After => {
                     clear_tombstone = true;
                 }
-                crate::ClockOrdering::Before | crate::ClockOrdering::Concurrent
+                crate::ClockOrdering::Before
+                | crate::ClockOrdering::Equal
+                | crate::ClockOrdering::Concurrent
                     if owner_recovery_wins_tombstone(
                         location,
                         sender_peer_id,
@@ -24606,6 +24608,31 @@ mod tests {
         assert!(
             owner_recovery_wins_tombstone(&location, &owner, &peer_death, false),
             "peer-death equality recovery retains the established compatibility behavior"
+        );
+    }
+
+    /// The upsert planner must honor the peer-death equality recovery decision
+    /// made by `owner_recovery_wins_tombstone`, rather than routing an equal
+    /// clock to the generic tombstone rejection arm.
+    #[test]
+    fn current_actor_upsert_plan_allows_equal_clock_peer_death_recovery() {
+        let registry = GossipRegistry::<()>::new(
+            test_addr(9438),
+            test_config_with_seed("equal-clock-peer-death-plan"),
+        );
+        let owner = test_peer_id("equal-clock-peer-death-plan-owner");
+        let actor = "actor.equal-clock-peer-death-plan";
+        let location = RemoteActorLocation::new_with_peer(test_addr(9439), owner.clone());
+        let tombstone = RemovedActorTombstone::new(location.vector_clock.clone());
+        let _ = registry
+            .actor_state
+            .removed_actors
+            .upsert_sync(actor.to_string(), tombstone);
+
+        assert_eq!(
+            registry.current_actor_upsert_plan(actor, &location, &owner, false),
+            Some((true, false)),
+            "equal-clock peer-death recovery must clear the tombstone and admit the actor"
         );
     }
 
