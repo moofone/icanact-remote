@@ -24460,6 +24460,7 @@ mod tests {
         // armed only from inside the hook below, at the exact moment the
         // race requires it to land.
         let new_source = test_addr(55702);
+        let replacement_epoch = next_session_epoch();
         let (io_new, _p_new) = tokio::io::duplex(1024);
         let (sh_new, _w_new, _r_new) = LockFreeStreamHandle::new(
             io_new,
@@ -24514,7 +24515,12 @@ mod tests {
                     peer_info.current_session_connection =
                         Some(std::sync::Arc::downgrade(&conn_new));
                     peer_info.accept_lower_sequence_from = Some(new_source);
-                    peer_info.current_session_epoch = next_session_epoch();
+                    peer_info.current_session_epoch = replacement_epoch;
+                    // Model a replacement that has already admitted its
+                    // lower-sequence FullSync before the old teardown's
+                    // deferred invalidation runs. The teardown must not
+                    // retract this durable restart evidence either.
+                    peer_info.session_restart_confirmed = true;
                 }
             }))
         };
@@ -24537,6 +24543,15 @@ mod tests {
             peer_info.accept_lower_sequence_from.is_some(),
             "the replacement's one-shot lower-sequence exemption must survive the old \
              connection's teardown too"
+        );
+        assert_eq!(
+            peer_info.current_session_epoch, replacement_epoch,
+            "the old teardown must not redraw the replacement session epoch"
+        );
+        assert!(
+            peer_info.session_restart_confirmed,
+            "the old teardown must not retract restart evidence already confirmed on the \
+             replacement session"
         );
     }
 
