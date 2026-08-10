@@ -348,6 +348,146 @@ fn timeout_retry_persists_recovered_connection() {
     });
 }
 
+/// Actor handler that never answers within any ask timeout a test here
+/// uses, so the caller's `ask_actor_frame` always observes a genuine
+/// `GossipError::Timeout` against a connection that is otherwise perfectly
+/// healthy - never a transport-class failure.
+struct NeverRespondsHandler;
+
+impl ActorMessageHandler for NeverRespondsHandler {
+    fn handle_actor_message(
+        &self,
+        _actor_id: u64,
+        _type_hash: u32,
+        _payload: icanact_remote::AlignedBytes,
+        _correlation_id: Option<u32>,
+    ) -> ActorMessageFuture<'_> {
+        Box::pin(async move {
+            sleep(Duration::from_secs(30)).await;
+            Ok(None)
+        })
+    }
+}
+
+/// Evicting on ask timeout and persisting a healed replacement are two
+/// independent decisions from replaying the timed-out request onto it - the
+/// policy combination that evicts but never replays
+/// (`evict_peer_on_ask_timeout = true`, `retry_actor_ask_once_after_timeout
+/// = false`) is exactly the one nothing else here covers, and exactly the
+/// one where conflating "dial a replacement" with "replay onto it" used to
+/// leave the ref's own slot stuck holding the connection instance that was
+/// just evicted underneath it.
+#[test]
+fn timeout_without_replay_still_heals_the_cached_slot() {
+    run_async_test("timeout-without-replay-heals-slot", async {
+        let addr_a: SocketAddr = "127.0.0.1:28477".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:28478".parse().unwrap();
+
+        let (key_pair_a, key_pair_b) =
+            key_pair_ordered_for_outbound_a("selfheal_noretry_a", "selfheal_noretry_b");
+        let peer_id_a = key_pair_a.peer_id();
+        let peer_id_b = key_pair_b.peer_id();
+        assert_ne!(
+            peer_id_a, peer_id_b,
+            "distinct test seeds must not collapse to the same PeerId"
+        );
+
+        let config = GossipConfig {
+            gossip_interval: Duration::from_secs(300),
+            peer_supervisor_interval: Duration::from_secs(300),
+            connection_recovery: ConnectionRecoveryPolicy {
+                evict_peer_on_ask_timeout: true,
+                evict_peer_on_ask_cancel: false,
+                retry_actor_ask_once_after_timeout: false,
+                consecutive_timeout_threshold: 0,
+            },
+            ..Default::default()
+        };
+
+        let handle_a = GossipRegistryHandle::new_with_transport_stack(
+            addr_a,
+            key_pair_a.to_secret_key(),
+            Some(config.clone()),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
+
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(
+            addr_b,
+            key_pair_b.to_secret_key(),
+            Some(config),
+            icanact_remote::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
+        handle_b
+            .registry
+            .set_actor_message_handler(Arc::new(NeverRespondsHandler))
+            .await;
+
+        let peer_b = handle_a.add_peer(&peer_id_b).await;
+        peer_b.connect(&addr_b).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+
+        let remote_actor = handle_a
+            .lookup_peer(&peer_id_b)
+            .await
+            .expect("initial lookup_peer should succeed");
+
+        let before_conn = remote_actor
+            .connection_ref()
+            .expect("connection should be cached");
+
+        let timed_out = remote_actor
+            .ask_actor_frame(
+                TEST_ACTOR_ID,
+                TEST_TYPE_HASH,
+                bytes::Bytes::from_static(b"slow"),
+                Duration::from_millis(300),
+            )
+            .await;
+        assert!(
+            matches!(timed_out, Err(icanact_remote::GossipError::Timeout)),
+            "the ask must time out against a handler that never responds, got: {:?}",
+            timed_out
+        );
+
+        assert!(
+            before_conn.is_closed(),
+            "the timed-out connection instance should have been evicted/closed \
+             synchronously before ask_actor_frame returned"
+        );
+
+        // The real assertion: even with replay disabled (this specific
+        // timed-out ask is never retried), the ref's own cached slot must
+        // not be left pointing at the connection instance that was just
+        // evicted underneath it - a follow-up call must not inherit the
+        // dead handle.
+        let after_conn = remote_actor
+            .connection_ref()
+            .expect("connection should still be cached after the timeout");
+        assert!(
+            !after_conn.is_closed(),
+            "the slot must be healed even when replay is disabled, found the ref still \
+             pointing at the closed evicted connection"
+        );
+
+        let follow_up = remote_actor
+            .ask(bytes::Bytes::from_static(b"ECHO:no-replay-heal"))
+            .await;
+        assert!(
+            follow_up.is_ok(),
+            "a subsequent ask() must not use the dead evicted connection, got: {:?}",
+            follow_up
+        );
+        assert_eq!(follow_up.unwrap().as_ref(), b"ECHOED:no-replay-heal");
+
+        handle_a.shutdown().await;
+        handle_b.shutdown().await;
+    });
+}
+
 /// Concurrent ambiguous asks may each fail, but must leave one coherent,
 /// usable repaired connection without replaying any request.
 #[test]

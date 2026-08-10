@@ -512,6 +512,80 @@ impl<T> RemoteActorRef<T> {
         }
     }
 
+    /// A `get_connection_to_peer` candidate is not a usable replacement for
+    /// `failed` if it is literally the same transport instance - the pool's
+    /// own index simply has not retired it yet - or is already closed.
+    /// Either way, accepting it would just wrap an identical or dead session
+    /// in a fresh `Arc`: a caller's CAS against it "succeeds" without the
+    /// underlying connection having actually changed. Checked by instance
+    /// identity, never by address: identity is the only signal that stays
+    /// correct no matter how the pool's index happens to be ordered at the
+    /// moment of the call.
+    fn is_unhealed_candidate(candidate: &RemoteConnection, failed: &Arc<RemoteConnection>) -> bool {
+        candidate.is_closed()
+            || (candidate.instance_id().is_some()
+                && candidate.instance_id() == failed.instance_id())
+    }
+
+    /// Dial (or reuse) a connection to `peer_id`, respecting `deadline` when
+    /// the caller has its own budget to enforce (`None` lets the pool's own
+    /// connection timeout govern instead, for a caller whose outer timeout
+    /// already wraps the whole repair).
+    async fn dial_connection_to_peer(
+        registry: &Arc<crate::registry::GossipRegistry>,
+        peer_id: &crate::PeerId,
+        deadline: Option<tokio::time::Instant>,
+    ) -> crate::Result<crate::connection_pool::ConnectionHandle> {
+        match deadline {
+            Some(deadline) => {
+                let remaining = Self::remaining_until(deadline)?;
+                tokio::time::timeout(
+                    remaining,
+                    registry.connection_pool.get_connection_to_peer(peer_id),
+                )
+                .await
+                .map_err(|_| crate::GossipError::Timeout)?
+            }
+            None => {
+                registry
+                    .connection_pool
+                    .get_connection_to_peer(peer_id)
+                    .await
+            }
+        }
+    }
+
+    /// Dial a replacement for `failed` and reject it via
+    /// [`Self::is_unhealed_candidate`] if the pool's own get-or-create just
+    /// handed the identical (or already-dead) instance back. On rejection,
+    /// evict that specific instance by identity - never by address, which
+    /// could collaterally take out an unrelated concurrent reconnection -
+    /// and dial exactly once more; bounded to a single extra attempt, the
+    /// same "self-healing never loops" contract the callers of this
+    /// document.
+    async fn dial_replacement(
+        registry: &Arc<crate::registry::GossipRegistry>,
+        peer_id: &crate::PeerId,
+        failed: &Arc<RemoteConnection>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> crate::Result<Arc<RemoteConnection>> {
+        let candidate = RemoteConnection::from_handle(
+            Self::dial_connection_to_peer(registry, peer_id, deadline).await?,
+        );
+        if !Self::is_unhealed_candidate(&candidate, failed) {
+            return Ok(Arc::new(candidate));
+        }
+        if let Some(instance_id) = failed.instance_id() {
+            registry
+                .connection_pool
+                .remove_connection_instance_for_peer(peer_id, failed.addr, instance_id);
+        }
+        let redial = RemoteConnection::from_handle(
+            Self::dial_connection_to_peer(registry, peer_id, deadline).await?,
+        );
+        Ok(Arc::new(redial))
+    }
+
     /// Re-resolve the peer through the registry's connection pool and
     /// persist the freshly dialed (or reused) connection into the shared
     /// slot, so every subsequent call on this ref - and any of its clones -
@@ -547,11 +621,7 @@ impl<T> RemoteActorRef<T> {
         }
 
         let peer_id = self.location.peer_id.clone();
-        let handle = registry
-            .connection_pool
-            .get_connection_to_peer(&peer_id)
-            .await?;
-        let fresh = Arc::new(RemoteConnection::from_handle(handle));
+        let fresh = Self::dial_replacement(&registry, &peer_id, failed, None).await?;
 
         Ok(
             match self.compare_and_set_connection(Some(failed), fresh.clone()) {
@@ -690,23 +760,16 @@ impl<T> RemoteActorRef<T> {
             "actor ask timed out; evicted the specific peer transport session instance it ran on"
         );
 
-        if !policy.retry_actor_ask_once_after_timeout {
-            return Ok(None);
-        }
-
-        let remaining = Self::remaining_until(deadline)?;
-        let handle = tokio::time::timeout(
-            remaining,
-            registry.connection_pool.get_connection_to_peer(peer_id),
-        )
-        .await
-        .map_err(|_| crate::GossipError::Timeout)??;
-        let fresh = Arc::new(RemoteConnection::from_handle(handle));
-
-        // Persist the recovered connection back into the shared slot so
-        // every subsequent call on this ref (and its clones) uses it
-        // directly, instead of leaving the repaired handle stranded in a
-        // local variable that only serves the current retry.
+        // Dial and persist a replacement unconditionally once eviction is
+        // enabled - whether the CALLER replays the timed-out ask onto it is
+        // an entirely separate decision, gated below by
+        // `retry_actor_ask_once_after_timeout`. Conflating the two left the
+        // safety-oriented combination (evict on timeout, never replay)
+        // stuck holding the just-evicted connection forever: the eviction
+        // above ran, but nothing ever replaced what this ref itself was
+        // still caching, so the next call on it hit the identical dead
+        // handle again.
+        let fresh = Self::dial_replacement(&registry, peer_id, failed_conn, Some(deadline)).await?;
         let healed = match self.compare_and_set_connection(Some(failed_conn), fresh.clone()) {
             Ok(()) => fresh,
             Err(Some(other)) => other,
@@ -715,6 +778,10 @@ impl<T> RemoteActorRef<T> {
                 fresh
             }
         };
+
+        if !policy.retry_actor_ask_once_after_timeout {
+            return Ok(None);
+        }
         Ok(Some(healed))
     }
 
@@ -1091,5 +1158,104 @@ impl<T> std::fmt::Debug for RemoteActorRef<T> {
             .field("connection", &"<connection>")
             .field("registry_alive", &self.is_registry_alive())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{GossipConfig, GossipRegistryHandle, KeyPair};
+    use tokio::time::{Duration, sleep};
+
+    /// `add_peer`/`connect` dial in one fixed direction; order the pair so
+    /// the lower `NodeId` always dials out, matching every other two-node
+    /// test in this crate.
+    fn ordered_pair(seed_a: &str, seed_b: &str) -> (KeyPair, KeyPair) {
+        let first = KeyPair::new_for_testing(seed_a);
+        let second = KeyPair::new_for_testing(seed_b);
+        if first
+            .peer_id()
+            .to_node_id()
+            .as_bytes()
+            .cmp(second.peer_id().to_node_id().as_bytes())
+            .is_lt()
+        {
+            (first, second)
+        } else {
+            (second, first)
+        }
+    }
+
+    /// `reheal_connection` must never accept the pool's own `get_connection_to_peer`
+    /// handing back the exact instance passed in as `failed`: wrapping that
+    /// same instance in a fresh `Arc<RemoteConnection>` would make the
+    /// caller's CAS succeed while the slot still points at a connection that
+    /// is no better than the one that just failed. Calling the repair path
+    /// directly with the ref's own live connection as `failed` reproduces
+    /// exactly the shape the pool exhibits when it has not yet retired the
+    /// instance a caller is repairing away from: `get_connection_to_peer`
+    /// legitimately has nothing else to offer but that same instance.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn reheal_connection_never_returns_the_instance_passed_in_as_failed() {
+        let addr_a: SocketAddr = "127.0.0.1:28491".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:28492".parse().unwrap();
+        let (key_pair_a, key_pair_b) = ordered_pair("reheal_identity_a", "reheal_identity_b");
+        let peer_id_a = key_pair_a.peer_id();
+        let peer_id_b = key_pair_b.peer_id();
+        assert_ne!(
+            peer_id_a, peer_id_b,
+            "distinct test seeds must not collapse to the same PeerId"
+        );
+
+        let config = GossipConfig {
+            gossip_interval: Duration::from_secs(300),
+            peer_supervisor_interval: Duration::from_secs(300),
+            ..Default::default()
+        };
+
+        let handle_a = GossipRegistryHandle::new_with_transport_stack(
+            addr_a,
+            key_pair_a.to_secret_key(),
+            Some(config.clone()),
+            crate::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
+        let handle_b = GossipRegistryHandle::new_with_transport_stack(
+            addr_b,
+            key_pair_b.to_secret_key(),
+            Some(config),
+            crate::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
+
+        let peer_b = handle_a.add_peer(&peer_id_b).await;
+        peer_b.connect(&addr_b).await.unwrap();
+        sleep(Duration::from_millis(300)).await;
+
+        let remote_actor = handle_a
+            .lookup_peer(&peer_id_b)
+            .await
+            .expect("lookup should succeed");
+        let current = remote_actor
+            .connection
+            .load_full()
+            .expect("connection should be cached");
+
+        let healed = remote_actor
+            .reheal_connection(&current)
+            .await
+            .expect("reheal should still resolve a connection");
+
+        assert_ne!(
+            healed.instance_id(),
+            current.instance_id(),
+            "reheal must not accept the same instance that was passed in as failed, even when \
+             the pool's own get-or-create still has it indexed"
+        );
+
+        handle_a.shutdown().await;
+        handle_b.shutdown().await;
     }
 }
