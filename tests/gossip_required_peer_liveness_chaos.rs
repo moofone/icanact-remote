@@ -497,6 +497,7 @@ async fn apply_no_response_rounds(node: &TlsHandle, peer_addr: SocketAddr, round
             .apply_gossip_results(vec![icanact_remote::registry::GossipResult {
                 peer_addr,
                 sent_sequence: sequence as u64,
+                session_source: None,
                 outcome: Ok(None),
             }])
             .await;

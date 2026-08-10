@@ -3339,12 +3339,14 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
                         let registry_clone = registry.clone();
                         let peer_addr = task.peer_addr;
                         let sent_sequence = task.current_sequence;
+                        let session_source = task.session_source;
                         let future = tokio::spawn(async move {
                             // Send the message using zero-copy persistent connections
                             let outcome = send_gossip_message_zero_copy(task, registry_clone).await;
                             GossipResult {
                                 peer_addr,
                                 sent_sequence,
+                                session_source,
                                 outcome: gossip_send_outcome_to_result(outcome),
                             }
                         });

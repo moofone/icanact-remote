@@ -4607,21 +4607,28 @@ pub(crate) fn handle_incoming_message(
                 // or the sweep could destroy and irreversibly tombstone
                 // this peer's actors moments after it proved itself alive.
                 //
-                // Recorded exactly like `mark_response_received` already
-                // does for an inbound gossip RESPONSE -- direct evidence
-                // the peer occupying `sender_socket_addr` is still there,
-                // on a connection that may have been claimed long ago and
-                // will not claim again just for continuing to answer.
-                // Recorded AFTER releasing `gossip_state`'s lock (the block
-                // just above), not before or while holding it: the owner's
-                // own command channel is an independent synchronization
-                // domain entirely, so there is nothing to protect by
-                // holding this widely shared, frequently contended lock
-                // across it.
-                registry
-                    .registry_owner
-                    .note_liveness_evidence(sender_socket_addr, std::time::Instant::now())
-                    .await;
+                // Revalidate the session and capture the monotonic evidence
+                // instant under `gossip_state` immediately before publishing
+                // it to the owner. The first session check above protects
+                // delta bookkeeping, but an old connection can be replaced
+                // in the gap before this point; recording `Instant::now()`
+                // after that replacement would make stale traffic look newer
+                // than the successor's failure and fence cleanup forever.
+                if !registry
+                    .mark_authenticated_inbound_liveness(
+                        sender_socket_addr,
+                        &delta.sender_peer_id,
+                        session_source,
+                        crate::current_timestamp_millis(),
+                    )
+                    .await
+                {
+                    debug!(
+                        peer = %sender_socket_addr,
+                        "ignoring delta gossip liveness from a superseded authenticated session"
+                    );
+                    return Ok(());
+                }
 
                 // Apply the delta using the canonical registry logic (vector clocks +
                 // deterministic tiebreakers). The previous "inline apply" fast-path had

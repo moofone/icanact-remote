@@ -1799,6 +1799,10 @@ pub struct GossipTask {
     pub peer_addr: SocketAddr,
     pub message: RegistryMessage,
     pub current_sequence: u64,
+    /// Session discriminator captured with the outbound task. A result from
+    /// this task may arrive after a reconnect, so response liveness must be
+    /// attributed only if this source is still the peer's current session.
+    pub session_source: Option<SocketAddr>,
 }
 
 /// Result of a gossip operation
@@ -1806,6 +1810,10 @@ pub struct GossipTask {
 pub struct GossipResult {
     pub peer_addr: SocketAddr,
     pub sent_sequence: u64,
+    /// The session that originated the request. `None` is meaningful for
+    /// pre-session/test peers; once a peer has an armed session, a result
+    /// without the matching source is rejected before it can refresh liveness.
+    pub session_source: Option<SocketAddr>,
     pub outcome: Result<Option<RegistryMessage>>,
 }
 
@@ -7233,6 +7241,7 @@ impl<T: 'static> GossipRegistry<T> {
                     peer_addr,
                     message,
                     current_sequence,
+                    session_source: peer_info.current_session_source,
                 });
             }
 
@@ -7372,14 +7381,27 @@ impl<T: 'static> GossipRegistry<T> {
                     // catch. Reset failures here, not on every
                     // successful send.
                     if let Some(response) = response_opt {
-                        self.mark_response_received(result.peer_addr, current_time_ms)
-                            .await;
-                        self.record_peer_activity(result.peer_addr).await;
-                        if let Err(err) = self
-                            .handle_gossip_response(result.peer_addr, response)
+                        if self
+                            .mark_response_received(
+                                result.peer_addr,
+                                result.session_source,
+                                current_time_ms,
+                            )
                             .await
                         {
-                            warn!(peer = %result.peer_addr, error = %err, "failed to handle gossip response");
+                            self.record_peer_activity(result.peer_addr).await;
+                            if let Err(err) = self
+                                .handle_gossip_response(result.peer_addr, response)
+                                .await
+                            {
+                                warn!(peer = %result.peer_addr, error = %err, "failed to handle gossip response");
+                            }
+                        } else {
+                            warn!(
+                                peer = %result.peer_addr,
+                                session_source = ?result.session_source,
+                                "discarding gossip response from a superseded or unproven session"
+                            );
                         }
                     }
                 }
@@ -7509,21 +7531,37 @@ impl<T: 'static> GossipRegistry<T> {
     /// layer, not just the kernel-buffer-accepted layer.
     ///
     /// Also the SOURCE of `RegistryOwnerHandle::note_liveness_evidence`:
-    /// an inbound response is genuinely DIRECT evidence the peer occupying
-    /// `peer_addr` is still there, on a connection that may have been
-    /// claimed long ago and will not claim again just for continuing to
-    /// answer -- exactly the evidence `PeerRegistryOwner::claim_committed_at`
-    /// alone cannot see, and `release_dead_peer` checks both.
-    async fn mark_response_received(&self, peer_addr: SocketAddr, now: u64) {
-        self.registry_owner
-            .note_liveness_evidence(peer_addr, std::time::Instant::now())
-            .await;
-        let mut gossip_state = self.gossip_state.lock().await;
-        if let Some(peer_info) = gossip_state.peers.get_mut(&peer_addr) {
+    /// an inbound response is direct evidence only when its originating
+    /// session still matches the peer's current authenticated session. The
+    /// session check, evidence timestamp capture, and volatile bookkeeping
+    /// update share one `gossip_state` critical section; a response from a
+    /// superseded request cannot clear the successor's failure or refresh the
+    /// owner fence after a reconnect.
+    async fn mark_response_received(
+        &self,
+        peer_addr: SocketAddr,
+        session_source: Option<SocketAddr>,
+        now: u64,
+    ) -> bool {
+        let evidence_at = {
+            let mut gossip_state = self.gossip_state.lock().await;
+            let Some(peer_info) = gossip_state.peers.get_mut(&peer_addr) else {
+                return false;
+            };
+            let Some(peer_id) = peer_info.node_id.as_ref().map(|node_id| node_id.to_peer_id())
+            else {
+                return false;
+            };
+            if !self.peer_info_is_from_current_session(&peer_id, peer_info, session_source) {
+                return false;
+            }
+
             // `now` is captured at the start of the gossip batch; a later
             // inbound response may have already advanced these fields.
             // Take the max so concurrent writes never roll the value
-            // backwards.
+            // backwards. Capture owner evidence while the same session
+            // verdict is protected by this lock.
+            let evidence_at = std::time::Instant::now();
             peer_info.last_response_received_ms = peer_info.last_response_received_ms.max(now);
             peer_info.last_success = peer_info.last_success.max(current_timestamp());
             // A valid application-level response is strong liveness evidence.
@@ -7534,7 +7572,13 @@ impl<T: 'static> GossipRegistry<T> {
                 peer_info.last_failure_time = None;
                 peer_info.last_failure_instant = None;
             }
-        }
+            evidence_at
+        };
+
+        self.registry_owner
+            .note_liveness_evidence(peer_addr, evidence_at)
+            .await;
+        true
     }
 
     /// Record direct liveness from an authenticated inbound message on the
@@ -10645,6 +10689,7 @@ impl<T: 'static> GossipRegistry<T> {
                 peer_addr,
                 message: msg.clone(),
                 current_sequence,
+                session_source: None,
             })
             .collect();
 
@@ -16684,10 +16729,11 @@ mod tests {
         // A hard socket error jumps straight to `max_peer_failures` in one
         // round, crossing the threshold immediately.
         registry
-            .apply_gossip_results(vec![GossipResult {
-                peer_addr,
-                sent_sequence: 1,
-                outcome: Err(GossipError::Network(std::io::Error::new(
+                .apply_gossip_results(vec![GossipResult {
+                    peer_addr,
+                    sent_sequence: 1,
+                    session_source: None,
+                    outcome: Err(GossipError::Network(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "test: simulated hard socket failure",
                 ))),
@@ -20015,6 +20061,7 @@ mod tests {
                 .apply_gossip_results(vec![GossipResult {
                     peer_addr,
                     sent_sequence: 1,
+                    session_source: None,
                     outcome: Err(GossipError::Timeout),
                 }])
                 .await;
@@ -22691,6 +22738,7 @@ mod tests {
                 wall_clock_time: 1000,
             },
             current_sequence: 10,
+            session_source: None,
         };
 
         assert_eq!(task.peer_addr, test_addr(8081));
@@ -22702,6 +22750,7 @@ mod tests {
         let result = GossipResult {
             peer_addr: test_addr(8081),
             sent_sequence: 10,
+            session_source: None,
             outcome: Ok(None),
         };
 
@@ -23814,6 +23863,7 @@ mod tests {
         reg.apply_gossip_results(vec![GossipResult {
             peer_addr,
             sent_sequence: 1,
+            session_source: None,
             outcome: Ok(Some(response)),
         }])
         .await;
@@ -23825,6 +23875,82 @@ mod tests {
             "an application-level response must clear soft no-response failures"
         );
         assert!(peer.last_failure_time.is_none());
+    }
+
+    /// A response result without its originating session must not refresh a
+    /// replacement session's liveness. This is the deterministic form of the
+    /// reconnect race: the request was sent before the old session was
+    /// replaced, but the result reaches the registry after the replacement.
+    #[tokio::test]
+    async fn sessionless_gossip_response_does_not_clear_a_armed_session_failure() {
+        let reg = GossipRegistry::<()>::new(test_addr(7053), test_config());
+        let peer_addr = test_addr(7054);
+        let peer_id = test_peer_id("sessionless-response-peer");
+        let old_session = test_addr(7055);
+        {
+            let mut state = reg.gossip_state.lock().await;
+            state.peers.insert(
+                peer_addr,
+                PeerInfo {
+                    address: peer_addr,
+                    peer_address: None,
+                    inbound_observed: false,
+                    outbound_dial_success: true,
+                    node_id: Some(peer_id.to_node_id()),
+                    dns_name: None,
+                    failures: 2,
+                    last_attempt: 0,
+                    last_success: 0,
+                    last_sequence: 0,
+                    last_sent_sequence: 0,
+                    consecutive_deltas: 0,
+                    last_failure_time: Some(1),
+                    last_failure_instant: Some(std::time::Instant::now()),
+                    last_dns_refresh_attempt: None,
+                    last_response_received_ms: crate::current_timestamp_millis()
+                        .saturating_sub(10_000),
+                    accept_lower_sequence_from: None,
+                    current_session_source: Some(old_session),
+                    current_session_connection: None,
+                    current_session_epoch: 17,
+                    identity_verified: false,
+                    transport_source_keyed: false,
+                },
+            );
+        }
+
+        let response = RegistryMessage::DeltaGossipResponse {
+            delta: RegistryDelta {
+                since_sequence: 0,
+                current_sequence: 1,
+                changes: Vec::new(),
+                sender_peer_id: peer_id,
+                wall_clock_time: 0,
+                precise_timing_nanos: 0,
+            },
+            extensions: None,
+        };
+        reg.apply_gossip_results(vec![GossipResult {
+            peer_addr,
+            sent_sequence: 1,
+            // No source means this result cannot be tied to the armed
+            // session. It must not be treated as direct liveness evidence.
+            session_source: None,
+            outcome: Ok(Some(response)),
+        }])
+        .await;
+
+        let state = reg.gossip_state.lock().await;
+        let peer = state.peers.get(&peer_addr).expect("peer remains tracked");
+        assert_eq!(peer.failures, 2, "sessionless response must not clear failures");
+        assert_eq!(peer.current_session_source, Some(old_session));
+        drop(state);
+        assert!(
+            !reg.registry_owner
+                .has_newer_liveness_evidence(peer_addr, std::time::Instant::now())
+                .await,
+            "sessionless response must not refresh owner-side liveness"
+        );
     }
 
 
