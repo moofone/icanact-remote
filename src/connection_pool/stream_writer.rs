@@ -942,6 +942,14 @@ impl LockFreeStreamHandle {
         NEXT_ID.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// Reserve the identity of a physical stream before TLS-side ownership
+    /// admission runs. The same id is supplied to `new_with_instance_id`, so
+    /// a certificate claim and the eventual IO task share one lifecycle
+    /// identity.
+    pub(crate) fn allocate_instance_id() -> u64 {
+        Self::next_instance_id()
+    }
+
     pub fn instance_id(&self) -> u64 {
         self.instance_id
     }
@@ -1037,7 +1045,29 @@ impl LockFreeStreamHandle {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let instance_id = Self::next_instance_id();
+        Self::new_with_instance_id(
+            stream,
+            addr,
+            channel_id,
+            buffer_config,
+            schema_hash,
+            read_context,
+            Self::next_instance_id(),
+        )
+    }
+
+    pub(crate) fn new_with_instance_id<S>(
+        stream: S,
+        addr: SocketAddr,
+        channel_id: ChannelId,
+        buffer_config: BufferConfig,
+        schema_hash: Option<u64>,
+        read_context: Option<ReadContext>,
+        instance_id: u64,
+    ) -> (Self, JoinHandle<()>, Option<JoinHandle<()>>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let shutdown_signal = Arc::new(AtomicBool::new(false));
         let streaming_active = Arc::new(AtomicBool::new(false));
         let stream_gate = Arc::new(tokio::sync::Semaphore::new(1));
@@ -1328,7 +1358,11 @@ impl LockFreeStreamHandle {
                         let peer_id = peer_id.clone();
                         tokio::spawn(async move {
                             registry
-                                .release_connection_scoped_claims(&peer_id, session_source)
+                                .release_connection_scoped_claims_with_instance(
+                                    &peer_id,
+                                    session_source,
+                                    Some(expected_instance),
+                                )
                                 .await;
                         });
                     }
@@ -2754,6 +2788,7 @@ impl LockFreeStreamHandle {
                                     &registry,
                                     ctx.peer_addr,
                                     ctx.session_source,
+                                    Some(instance_id),
                                     ctx.peer_id.as_ref(),
                                     ctx.response_correlation.as_ref().map(|c| c.as_ref()),
                                     ctx.sync_actor_handler.as_ref().map(|v| &**v),
@@ -2954,6 +2989,7 @@ impl LockFreeStreamHandle {
                                             &registry,
                                             ctx.peer_addr,
                                             ctx.session_source,
+                                            Some(instance_id),
                                             ctx.peer_id.as_ref(),
                                             ctx.response_correlation.as_ref().map(|c| c.as_ref()),
                                             ctx.sync_actor_handler.as_ref().map(|v| &**v),
@@ -3123,6 +3159,7 @@ impl LockFreeStreamHandle {
                                             &registry,
                                             ctx.peer_addr,
                                             ctx.session_source,
+                                            Some(instance_id),
                                             ctx.peer_id.as_ref(),
                                             ctx.response_correlation.as_ref().map(|c| c.as_ref()),
                                             ctx.sync_actor_handler.as_ref().map(|v| &**v),

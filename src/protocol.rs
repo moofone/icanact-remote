@@ -1516,7 +1516,35 @@ fn registry_message_sender_peer_id(msg: &RegistryMessage) -> Option<&PeerId> {
 /// - Responses -> handle_response_message
 /// - Actor messages -> registry.actor_message_handler
 /// - Streaming messages -> state.streaming (assembly) -> handler
+#[cfg(test)]
 pub(crate) async fn process_read_result(
+    result: MessageReadResult,
+    streaming_state: &mut StreamingState,
+    registry: &Arc<GossipRegistry>,
+    peer_addr: SocketAddr,
+    session_source: SocketAddr,
+    response_correlation: Option<&crate::connection_pool::CorrelationTracker>,
+    response_connection: Option<&Arc<crate::connection_pool::LockFreeConnection>>,
+    authenticated_peer_id: Option<&PeerId>,
+) -> Result<()> {
+    process_read_result_with_instance(
+        result,
+        streaming_state,
+        registry,
+        peer_addr,
+        session_source,
+        None,
+        response_correlation,
+        response_connection,
+        authenticated_peer_id,
+    )
+    .await
+}
+
+/// Process a frame with the exact stream instance when the caller owns the
+/// stream task. This identity is carried only through the transport call
+/// path; synthetic/test callers use the legacy wrapper above.
+pub(crate) async fn process_read_result_with_instance(
     result: MessageReadResult,
     streaming_state: &mut StreamingState,
     registry: &Arc<GossipRegistry>,
@@ -1526,6 +1554,7 @@ pub(crate) async fn process_read_result(
     // `handle_incoming_message` so the restart-sequence exemption is
     // scoped to the exact connection that armed it.
     session_source: SocketAddr,
+    connection_instance_id: Option<u64>,
     response_correlation: Option<&crate::connection_pool::CorrelationTracker>,
     response_connection: Option<&Arc<crate::connection_pool::LockFreeConnection>>,
     authenticated_peer_id: Option<&PeerId>,
@@ -1566,10 +1595,11 @@ pub(crate) async fn process_read_result(
                 }
             }
 
-            if let Err(e) = crate::connection_pool::handle_incoming_message(
+            if let Err(e) = crate::connection_pool::handle_incoming_message_with_instance(
                 registry.clone(),
                 peer_addr,
                 session_source,
+                connection_instance_id,
                 authenticated_peer_id.cloned(),
                 msg,
             )

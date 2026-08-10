@@ -3758,6 +3758,12 @@ where
 {
     let max_message_size = registry.config.max_message_size;
     let aligned_pool = registry.connection_pool.aligned_bytes_pool();
+    // Allocate the physical connection identity before the first
+    // certificate-backed claim. The same id is installed on the stream
+    // handle below and carried by teardown, so a reused TCP source cannot
+    // alias a replacement session's receipt.
+    let connection_instance_id =
+        crate::connection_pool::LockFreeStreamHandle::allocate_instance_id();
 
     // First, read the initial message to identify the sender.
     //
@@ -4052,7 +4058,13 @@ where
         let addr_claim_kind = inbound_addr_claim_kind(peer_state_addr, peer_addr, required_addr);
 
         let (claim_outcome, claim_receipt) = registry
-            .add_connection_scoped_peer_claim(peer_state_addr, node_id, addr_claim_kind, peer_addr)
+            .add_connection_scoped_peer_claim_with_instance(
+                peer_state_addr,
+                node_id,
+                addr_claim_kind,
+                peer_addr,
+                Some(connection_instance_id),
+            )
             .await;
 
         // The address this connection is actually attributed to after
@@ -4088,11 +4100,12 @@ where
                 );
                 fell_back_to_observed_source = true;
                 let (fallback_outcome, fallback_receipt) = registry
-                    .add_connection_scoped_peer_claim(
+                    .add_connection_scoped_peer_claim_with_instance(
                         peer_addr,
                         node_id,
                         crate::addr_ownership::ClaimKind::Verified,
                         peer_addr,
+                        Some(connection_instance_id),
                     )
                     .await;
                 match fallback_outcome {
@@ -4229,13 +4242,14 @@ where
             sync_actor_handler: registry.actor_message_handler_sync.load_full(),
         };
         let (stream_handle, writer_task_handle, reader_task_handle) =
-            crate::connection_pool::LockFreeStreamHandle::new(
+            crate::connection_pool::LockFreeStreamHandle::new_with_instance_id(
                 stream,
                 peer_addr,
                 crate::connection_pool::ChannelId::Global,
                 buffer_config,
                 registry.config.schema_hash,
                 Some(read_context),
+                connection_instance_id,
             );
         let stream_handle = Arc::new(stream_handle);
         response_writer.bind_stream_handle(stream_handle.clone());
@@ -4730,7 +4744,7 @@ where
 
     // Process the initial message with correlation ID if present
     // We can safely unwrap here because the error case was handled by the match block above (returning early)
-    if let Err(e) = crate::protocol::process_read_result(
+    if let Err(e) = crate::protocol::process_read_result_with_instance(
         msg_result.unwrap(),
         &mut streaming_state,
         &registry,
@@ -4738,6 +4752,7 @@ where
         // Inbound: the remote client's own TCP source is already unique per
         // connection, so it doubles as the R-11 session discriminator.
         peer_addr,
+        Some(connection_instance_id),
         response_correlation.as_ref().map(|c| c.as_ref()),
         Some(&response_connection),
         Some(&peer_id),

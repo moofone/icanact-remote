@@ -508,6 +508,13 @@ impl<T> ConnectionPool<T> {
                     // use this socket's own local ephemeral port as the
                     // connection-scoped ownership discriminator.
                     let local_session_addr = tls_stream.get_ref().0.local_addr().unwrap_or(addr);
+                    // Reserve the physical stream identity before any
+                    // certificate-backed ownership claim. The finalizer and
+                    // IO teardown receive this same id, so a delayed old
+                    // teardown cannot remove a replacement receipt even if
+                    // the OS later reuses the local socket tuple.
+                    let connection_instance_id =
+                        crate::connection_pool::LockFreeStreamHandle::allocate_instance_id();
 
                     if let Some(certs) = tls_stream.get_ref().1.peer_certificates() {
                         if let Some(cert) = certs.first() {
@@ -534,11 +541,12 @@ impl<T> ConnectionPool<T> {
                                     crate::PeerId::from(&node_id) == registry_arc.peer_id;
                                 if !is_self_identity {
                                     let claim_outcome = registry_arc
-                                        .add_connection_scoped_peer_claim(
+                                        .add_connection_scoped_peer_claim_with_instance(
                                             addr,
                                             node_id,
                                             crate::addr_ownership::ClaimKind::Verified,
                                             local_session_addr,
+                                            Some(connection_instance_id),
                                         )
                                         .await
                                         .0;
@@ -694,7 +702,7 @@ impl<T> ConnectionPool<T> {
 
                     let finalize_started = Instant::now();
                     let result = self
-                        .finalize_new_outbound_connection(
+                        .finalize_new_outbound_connection_with_instance(
                             addr,
                             tls_stream,
                             registry_weak.clone(),
@@ -704,6 +712,7 @@ impl<T> ConnectionPool<T> {
                             discovered_node_id,
                             local_session_addr,
                             fresh_session_node_id,
+                            connection_instance_id,
                         )
                         .await;
                     match &result {

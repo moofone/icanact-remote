@@ -29,13 +29,13 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Weak};
 
 use arc_swap::ArcSwap;
 use crossbeam_queue::ArrayQueue;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, trace, warn};
 
 use crate::PeerId;
 use crate::addr_ownership::{
@@ -47,6 +47,21 @@ use crate::addr_ownership::{
 /// full mailbox applies backpressure to the claimant rather than dropping a
 /// decision.
 const OWNER_MAILBOX_CAPACITY: usize = 512;
+
+/// Legacy/unit-test callers that only have a socket discriminator still get a
+/// deterministic receipt identity. Production transport paths always pass a
+/// `LockFreeStreamHandle` instance id; this fallback keeps the small owner API
+/// usable for synthetic callers without making a socket address the live
+/// connection identity again.
+pub(crate) fn legacy_connection_instance_id(session_source: SocketAddr) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    session_source.hash(&mut hasher);
+    hasher.finish() | (1_u64 << 63)
+}
+
+const REAP_PENDING: u8 = 0;
+const REAP_COMMITTED: u8 = 1;
+const REAP_INVALIDATED: u8 = 2;
 
 /// Exact authority held by one ownership generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,22 +112,29 @@ struct PublishedOwner {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingSnapshot {
     owner_shards: [Arc<HashMap<SocketAddr, PublishedOwner>>; ROUTING_SNAPSHOT_SHARDS],
-    /// Operator-pin identity, published separately from ownership: a pin
-    /// is a DIFFERENT fact than "who owns this address" -- decided and
-    /// moved only by `configure_peer`'s atomic transaction and `migrate`'s
-    /// pin carry, never by `claim`. Neither `ConnectionPool`'s derived
-    /// `required_addr` (moved by every `.connect()`, configured or not)
-    /// nor the ownership generation (advanced by every accepted claim,
-    /// including unrelated chatter) answers "is this peer still the one I
-    /// pinned here" -- only this does.
+    /// Operator-pin identity, published separately from ownership: a pin is
+    /// a DIFFERENT fact than "who owns this address" (see `operator_pinned`'s
+    /// doc comment), decided and moved by its own owner commands
+    /// (`configure_peer`'s atomic transaction, and `migrate`'s pin carry),
+    /// not by `claim`. Neither `ConnectionPool`'s derived `required_addr`
+    /// (updated by any `.connect()` call, configured or not) nor the
+    /// ownership generation above (advanced by every accepted claim,
+    /// including unrelated gossip/discovery chatter for the same identity)
+    /// answers "is this peer still the one I pinned here" -- only the
+    /// owner's own pin decision does, so it gets its own publication.
     pin_shards: [Arc<HashMap<SocketAddr, PeerId>>; ROUTING_SNAPSHOT_SHARDS],
     /// Reverse of `pin_shards`: the address, if any, `peer_id` is CURRENTLY
     /// operator-pinned to. Kept in the SAME `with_pin` step as the
-    /// addr-keyed side, so the two can never disagree. Not sharded --
+    /// addr-keyed side, so the two can never disagree. Not sharded by
+    /// address (there is nothing to shard on for a peer-keyed lookup);
     /// operator pins are expected to be orders of magnitude fewer than
-    /// gossiped addresses. Exists so a non-owner caller can cheaply,
-    /// lock-freely check "is this peer pinned to some OTHER address" --
-    /// see `Peer::connect_with_route_mode`'s use of `pinned_addr_for`.
+    /// gossiped addresses, so one `Arc<HashMap>` clone-on-write is fine at
+    /// this scale.
+    ///
+    /// Exists so a non-owner caller can cheaply, lock-freely check "is this
+    /// peer pinned to some OTHER address" before writing an address-keyed
+    /// field it shares with the owner's own pin publication -- see
+    /// `Peer::connect_with_route_mode`'s use of `pinned_addr_for`.
     pinned_by_peer: Arc<HashMap<PeerId, SocketAddr>>,
 }
 
@@ -202,11 +224,15 @@ impl RoutingSnapshot {
     }
 
     /// Whether `peer_id` is still the exact identity `addr` is pinned for.
-    /// The authoritative "did I lose the race to a concurrent
-    /// reconfiguration" check, not a "who owns this now" query: it reads
-    /// the SAME pin decision `configure_peer`/`migrate` themselves just
-    /// published, not a value an unrelated path (`required_addr`, the
-    /// ownership generation) can move independently of the pin question.
+    ///
+    /// This is the authoritative "did I lose the configuration" check: it
+    /// reads the SAME pin decision `configure_peer`'s atomic transaction
+    /// (or `migrate`'s pin carry) itself just published, not a value some
+    /// unrelated path can move independently -- `ConnectionPool`'s
+    /// `required_addr` is written by every `.connect()` call, configured or
+    /// not, and the ownership generation advances on every accepted claim,
+    /// including unrelated gossip/discovery chatter for the SAME identity.
+    /// Neither answers this question; only the owner's own pin state does.
     pub fn pin_is_current(&self, addr: &SocketAddr, peer_id: &PeerId) -> bool {
         self.pin_owner(addr) == Some(peer_id)
     }
@@ -258,51 +284,85 @@ impl RoutingSnapshot {
 
 /// Why a claim did not take ownership.
 ///
-/// `#[non_exhaustive]`: adding a variant to this already-public enum is an
-/// unavoidable break for an exhaustive external match, but costs existing
-/// consumers nothing further once marked, while preventing the same
-/// silent break next time this enum grows.
+/// `#[non_exhaustive]` (added review round against `c111380`,
+/// `registry.rs:4538`): this enum already exists on `main`, and this PR's
+/// `ReapInProgress` variant is a genuine, unavoidable break for any
+/// exhaustive external match on it -- adding a variant to a
+/// non-`#[non_exhaustive]` public enum always is. That break cannot be
+/// undone (the variant is real, load-bearing information callers need),
+/// but marking it `#[non_exhaustive]` now, in the same round that adds it,
+/// costs nothing further for THIS round's consumers (they already must
+/// handle the new variant one way or another) while preventing this exact
+/// category of silent break from recurring the next time this enum grows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ClaimRejection {
     /// The arbitration truth table refused the claim.
     Arbitration(RejectReason),
-    /// The owner task is not reachable. Fail closed: no address-keyed
-    /// mutation may proceed on a decision that was never actually made.
+    /// The owner task is not reachable (shutting down, or its mailbox side
+    /// was dropped). Fail closed: no address-keyed mutation may proceed on a
+    /// decision that was never actually made.
     OwnerUnavailable,
-    /// Another caller currently holds a reap reservation for this address.
-    /// Refused unconditionally, before `arbitrate` is even consulted: the
-    /// holder's destructive, non-owner work relies on nothing committing
-    /// ownership out from under it while held. Worth retrying -- released
-    /// promptly once the holder is done, successfully or not.
+    /// A `cleanup_dead_peers` sweep currently holds a reap reservation for
+    /// this address (see `OwnerCommand::ReserveForReap`). Refused
+    /// unconditionally, before `arbitrate` is even consulted: the sweep's
+    /// destructive, non-owner work (actor removal, tombstone emission) is
+    /// about to run, or is running, on the assumption that nothing can
+    /// commit ownership of this address out from under it while the
+    /// reservation is held. The caller is expected to retry -- the
+    /// reservation is released promptly once the sweep finishes with this
+    /// address, successfully or not.
     ReapInProgress,
-    /// A `configure_peer` retry presented an `expected_generation` older
-    /// than the current value -- a LATER call for the SAME peer already
-    /// superseded it, atomically, at the owner. Refused before touching
-    /// anything; unlike `ReapInProgress`, not worth retrying, since
-    /// generations only increase.
+    /// P1 finding (review round against `ded8495`, `registry.rs:4982`): a
+    /// `configure_peer` retry presented an `expected_generation` older
+    /// than the current value `configure_peer_generation` records for
+    /// this peer -- a LATER `configure_peer` call for the SAME peer has
+    /// already been made, atomically, at the owner, since this retry's
+    /// own generation was established. Refused unconditionally, before
+    /// `arbitrate` is even consulted and before touching anything: retrying
+    /// again would not help (a newer request already superseded this one,
+    /// permanently, by construction -- generations only increase), unlike
+    /// `ReapInProgress`, which IS worth retrying.
     SupersededByNewerConfiguration,
-}
-
-/// The owner's complete decision for a dead-peer release.
-///
-/// `ProvenAlive` is distinct from `NotApplicable`: the former means direct
-/// or ordinary liveness evidence arrived after the sweep's failure boundary,
-/// so callers must preserve every side table as well as ownership; the latter
-/// means this identity simply has no releasable ownership (for example an
-/// operator pin or an already-displaced owner), so non-owner cleanup may
-/// still proceed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeadPeerReleaseOutcome {
-    Released(CommitSeq),
-    ProvenAlive,
-    NotApplicable,
 }
 
 /// Monotonic position of a committed mutation in the owner task's total
 /// order. Issued by the owner task alone, so it is a true sequence number and
 /// not a timestamp: `a < b` means `a` was committed strictly before `b`.
 pub type CommitSeq = u64;
+
+/// `OwnerCommand::ReleaseDeadPeer`'s full outcome. A plain
+/// `Option<CommitSeq>` (as this used to be) collapses two, very
+/// different, refusal reasons into one bit: "this candidate has been
+/// PROVEN ALIVE since the failure evidence it was selected on" and "there
+/// was never any ownership here to release in the first place (operator
+/// pin, or this identity never actually held it)". A caller that destroys
+/// unrelated, transient state (capabilities, clock calibration) only when
+/// this call actually released ownership needs to tell those apart: the
+/// former must block that destruction too, the latter must not -- the
+/// address genuinely has nothing left to protect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeadPeerReleaseOutcome {
+    /// Ownership was retracted at this commit.
+    Released(CommitSeq),
+    /// Refused: `addr` has direct or ordinary liveness evidence causally
+    /// AFTER the failure this reap is acting on (`claim_committed_at` or
+    /// `liveness_evidence_at`) -- this peer has been proven alive. Callers
+    /// must treat this exactly like a live peer: no destructive cleanup
+    /// of ANY kind for this candidate, not just ownership. Also the
+    /// fail-CLOSED default when the owner itself is unreachable: unable
+    /// to prove anything, so assumed unsafe, the same "cannot prove it is
+    /// safe, so don't" direction every other command in this module
+    /// takes.
+    ProvenAlive,
+    /// Refused for a reason unrelated to liveness: `addr` is
+    /// operator-pinned, or `peer_id` never actually held ownership of it
+    /// at the owner at all (a `GossipState`-only entry, e.g. discovered
+    /// but never connection-verified). There is no ownership here for a
+    /// caller to have accidentally destroyed, so transient, non-ownership
+    /// cleanup may still proceed.
+    NotApplicable,
+}
 
 /// Lifecycle receipt for one accepted claim command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -424,7 +484,13 @@ impl ClaimCommit {
 /// state. An address that was never claimed (a seed configured by host name
 /// before any handshake) has no ownership record to move and no conflict.
 ///
-/// `#[non_exhaustive]` for the same reason as `ClaimRejection`'s own.
+/// `#[non_exhaustive]` (added review round against `c111380`,
+/// `registry.rs:4538`) for the same reason, and at the same time, as
+/// `ClaimRejection`'s own: this PR's `ReapInProgress` variant is a real,
+/// unavoidable break for an exhaustive external match on an enum that
+/// already existed on `main`; marking it `#[non_exhaustive]` now costs
+/// this round's consumers nothing further and closes off the category for
+/// future growth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MigrateOutcome {
@@ -448,19 +514,30 @@ pub enum MigrateOutcome {
     /// peer can never own it, regardless of what DNS returned.
     TargetIsLocal,
     /// The caller named an expected owner for `from` and that is no longer
-    /// the identity holding it. A caller re-keying its own identity-scoped
-    /// state must resolve the identity BEFORE issuing the command; naming
-    /// the expected owner makes the move conditional on that resolution
-    /// still holding, so a displaced caller re-keys nothing instead of
-    /// re-keying the wrong identity onto the destination.
+    /// the identity holding it.
+    ///
+    /// A caller that re-keys its own identity-scoped state alongside the move
+    /// must resolve the identity to re-key BEFORE issuing the command, and
+    /// that resolution is not part of the command. Between the two, another
+    /// claimant can displace the source's owner. Naming the expected owner
+    /// makes the move conditional on the caller's resolution still holding,
+    /// so a displaced caller re-keys nothing instead of re-keying the wrong
+    /// identity onto the destination.
     SourceOwnerMismatch,
-    /// Another caller currently holds a reap reservation for `from`, `to`,
-    /// or both. Refused before any ownership state is inspected: `migrate`
-    /// mutates `addr_ownership`/`claim_committed_at` directly, without
-    /// going through `claim`'s own `reap_reserved` check, so it's checked
-    /// here instead -- a sweep relies on `reap_reserved` keeping both
-    /// addresses fixed for its destructive work's duration. Worth
-    /// retrying, like `ClaimRejection::ReapInProgress`.
+    /// A `cleanup_dead_peers` sweep currently holds a reap reservation for
+    /// `from`, `to`, or both -- see `reap_reserved`'s doc comment and
+    /// `OwnerCommand::ReserveForReap`. Refused unconditionally, before any
+    /// ownership state is even inspected: `migrate` mutates
+    /// `addr_ownership`/`claim_committed_at` for both addresses exactly as
+    /// `claim`/`claim_connection_scoped` do, and is the one owner command
+    /// that used to reach those tables without going through `claim`'s own
+    /// `reap_reserved` check. Refusing it here closes that gap: nothing may
+    /// move fresh (or existing) ownership onto a reserved destination, and
+    /// nothing may move ownership away from a reserved source, while a sweep
+    /// is relying on `reap_reserved` to keep both fixed for the duration of
+    /// its non-owner destructive work. The caller is expected to retry, same
+    /// as any other refused migration -- the reservation is released
+    /// promptly once the sweep finishes with that address.
     ReapInProgress,
 }
 
@@ -514,30 +591,69 @@ pub trait RoutingPublisher: Send + Sync + 'static {
     ///
     /// Called synchronously from `PeerRegistryOwner::pin`, in the SAME
     /// serialized command as the operator-pin decision, so the two can
-    /// never be observed disagreeing: a caller that instead reads the pin
-    /// and performs an equivalent mutation itself is never truly atomic
-    /// with the owner's own commands, since `ConnectionPool`'s maps aren't
-    /// protected by one lock spanning a whole owner command -- two
-    /// concurrent `configure_peer` calls for the same peer could then have
-    /// their pin decided in one order by the owner but this write land in
-    /// the other order on `ConnectionPool`. This is the ONLY place the
-    /// reindex may happen; three prior attempts fencing on other
-    /// externally-observed state (ownership generation, `required_addr`,
-    /// a separately-read `pinned_addr` mirror) all left the same class of
-    /// gap open.
+    /// never be observed disagreeing: without this, `configure_peer` would
+    /// have to make this `ConnectionPool` write itself, afterward and
+    /// outside the owner, and two concurrent `configure_peer` calls for the
+    /// same peer could then have their pin decided in one order by the
+    /// owner but this write land in the other order on `ConnectionPool` --
+    /// two independently-atomic operations that are not atomic WITH each
+    /// other. Bringing the write inside the same command the pin is
+    /// decided in removes the second ordering domain entirely.
+    ///
+    /// The reindex is folded in here for the exact same reason, and this is
+    /// the ONLY place it may happen: a caller that instead reads the pin
+    /// (however it is published) and THEN calls a reindex-equivalent
+    /// mutation itself is never truly atomic with the owner's own commands,
+    /// no matter how tightly the read and the mutation are held together on
+    /// the caller's side -- the owner runs as its own independently
+    /// scheduled task, and `ConnectionPool`'s underlying maps are not
+    /// protected by one lock spanning a whole owner command, so a caller's
+    /// unsynchronized read/mutate pair can still straddle the exact instant
+    /// a DIFFERENT owner command changes the pin, publishing a losing alias
+    /// that no later check can retract. Three prior attempts in this same
+    /// spot -- fencing on the ownership generation, on `ConnectionPool`'s
+    /// derived `required_addr`, and finally on a dedicated but still
+    /// separately-read `pinned_addr` mirror compared just before the
+    /// mutation -- were all instances of *observing* the pin from outside
+    /// the owner rather than performing the mutation *inside* it, and each
+    /// left the same class of gap open to some degree. Doing the write
+    /// here, synchronously, as part of the command that decides the pin, is
+    /// the only way for the comparison and the mutation to share the
+    /// owner's own serialization instead of a lock or snapshot copied from
+    /// it.
     ///
     /// `evicted_addr`, `Some` whenever this SAME command's pin decision
-    /// evicted a different address from `peer_id`'s pin, matters because
-    /// leaving `connections_by_addr[evicted_addr]` un-retracted is
-    /// misdelivery, not just lost state: once a different identity claims
-    /// `evicted_addr`, `ConnectionPool::get_connection_by_peer_id`'s
-    /// address-fallback reads the stale alias, finds it `is_usable_
-    /// connection` (a liveness check only, not an identity check), and
-    /// publishes the OLD peer's live connection as the NEW peer's current
-    /// one -- traffic addressed to the new identity delivered over the old
-    /// identity's TCP stream. See `ConnectionPool::evict_pin_alias`'s own
-    /// doc comment, which reintroduced exactly this for an outbound
-    /// connection.
+    /// evicted a DIFFERENT address from `peer_id`'s pin (see `install_pin`/
+    /// `migrate`, the two callers), is what P1 review (round against
+    /// `ba2bff2`, `registry_owner.rs:615`) found missing: `connections_by_
+    /// addr` aliases used to be "never un-published just because a pin
+    /// moved" (this doc comment's own prior wording) -- but that is not a
+    /// property to preserve, it is the bug. `reindex_connection_addr`
+    /// installs `addr` as a NEW alias for `peer_id`'s connection in this
+    /// same call; without also being told which address to evict, nothing
+    /// ever removes the address this peer's pin just moved AWAY from,
+    /// leaving `connections_by_addr[evicted_addr]` pointing at this peer's
+    /// connection indefinitely. Once a DIFFERENT identity legitimately
+    /// claims `evicted_addr`, `ConnectionPool::get_connection_by_peer_id`'s
+    /// own address-fallback (checked whenever the new identity's own
+    /// peer-indexed session has no connection yet -- the common case for a
+    /// just-claimed, not-yet-directly-connected address) reads that stale
+    /// alias, finds it `is_usable_connection` (a liveness check only, not
+    /// an identity check), and publishes the OLD peer's live connection as
+    /// the NEW peer's current connection -- traffic addressed to the new
+    /// identity is delivered over the old identity's actual TCP stream.
+    /// Not lost state: misdelivery.
+    ///
+    /// P1 review, second pass (round against `aea7772`): the first
+    /// implementation of the eviction this triggers
+    /// (`ConnectionPool::evict_pin_alias`) reintroduced the exact
+    /// misdelivery above for the common case of an OUTBOUND connection
+    /// (`connection.addr == evicted_addr`, since an outbound connection's
+    /// own address IS its dial target, normally the same as its pin). See
+    /// that function's own doc comment for the corrected invariant: an
+    /// address-keyed lookup must never resolve `peer_id`'s connection once
+    /// `evicted_addr` has changed hands, independent of whether that
+    /// address also happens to be the connection's own.
     fn set_configured_peer_addr(
         &self,
         addr: SocketAddr,
@@ -580,16 +696,19 @@ pub struct ConfigurePeerCommit {
     /// The address (if any, and if different from the newly pinned one)
     /// this peer was pinned at immediately beforehand.
     evicted_pin: Option<SocketAddr>,
-    /// If the eviction above also released that address's ownership, the
-    /// position of that release in the owner's commit order. Released in
-    /// this SAME synchronous step as the eviction, never as a separate,
-    /// later command a concurrent claim or migrate could land in front of.
+    /// If the eviction above also released that address's ownership --
+    /// because this SAME peer still genuinely owned it -- the position of
+    /// that release in the owner's commit order. Released in this SAME
+    /// synchronous step as the eviction, never as a separate, later command
+    /// a concurrent claim or migrate could land in front of.
     evicted_release_seq: Option<CommitSeq>,
     /// This peer's CURRENT `configure_peer_generation` value as of this
-    /// SAME atomic transaction -- see that field's own doc comment. A
-    /// first call must capture and later present this back as
-    /// `expected_generation` for a retry. Present regardless of `claim`'s
-    /// outcome, including `SupersededByNewerConfiguration` itself.
+    /// SAME atomic transaction -- see that field's own doc comment. The
+    /// value a first call must capture and later present back as `expected_
+    /// generation` for a retry to be validated against, atomically, at the
+    /// owner. Present regardless of `claim`'s own outcome (including
+    /// `SupersededByNewerConfiguration` itself, whose caller needs to know
+    /// it lost, not just that it did).
     generation: u64,
 }
 
@@ -657,48 +776,170 @@ enum OwnerCommand {
         addr: SocketAddr,
         claim: Claim,
         session_source: SocketAddr,
-        /// Monotonic instant when the authenticated transport supplied this
-        /// evidence. Capture it before mailbox queueing so delayed owner
-        /// processing cannot make old evidence appear fresh.
+        /// Stable identity of the physical transport instance. The socket
+        /// tuple is useful for diagnostics, but it can be reused by a later
+        /// connection, so it is never the receipt key on its own.
+        connection_instance_id: u64,
+        /// Monotonic instant at which the authenticated connection supplied
+        /// this evidence, captured before the command entered the owner
+        /// mailbox. Sampling in the owner handler would make queued older
+        /// evidence look newer than a failure recorded while it waited.
         evidence_at: std::time::Instant,
         reply: oneshot::Sender<ClaimCommit>,
     },
     /// Atomically take every connection-scoped receipt `peer_id` holds for
-    /// `session_source`, AND release ownership of every address no OTHER
-    /// live session still covers -- in this SAME command, not as
-    /// candidates for a separately-ordered `Release` call (see
-    /// `PeerRegistryOwner::release_session`'s doc comment for why
-    /// splitting it that way strands addresses permanently).
+    /// `session_source`, AND release the ownership of every address no
+    /// OTHER live session still covers -- in this SAME command, not as a
+    /// set of candidates for a separately-ordered `Release` command to act
+    /// on afterward (see `PeerRegistryOwner::release_session`'s doc comment
+    /// for why splitting it that way stranded addresses permanently).
+    /// Deciding "covered by another session" in this same step, against the
+    /// map as it exists after this session's own entries are removed, is
+    /// what makes a session exit racing a fresh claim for the same
+    /// peer+address resolve consistently rather than stranding a receipt
+    /// for the exiting session.
     ReleaseSession {
         peer_id: PeerId,
         session_source: SocketAddr,
+        /// The exact physical transport instance being torn down.
+        connection_instance_id: u64,
         reply: oneshot::Sender<Vec<(SocketAddr, CommitSeq)>>,
     },
-    /// Release everything a peer that has been dead longer than the
-    /// dead-peer timeout still holds at `addr`: every connection-scoped
-    /// receipt recorded for `peer_id` at `addr` under any session, and the
-    /// address ownership itself when it is not operator-pinned.
+    /// Release everything a peer whose `GossipState` failure evidence looks
+    /// dead still holds at `addr`: every connection-scoped receipt recorded
+    /// for `peer_id` at `addr` under any session (a missed or
+    /// still-in-flight teardown must not leave a ghost behind for a peer
+    /// that is never coming back), and the address ownership itself if
+    /// `peer_id` still holds it and `addr` is not operator-pinned.
+    ///
+    /// Refused entirely (no receipts touched, no ownership cleared) if
+    /// `addr` has DIRECT evidence of a live owner -- the owner's OWN
+    /// `claim_committed_at` record, not any liveness snapshot the caller
+    /// took -- that is causally NEWER than `evidence_before`: the instant,
+    /// on this same process's monotonic clock, that the failure evidence
+    /// the caller's selection is acting on was itself recorded. This is a
+    /// causal fence, not a temporal one -- "did direct evidence of life
+    /// happen after the evidence of death I'm acting on", not "has enough
+    /// time passed since the last commit". A purely elapsed-time check
+    /// (whether measured against the commit, or against a generation
+    /// snapshot's own submission) is a LEASE: it can be made to expire
+    /// simply by the command sitting queued long enough -- behind lock
+    /// contention, earlier peers in the same sweep, or actor-table cleanup
+    /// work -- even though a reconnect landed, and was itself proven live,
+    /// before that queueing delay ever started. A claim causally after the
+    /// failure it is being reaped for invalidates the reap permanently,
+    /// regardless of how much wall-clock time elapses before this command
+    /// actually runs; a claim causally before it (or no direct evidence at
+    /// all) never protects the address, no matter how recently the caller's
+    /// selection happened to run.
     ReleaseDeadPeer {
         peer_id: PeerId,
         addr: SocketAddr,
+        /// The Instant-equivalent of when the `GossipState` failure
+        /// evidence this reap is acting on was recorded, computed by the
+        /// caller from `PeerInfo::last_failure_time`'s wall-clock age as of
+        /// selection time. Fixed at submission time and never re-derived
+        /// from "now" inside the owner, so this fence cannot be satisfied
+        /// merely by elapsed wall-clock delay before the command runs.
         evidence_before: std::time::Instant,
         reply: oneshot::Sender<DeadPeerReleaseOutcome>,
     },
-    /// Read `ReleaseDeadPeer`'s causal liveness fence without performing
-    /// any side effects. Cleanup uses this before destroying actors or
-    /// emitting tombstones so a reconnect that raced selection protects the
-    /// entire candidate, not merely its address ownership.
+    /// P1 finding (review round against `7c05e40`, `registry.rs:8824`): a
+    /// PURE READ, answering exactly the same causal-fence question
+    /// `ReleaseDeadPeer` checks FIRST -- does `addr` have direct evidence
+    /// of life (`claim_committed_at`) or ordinary liveness
+    /// (`liveness_evidence_at`) causally NEWER than `evidence_before` --
+    /// but with NONE of that command's side effects: no
+    /// `connection_scoped_claims` purge, no ownership retraction. Brought
+    /// back (this shape previously existed, then got fused into
+    /// `ReleaseDeadPeer` itself) specifically so `reap_reserved_candidates`
+    /// can obtain the "is this candidate still worth destroying at all"
+    /// verdict WITHOUT that verdict itself performing the FIRST
+    /// destructive step (ownership retraction used to happen inside the
+    /// same call that decided whether to destroy, ahead of every
+    /// `ReapReservation::is_still_valid()` check the destructive phase
+    /// runs) -- see `reap_reserved_candidates`'s own doc comment for the
+    /// full ordering this enables. `ReleaseDeadPeer` remains the sole
+    /// place ownership is EVER actually retracted, called LAST, after
+    /// every other destructive step, behind its own final validity check;
+    /// this command exists only to gate ENTRY into that whole sequence
+    /// cheaply, before any of it runs.
     HasNewerLivenessEvidence {
         addr: SocketAddr,
+        /// Same fence as `ReleaseDeadPeer::evidence_before`.
         evidence_before: std::time::Instant,
         reply: oneshot::Sender<bool>,
     },
-    /// Best-effort read of activity since a reserved reap's baseline.
-    /// Liveness evidence and operator reconfiguration are independent ways
-    /// for the selection to become stale, so the caller checks both in one
-    /// owner-serialized read immediately before destructive work. This is a
-    /// mitigation, not an authorization: activity can still commit after
-    /// this read returns and before the caller mutates shared state.
+    /// NOT an authorization or a fence -- a best-effort MITIGATION. Read
+    /// this variant's name literally: it detects whether activity
+    /// (liveness evidence, or an operator's own `configure_peer` call) has
+    /// committed for this peer since a baseline the caller captured
+    /// earlier. It narrows the window in which a stale reap can destroy
+    /// actors for a peer that just proved itself alive or was just
+    /// reconfigured; it does NOT close that window, because this is a
+    /// plain read taken as close as practical to the caller's own
+    /// mutation, not a step inside the same serialized commit as that
+    /// mutation. See `reap_reserved_candidates`'s own doc comment (Gap A)
+    /// for why closing it for real requires moving the mutation itself
+    /// into this owner's serialized command stream -- structural work,
+    /// tracked separately, not something another read here can achieve.
+    ///
+    /// P1 finding (review round against `ded8495`, `registry.rs:9508`):
+    /// `HasNewerLivenessEvidence` alone answers "has this peer proven
+    /// itself alive", but `reap_reserved_candidates`'s fresh pre-
+    /// destruction re-check (added the previous round to close a
+    /// `DeadPeerReleaseOutcome::ProvenAlive` contract violation) also needs
+    /// to catch an OPERATOR reconfiguring this SAME peer (to `addr` or to
+    /// anywhere else), entirely independent of liveness -- `configure_peer`
+    /// atomically releases a PIN's evicted address's ownership as part of
+    /// installing a new one, with no liveness evidence involved at all
+    /// (the peer may still genuinely be dead; the operator is simply
+    /// repointing it). `try_consume`'s own reservation flag cannot
+    /// observe this either, once already consumed (round 5's own,
+    /// deliberate, unchanged design) -- so this, like
+    /// `HasNewerLivenessEvidence`, is a SEPARATE, additional, pure read
+    /// the caller must take fresh, immediately before the irreversible
+    /// step it guards, not a substitute for anything already in place, and
+    /// not a way to make that step atomic either.
+    ///
+    /// P1 finding, second pass (review round against `ded8495` itself,
+    /// this exact command): the FIRST version of this check answered "is
+    /// `addr` currently owned by `peer_id`" -- which produced false
+    /// positives for the overwhelmingly common case of a candidate that
+    /// was NEVER owner-claimed in the first place (a `GossipState`-only
+    /// entry `node_id` merely resolves; ordinary `cleanup_dead_peers`
+    /// selection does not require an owner-level claim to exist at all).
+    /// `addr_ownership.get(&addr)` reads `None` for such a candidate
+    /// regardless of whether anything actually changed, so this used to
+    /// treat "never owned to begin with" identically to "was owned, now
+    /// isn't" -- aborting perfectly ordinary reaps.
+    ///
+    /// Fixed by checking `configure_peer_generation` instead of ownership
+    /// directly: `baseline_configure_peer_generation`, captured by the
+    /// caller BEFORE `try_consume` runs (see `reap_reserved_candidates`'s
+    /// own doc comment for the P1 finding on that exact ordering -- an
+    /// earlier version of this doc comment said "immediately after
+    /// `try_consume` succeeds", which was already stale by the time it was
+    /// written), is `peer_id`'s `configure_peer_generation` value AT THAT
+    /// INSTANT (see `RegistryOwnerHandle::configure_peer_generation_of`).
+    /// If it has since advanced, SOME `configure_peer` call for this SAME
+    /// peer_id committed in the window this check exists to shrink --
+    /// regardless of whether the candidate was ever pinned, ever owned at
+    /// `addr`, or owned anywhere at all before. This is precise where the
+    /// ownership check was not: it answers "did an operator reconfigure
+    /// THIS peer during this exact window", not "does `addr` currently
+    /// look unowned", which can be true for entirely unrelated, benign
+    /// reasons.
+    ///
+    /// PURE READ, no mutation: answers "has liveness evidence newer than
+    /// `evidence_before` committed for `addr`, OR has `peer_id`'s
+    /// `configure_peer_generation` advanced past `baseline_configure_
+    /// peer_generation`" -- either one independently means activity has
+    /// been detected since this reap's baseline was captured, and the
+    /// caller should abandon this candidate. A `false` reply means no
+    /// activity was detected AS OF THIS READ -- it is not, and cannot be,
+    /// a guarantee that none commits in the remaining gap between this
+    /// reply and the caller's own subsequent mutation.
     ReapBaselineActivityDetected {
         addr: SocketAddr,
         peer_id: PeerId,
@@ -706,70 +947,138 @@ enum OwnerCommand {
         baseline_configure_peer_generation: u64,
         reply: oneshot::Sender<bool>,
     },
-    /// Read the current operator-configuration generation for `peer_id` so
-    /// a reap can capture a baseline before consuming its reservation.
+    /// PURE READ, no mutation: `peer_id`'s CURRENT `configure_peer_
+    /// generation` value (`0` if this peer has never had a `configure_peer`
+    /// call at all). Exists so `reap_reserved_candidates` can capture a
+    /// baseline BEFORE `try_consume` runs (see that function's own doc
+    /// comment for why that ordering, not "immediately after", is what
+    /// this must be captured against), to later present back as
+    /// `ReapBaselineActivityDetected`'s own `baseline_configure_peer_
+    /// generation` -- see that variant's own doc comment.
     ConfigurePeerGenerationOf {
         peer_id: PeerId,
         reply: oneshot::Sender<u64>,
     },
-    /// Atomically checks the causal fence a dead-peer reap also checks
-    /// (does `addr` have DIRECT evidence of a live owner causally NEWER
-    /// than `evidence_before`?) AND revalidates the full identity selection
-    /// observed for `addr` -- ownership and operator pin state -- against
-    /// the owner's current state; only if every check passes is `addr`
-    /// marked reserved (see `reap_reserved`'s doc comment). Returns whether
-    /// the reservation was granted.
+    /// Atomically check the causal fence `ReleaseDeadPeer` also checks
+    /// (does `addr` have DIRECT evidence of a live owner -- a
+    /// connection-scoped claim -- causally NEWER than `evidence_before`,
+    /// the failure this candidate was selected on?) AND revalidate the
+    /// FULL identity the caller's selection observed for `addr` --
+    /// ownership (peer id + generation) and operator pin state -- against
+    /// the owner's OWN current state, and, only if EVERY check passes,
+    /// mark `addr` as reserved for reaping -- see `reap_reserved`'s doc
+    /// comment. Returns whether the reservation was granted.
     ///
-    /// A reservation, not a plain check-then-act read: a query that only
-    /// answers "is it safe right now" is stale the instant a concurrent
-    /// claim commits before the caller acts on it. A reservation instead
-    /// gives the caller a fact the owner itself continues to enforce (via
-    /// `claim`'s own refusal) for as long as it is held.
+    /// This supersedes a plain "check, then let the caller act later"
+    /// query: a read that only ANSWERS "is it safe right now" and lets
+    /// the caller act afterward is stale the instant a concurrent claim
+    /// commits in the gap between the read and whatever the caller does
+    /// next -- the same class of race this PR keeps finding in every
+    /// shape of "observe a fact, then act on it later" it has tried. A
+    /// RESERVATION instead gives the caller a fact the owner itself
+    /// continues to enforce (via `claim`'s own check) for as long as the
+    /// caller holds it, so the caller's later, non-owner destructive work
+    /// (actor removal, tombstone emission/gossip, capability/clock state
+    /// clearing) can safely run OUTSIDE the owner's critical path without
+    /// re-racing a concurrent reconnect. `ReleaseDeadPeer`'s own check at
+    /// the end of a sweep is necessary but not sufficient on its own: it
+    /// protects ONLY the address-ownership mutation it performs, by which
+    /// point a stale candidate's actors, capabilities, clock state, and
+    /// their gossiped removal would already be irrecoverable -- unlike a
+    /// purely local ownership refusal.
     ///
-    /// Both checks are required, for different windows: the causal fence
-    /// covers failure-to-selection (a claim can commit before `GossipState`
-    /// reflects it). The identity-match check covers selection-to-this-
-    /// command against a DIFFERENT identity claiming `addr` -- a claim
-    /// that doesn't refresh `claim_committed_at` (gossip/discovery, or
-    /// `configure_peer`) would slip past the causal fence alone.
-    /// `expected_node_id` closes a further gap: a claim landing while
-    /// selection's `GossipState` read and its separate ownership/pin reads
-    /// straddled a change could otherwise pair the OLD peer's `node_id`
-    /// with the NEW owner's token.
+    /// The causal fence and the identity-match check are BOTH required --
+    /// neither subsumes the other, because they protect two DIFFERENT
+    /// windows against two DIFFERENT kinds of evidence:
+    /// - The causal fence protects the (possibly long) window between the
+    ///   FAILURE this candidate was selected on and this command actually
+    ///   running, against DIRECT evidence of life: a connection-scoped
+    ///   claim can commit well before selection ever runs, while
+    ///   `GossipState` still shows the old "failed" verdict (its own
+    ///   liveness update only happens AFTER the owner has already
+    ///   committed the claim) -- selection would then capture that
+    ///   ALREADY-reconnected state as the new "expected" baseline, and an
+    ///   identity-match check alone would see nothing has moved SINCE
+    ///   selection and wrongly grant the reservation anyway.
+    /// - The identity-match check protects the (much narrower) window
+    ///   between SELECTION itself and this command running, against ANY
+    ///   claim for a DIFFERENT identity: a plain gossip/discovery claim or
+    ///   an operator `configure_peer` claiming `addr` for someone else
+    ///   deliberately does NOT refresh `claim_committed_at` (see `claim`'s
+    ///   own doc comment), so the causal fence alone would not notice a
+    ///   new owner has taken the address in that window, and the
+    ///   reservation would authorize destructive work against the NEW
+    ///   owner's actors, capabilities, and clock state instead of the
+    ///   dead peer's.
+    ///
+    /// If EITHER check fails, the reservation is refused and the sweep
+    /// simply skips this candidate, reconsidering it against fresh state
+    /// next cycle.
+    ///
+    /// P1 finding (review round against `a147603`, `registry.rs:8653`):
+    /// `expected_ownership`/`expected_pin` prove "this address's owner-side
+    /// identity has not moved since selection" -- but the destructive
+    /// phase does not act on an `OwnershipToken`, it acts on a `PeerId`
+    /// (`node_id`, threaded through separately, sourced from `GossipState`'s
+    /// OWN, independently-updated `PeerInfo::node_id` rather than from
+    /// either of the values validated here). Nothing tied that `PeerId` to
+    /// the identity `expected_ownership`/`expected_pin` describe: if a
+    /// NEW claim for `addr` committed while selection's `GossipState` read
+    /// of `node_id` and its SEPARATE, lock-free reads of
+    /// `ownership_token`/`pin_owner` straddled the change, selection could
+    /// capture the OLD failed peer's `node_id` alongside the NEW owner's
+    /// (now current, validated-below) token -- and this command would
+    /// grant the reservation, since nothing here ever looked at `node_id`
+    /// at all.
+    ///
+    /// `expected_node_id` closes that: checked here, atomically, in the
+    /// SAME step that just reconfirmed `expected_ownership`/`expected_pin`
+    /// are current -- not as a separate, earlier read, which is the shape
+    /// that keeps failing here. See `PeerRegistryOwner::reserve_for_reap`'s
+    /// handler for the exact comparison.
     ReserveForReap {
         addr: SocketAddr,
-        /// When the `GossipState` failure evidence this candidate was
-        /// selected on was recorded. Fixed at submission time, never
-        /// re-derived from "now" inside the owner, so this fence cannot be
-        /// satisfied merely by elapsed wall-clock delay.
+        /// The Instant-equivalent of when the `GossipState` failure
+        /// evidence this candidate was selected on was recorded -- see
+        /// `ReleaseDeadPeer::evidence_before`'s doc comment, which this
+        /// mirrors exactly.
         evidence_before: std::time::Instant,
-        /// Ownership selection observed for `addr`. `None` means unowned
-        /// at selection, and must still be unowned now.
+        /// Ownership (peer id + generation) the caller's selection
+        /// observed for `addr`, lock-free, via `RegistryOwnerHandle::
+        /// ownership_token`. `None` means `addr` was unowned at
+        /// selection -- and must still be unowned now for the
+        /// reservation to be granted.
         expected_ownership: Option<OwnershipToken>,
-        /// The operator pin owner selection observed for `addr`. `None`
-        /// means unpinned at selection, and must still be unpinned now.
+        /// The operator pin owner the caller's selection observed for
+        /// `addr`, lock-free, via `RegistryOwnerHandle::pin_owner`.
+        /// `None` means `addr` was unpinned at selection -- and must
+        /// still be unpinned now.
         expected_pin: Option<PeerId>,
-        /// The `PeerId` the destructive phase will act against, validated
-        /// against `expected_ownership`/`expected_pin` when they name a
-        /// concrete identity. Unconstrained when both are `None`:
-        /// `GossipState` routinely knows a `node_id` with no owner-level
-        /// claim behind it (gossip/discovery chatter, or an independently
-        /// released address) -- legitimate, not evidence of a race.
+        /// The `PeerId` the caller's destructive phase will act against --
+        /// sourced independently of `expected_ownership`/`expected_pin`
+        /// (typically `GossipState::PeerInfo::node_id`), and validated
+        /// here against them for exactly that reason: whenever
+        /// `expected_ownership`/`expected_pin` name a CONCRETE identity
+        /// (`Some`), this must name the SAME one, or the reservation would
+        /// authorize destructive work keyed to a `PeerId` no longer
+        /// connected to this address at all. When ownership and pin are
+        /// BOTH `None` (unowned, unpinned), this is unconstrained: `Gossip
+        /// State` routinely knows a `node_id` for an address with no
+        /// owner-level claim behind it at all (gossip/discovery chatter
+        /// about a peer never itself claimed, or an address whose
+        /// ownership was independently released while `GossipState`'s own
+        /// record lingers) -- legitimate, not evidence of a race, and
+        /// there is no ownership-level identity there to be wrong about.
         expected_node_id: Option<PeerId>,
-        /// `Some(valid)` when granted -- the SAME `Arc<AtomicBool>` the
-        /// owner's `reap_reserved` map stores for this address, so the
-        /// caller's `ReapReservation` guard and the owner's entry share
-        /// one flag. `None` when refused.
-        reply: oneshot::Sender<Option<Arc<AtomicBool>>>,
-    },
-    /// One-shot, owner-coordinated authorization for a granted
-    /// reservation's destructive work -- see `ReapReservation::
-    /// try_consume`'s own doc comment for why this must be an owner round
-    /// trip rather than a client-side CAS. `true` exactly once per
-    /// reservation; `false` for a missing or already-consumed entry.
-    ConsumeReapReservation {
-        addr: SocketAddr,
-        reply: oneshot::Sender<bool>,
+        /// `Some(valid)` when granted -- `valid` is the SAME `Arc<AtomicU8>`
+        /// the owner-internal `reap_reserved` map stores for this address,
+        /// so the caller's `ReapReservation` guard and the owner's own
+        /// entry share one flag. `None` when refused. See
+        /// `PeerRegistryOwner::reap_reserved`'s doc comment for why this
+        /// exists: a one-time grant/refuse answer is not enough once the
+        /// destructive phase needs to keep re-checking validity long after
+        /// this reply was sent.
+        reply: oneshot::Sender<Option<Arc<AtomicU8>>>,
     },
     /// Release a reservation `ReserveForReap` granted, whether the sweep
     /// used it to reap the address or is abandoning the candidate for
@@ -792,13 +1101,16 @@ enum OwnerCommand {
     },
     /// Atomically claim `addr` for `peer_id` with `ClaimKind::Verified` and,
     /// if accepted, install it as `peer_id`'s operator pin -- evicting
-    /// whatever address this SAME peer was pinned at beforehand and
-    /// releasing that evicted address's ownership if `peer_id` still holds
-    /// it, all in one `&mut self` step. This is the atomic transaction
-    /// `GossipRegistry::configure_peer` submits in place of
-    /// separately-ordered claim, pin, and release commands, closing the
-    /// interleaving window a concurrent call could otherwise exploit
-    /// between the claim taking effect and the pin landing -- see
+    /// whatever address this SAME peer was pinned at beforehand and, in
+    /// this SAME synchronous step, releasing that evicted address's
+    /// ownership if `peer_id` still holds it.
+    ///
+    /// This is the atomic transaction `GossipRegistry::configure_peer`
+    /// submits in place of separately-ordered claim, pin, and release
+    /// commands. Folding the three into one `&mut self` step closes the
+    /// interleaving window a concurrent `configure_peer`/claim/migrate
+    /// could otherwise exploit between the claim taking effect and the pin
+    /// (with its eviction and release) landing -- see
     /// `PeerRegistryOwner::configure_peer`.
     ConfigurePeer {
         addr: SocketAddr,
@@ -809,14 +1121,26 @@ enum OwnerCommand {
         reply: oneshot::Sender<ConfigurePeerCommit>,
     },
     /// `Peer::connect`'s ordinary (non-`configure_peer`) route update,
-    /// submitted as an owner command rather than writing `ConnectionPool`
-    /// directly: it writes the SAME fields `install_pin`/`migrate` do via
-    /// `set_configured_peer_addr`, so a caller-side "is this peer pinned
-    /// elsewhere" check done outside the owner's serialization could be
-    /// invalidated by a pin decision landing in the gap. `reply` carries
-    /// whether the write happened -- `false` means `peer_id` is pinned to
-    /// a DIFFERENT address and the write was declined; the caller MUST
-    /// consult this (an earlier version discarded it and shipped a bug).
+    /// submitted as an owner command instead of writing `ConnectionPool`
+    /// directly from the caller's own task.
+    ///
+    /// An ordinary connect writes the SAME `ConnectionPool` fields
+    /// `RoutingPublisher::set_configured_peer_addr` writes from inside
+    /// `install_pin`/`migrate` -- if it wrote them directly, a caller-side
+    /// "is this peer pinned elsewhere" read (however published, however
+    /// tightly held next to the write) could still be invalidated by a
+    /// pin decision the owner commits in the gap, since the two are not
+    /// on the same serialization. Submitting this as an owner command
+    /// instead means the pin check and the route write are the SAME
+    /// serialized step no other owner command can land inside of -- see
+    /// `PeerRegistryOwner::set_ordinary_connect_route`.
+    ///
+    /// `reply` carries whether the write actually happened: `false` means
+    /// `peer_id` is operator-pinned to a DIFFERENT address and the write
+    /// was declined. The caller MUST consult this -- see
+    /// `RegistryOwnerHandle::set_ordinary_connect_route`'s doc comment for
+    /// the bug that shipped when an earlier version of this command's
+    /// caller discarded it.
     SetOrdinaryConnectRoute {
         peer_id: PeerId,
         addr: SocketAddr,
@@ -827,28 +1151,34 @@ enum OwnerCommand {
         addr: SocketAddr,
         reply: oneshot::Sender<Option<CommitSeq>>,
     },
-    /// Test-only, side-effect-free read of `claim_committed_at` for `addr` --
-    /// direct evidence a connection-scoped claim ever recorded for it. No
-    /// production reader exists in this crate yet; this exists so
-    /// tests can verify `claim_connection_scoped`/`migrate`'s own
-    /// bookkeeping of this field directly, without depending on a consumer
-    /// that does not exist yet.
-    #[cfg(test)]
-    InspectClaimCommittedAt {
-        addr: SocketAddr,
-        reply: oneshot::Sender<Option<std::time::Instant>>,
-    },
     /// Pure, side-effect-free read of whether `addr` currently has a live
-    /// reap reservation held for it. This is test-only observability for
-    /// proving that a sweep reserves one candidate at a time.
+    /// reap reservation held for it -- for deterministically polling, in
+    /// tests, exactly when a background sweep's reservation for a
+    /// candidate has been granted, without submitting a real (and
+    /// therefore side-effecting) claim to probe it indirectly.
     #[cfg(test)]
     IsReapReserved {
         addr: SocketAddr,
         reply: oneshot::Sender<bool>,
     },
-    /// Record direct liveness evidence for `addr`, observed at `at`, through
-    /// the owner's serialized command stream. This keeps the evidence write
-    /// atomic with the dead-peer release decision that consumes it.
+    /// Record DIRECT liveness evidence for `addr`, observed at `at` -- see
+    /// `RegistryOwnerHandle::note_liveness_evidence`'s doc comment for the
+    /// exact standard (an inbound, application-level response actually
+    /// received from the peer; never indirect chatter). Routed through
+    /// this SAME serialized command stream, not a side channel a caller
+    /// writes directly: a lock-free structure the owner merely CONSULTS
+    /// has the same check-then-act gap as every other mirror this PR has
+    /// found and closed on this project -- `claim_generation`,
+    /// `get_required_peer_addr`, the pin token, `pinned_addr`,
+    /// `pinned_addr_for`. Routing the WRITE through the owner, not just
+    /// the read, is what makes `release_dead_peer`'s check atomic with
+    /// this update: whichever of the two commands the owner processes
+    /// first is fully committed before the other is even looked at,
+    /// because both run inside the same single-threaded `handle()`.
+    /// No reply: the caller does not need confirmation the owner
+    /// processed it, only that the send is durably enqueued before this
+    /// call returns (`mpsc::Sender::send` itself is the ordering
+    /// guarantee -- see this variant's caller).
     NoteLivenessEvidence {
         addr: SocketAddr,
         at: std::time::Instant,
@@ -859,13 +1189,36 @@ enum OwnerCommand {
 struct OwnerShared {
     tx: mpsc::Sender<OwnerCommand>,
     /// Dedicated, UNBOUNDED channel carrying `OwnerCommand::
-    /// ReleaseReapReservation` exclusively -- never the bounded `tx`
-    /// mailbox above. See `ReapReservation`'s doc comment for why a
-    /// release must never be droppable mid-abort. Deliberately not
-    /// unbounded for every command: an unbounded queue for ordinary
-    /// traffic would let flooding requests grow the backlog without
-    /// limit; releases are bounded instead by how many reservations are
-    /// concurrently held, not by caller behavior.
+    /// ReleaseReapReservation` exclusively -- never routed through the
+    /// bounded `tx` mailbox above. See `ReapReservation`'s doc comment for
+    /// the failure this exists to close: "failing to TAKE a reservation is
+    /// safe (the sweep just skips the candidate); failing to RELEASE one is
+    /// not (every later claim for that address is refused forever)." A
+    /// bounded send can suspend waiting for mailbox capacity, and a task
+    /// aborted while suspended there drops the release with it. An
+    /// unbounded sender's `send` is synchronous -- it enqueues or reports
+    /// the owner gone immediately, with no `.await` point in between for an
+    /// abort to land inside -- so by the time it returns, the release is
+    /// either irrevocably queued or there is no owner left to leak a
+    /// reservation against. This is deliberately NOT unbounded for every
+    /// command, only this one: an unbounded queue for ordinary claim/
+    /// mutation traffic would let a caller flooding requests grow the
+    /// owner's backlog without limit, which the bounded `tx` mailbox's
+    /// backpressure exists to prevent. Releases are different: they can
+    /// only ever be in flight once per outstanding reservation, so their
+    /// worst-case queue depth is already bounded by how many reservations
+    /// are concurrently held, not by caller behavior.
+    ///
+    /// `NoteLivenessEvidence` goes through the ORDINARY bounded `tx`
+    /// mailbox below, deliberately, even though it is genuinely
+    /// higher-frequency than the claim/ownership traffic that mailbox was
+    /// originally sized for: correctness requires it to be serialized
+    /// with `ReleaseDeadPeer` on the SAME queue (see
+    /// `OwnerCommand::NoteLivenessEvidence`'s own doc comment), and
+    /// backpressure on a per-response signal is a feature here, not a
+    /// bug -- it naturally sheds load rather than growing an unbounded
+    /// backlog the way this comment's own reasoning rejects for the
+    /// release channel.
     release_tx: mpsc::UnboundedSender<OwnerCommand>,
     snapshot: Arc<ArcSwap<RoutingSnapshot>>,
     /// Exactly-once start latch. The receiving half plus the publisher live
@@ -921,10 +1274,38 @@ impl RegistryOwnerHandle {
         }
     }
 
-    /// Record direct liveness evidence for an address through the same
-    /// serialized owner mailbox used by dead-peer release. This is reserved
-    /// for an application-level response received from the peer; indirect
-    /// gossip/discovery chatter must not refresh it.
+    /// Record DIRECT liveness evidence for `addr`, observed at `at`: an
+    /// inbound, application-level response actually received from the
+    /// peer occupying it -- see `mark_response_received`'s own doc
+    /// comment for the exact source.
+    ///
+    /// Submitted through the SAME serialized command stream
+    /// `release_dead_peer` reads from -- see `OwnerCommand::
+    /// NoteLivenessEvidence`'s own doc comment for why a lock-free side
+    /// table the owner merely consulted (an earlier version of this) is
+    /// not enough: `release_dead_peer`'s read of it was not atomic with
+    /// its own decision, so a response could land between the check and
+    /// the ownership removal it was meant to prevent. Routing the WRITE
+    /// through the owner closes that -- by the time `release_dead_peer`
+    /// runs, either this command already committed (and the release
+    /// correctly refuses) or it has not been submitted yet at all (and
+    /// there is genuinely nothing to protect against yet); there is no
+    /// third possibility where it is "in flight" relative to the check.
+    ///
+    /// This is deliberately narrow in the SAME way
+    /// `PeerRegistryOwner::claim_committed_at` is: only genuinely direct
+    /// evidence from the peer itself may advance it. A caller that bumps
+    /// this for indirect chatter about a peer (third-party relay,
+    /// repeated discovery claims, DNS refresh attempts) would let that
+    /// chatter keep a dead peer's address permanently unreapable, exactly
+    /// the failure mode `claim_committed_at`'s own doc comment already
+    /// rejects for claims.
+    ///
+    /// No reply is needed: `mpsc::Sender::send` returning is itself the
+    /// ordering guarantee (a bounded, single-consumer FIFO channel), and
+    /// the caller does not need to know whether the owner has processed
+    /// it yet, only that it is durably enqueued before this call
+    /// returns.
     pub async fn note_liveness_evidence(&self, addr: SocketAddr, at: std::time::Instant) {
         self.ensure_started();
         let _ = self
@@ -1032,17 +1413,27 @@ impl RegistryOwnerHandle {
         claim: Claim,
         session_source: SocketAddr,
     ) -> ClaimCommit {
-        self.claim_connection_scoped_at(addr, claim, session_source, std::time::Instant::now())
-            .await
+        self.claim_connection_scoped_at(
+            addr,
+            claim,
+            session_source,
+            legacy_connection_instance_id(session_source),
+            std::time::Instant::now(),
+        )
+        .await
     }
 
-    /// Submit a connection-scoped claim with the transport evidence instant
-    /// captured before the owner mailbox can delay processing it.
+    /// Submit a connection-scoped claim with the monotonic instant at which
+    /// the authenticated connection supplied its liveness evidence.
+    /// Production callers capture this before waiting on the owner mailbox;
+    /// tests and internal callers that do not have a more precise source may
+    /// use [`Self::claim_connection_scoped`].
     pub(crate) async fn claim_connection_scoped_at(
         &self,
         addr: SocketAddr,
         claim: Claim,
         session_source: SocketAddr,
+        connection_instance_id: u64,
         evidence_at: std::time::Instant,
     ) -> ClaimCommit {
         self.ensure_started();
@@ -1051,6 +1442,7 @@ impl RegistryOwnerHandle {
             addr,
             claim,
             session_source,
+            connection_instance_id,
             evidence_at,
             reply,
         };
@@ -1067,20 +1459,43 @@ impl RegistryOwnerHandle {
         }
     }
 
-    /// See `OwnerCommand::ReleaseSession`'s doc comment. Returns the
-    /// addresses actually released, paired with the resulting commit
-    /// sequence -- callers tombstone their own `gossip_state` projection
-    /// at that sequence. An unreachable owner reports nothing released.
+    /// Atomically release every connection-scoped receipt `peer_id` holds
+    /// for `session_source` AND retract the ownership of every address no
+    /// other live session still covers, in the SAME owner command -- see
+    /// `OwnerCommand::ReleaseSession` and `PeerRegistryOwner::release_session`
+    /// for why this must not be split into "find candidates" plus a
+    /// separately-ordered `release` call. Returns the addresses actually
+    /// released, paired with the resulting commit sequence -- callers
+    /// tombstone their own `gossip_state` projection at that sequence, the
+    /// same as `release_dead_peer`'s callers do. An unreachable owner
+    /// reports nothing released: fail closed, the same as every other
+    /// command here.
     pub async fn release_session(
         &self,
         peer_id: PeerId,
         session_source: SocketAddr,
+    ) -> Vec<(SocketAddr, CommitSeq)> {
+        self.release_session_for_instance(
+            peer_id,
+            session_source,
+            legacy_connection_instance_id(session_source),
+        )
+        .await
+    }
+
+    /// Release receipts for one exact physical transport instance.
+    pub(crate) async fn release_session_for_instance(
+        &self,
+        peer_id: PeerId,
+        session_source: SocketAddr,
+        connection_instance_id: u64,
     ) -> Vec<(SocketAddr, CommitSeq)> {
         self.ensure_started();
         let (reply, response) = oneshot::channel();
         let command = OwnerCommand::ReleaseSession {
             peer_id,
             session_source,
+            connection_instance_id,
             reply,
         };
         if self.shared.tx.send(command).await.is_err() {
@@ -1089,10 +1504,13 @@ impl RegistryOwnerHandle {
         response.await.unwrap_or_default()
     }
 
-    /// Release all ownership and connection-scoped receipts that remain for
-    /// `peer_id` at `addr` after a dead-peer sweep. The outcome distinguishes
-    /// a live peer from an address that simply has nothing applicable to
-    /// release, so callers can gate unrelated side-table destruction safely.
+    /// Release everything `peer_id` still holds at `addr` -- every
+    /// connection-scoped receipt recorded for it under any session, and the
+    /// address ownership itself if `peer_id` still holds it and `addr` is not
+    /// operator-pinned -- but ONLY if `addr` has no direct OR ordinary
+    /// liveness evidence causally newer than `evidence_before`; otherwise a
+    /// no-op. See `OwnerCommand::ReleaseDeadPeer` and
+    /// `DeadPeerReleaseOutcome`.
     pub async fn release_dead_peer(
         &self,
         peer_id: PeerId,
@@ -1108,6 +1526,8 @@ impl RegistryOwnerHandle {
             reply,
         };
         if self.shared.tx.send(command).await.is_err() {
+            // Fail-closed: see `DeadPeerReleaseOutcome::ProvenAlive`'s own
+            // doc comment.
             return DeadPeerReleaseOutcome::ProvenAlive;
         }
         response
@@ -1115,10 +1535,19 @@ impl RegistryOwnerHandle {
             .unwrap_or(DeadPeerReleaseOutcome::ProvenAlive)
     }
 
-    /// Read `release_dead_peer`'s causal liveness fence without applying its
-    /// ownership side effects. Fail closed when the owner is unavailable:
-    /// cleanup must preserve a candidate it cannot prove safe to destroy.
-    pub async fn has_newer_liveness_evidence_since(
+    /// A PURE READ of the same causal fence `release_dead_peer` checks
+    /// first -- `true` means `addr` has direct or ordinary liveness
+    /// evidence causally newer than `evidence_before` (this candidate is
+    /// proven alive). Unlike `release_dead_peer`, this performs no
+    /// mutation whatsoever: no receipt purge, no ownership change. See
+    /// `OwnerCommand::HasNewerLivenessEvidence`'s own doc comment for why
+    /// this exists separately.
+    ///
+    /// Fail-CLOSED like every other command here: an unreachable owner
+    /// reports `true` (behave as if proven alive -- "cannot prove it is
+    /// safe [to destroy], so don't"), the same direction `release_dead_peer`
+    /// itself takes when it cannot be reached.
+    pub async fn has_newer_liveness_evidence(
         &self,
         addr: SocketAddr,
         evidence_before: std::time::Instant,
@@ -1136,23 +1565,45 @@ impl RegistryOwnerHandle {
         response.await.unwrap_or(true)
     }
 
-    /// Compatibility spelling for callers that ask the same owner-side
-    /// causal fence without the historical `_since` suffix.
-    pub async fn has_newer_liveness_evidence(
-        &self,
-        addr: SocketAddr,
-        evidence_before: std::time::Instant,
-    ) -> bool {
-        self.has_newer_liveness_evidence_since(addr, evidence_before)
-            .await
-    }
-
-    /// Read whether activity has been observed since a reserved reap's
-    /// baseline. The result is true when either newer direct liveness
-    /// evidence exists or the same peer was operator-reconfigured after the
-    /// captured baseline. This narrows the post-consume window; it is not an
-    /// atomic authorization for the caller's later mutation. An unavailable
-    /// owner fails closed.
+    /// A PURE READ combining `has_newer_liveness_evidence` with an
+    /// independent, fresh check that `peer_id`'s `configure_peer_
+    /// generation` has not advanced past `baseline_configure_peer_
+    /// generation` -- `true` means activity (liveness evidence, or an
+    /// operator's own `configure_peer` call) has been detected for this
+    /// exact (addr, peer_id) pair since the caller's baseline was
+    /// captured, for EITHER reason.
+    ///
+    /// NOT an authorization check and NOT a fence -- a best-effort
+    /// MITIGATION, same as `OwnerCommand::ReapBaselineActivityDetected`'s
+    /// own doc comment says. It is a plain read taken as close as
+    /// practical to the caller's own subsequent mutation, not a step
+    /// inside the same serialized commit as that mutation, so it narrows
+    /// the destructive window without closing it: activity that commits
+    /// after this call returns but before the caller's mutation runs is
+    /// invisible to it. See `GossipRegistry::reap_reserved_candidates`'s
+    /// own doc comment (Gap A) for why closing this for real requires
+    /// moving the mutation itself into this owner's serialized command
+    /// stream, and why that is tracked as separate structural work rather
+    /// than attempted here.
+    ///
+    /// See `OwnerCommand::ReapBaselineActivityDetected`'s own doc comment
+    /// (and its second-pass history) for the P1 finding this mitigates:
+    /// liveness evidence alone does not catch an operator's own
+    /// `configure_peer` reconfiguring this peer, since that can commit
+    /// with no liveness evidence involved at all -- and a raw ownership
+    /// check produced false positives for the common case of a candidate
+    /// never owner-claimed in the first place, which the generation
+    /// counter does not.
+    ///
+    /// `baseline_configure_peer_generation`: capture via [`Self::
+    /// configure_peer_generation_of`] BEFORE `try_consume` runs, not after
+    /// -- see `GossipRegistry::reap_reserved_candidates`'s own doc comment
+    /// for the P1 finding on exactly that ordering.
+    ///
+    /// Fail-CLOSED like every other command here: an unreachable owner
+    /// reports `true` (behave as if activity was detected -- "cannot
+    /// prove nothing has changed, so don't proceed"), the same direction
+    /// `has_newer_liveness_evidence` and `release_dead_peer` both take.
     pub async fn reap_baseline_activity_detected(
         &self,
         addr: SocketAddr,
@@ -1175,9 +1626,24 @@ impl RegistryOwnerHandle {
         response.await.unwrap_or(true)
     }
 
-    /// Read the current operator-configuration generation for `peer_id`.
-    /// An unavailable owner returns the fail-closed sentinel, which is not a
-    /// real generation and therefore cannot authorize a later reap.
+    /// PURE READ: `peer_id`'s CURRENT `configure_peer_generation` value
+    /// (`0` if it has never had a `configure_peer` call at all). Intended
+    /// use is capturing a baseline BEFORE a `reap_reserved_candidates`
+    /// candidate's `try_consume` runs (see that function's own doc comment
+    /// for the P1 finding on that ordering), to later present back as
+    /// [`Self::reap_baseline_activity_detected`]'s own `baseline_
+    /// configure_peer_generation` -- see that method's own doc comment for
+    /// why this is a mitigation, not a closing check.
+    ///
+    /// Fail-CLOSED like every other command here, in spirit if not in the
+    /// literal sense: an unreachable owner reports `u64::MAX`, a baseline
+    /// no REAL generation could ever be captured as `<=` -- so the later
+    /// `reap_baseline_activity_detected` call this feeds is guaranteed to
+    /// see `current_generation > baseline` as false regardless of what the
+    /// owner (if it recovers) later reports, deferring entirely to that
+    /// call's OWN fail-closed default (`true`, activity detected) rather
+    /// than this one accidentally manufacturing a false-positive verdict
+    /// from an owner that was merely unreachable for one specific query.
     pub async fn configure_peer_generation_of(&self, peer_id: PeerId) -> u64 {
         self.ensure_started();
         let (reply, response) = oneshot::channel();
@@ -1188,14 +1654,41 @@ impl RegistryOwnerHandle {
         response.await.unwrap_or(u64::MAX)
     }
 
-    /// See `OwnerCommand::ReserveForReap`'s doc comment for the causal
-    /// fence and identity checks this performs. Returns a
-    /// [`ReapReservation`] guard when granted, `None` when refused
-    /// (fail-closed, including when the owner is unreachable). The
-    /// returned guard is what makes a granted reservation impossible to
-    /// leak -- see `ReapReservation`'s own doc comment for why a bare
-    /// `bool` (this method's previous return type) could not guarantee
-    /// that.
+    /// Atomically check the causal fence against `evidence_before` AND
+    /// revalidate the identity the caller's selection observed for `addr`
+    /// -- `expected_ownership`, `expected_pin`, and that `expected_node_id`
+    /// corresponds to them -- against the owner's own current state, and,
+    /// only if EVERY check still passes, reserve `addr` for reaping -- see
+    /// `OwnerCommand::ReserveForReap`'s doc comment for why the causal
+    /// fence and the identity checks are all required; none alone closes
+    /// every window. Returns a [`ReapReservation`] guard when granted,
+    /// `None` when refused. Fail-CLOSED like every other command here: an
+    /// unreachable owner reports `None` (not granted / don't proceed), the
+    /// same "cannot prove it is safe, so don't" direction `release_dead_peer`
+    /// itself takes when it cannot be reached.
+    ///
+    /// `expected_node_id` must be the `PeerId` the caller's destructive
+    /// phase will act against once granted (typically `GossipState::
+    /// PeerInfo::node_id`, sourced independently of `expected_ownership`/
+    /// `expected_pin`) -- see `OwnerCommand::ReserveForReap`'s own doc
+    /// comment for the finding this closes: without this check, a
+    /// reservation could be granted for a candidate whose `node_id` no
+    /// longer corresponds to the address's actual current owner, and the
+    /// destructive phase would run against whichever peer that stale
+    /// `node_id` happens to still resolve to instead of the dead one.
+    ///
+    /// The returned guard is what makes a granted reservation impossible to
+    /// leak: releasing it is normally an explicit, awaited
+    /// `ReapReservation::release()` call once the sweep's destructive work
+    /// for `addr` has actually finished, but if the guard is instead
+    /// dropped without that call -- because the task holding it was hard-
+    /// aborted mid-sweep, not merely raced past in a `select!` -- its `Drop`
+    /// impl still releases the reservation, best-effort. See
+    /// `ReapReservation`'s doc comment for why a plain `bool` (as this
+    /// method returned before) cannot provide that guarantee: nothing forces
+    /// a caller holding a bare `true` to ever call the matching release, and
+    /// nothing runs on its behalf if the caller's task ends without doing
+    /// so.
     pub async fn reserve_for_reap(
         &self,
         addr: SocketAddr,
@@ -1226,29 +1719,18 @@ impl RegistryOwnerHandle {
         })
     }
 
-    /// `ReapReservation::try_consume`'s owner round trip -- see that
-    /// method's own doc comment. `false` on an unreachable owner, the same
-    /// fail-closed default as every other "cannot obtain a decision" path.
-    async fn consume_reap_reservation(&self, addr: SocketAddr) -> bool {
-        self.ensure_started();
-        let (reply, response) = oneshot::channel();
-        if self
-            .shared
-            .tx
-            .send(OwnerCommand::ConsumeReapReservation { addr, reply })
-            .await
-            .is_err()
-        {
-            return false;
-        }
-        response.await.unwrap_or(false)
-    }
-
-    /// Enqueue an `OwnerCommand::ReleaseReapReservation` on the dedicated
-    /// unbounded release channel -- see `OwnerShared::release_tx`'s doc
-    /// comment. Deliberately synchronous, not `async`, so it is callable
-    /// from both `ReapReservation::release` and its synchronous `Drop`
-    /// impl.
+    /// Enqueue an `OwnerCommand::ReleaseReapReservation` for `addr` on the
+    /// dedicated, unbounded release channel -- see `OwnerShared::
+    /// release_tx`'s doc comment. Deliberately synchronous, not `async`:
+    /// `UnboundedSender::send` cannot suspend on capacity, and has no
+    /// `.await` point inside it for a task abort to land in the middle of,
+    /// so by the time this call returns, the release is either irrevocably
+    /// queued -- `Some`, carrying the reply receiver for a caller that can
+    /// afford to await confirmation the owner actually processed it -- or
+    /// the owner task is already gone (`None`), in which case there is
+    /// nothing left to release against. Callable from both the async
+    /// `ReapReservation::release` and its synchronous `Drop` impl for
+    /// exactly this reason.
     fn enqueue_reap_release(&self, addr: SocketAddr) -> Option<oneshot::Receiver<()>> {
         self.ensure_started();
         let (reply, response) = oneshot::channel();
@@ -1260,19 +1742,35 @@ impl RegistryOwnerHandle {
     }
 
     /// Reserve `addr` for `peer_id` independently of any connection,
-    /// atomically replacing any address this peer was previously pinned
-    /// at. Returns the evicted address, if any -- the caller's cue to also
-    /// release that address's ownership. Does NOT itself verify `peer_id`
-    /// owns `addr`; `GossipRegistry::configure_peer` claims ownership
-    /// first in the SAME atomic step rather than calling this directly.
+    /// atomically replacing any address this peer was previously pinned at.
+    /// Returns the evicted address, if this peer held a DIFFERENT pin
+    /// beforehand -- the caller's cue to also release that address's
+    /// ownership.
     ///
-    /// Looks up the previous pinned address from the owner's own reverse
-    /// map at the moment this command runs, rather than trusting a
-    /// caller-supplied value: two concurrent callers for the same peer
-    /// observing the same stale "previous address" from `ConnectionPool`
-    /// could otherwise each pin independently and leave both addresses
-    /// pinned forever. Reading it here means whichever `pin` the owner
-    /// serializes LAST always wins outright.
+    /// The lower-level pin-bookkeeping primitive `configure_peer` (below)
+    /// is now built on: it does NOT itself verify that `peer_id` actually
+    /// owns `addr` (or, for the evicted address, release its ownership) --
+    /// only `pinned_by_peer`/`operator_pinned`/the `ConnectionPool` route
+    /// are touched here. `GossipRegistry::configure_peer` no longer calls
+    /// this directly for that reason: claiming and pinning as two
+    /// separately-ordered commands left a window for another command to
+    /// land in between, observing (or acting on) a pin with no matching
+    /// claim. Kept as its own command for the reverse-map invariant it
+    /// guarantees in isolation (see the concurrent-pin tests below); any
+    /// future caller must claim ownership first in the SAME atomic step --
+    /// i.e. use `configure_peer` -- rather than calling this directly.
+    ///
+    /// Two concurrent callers for the same peer can each observe the same
+    /// stale "previous address" from `ConnectionPool` before either has
+    /// applied its own change; if each then independently pinned its own
+    /// target, both addresses would end up pinned for one peer, and since a
+    /// pinned address can never be reclaimed by `release`/`release_dead_peer`,
+    /// the loser would stay reserved forever. Routing the replacement
+    /// through the owner's own reverse map instead -- looked up here, at
+    /// the moment this command actually runs, rather than trusted from the
+    /// caller -- means whichever `pin` command the owner serializes LAST
+    /// always wins outright, and there is never a window in which two
+    /// addresses are simultaneously pinned for the same peer.
     #[cfg(test)]
     pub(crate) async fn pin(&self, addr: SocketAddr, peer_id: PeerId) -> Option<SocketAddr> {
         self.ensure_started();
@@ -1293,21 +1791,22 @@ impl RegistryOwnerHandle {
     /// previous pin for this SAME peer in the same synchronous step. See
     /// `OwnerCommand::ConfigurePeer` and `PeerRegistryOwner::configure_peer`.
     ///
-    /// `expected_generation`: `None` for a peer's first call (always
-    /// applies, bumps `configure_peer_generation`); `Some(generation)` for
-    /// a retry, accepted only when it is EXACTLY the stored generation --
-    /// not merely not-less-than-it. A caller can only ever have legitimately
-    /// learned `generation` from this SAME method's own prior response for
-    /// this peer, so any other value is either stale (rejected as
-    /// `SupersededByNewerConfiguration`, the same as too-small: a newer call
-    /// already moved on) or not a value this fence ever produced at all --
-    /// neither is worth retrying. `pub(crate)`: the retry path this
-    /// parameter exists for is driven internally
-    /// (`GossipRegistry::configure_peer_with_outcome_and_generation`); no
-    /// caller outside this crate has a legitimate `Some(generation)` to
-    /// present. See `configure_peer_generation`'s own doc comment for why
-    /// this fences a stale retry from overwriting a newer request.
-    pub(crate) async fn configure_peer(
+    /// `expected_generation`: `None` for a peer's FIRST `configure_peer`
+    /// call (always applies, and bumps `configure_peer_generation` to a
+    /// new value, returned via [`ConfigurePeerCommit::generation`]);
+    /// `Some(generation)` for a retry presenting a value a PRIOR call
+    /// already established -- rejected outright, atomically, with
+    /// `ClaimRejection::SupersededByNewerConfiguration`, if a NEWER call
+    /// for the same peer has bumped the generation further in the
+    /// meantime. See `configure_peer_generation`'s own doc comment for
+    /// the P1 finding this closes.
+    ///
+    /// An owner-unavailable send failure reports a rejected claim with no
+    /// eviction, the same fail-closed shape as every other command here;
+    /// `generation` in that case is a placeholder (`0`), never meaningful
+    /// to present back as `expected_generation` since `OwnerUnavailable`
+    /// is not retried by any caller.
+    pub async fn configure_peer(
         &self,
         addr: SocketAddr,
         peer_id: PeerId,
@@ -1338,16 +1837,28 @@ impl RegistryOwnerHandle {
         })
     }
 
-    /// `Peer::connect`'s ordinary route update -- see
-    /// `OwnerCommand::SetOrdinaryConnectRoute`'s doc comment. Returns
-    /// whether `addr` actually became the effective route: `false` when
-    /// declined (`peer_id` is pinned elsewhere) or the owner is
-    /// unreachable.
+    /// `Peer::connect`'s ordinary route update, submitted as an owner
+    /// command so the pin-conflict check and the `ConnectionPool` write
+    /// share the owner's own serialization instead of racing it -- see
+    /// `OwnerCommand::SetOrdinaryConnectRoute` and
+    /// `PeerRegistryOwner::set_ordinary_connect_route`.
+    ///
+    /// Returns whether `addr` actually became (or already was) the
+    /// effective route: `false` when the owner declined it -- `peer_id` is
+    /// operator-pinned to a DIFFERENT address -- or when the owner is
+    /// unreachable (fail-closed: cannot prove the write happened, so
+    /// treat it as not having happened).
     ///
     /// CALLERS MUST CONSULT THIS. An earlier version returned `()` and
-    /// discarded the result: on a decline, it still dialed, inserted the
-    /// requested address into `gossip_state`, and on success advertised a
-    /// route this node never actually connected to.
+    /// `connect_with_route_mode` discarded the result entirely: on a
+    /// decline, it still unconditionally inserted the requested address
+    /// into `gossip_state`, still dialed (`connect_to_peer` uses
+    /// `ConnectionPool`'s required/configured route, which the decline
+    /// left pointing at the PIN's address, not the requested one), and on
+    /// that dial's success still marked the REQUESTED address healthy and
+    /// gossiped it -- advertising a route this node never actually
+    /// connected to, reachable any time an ordinary `.connect()` named an
+    /// address other than a peer's current pin.
     pub async fn set_ordinary_connect_route(&self, peer_id: PeerId, addr: SocketAddr) -> bool {
         self.ensure_started();
         let (reply, response) = oneshot::channel();
@@ -1449,41 +1960,7 @@ impl RegistryOwnerHandle {
                 routing,
                 commit_seq: 0,
             };
-            let owner_task = tokio::spawn(owner.run(rx, release_rx));
-            tokio::spawn(Self::watch_owner_task(owner_task));
-        }
-    }
-
-    /// Every `claim`/`release`/`migrate` already fails closed, independently,
-    /// the moment its own send hits a closed mailbox -- but each of those
-    /// sites logs a generic "unavailable" warning with no way to tell a
-    /// panic apart from ordinary shutdown (`run`'s own `while let Some(..) =
-    /// rx.recv()` loop exits cleanly, at `debug!`, once every handle is
-    /// dropped). This watches the task itself for the one signal that
-    /// distinguishes them: `JoinHandle::await` returning `Err` only on panic
-    /// or external cancellation, never on a clean exit.
-    async fn watch_owner_task(owner_task: tokio::task::JoinHandle<()>) {
-        if let Err(join_error) = owner_task.await {
-            error!(
-                error = %join_error,
-                "registry owner task exited unexpectedly (panic, not a clean shutdown); \
-                 every subsequent claim/release/migrate will fail closed for the rest of \
-                 this process's lifetime"
-            );
-            // Opt-in only: a dead owner silently wedges address arbitration
-            // for good, which is far more likely to be mistaken for a hang
-            // than diagnosed from a log line, so an operator who would
-            // rather crash loudly and get restarted (under a supervisor)
-            // than run on in this state can ask for that explicitly.
-            // Defaulting to *off* means this can never surprise a test
-            // suite or a deployment that has not opted in -- unlike
-            // `panic!()`, which a detached task like this one would only
-            // ever have tokio print and move past, `abort()` is the one
-            // primitive that reliably takes the whole process down from
-            // here, so the check is worth the environment read.
-            if std::env::var_os("ICANACT_REMOTE_ABORT_ON_REGISTRY_OWNER_DEATH").is_some() {
-                std::process::abort();
-            }
+            tokio::spawn(owner.run(rx, release_rx));
         }
     }
 
@@ -1509,26 +1986,12 @@ impl RegistryOwnerHandle {
         response.await.ok().flatten()
     }
 
-    /// Observe `claim_committed_at` directly in deterministic tests -- see
-    /// `OwnerCommand::InspectClaimCommittedAt`'s own doc comment.
-    #[cfg(test)]
-    pub(crate) async fn claim_committed_at_for_test(
-        &self,
-        addr: SocketAddr,
-    ) -> Option<std::time::Instant> {
-        self.ensure_started();
-        let (reply, response) = oneshot::channel();
-        self.shared
-            .tx
-            .send(OwnerCommand::InspectClaimCommittedAt { addr, reply })
-            .await
-            .ok()?;
-        response.await.ok().flatten()
-    }
-
-    /// Observe whether an address currently has a live reap reservation.
-    /// This read is side-effect-free and exists only for deterministic
-    /// reservation-scope regression tests.
+    /// Pure, side-effect-free read of whether `addr` currently has a live
+    /// reap reservation held for it. See `OwnerCommand::IsReapReserved`'s
+    /// own doc comment for why: deterministically polling for exactly
+    /// when a background sweep's reservation for a candidate has been
+    /// granted, without submitting a real, side-effecting claim to probe
+    /// it indirectly.
     #[cfg(test)]
     pub(crate) async fn is_reap_reserved_for_test(&self, addr: SocketAddr) -> bool {
         self.ensure_started();
@@ -1544,85 +2007,124 @@ impl RegistryOwnerHandle {
         }
         response.await.unwrap_or(false)
     }
-
-}
-
-/// One granted reservation's owner-side bookkeeping. `consumed` is the
-/// owner-authoritative record of whether `ConsumeReapReservation` has
-/// already granted this entry's destructive-work authorization -- a plain
-/// `bool`, not an atomic, since only the owner's own serialized command
-/// processing ever reads or writes it. `valid` is a separate,
-/// shared `Arc<AtomicBool>`, cloned to the matching `ReapReservation`
-/// guard purely for that guard's cheap, external, non-authoritative
-/// `is_still_valid()` peek.
-struct ReapReservationEntry {
-    valid: Arc<AtomicBool>,
-    consumed: bool,
 }
 
 /// RAII guard for one reservation `RegistryOwnerHandle::reserve_for_reap`
-/// granted -- the type system, not just documentation, enforces that a
-/// caller either releases it or has `Drop` do so.
+/// granted. This is what upgrades "the owner enforces this fact for as long
+/// as the caller holds it" from a documented obligation (the previous
+/// `bool`-returning shape) into something the type system makes hard to get
+/// wrong: nothing about a bare `true` stops a caller from losing track of
+/// it, forgetting the matching release, or having its task end -- panic,
+/// early return, or a hard `JoinHandle::abort()` -- before reaching it.
 ///
-/// `release()` is the ordinary path: an explicit, awaited owner round trip
-/// once the sweep's destructive work finishes. `Drop` exists only for a
-/// hard task abort mid-sweep (`shutdown`/`shutdown_and_wait` both
-/// `JoinHandle::abort()` the task running `cleanup_dead_peers`). Both paths
-/// enqueue through the dedicated UNBOUNDED `release_tx` channel, never the
-/// bounded `tx` mailbox: an unbounded send has no `.await` point an abort
-/// can land inside, so by the time it returns the release is either
-/// irrevocably queued or the owner task is already gone (a fresh owner
-/// starts with an empty `reap_reserved`, nothing left to leak against).
-/// `released` is set only strictly AFTER that enqueue succeeds -- setting
-/// it earlier risks `Drop` seeing `released == true` after an aborted send
-/// and leaking the reservation. Failing to TAKE a reservation is safe (the
-/// sweep just skips that candidate); failing to RELEASE one is not, since
-/// every later claim for that address is refused forever.
+/// The intended path is `release()`: an explicit, awaited owner round trip
+/// once the sweep's destructive work for the reserved address has actually
+/// finished, giving the same guarantee a direct release command always
+/// gave -- the release is fully committed, in order, before the caller
+/// proceeds. `cleanup_dead_peers` is `select!`-cancellation-safe (a chosen
+/// arm's body, including this one, runs to completion; only sibling arms
+/// are dropped -- see its own doc comment), so under ordinary operation
+/// `release()` is the only path this guard's release ever takes.
 ///
-/// [`Self::try_consume`] is an owner round trip
-/// (`OwnerCommand::ConsumeReapReservation`), not a client-side
-/// compare-and-swap on `valid`: a bare CAS on a caller-held atomic races
-/// an invalidating owner command (`configure_peer` evicting this address
-/// from a pin) from a completely separate synchronization domain --
-/// whichever runs "second" by wall-clock time still only ever sees a
-/// plain store/CAS result, with no way to tell a reservation it just
-/// invalidated was already consumed a moment earlier by the other side.
-/// Routing consumption through the owner's own serialized command stream
-/// instead means whichever the owner actually dequeues first -- the
-/// consume or the invalidation -- is authoritative, and the loser can
-/// observe that fact instead of silently believing it won:
-/// `configure_peer`'s own handler checks `ReapReservationEntry::consumed`
-/// before evicting a pin, refusing rather than invalidating out from under
-/// an already-authorized reap. `valid` remains a shared `Arc<AtomicBool>`,
-/// kept in step for [`Self::is_still_valid`]'s cheap, external,
-/// non-authoritative peek -- but it no longer authorizes anything itself.
+/// The `Drop` impl exists for the one case that is NOT
+/// cancellation-through-`select!`: a genuine hard abort of the task holding
+/// this guard mid-sweep. `GossipRegistryHandle::shutdown` and
+/// `shutdown_and_wait` both `JoinHandle::abort()` the exact task that runs
+/// `cleanup_dead_peers` (the periodic timer loop), and `Drop for
+/// GossipRegistryHandle` does the same if a caller drops the handle without
+/// an explicit shutdown -- all three reachable in ordinary operation, not
+/// exotic edge cases. An abort drops the task's future in place, the same
+/// as dropping any other value on the stack, which runs this guard's `Drop`
+/// impl synchronously.
+///
+/// Both paths, `release()` and `Drop`, enqueue through
+/// `RegistryOwnerHandle::enqueue_reap_release` -- the dedicated, UNBOUNDED
+/// release channel (`OwnerShared::release_tx`), never the bounded `tx`
+/// mailbox ordinary commands use. This is what closes a real bug an
+/// earlier version of this guard had: `release()` used to disarm
+/// (`released = true`) and only THEN `.await` a send on the bounded
+/// mailbox. If the task was aborted while that send was suspended waiting
+/// for mailbox capacity, the future -- `released` already `true` -- was
+/// dropped mid-await, `Drop` saw `released == true` and did nothing, and
+/// the `try_send` fallback it would otherwise have attempted could itself
+/// fail on that same full mailbox. The exact leak this guard exists to
+/// prevent, reappearing through the guard's own failure path. The
+/// governing asymmetry: failing to TAKE a reservation is safe --
+/// `reserve_for_reap` returning `None` just means the sweep skips that
+/// candidate this round -- but failing to RELEASE one is not, since every
+/// later claim for that address is refused forever. An unbounded sender's
+/// `send` cannot suspend on capacity and has no `.await` point inside it
+/// for an abort to land in the middle of, so by the time it returns, the
+/// release is either irrevocably queued or the owner task is already gone
+/// -- and in the latter case there is nothing left to leak a reservation
+/// against, since a fresh owner task starts with an empty `reap_reserved`.
+/// `released` is now set only strictly AFTER that synchronous enqueue
+/// succeeds, never before it -- see `release()` below.
+///
+/// P1 finding (review round against `d4000e2`, `registry.rs:8750`): a
+/// reservation blocks new ownership CLAIMS, never ordinary liveness
+/// evidence on an already-established connection -- and the one-time
+/// verdict `release_dead_peer_ownership` returns is a snapshot, obtained
+/// through an `.await`, stale the instant it returns. Evidence proving the
+/// candidate alive can still commit in the window between that verdict
+/// returning and the destructive phase's own irreversible steps -- actor
+/// removal, `ActorRemoved` tombstone emission -- actually running.
+/// `valid` (below) is a shared, lock-free `Arc<AtomicU8>`, the same state
+/// stored by `PeerRegistryOwner::reap_reserved` for this address. It starts
+/// as `REAP_PENDING`; owner-side liveness evidence can transition it to
+/// `REAP_INVALIDATED` before the sweep commits. `try_consume` performs the
+/// single `REAP_PENDING -> REAP_COMMITTED` compare-and-swap that linearizes
+/// the entire reap. The caller then performs all actor, tombstone, side-table
+/// and ownership work for that candidate under that committed decision.
+/// Evidence processed after the CAS is ordered after the reap and cannot make
+/// ownership return `ProvenAlive` after actors were already removed.
+///
+/// `is_still_valid` remains a cheap diagnostic peek. It is useful before the
+/// commit point, but it is not a second authorization: once the CAS commits,
+/// the decision is final; once owner evidence invalidates the reservation, the
+/// CAS fails. Pin-changing configuration is rejected while the previous pin
+/// is reserved, so it cannot invalidate a reap after the destructive decision
+/// has crossed its linearization point.
 pub struct ReapReservation {
     owner: RegistryOwnerHandle,
     addr: SocketAddr,
     released: bool,
-    valid: Arc<AtomicBool>,
+    valid: Arc<AtomicU8>,
 }
 
 impl ReapReservation {
-    /// Cheap, synchronous, no `.await` -- advisory only. See this type's
-    /// own doc comment for why this must never gate a destructive step;
-    /// [`Self::try_consume`] is the actual authorization.
+    /// Cheap, synchronous, no `.await`: `false` while DIRECT liveness
+    /// evidence for this reservation's address has invalidated the pending
+    /// reservation through the owner's serialized command stream
+    /// (`note_liveness_evidence`). This is a diagnostic view of the pending
+    /// state; `try_consume` is the only authorization for the destructive
+    /// sequence.
     pub fn is_still_valid(&self) -> bool {
-        self.valid.load(Ordering::Acquire)
+        self.valid.load(Ordering::Acquire) == REAP_PENDING
     }
 
-    /// One-shot, race-free authorization for this reservation's
-    /// RESERVATION-gated destructive work (not address-ownership
-    /// retraction, which keeps its own separate, always-fresh fence -- see
-    /// this type's own doc comment). An owner round trip, not a local CAS
-    /// -- see the type's own doc comment for why. `true` means this call,
-    /// and only this call, is authorized; `false` means something already
-    /// invalidated the reservation and the candidate must be abandoned.
-    /// Call exactly once per candidate, as the single gate for its whole
-    /// sequence -- never per-step alongside a later `is_still_valid()`
-    /// check treated as a second authorization.
-    pub async fn try_consume(&self) -> bool {
-        self.owner.consume_reap_reservation(self.addr).await
+    /// One-shot, race-free authorization to perform this reservation's
+    /// complete destructive sequence: side tables, actors, tombstones and
+    /// ownership. It is a compare-and-swap from `REAP_PENDING` to
+    /// `REAP_COMMITTED` on the same `Arc<AtomicU8>` that
+    /// [`Self::is_still_valid`] reads, not a second read of it. `true` means
+    /// this call crossed the reap's linearization point; later owner evidence
+    /// is ordered after it and cannot produce an inconsistent ownership
+    /// verdict. `false` means owner-side evidence invalidated the pending
+    /// reservation first, so the caller must abandon this candidate.
+    ///
+    /// Call this exactly once per candidate as the single gate for its whole
+    /// sequence; do not treat a later diagnostic peek as a second
+    /// authorization.
+    pub fn try_consume(&self) -> bool {
+        self.valid
+            .compare_exchange(
+                REAP_PENDING,
+                REAP_COMMITTED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     /// Release this reservation. The normal path: call once the sweep's
@@ -1678,98 +2180,143 @@ struct PeerRegistryOwner {
     claim_generation: HashMap<SocketAddr, CommitSeq>,
     /// When each owned address last had DIRECT evidence of a live owner --
     /// an outbound dial this node completed, or an authenticated inbound
-    /// session (refreshed only by `claim_connection_scoped`, never by
-    /// plain gossip/discovery `claim`s). Independent of `GossipState`'s
-    /// `failures`/`last_failure_time`, which only updates AFTER the owner
-    /// has already committed the fresh claim -- so a caller checking this
-    /// can never be fooled by a reconnect whose claim commit and
-    /// `GossipState` update straddle its own observation, and can't be
-    /// kept perpetually "fresh" by indirect chatter about a peer nothing
-    /// has reconnected to.
+    /// session (refreshed only by `claim_connection_scoped`, carried
+    /// unchanged rather than refreshed by `migrate`, and never touched by
+    /// the plain `claim` command gossip/discovery claims also go through).
+    /// This is the owner's OWN, self-contained notion of "how recently was
+    /// this address touched by something that actually proves liveness",
+    /// independent of `GossipState`'s `failures`/`last_failure_time`
+    /// bookkeeping -- which a reconnect only updates AFTER the owner has
+    /// already committed the fresh claim that proves the peer alive, and
+    /// which lives behind a different lock entirely. `release_dead_peer`
+    /// checks this instead of trusting any liveness snapshot a caller took
+    /// from that other domain, so it can never be fooled by a reconnect
+    /// whose claim commit and whose `GossipState` update straddle the
+    /// caller's own observation in either order -- and, because only direct
+    /// evidence refreshes it, it also cannot be kept perpetually "fresh" by
+    /// indirect chatter (repeated gossip/discovery claims, or DNS refresh
+    /// attempts) about a peer nothing has actually reconnected to.
     ///
     /// Deliberately narrow to NEW-CONNECTION/claim evidence, not ongoing
-    /// liveness on an already-claimed connection -- a complementary fence
-    /// for that is out of this crate's current scope.
+    /// liveness on a connection already claimed: see `liveness_evidence_at`
+    /// below for the complementary fence `release_dead_peer` ALSO checks,
+    /// covering exactly the gap this field alone leaves -- an
+    /// already-claimed connection that keeps delivering ordinary responses
+    /// never commits another claim, so `claim_committed_at` never advances
+    /// for it again.
     claim_committed_at: HashMap<SocketAddr, std::time::Instant>,
-    /// Direct liveness evidence from the registry's response path. Kept
-    /// outside the owner task's mailbox so an already-claimed connection can
-    /// refresh this marker without fabricating a new ownership claim.
-    /// Direct liveness evidence recorded only by `NoteLivenessEvidence` in
-    /// this owner's serialized command stream.
-    liveness_evidence_at: HashMap<SocketAddr, std::time::Instant>,
     /// Connection-scoped ownership receipts: which live authenticated
     /// sessions currently back a peer's claim on an address, and at what
     /// owner generation. Keyed by `(peer, session_source, addr)` --
-    /// `session_source` is this exact connection's own discriminator, so
-    /// a stale session's teardown can only ever remove its own entry.
-    /// Every mutation happens from `&mut self` in the same synchronous
-    /// command as the ownership commit/release it corresponds to, so a
-    /// receipt can never be observed at a generation the owner doesn't
-    /// simultaneously agree is current.
-    connection_scoped_claims: HashMap<(PeerId, SocketAddr, SocketAddr), CommitSeq>,
+    /// `connection_instance_id` is the exact physical connection's stable
+    /// discriminator. `session_source` remains in the command/API for
+    /// diagnostics and the legacy synthetic wrapper, but is deliberately not
+    /// part of the authoritative identity: sequential sockets can reuse the
+    /// same tuple.
+    ///
+    /// Lives here, alongside `claim_generation`, rather than in a
+    /// separately-synchronized map the way PR #178 first shipped it: every
+    /// mutation below happens from `&mut self` in the same synchronous
+    /// command as the ownership commit or release it corresponds to, so a
+    /// receipt can never be observed (or left behind) at a generation the
+    /// owner authority does not simultaneously agree is current.
+    connection_scoped_claims: HashMap<(PeerId, u64, SocketAddr), CommitSeq>,
     /// Addresses reserved by an explicit `GossipRegistry::configure_peer`
-    /// call, independent of any connection. Invisible to
-    /// `claim_connection_scoped`'s receipt bookkeeping and refused by any
-    /// ordinary release path (checked directly, not inferred from the
-    /// absence of a receipt): a session authenticating the same identity
-    /// at a pinned address must not make the reservation releasable
-    /// merely by connecting and disconnecting. Distinct from
-    /// `ConnectionPool`'s `required_addr` (set by every `.connect()`,
-    /// configured or not) -- conflating the two let an ordinary dial's
-    /// address become permanently undisplaceable once its session ended.
+    /// call, independent of any connection. A pinned address is invisible to
+    /// `claim_connection_scoped`'s receipt bookkeeping (no receipt is ever
+    /// recorded for it) and refused by `release`/`release_dead_peer`
+    /// (checked directly, not merely inferred from the absence of a
+    /// receipt): a session that happens to authenticate the same identity
+    /// at a pinned address must not be able to make the reservation
+    /// releasable merely by connecting and later disconnecting. Distinct
+    /// from `ConnectionPool`'s `required_addr` (the supervisor's
+    /// keep-retrying-this-dial-target bookkeeping, set by every `.connect()`
+    /// call, configured or not): conflating the two was what let an
+    /// ordinary, non-configured dial's address become permanently
+    /// undisplaceable once its peer's session ended.
     operator_pinned: HashMap<SocketAddr, PeerId>,
     /// Reverse index of `operator_pinned`: the address (if any) each peer is
     /// currently pinned at. `pin` looks a peer up here -- never trusts a
     /// caller-supplied "previous address" -- so installing a new pin always
     /// atomically replaces whatever this SAME peer was pinned at a moment
-    /// ago, keeping "at most one pinned address per peer" true at every
-    /// instant, not merely eventually.
+    /// ago, even if that address was itself the product of a different,
+    /// concurrently-running `configure_peer`/`migrate` command this task
+    /// already serialized ahead of this one. This is what keeps "at most one
+    /// pinned address per peer" true at every instant, not merely eventually.
     pinned_by_peer: HashMap<PeerId, SocketAddr>,
     /// Addresses a `cleanup_dead_peers` sweep has RESERVED for reaping --
-    /// see `OwnerCommand::ReserveForReap`. While an address is a member
-    /// here, `claim`/`claim_connection_scoped` refuse EVERY claim for it,
-    /// which is what makes the sweep's later, non-owner destructive work
-    /// safe to run OUTSIDE the owner's critical path without racing a
-    /// concurrent reconnect. Released by `ReleaseReapReservation` once the
-    /// sweep is done, successfully or not.
+    /// see `OwnerCommand::ReserveForReap`. Keyed purely by address (no
+    /// `PeerId` is needed to check or hold membership), but the DECISION
+    /// to grant a reservation is not: it is only made after revalidating
+    /// the full identity (ownership + pin state) the caller's selection
+    /// observed for the address still matches exactly -- see
+    /// `ReserveForReap`'s doc comment for why an address-only or
+    /// `claim_committed_at`-only check is not enough. While an address is
+    /// a member here, `claim`/`claim_connection_scoped` refuse EVERY claim
+    /// for it outright, regardless of claimant identity or what
+    /// `arbitrate` would otherwise decide. This is what makes the sweep's
+    /// later, non-owner destructive work (actor removal, tombstone
+    /// emission) safe to run OUTSIDE the owner's critical path without
+    /// racing a concurrent reconnect, instead of the sweep merely
+    /// re-checking a snapshot that could go stale again before it finishes
+    /// acting on it. Released by `OwnerCommand::ReleaseReapReservation`
+    /// once the sweep is done with the address, successfully or not.
     ///
-    /// EXCLUSIVE: granted only when THIS call actually inserts the address
-    /// (`contains_key` checked immediately before inserting, same
-    /// synchronous call) -- two concurrent sweeps must never share one
-    /// guard, or whichever releases first would remove the entry while the
-    /// other's destructive work still relied on it.
+    /// EXCLUSIVE, not merely present/absent: `reserve_for_reap` grants a
+    /// reservation only when THIS call is the one that actually inserts
+    /// the address (checked via `contains_key` immediately before
+    /// inserting, both inside the same synchronous call -- no other
+    /// command can interleave between them). Two concurrent sweeps racing
+    /// to reserve the SAME address must never both receive a guard backed
+    /// by one shared entry: whichever released first would remove the
+    /// entry while the OTHER sweep's destructive work was still relying
+    /// on it staying held, reopening the exact race this mechanism exists
+    /// to close, one level up. The second sweep instead finds the address
+    /// already reserved and skips the candidate entirely -- there is no
+    /// legitimate reason for two sweeps to reap the same address at once,
+    /// so refusal (not reference-counted sharing) keeps "at most one
+    /// destructive pass per address" true by construction.
     ///
-    /// The VALUE is what makes this a LIVE authority, not just a presence
-    /// check. `consumed` is the owner-authoritative record of whether
-    /// `ConsumeReapReservation` has already granted this entry's
-    /// destructive-work authorization -- read here, from within the SAME
-    /// serialized command stream, by anything that would otherwise
-    /// invalidate the reservation (currently `configure_peer` evicting a
-    /// reserved address from a peer's pin), so an already-consumed entry
-    /// is never mistaken for one a fresh invalidation can still stop.
-    /// `valid` is a shared `Arc<AtomicBool>`, cloned to the matching
-    /// [`ReapReservation`] guard, for that guard's own cheap, external,
-    /// non-authoritative `is_still_valid()` peek; kept in step with
-    /// `consumed` but never itself the authority for either consumption
-    /// or invalidation. See `ReapReservation`'s own doc comment for why
-    /// consumption is an owner command rather than a client-side CAS.
-    reap_reserved: HashMap<SocketAddr, ReapReservationEntry>,
-    /// `GossipRegistry`'s own caller-side generation fence for
-    /// `configure_peer`'s queued retry was not atomic with the pin update
-    /// it guarded -- a newer call could bump the caller-side counter and
-    /// commit its own pin after the check passed but before the stale
-    /// retry's command reached the owner, installing the stale pin with
-    /// no way for the already-passed caller-side check to catch it.
-    /// Moved here, owner-side, so `configure_peer`'s atomic transaction
-    /// validates a retry's generation in the SAME serialized step that
-    /// installs the pin. The FIRST call for a peer bumps this
-    /// monotonically and reports the new value back; every retry presents
-    /// that value as `expected_generation`, accepted only on an EXACT
-    /// match -- rejected outright both if a newer call has since bumped it
-    /// further, and if the presented value was never actually stored here
-    /// at all (see `RegistryOwnerHandle::configure_peer`'s own doc
-    /// comment for why accepting the latter used to be a hole in this
-    /// fence).
+    /// The VALUE is what makes a reservation a live authority rather than a
+    /// one-time admission ticket: a shared, lock-free `Arc<AtomicU8>`,
+    /// initialized to `REAP_PENDING` when granted, with a clone handed to
+    /// the matching [`ReapReservation`] guard. Owner-side liveness evidence
+    /// can transition it to `REAP_INVALIDATED`; the guard's single
+    /// `REAP_PENDING -> REAP_COMMITTED` CAS is the reap's linearization
+    /// point. Pin-changing configuration is rejected while a previous pin
+    /// is reserved, so no operator eviction can race a committed sweep.
+    reap_reserved: HashMap<SocketAddr, Arc<AtomicU8>>,
+    /// Updated ONLY via `OwnerCommand::NoteLivenessEvidence`, from within
+    /// this task's own `&mut self` command handling -- see that variant's
+    /// doc comment, and `claim_committed_at`'s just above, for why this
+    /// must NOT be a lock-free structure some other task writes directly:
+    /// `release_dead_peer`'s read of it must be atomic with the release
+    /// decision it feeds, and the only way to guarantee that is for both
+    /// the write and the read to happen inside this task's own
+    /// serialized command stream, exactly like every other piece of
+    /// owner-authoritative state in this struct.
+    liveness_evidence_at: HashMap<SocketAddr, std::time::Instant>,
+    /// P1 finding (review round against `ded8495`, `registry.rs:4982`):
+    /// `GossipRegistry`'s own, caller-side generation fence for
+    /// `configure_peer`'s queued retry (`should_abandon`, checked before
+    /// submitting the async owner command) was not atomic with the pin
+    /// update it guarded -- a later, genuinely newer call could bump the
+    /// caller-side counter and commit its OWN pin AFTER the check passed
+    /// but BEFORE the stale retry's own command reached the owner, which
+    /// would then still install the stale pin, evicting the newer one,
+    /// with no way for the (already-passed) caller-side check to catch it.
+    ///
+    /// Moved here, owner-side, so `configure_peer`'s own atomic transaction
+    /// (`PeerRegistryOwner::configure_peer`) can validate a retry's
+    /// generation in the SAME serialized step that installs the pin,
+    /// rather than the caller validating a snapshot of it beforehand and
+    /// hoping nothing changes before its own separate command lands. The
+    /// FIRST `configure_peer` call for a peer (no `expected_generation`)
+    /// bumps this monotonically and reports the new value back to the
+    /// caller; every retry presents that value back as `expected_
+    /// generation`, and is rejected outright -- atomically, before
+    /// touching anything else -- if a NEWER call has since bumped it
+    /// further.
     configure_peer_generation: HashMap<PeerId, u64>,
     snapshot: Arc<ArcSwap<RoutingSnapshot>>,
     routing: Weak<dyn RoutingPublisher>,
@@ -1784,16 +2331,34 @@ struct PeerRegistryOwner {
 
 impl PeerRegistryOwner {
     /// Run until every sender is dropped. Drains TWO channels: the main
-    /// bounded mailbox, and the dedicated unbounded release channel --
-    /// `biased` so a ready release is always handled before a ready
-    /// ordinary command, since a granted reservation should be held no
-    /// longer than necessary once its release is queued. Re-checked on
-    /// EVERY drained command, not just once per outer wakeup: draining
-    /// `release_rx` fully then `rx` fully in two separate loops would let
-    /// a synchronous burst of ordinary commands starve a release queued
-    /// only after the first loop's single check, exhausting a caller's
-    /// `ReapInProgress` retry budget even though the reservation it was
-    /// waiting on had already been released.
+    /// bounded mailbox, and the dedicated unbounded release channel (see
+    /// `OwnerShared::release_tx`'s doc comment) -- `biased` so a ready
+    /// release is always handled before a ready ordinary command, on the
+    /// theory that a granted reservation should be held no longer than
+    /// necessary once its release is already queued.
+    ///
+    /// The priority is re-checked on EVERY drained command, not just once
+    /// per outer wakeup: an earlier version drained `release_rx` fully,
+    /// then drained `rx` fully, each in its own separate `while let`
+    /// loop. `self.handle` never awaits, so once that second loop started
+    /// it ran to completion as one uninterruptible synchronous burst --
+    /// any release that became queued only after the first loop's single
+    /// check (e.g. a concurrent `ReleaseReapReservation` landing while a
+    /// burst of ordinary commands was already draining) was invisible to
+    /// this task until the ENTIRE ordinary backlog was exhausted, no
+    /// matter how large that backlog was. That starves exactly the
+    /// priority this function's own `biased` select exists to provide:
+    /// `reap_reserved`'s own doc comment is explicit that a reservation
+    /// should be "held no longer than necessary once its release is
+    /// already queued", and a caller retrying against a supposedly
+    /// temporary `ClaimRejection::ReapInProgress` (`configure_peer`'s
+    /// bounded reap-retry among them) could exhaust its retry budget
+    /// entirely behind an ordinary-command backlog even though the
+    /// reservation the retries are waiting on was released long before
+    /// the backlog finished. A single combined loop that re-checks
+    /// `release_rx` before every single item -- ordinary or release --
+    /// keeps the priority intact for the whole drain, not just its first
+    /// instant.
     async fn run(
         mut self,
         mut rx: mpsc::Receiver<OwnerCommand>,
@@ -1812,8 +2377,13 @@ impl PeerRegistryOwner {
                     self.handle(command);
                 }
             }
-            // Drain whatever else is queued, release commands first (same
-            // priority reason as the select above), without re-suspending.
+            // Drain whatever else is already queued on EITHER channel
+            // without re-suspending -- release commands first, on EVERY
+            // iteration, for the same priority reason as the select
+            // above (see this function's own doc comment). Publication
+            // still happens per command inside `handle` rather than once
+            // per batch: a reply must never be observable before the
+            // snapshot that justifies it.
             loop {
                 if let Ok(command) = release_rx.try_recv() {
                     self.handle(command);
@@ -1864,18 +2434,27 @@ impl PeerRegistryOwner {
                 addr,
                 claim,
                 session_source,
+                connection_instance_id,
                 evidence_at,
                 reply,
             } => {
-                let commit = self.claim_connection_scoped(addr, claim, session_source, evidence_at);
+                let commit = self.claim_connection_scoped(
+                    addr,
+                    claim,
+                    session_source,
+                    connection_instance_id,
+                    evidence_at,
+                );
                 let _ = reply.send(commit);
             }
             OwnerCommand::ReleaseSession {
                 peer_id,
                 session_source,
+                connection_instance_id,
                 reply,
             } => {
-                let candidates = self.release_session(&peer_id, session_source);
+                let candidates =
+                    self.release_session(&peer_id, session_source, connection_instance_id);
                 let _ = reply.send(candidates);
             }
             OwnerCommand::ReleaseDeadPeer {
@@ -1892,16 +2471,8 @@ impl PeerRegistryOwner {
                 evidence_before,
                 reply,
             } => {
-                let has_newer_claim = self
-                    .claim_committed_at
-                    .get(&addr)
-                    .is_some_and(|committed_at| *committed_at > evidence_before);
-                let has_newer_response = self
-                    .liveness_evidence_at
-                    .get(&addr)
-                    .copied()
-                    .is_some_and(|observed_at| observed_at > evidence_before);
-                let _ = reply.send(has_newer_claim || has_newer_response);
+                let has_newer = self.has_newer_liveness_evidence(addr, evidence_before);
+                let _ = reply.send(has_newer);
             }
             OwnerCommand::ReapBaselineActivityDetected {
                 addr,
@@ -1943,10 +2514,6 @@ impl PeerRegistryOwner {
                 );
                 let _ = reply.send(granted);
             }
-            OwnerCommand::ConsumeReapReservation { addr, reply } => {
-                let consumed = self.consume_reap_reservation(addr);
-                let _ = reply.send(consumed);
-            }
             OwnerCommand::ReleaseReapReservation { addr, reply } => {
                 self.reap_reserved.remove(&addr);
                 let _ = reply.send(());
@@ -1982,10 +2549,6 @@ impl PeerRegistryOwner {
                 let _ = reply.send(self.claim_generation.get(&addr).copied());
             }
             #[cfg(test)]
-            OwnerCommand::InspectClaimCommittedAt { addr, reply } => {
-                let _ = reply.send(self.claim_committed_at.get(&addr).copied());
-            }
-            #[cfg(test)]
             OwnerCommand::IsReapReserved { addr, reply } => {
                 let _ = reply.send(self.reap_reserved.contains_key(&addr));
             }
@@ -1993,43 +2556,6 @@ impl PeerRegistryOwner {
                 self.note_liveness_evidence(addr, at);
             }
         }
-    }
-
-    fn note_liveness_evidence(&mut self, addr: SocketAddr, at: std::time::Instant) {
-        self.liveness_evidence_at
-            .entry(addr)
-            .and_modify(|existing| {
-                if at > *existing {
-                    *existing = at;
-                }
-            })
-            .or_insert(at);
-    }
-
-    fn reap_baseline_activity_detected(
-        &self,
-        addr: SocketAddr,
-        peer_id: &PeerId,
-        evidence_before: std::time::Instant,
-        baseline_configure_peer_generation: u64,
-    ) -> bool {
-        let has_newer_claim = self
-            .claim_committed_at
-            .get(&addr)
-            .is_some_and(|committed_at| *committed_at > evidence_before);
-        let has_newer_response = self
-            .liveness_evidence_at
-            .get(&addr)
-            .copied()
-            .is_some_and(|observed_at| observed_at > evidence_before);
-        if has_newer_claim || has_newer_response {
-            return true;
-        }
-        self.configure_peer_generation
-            .get(peer_id)
-            .copied()
-            .unwrap_or(0)
-            > baseline_configure_peer_generation
     }
 
     fn claim(&mut self, addr: SocketAddr, claim: Claim, is_local_addr: bool) -> ClaimCommit {
@@ -2079,22 +2605,60 @@ impl PeerRegistryOwner {
                 self.claim_generation.insert(addr, commit_seq);
                 // Keep every still-live connection-scoped receipt for this
                 // SAME owner+address in sync with the generation this claim
-                // just advanced to, regardless of whether THIS claim is
-                // itself connection-scoped: a receipt that doesn't move
-                // with `claim_generation` is a stale CACHE of a token that
-                // already moved, and `release`'s CAS would reject it with
-                // no retry possible, stranding the address forever.
+                // just advanced to -- regardless of whether THIS claim is
+                // itself connection-scoped. `claim_generation` is the CAS
+                // fencing token `release`'s `expected_generation` check
+                // compares a receipt's stored generation against, and it
+                // advances on every accepted claim for the reasons above
+                // (`ownership_token`/`claim_is_current`, and `migrate`'s own
+                // CAS check, all need "any accepted claim is a new,
+                // distinguishable state" -- not only a connection-scoped
+                // one). A receipt that does not move with it is not stale
+                // evidence, it is a stale CACHE of a token that already
+                // moved: `release_session` finds it, hands its old
+                // generation to `release`, and `release`'s CAS rejects it
+                // against the newer one -- and because `release_session`
+                // already removed the receipt before that CAS ever ran,
+                // there is no retry, and the address's ownership is
+                // stranded forever on a later, genuinely correct teardown.
+                //
+                // This is deliberately NOT "stop advancing `claim_generation`
+                // for indirect refreshes" instead: `claim_generation` and
+                // `claim_committed_at` already answer two DIFFERENT
+                // questions correctly-scoped to two different kinds of
+                // evidence -- "is this the current CAS-fenced state"
+                // (any accepted claim, on purpose) vs. "when did this
+                // address last have DIRECT evidence of a live owner"
+                // (connection-scoped only, on purpose, see
+                // `claim_committed_at` below). Splitting `claim_generation`
+                // itself into a second, indirect-claims-excluded counter
+                // would re-fold those two already-cleanly-separated
+                // concerns back together and require threading a THIRD
+                // generation concept through `release`'s CAS and every
+                // `connection_scoped_claims` entry, for no benefit over
+                // just keeping the existing receipt cache in sync with the
+                // token it is meant to track.
                 for (key, generation) in self.connection_scoped_claims.iter_mut() {
                     if key.0 == node_id && key.2 == addr {
                         *generation = commit_seq;
                     }
                 }
-                // `claim_committed_at` is deliberately NOT touched here:
-                // this method also serves the gossip/discovery path, whose
-                // third-party claims can be repeated indefinitely regardless
-                // of reachability. Only `claim_connection_scoped` (below) is
-                // direct evidence of life, so only it refreshes this
-                // timestamp.
+                // `claim_committed_at` is deliberately NOT touched here.
+                // This method also serves the gossip/discovery path (any
+                // caller of the plain, non-connection-scoped `claim`
+                // command) -- third-party address announcements this
+                // registry never directly verified, which can be repeated
+                // indefinitely (benign chatter or a deliberate replay)
+                // regardless of whether the claimed peer is actually
+                // reachable. Only `claim_connection_scoped` -- backed by an
+                // outbound dial this node completed or an authenticated
+                // inbound session -- is direct evidence the peer is alive
+                // right now, so only it refreshes this timestamp. Refreshing
+                // it here would let indirect chatter about an offline peer
+                // keep `release_dead_peer`'s freshness fence perpetually
+                // satisfied, answering "when did we last hear a claim
+                // mentioning this address" instead of "when did this
+                // address last have a directly-evidenced live owner".
                 // The lock-free snapshot is also the authoritative
                 // generation fence. Refresh it for every accepted command;
                 // route publication itself remains identity/kind-change only.
@@ -2115,28 +2679,53 @@ impl PeerRegistryOwner {
     }
 
     /// `claim`, plus the connection-scoped receipt bookkeeping for
-    /// `session_source`, committed in the same synchronous step -- so two
-    /// concurrent claims for the same peer+address can't finish their
-    /// receipt transfer out of commit order, and a session exit racing a
-    /// fresh claim can't strand a ghost receipt for the exiting session.
-    /// The generation-sync transfer itself lives in `claim`, not here, and
-    /// runs for every accepted same-owner claim, connection-scoped or
-    /// not -- see its doc comment.
+    /// `session_source`, committed in the same synchronous step.
+    ///
+    /// This is the structural fix for two races PR #178's separately
+    /// synchronized receipt map could hit: with the transfer folded into the
+    /// same `&mut self` call as the commit itself (inside `claim` -- see its
+    /// doc comment), no second command can ever be handled in between, so
+    /// - two concurrent claims for the same peer+address can no longer
+    ///   finish their receipt transfer out of commit order (whichever claim
+    ///   this method processes SECOND always sees the first one's receipts
+    ///   already installed, and transfers them again to its own, later,
+    ///   generation), and
+    /// - a session exit racing a fresh claim for the same peer+address can no
+    ///   longer strand a ghost receipt for the exiting session (`release_session`
+    ///   either runs first and removes it before this transfer would touch
+    ///   it, or this transfer runs first and carries it forward to the new
+    ///   generation like any other still-live receipt, for `release_session`
+    ///   to remove correctly afterward).
+    ///
+    /// The transfer itself lives in `claim`, not here, and runs for EVERY
+    /// accepted same-owner claim, connection-scoped or not: a plain
+    /// gossip/discovery refresh through the shared `claim` path advances
+    /// `claim_generation` exactly the same way this method's own commit
+    /// does, so it must keep live receipts in sync exactly the same way too,
+    /// or a plain refresh between a connection's claim and its later
+    /// teardown leaves that session's receipt holding a generation
+    /// `release`'s CAS will reject -- permanently stranding the address once
+    /// `release_session` has already removed the now-useless receipt.
     fn claim_connection_scoped(
         &mut self,
         addr: SocketAddr,
         claim: Claim,
-        session_source: SocketAddr,
+        _session_source: SocketAddr,
+        connection_instance_id: u64,
         evidence_at: std::time::Instant,
     ) -> ClaimCommit {
         let peer_id = claim.node_id.clone();
         let commit = self.claim(addr, claim, /* is_local_addr */ false);
         if commit.is_accepted() {
-            // Unlike the plain `claim` command, every call here is backed
-            // by an actual connection -- direct evidence the peer is alive
-            // right now -- so this is the one place `claim_committed_at`
-            // is refreshed, regardless of whether the address ends up
-            // pinned below.
+            // Unlike the plain `claim` command, every call into this method
+            // is backed by an actual connection -- an outbound dial this
+            // node completed, or an authenticated inbound session (see
+            // `GossipRegistry::add_connection_scoped_peer_claim`'s only two
+            // production callers). That is direct evidence the peer is
+            // alive right now, so this is the one place `claim_committed_at`
+            // is refreshed to "now" -- regardless of whether the address
+            // ends up pinned below, so a currently-connected pinned peer's
+            // address is never mistaken for one that has been untouched.
             self.claim_committed_at
                 .insert(addr, evidence_at);
         }
@@ -2155,7 +2744,7 @@ impl PeerRegistryOwner {
             // scoped or not -- see its doc comment). Only THIS session's own
             // new receipt remains to be added.
             self.connection_scoped_claims
-                .insert((peer_id, session_source, addr), commit_seq);
+                .insert((peer_id, connection_instance_id, addr), commit_seq);
         }
         commit
     }
@@ -2192,28 +2781,46 @@ impl PeerRegistryOwner {
     /// for every address no OTHER live session still covers -- in the SAME
     /// synchronous step, not as two separately-ordered owner commands.
     ///
-    /// Folding both into one command closes a stranding window: a separate
-    /// "find candidates, then `release` each with its generation" pair
-    /// would let a plain, same-identity claim land in between and move
-    /// `claim_generation`, so `release`'s CAS rejects the stale generation
-    /// with no retry possible, stranding the address permanently. Folded,
-    /// no CAS is needed: nothing can move `claim_generation` mid-call, so
-    /// checking "is `peer_id` still `addr`'s owner right now" is enough.
+    /// Folding both into one command, rather than reporting release
+    /// candidates for a caller to release with a follow-up `release` call,
+    /// is what closes a real stranding window: `release` fences a CAS
+    /// against `claim_generation`, and a plain, same-identity claim landing
+    /// between "find the last receipt here" and "release using its
+    /// generation" advances that generation with no receipt left to update
+    /// (this session's own receipt was already removed by the first
+    /// command) -- so the follow-up `release` rejects its now-stale
+    /// generation, and because the receipt is already gone there is no
+    /// retry. An unpinned address with no receipt left that could ever
+    /// release it is stranded permanently: the exact failure this PR
+    /// exists to fix, reached through the ordinary teardown path instead
+    /// of the dead-peer sweep. Folded, this needs no CAS at all -- nothing
+    /// can move `claim_generation` in the middle of one synchronous call,
+    /// so checking "is `peer_id` still `addr`'s owner right now" (the same
+    /// check `release_dead_peer` uses, for the same reason) is sufficient;
+    /// it also naturally covers the case where a DIFFERENT identity has
+    /// since taken the address (a displacing claim, a migration), which
+    /// this session's exit must never retract regardless of receipts.
     ///
     /// An address is only released when NO other live session still holds
-    /// a receipt for the same peer+address, checked after this session's
-    /// own entries are already removed, in the same step. Returns the
-    /// addresses actually released, paired with the resulting commit
-    /// sequence, for the caller to tombstone its own `gossip_state`
-    /// ownership projection at.
+    /// a receipt for the same peer+address at this exact moment -- checked
+    /// against the map after this session's own entries are already
+    /// removed, in the same synchronous step, so a concurrent claim or a
+    /// concurrent second session's own exit can never be interleaved into
+    /// the middle of this decision.
+    ///
+    /// Returns the addresses actually released, paired with the resulting
+    /// commit sequence, for the caller to tombstone its own `gossip_state`
+    /// ownership projection at -- the same shape `release_dead_peer`
+    /// returns, and for the same purpose.
     fn release_session(
         &mut self,
         peer_id: &PeerId,
-        session_source: SocketAddr,
+        _session_source: SocketAddr,
+        connection_instance_id: u64,
     ) -> Vec<(SocketAddr, CommitSeq)> {
         let mut own_entries = Vec::new();
         self.connection_scoped_claims.retain(|key, generation| {
-            if &key.0 == peer_id && key.1 == session_source {
+            if &key.0 == peer_id && key.1 == connection_instance_id {
                 own_entries.push((key.2, *generation));
                 false
             } else {
@@ -2253,40 +2860,213 @@ impl PeerRegistryOwner {
         released
     }
 
+    /// Invalidate a currently-held reap reservation for `addr`, if one
+    /// exists -- a no-op otherwise. Cheap and synchronous: transitions the
+    /// SAME `Arc<AtomicU8>` `reap_reserved` shares with the matching
+    /// `ReapReservation` guard, from within this task's own serialized
+    /// command stream (see `reap_reserved`'s own doc comment for why the
+    /// write must happen here, never from outside).
+    ///
+    /// Every owner command that commits a fact making `addr` no longer
+    /// genuinely worth reaping -- currently direct liveness evidence
+    /// (`note_liveness_evidence`) -- calls this as part of that SAME atomic
+    /// commit, so a pending destructive phase's CAS fails. Operator pin
+    /// changes are rejected while a reservation is held, before they can
+    /// need this invalidation path.
+    fn invalidate_reap_reservation(&self, addr: SocketAddr) {
+        if let Some(valid) = self.reap_reserved.get(&addr) {
+            // Invalidation wins only before the reap's commit point. Once
+            // `try_consume` has linearized the destructive phase, later
+            // evidence is ordered after that decision and must not turn the
+            // final ownership verdict into an inconsistent ProvenAlive.
+            let _ = valid.compare_exchange(
+                REAP_PENDING,
+                REAP_INVALIDATED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+    }
+
+    /// `OwnerCommand::NoteLivenessEvidence`'s handler: record `at` as the
+    /// latest DIRECT liveness evidence for `addr`, taking the max so a
+    /// command that happens to be processed out of SEND order (never out
+    /// of PROCESSING order -- this queue is FIFO -- but a caller could in
+    /// principle construct two `Instant`s and submit the later-timestamped
+    /// one first) never rolls the recorded evidence backwards.
+    ///
+    /// P1 finding (review round against `d4000e2`, `registry.rs:8750`):
+    /// ALSO invalidates a currently-held reap reservation for `addr`, if
+    /// one exists, the instant this evidence commits. `release_dead_peer_
+    /// ownership`'s own verdict (checked against `liveness_evidence_at`
+    /// exactly like `release_dead_peer` below does) is obtained through an
+    /// `.await` before the destructive phase's irreversible steps run --
+    /// stale the moment it returns, since nothing blocks THIS evidence from
+    /// committing while the reservation is pending. Transitioning the
+    /// reservation here, synchronously, from within this task's serialized
+    /// command stream, makes the pending CAS fail; evidence processed after
+    /// a committed CAS is ordered after the reap by `release_dead_peer`.
+    fn note_liveness_evidence(&mut self, addr: SocketAddr, at: std::time::Instant) {
+        self.liveness_evidence_at
+            .entry(addr)
+            .and_modify(|existing| {
+                if at > *existing {
+                    *existing = at;
+                }
+            })
+            .or_insert(at);
+        self.invalidate_reap_reservation(addr);
+    }
+
+    /// `OwnerCommand::HasNewerLivenessEvidence`'s handler: the SAME causal
+    /// fence `release_dead_peer` checks first (`claim_committed_at` OR
+    /// `liveness_evidence_at` causally newer than `evidence_before`), as a
+    /// PURE READ -- `&self`, not `&mut self`, and no mutation of any kind.
+    /// See that command's own doc comment for why this exists separately
+    /// from `release_dead_peer` rather than the caller trying to infer the
+    /// same answer from its outcome: this is what lets
+    /// `reap_reserved_candidates` decide whether a candidate is worth
+    /// destroying at all WITHOUT that decision itself performing the
+    /// first destructive step.
+    fn has_newer_liveness_evidence(&self, addr: SocketAddr, evidence_before: std::time::Instant) -> bool {
+        self.claim_committed_at
+            .get(&addr)
+            .is_some_and(|committed_at| *committed_at > evidence_before)
+            || self
+                .liveness_evidence_at
+                .get(&addr)
+                .is_some_and(|seen_at| *seen_at > evidence_before)
+    }
+
+    /// `OwnerCommand::ReapBaselineActivityDetected`'s handler -- see that
+    /// variant's own doc comment for why this is a best-effort MITIGATION
+    /// that narrows, not an authorization that closes, plus the P1 finding
+    /// it exists to shrink and its SECOND pass (both: review round against
+    /// `ded8495`, `registry.rs:9508`). PURE READ, no mutation: reuses
+    /// `has_newer_liveness_evidence` verbatim for the evidence half, and
+    /// independently checks whether `peer_id`'s OWN `configure_peer_
+    /// generation` has advanced past `baseline_configure_peer_generation`
+    /// -- i.e. whether some `configure_peer` call for this SAME peer
+    /// committed since the caller captured that baseline (BEFORE
+    /// `try_consume` ran -- see `GossipRegistry::reap_reserved_
+    /// candidates`'s own doc comment for the P1 finding on that exact
+    /// ordering). Deliberately NOT an ownership check
+    /// (`addr_ownership.get(&addr)`): the first version of this function
+    /// tried that and produced false positives for every candidate that
+    /// was never owner-claimed at all (a `GossipState`-only entry, the
+    /// common case for ordinary dead-peer selection) -- reading `None`
+    /// there regardless of whether anything actually changed. The
+    /// generation counter has no such ambiguity: it only ever advances on
+    /// an actual `configure_peer` call for this exact peer, so "advanced
+    /// past the baseline" means precisely "an operator reconfigured this
+    /// peer during this window", never "this candidate happens to look
+    /// unowned for an unrelated reason".
+    fn reap_baseline_activity_detected(
+        &self,
+        addr: SocketAddr,
+        peer_id: &PeerId,
+        evidence_before: std::time::Instant,
+        baseline_configure_peer_generation: u64,
+    ) -> bool {
+        if self.has_newer_liveness_evidence(addr, evidence_before) {
+            return true;
+        }
+        let current_generation = self
+            .configure_peer_generation
+            .get(peer_id)
+            .copied()
+            .unwrap_or(0);
+        current_generation > baseline_configure_peer_generation
+    }
+
     /// Release everything `peer_id` still holds at `addr`: every
     /// connection-scoped receipt recorded for it there under any session
-    /// (including a teardown that never ran), and the ownership record itself
-    /// if this peer still owns the address and it is not operator-pinned.
-    /// This is deliberately one owner-task operation so a stale peer reap
-    /// cannot race a reconnect between receipt cleanup and ownership release.
+    /// (ghost cleanup for a teardown that never ran), and the ownership
+    /// record itself if `peer_id` is still its owner and `addr` is not
+    /// operator-pinned.
+    ///
+    /// `evidence_before` is a CAUSAL fence, checked against
+    /// `claim_committed_at` -- owner-internal, exclusively owner-written
+    /// state -- rather than against anything the caller observed or against
+    /// elapsed wall-clock time. It answers "did this address get direct
+    /// evidence of a live owner AFTER the failure evidence this reap is
+    /// acting on was itself recorded", not "how long ago was the last
+    /// commit" and not "does the generation still match what the caller
+    /// saw". Both of those alternatives are temporal/snapshot LEASES: each
+    /// can be satisfied merely by enough wall-clock time passing --
+    /// elapsed-time-since-commit expires as soon as the command sits queued
+    /// past the timeout regardless of when the reconnect actually happened,
+    /// and a generation snapshot only fences the window between selection
+    /// and this command running, not the window before selection where a
+    /// reconnect can land while `GossipState`'s own failure bookkeeping
+    /// (cleared only by `mark_peer_connected*`, itself running AFTER this
+    /// owner already committed the claim) has not caught up yet.
+    ///
+    /// A causal comparison between two FIXED instants has neither problem:
+    /// `claim_committed_at` is fixed the moment a connection-scoped claim
+    /// commits, and `evidence_before` is fixed by the caller at selection
+    /// time from the failure's own recorded age. Neither moves as more time
+    /// elapses before this command actually runs, so a claim causally after
+    /// the failure invalidates the reap permanently -- it cannot expire by
+    /// waiting -- and a claim causally before it (or no direct evidence at
+    /// all) never protects the address, no matter how promptly the sweep
+    /// reaches this command.
+    ///
+    /// `claim_committed_at` alone only ever advances on a NEW claim/session
+    /// event -- it says nothing about ongoing traffic on a connection
+    /// ALREADY claimed, which never commits another claim no matter how
+    /// many responses it delivers. `liveness_evidence_at` (the same causal
+    /// comparison, against the same `evidence_before`) is the
+    /// complementary fence for exactly that case -- see its own doc
+    /// comment. Checking both, in the SAME synchronous step that decides
+    /// the release, is what finally closes this family of finding: every
+    /// earlier fence in this file answered "did a NEW claim land in some
+    /// window", and gossip delivering ordinary liveness on an
+    /// already-established connection was never a claim at all, so it
+    /// could slip through any fence built only from claim events, no
+    /// matter how many windows those fences closed or how early they
+    /// closed them.
     fn release_dead_peer(
         &mut self,
         peer_id: &PeerId,
         addr: SocketAddr,
         evidence_before: std::time::Instant,
     ) -> DeadPeerReleaseOutcome {
-        if self
-            .claim_committed_at
+        // A reservation's successful `try_consume` is the single
+        // linearization point shared with actor/tombstone destruction. Any
+        // evidence observed after that point is ordered after this reap and
+        // must not make the final ownership result disagree with the work
+        // already committed. Unreserved callers retain the normal causal
+        // liveness fence.
+        let reap_committed = self
+            .reap_reserved
             .get(&addr)
-            .is_some_and(|committed_at| *committed_at > evidence_before)
+            .is_some_and(|state| state.load(Ordering::Acquire) == REAP_COMMITTED);
+        if !reap_committed
+            && self
+                .claim_committed_at
+                .get(&addr)
+                .is_some_and(|committed_at| *committed_at > evidence_before)
         {
             trace!(
                 addr = %addr,
                 peer = %peer_id,
-                "dead-peer release refused: address has direct evidence of life after the failure this reap is acting on"
+                "dead-peer release refused: address has direct evidence of life after the \
+                 failure this reap is acting on"
             );
             return DeadPeerReleaseOutcome::ProvenAlive;
         }
-        if self
-            .liveness_evidence_at
-            .get(&addr)
-            .copied()
-            .is_some_and(|observed_at| observed_at > evidence_before)
+        if !reap_committed
+            && self
+                .liveness_evidence_at
+                .get(&addr)
+                .is_some_and(|seen_at| *seen_at > evidence_before)
         {
             trace!(
                 addr = %addr,
                 peer = %peer_id,
-                "dead-peer release refused: address has response evidence of life after the failure this reap is acting on"
+                "dead-peer release refused: address has ordinary liveness evidence (a response \
+                 on an already-claimed connection) after the failure this reap is acting on"
             );
             return DeadPeerReleaseOutcome::ProvenAlive;
         }
@@ -2308,34 +3088,6 @@ impl PeerRegistryOwner {
         DeadPeerReleaseOutcome::Released(self.retract_owner(addr, owner))
     }
 
-    /// Invalidate a currently-held, NOT YET CONSUMED reap reservation for
-    /// `addr`. Returns `true` when it did -- the caller's cue that it
-    /// genuinely prevented that reservation's destructive work from ever
-    /// being authorized. Returns `false` for both a missing entry and,
-    /// critically, an already-consumed one: `ConsumeReapReservation` may
-    /// have granted authorization for this exact address moments earlier,
-    /// from within this SAME serialized command stream, and a `store`
-    /// here cannot retroactively revoke it -- the caller must not treat
-    /// that as "successfully stopped," or it proceeds as if the
-    /// reservation's destructive work will never run, while it may
-    /// already be committed to running regardless.
-    ///
-    /// Any owner command that commits a fact making `addr` no longer
-    /// genuinely worth reaping should call this as part of that SAME
-    /// atomic commit. Currently only `configure_peer` does, the instant an
-    /// operator's own reconfiguration evicts `addr` from a peer's pin --
-    /// and it consults the return value precisely because of the case
-    /// above.
-    fn invalidate_reap_reservation(&self, addr: SocketAddr) -> bool {
-        match self.reap_reserved.get(&addr) {
-            Some(entry) if !entry.consumed => {
-                entry.valid.store(false, Ordering::Release);
-                true
-            }
-            _ => false,
-        }
-    }
-
     /// This address's current ownership, as an `OwnershipToken`,
     /// constructed directly from this task's own authoritative
     /// `addr_ownership`/`claim_generation` -- not the published
@@ -2354,14 +3106,37 @@ impl PeerRegistryOwner {
         Some(OwnershipToken::new(owner.node_id.clone(), generation))
     }
 
-    /// `OwnerCommand::ReserveForReap`'s handler -- see its doc comment for
-    /// why the causal fence and the ownership/pin/node_id checks are all
-    /// required. `expected_node_id` is checked LAST, deliberately, against
-    /// ownership/pin only after THIS call has freshly reconfirmed them
-    /// current: checking it against a selection-time snapshot instead
-    /// would tell us nothing about whether it still holds once this
-    /// command actually runs, since all three could have gone stale
-    /// together in the interim.
+    /// `OwnerCommand::ReserveForReap`'s handler: checks the causal fence
+    /// against `evidence_before` (the SAME one `release_dead_peer` checks
+    /// first) AND revalidates the FULL identity the caller's selection
+    /// observed for `addr` -- ownership, pin state, AND that the
+    /// destructive phase's own `node_id` corresponds to them -- against
+    /// this task's own current state, and, only if EVERY check passes,
+    /// marks `addr` reserved (see `reap_reserved`'s doc comment) instead
+    /// of releasing anything outright. Nothing else is touched: no
+    /// receipt purge, no ownership change. See `OwnerCommand::
+    /// ReserveForReap`'s own doc comment for why the causal fence and the
+    /// ownership/pin checks are both required -- they protect two
+    /// different windows against two different kinds of evidence, and
+    /// neither alone closes both. The reservation alone is what makes
+    /// `claim`'s own refusal of every claim for a reserved address the
+    /// thing that keeps a concurrent reconnect from committing while the
+    /// caller's later, non-owner destructive work runs.
+    ///
+    /// The `expected_node_id` check runs LAST, after ownership/pin are
+    /// already reconfirmed current -- deliberately, not incidentally: by
+    /// that point, `expected_ownership`/`expected_pin` are not merely
+    /// what the caller observed at selection, they are what THIS atomic
+    /// step has just, freshly, reconfirmed IS the current state. Checking
+    /// `expected_node_id` against them here, rather than at selection
+    /// time (or against them at selection time, which is the same
+    /// mistake one step earlier), is what makes the comparison meaningful
+    /// against the actual race: a `node_id` that agreed with
+    /// `expected_ownership`/`expected_pin` back at selection tells us
+    /// nothing about whether it still does once this command actually
+    /// runs, since all three could have gone stale together in the
+    /// interim. Borrowing the freshness the ownership/pin checks above
+    /// just established is what closes that gap.
     fn reserve_for_reap(
         &mut self,
         addr: SocketAddr,
@@ -2369,7 +3144,7 @@ impl PeerRegistryOwner {
         expected_ownership: Option<OwnershipToken>,
         expected_pin: Option<PeerId>,
         expected_node_id: Option<PeerId>,
-    ) -> Option<Arc<AtomicBool>> {
+    ) -> Option<Arc<AtomicU8>> {
         if self
             .claim_committed_at
             .get(&addr)
@@ -2397,14 +3172,32 @@ impl PeerRegistryOwner {
             );
             return None;
         }
-        // Checked only when ownership/pin (just reconfirmed current above)
-        // name a concrete identity. `None`/`None` means unowned AND
-        // unpinned -- a real, legitimate state (e.g. gossip/discovery
-        // chatter about a peer never itself claimed), not evidence of a
-        // race -- so `expected_node_id` is unconstrained there. The
-        // adversarial case this closes is the opposite: a concrete,
-        // just-reconfirmed identity that `expected_node_id` disagrees
-        // with or is silent about -- fail-closed, like every check here.
+        // `expected_ownership`/`expected_pin` are, as of the two checks
+        // just above, confirmed current -- so the identity they name IS
+        // this address's current identity, right now, atomically. Ownership
+        // is authoritative when present (a claim always exists before a
+        // pin can be installed on top of it -- see `configure_peer`); pin
+        // alone covers the (should-be-unreachable in steady state, but
+        // checked anyway) case of a pin surviving without a corresponding
+        // claim.
+        //
+        // Checked ONLY when this names a concrete identity -- `Some`.
+        // `None` means unowned AND unpinned, which is not the same thing
+        // as "no identity to protect": `GossipState` routinely knows a
+        // `node_id` for an address with no owner-level claim behind it at
+        // all (gossip/discovery chatter about a peer this node has never
+        // itself claimed, or an address whose ownership was independently
+        // released elsewhere while `GossipState`'s own record of who it
+        // last belonged to lingers) -- a real, common, entirely legitimate
+        // state, not evidence of a race. There is no ownership-level
+        // identity there to be wrong about, so `expected_node_id` is not
+        // constrained by this check in that case; it is exactly what the
+        // destructive phase will act on regardless, and nothing here
+        // authorizes any ownership-affecting step against it. The
+        // adversarial case this closes is the opposite direction: a
+        // CONCRETE, just-reconfirmed identity (`Some`) that `expected_
+        // node_id` disagrees with, or is entirely silent about (`None`) --
+        // fail-closed, exactly like every other check in this function.
         if let Some(current_identity) = expected_ownership
             .as_ref()
             .map(|token| token.owner().clone())
@@ -2431,81 +3224,62 @@ impl PeerRegistryOwner {
         if self.reap_reserved.contains_key(&addr) {
             return None;
         }
-        let valid = Arc::new(AtomicBool::new(true));
-        self.reap_reserved.insert(
-            addr,
-            ReapReservationEntry {
-                valid: valid.clone(),
-                consumed: false,
-            },
-        );
+        let valid = Arc::new(AtomicU8::new(REAP_PENDING));
+        self.reap_reserved.insert(addr, valid.clone());
         Some(valid)
-    }
-
-    /// `OwnerCommand::ConsumeReapReservation`'s handler -- the owner round
-    /// trip [`ReapReservation::try_consume`] performs instead of a
-    /// client-side CAS. `false` when there is no entry (already released
-    /// or invalidated) or it is already consumed (a second consume attempt
-    /// for the same reservation, which must never succeed twice). `true`
-    /// exactly once per reservation: sets `consumed` and mirrors the flip
-    /// into `valid` so the guard's own external `is_still_valid()` peek
-    /// stays accurate without a second round trip.
-    fn consume_reap_reservation(&mut self, addr: SocketAddr) -> bool {
-        match self.reap_reserved.get_mut(&addr) {
-            Some(entry) if !entry.consumed => {
-                entry.consumed = true;
-                entry.valid.store(false, Ordering::Release);
-                true
-            }
-            _ => false,
-        }
     }
 
     /// Atomically install `peer_id`'s operator pin at `addr`, evicting
     /// whatever address `pinned_by_peer` shows this SAME peer pinned at
-    /// beforehand (if different), AND whatever different peer `addr`
-    /// itself was previously pinned to. The first eviction is keyed off
-    /// `pinned_by_peer`, not an address the caller believes was previously
-    /// configured (which can be stale by the time this runs): consulting
-    /// the owner's own authoritative reverse map guarantees at most one
-    /// pinned address per peer at every instant. The second keeps
-    /// `operator_pinned` and `pinned_by_peer` from disagreeing about who
-    /// holds `addr` after a standalone conflicting pin.
+    /// beforehand (if different).
     ///
-    /// Returns the evicted address, if any -- the caller's cue to also
-    /// release its ownership; `configure_peer` below does so in the SAME
-    /// synchronous step, the standalone `pin` command does not (see its
-    /// doc comment).
+    /// The eviction is keyed off `pinned_by_peer`, not off any address the
+    /// caller believes was previously configured: that belief can be stale
+    /// by the time this command runs (read from `ConnectionPool` before a
+    /// concurrent `configure_peer`/`migrate` command for the same peer was
+    /// serialized ahead of this one here). Consulting the owner's own
+    /// authoritative reverse map instead is what guarantees at most one
+    /// pinned address per peer at every instant, regardless of how many
+    /// pin installs for that peer are in flight or in what order the owner
+    /// task actually processes them.
     ///
-    /// Also publishes `addr` as `peer_id`'s route via
-    /// `RoutingPublisher::set_configured_peer_addr` (see that trait
-    /// method's own doc comment for why this must happen inside this same
-    /// step), and the pin identity into the lock-free `RoutingSnapshot` --
-    /// the answer `RegistryOwnerHandle::pin_is_current` revalidates
-    /// against. Deliberately separate from `ConnectionPool`'s route and
-    /// the ownership generation: neither answers the pin question.
+    /// Returns the evicted address, if any and if different from `addr` --
+    /// the caller's cue to also release that address's ownership. This
+    /// helper only touches pin bookkeeping and the `ConnectionPool` route;
+    /// releasing the evicted address's ownership (when applicable) is the
+    /// caller's responsibility -- `configure_peer` below does so in the
+    /// SAME synchronous step, atomically; the standalone `pin` command does
+    /// not, by design (see its doc comment).
+    ///
+    /// Also publishes `addr` as `peer_id`'s configured/required
+    /// `ConnectionPool` dial target, in this SAME step, via
+    /// `RoutingPublisher::set_configured_peer_addr` -- so the pin decision
+    /// and the connection-pool route caller code elsewhere reads
+    /// (`get_required_peer_addr`) can never disagree about which address is
+    /// current for this peer, the way two independently-atomic writes
+    /// (owner pin, then a separate later `ConnectionPool` write) could
+    /// under two concurrent `configure_peer` calls for the same peer.
+    ///
+    /// Also publishes the pin identity itself into the lock-free
+    /// `RoutingSnapshot`, in this SAME step -- the authoritative answer to
+    /// "is this peer still the one I pinned at this address" a caller
+    /// revalidates via `RegistryOwnerHandle::pin_is_current` after this
+    /// command returns. Deliberately a SEPARATE publication from both
+    /// `ConnectionPool`'s route (moved by any `.connect()` call, configured
+    /// or not) and the ownership generation (advanced by every accepted
+    /// claim, including unrelated same-identity chatter): neither answers
+    /// the pin question, only this does.
     fn install_pin(&mut self, addr: SocketAddr, peer_id: PeerId) -> Option<SocketAddr> {
-        // If a DIFFERENT peer is currently pinned at `addr` (a standalone
-        // pin conflict, not this peer's own address move), its reverse
-        // entry must be dropped too, mirroring what `RoutingSnapshot::
-        // with_pin` already does for the published snapshot below.
-        // Otherwise `operator_pinned[addr]` moves to `peer_id` here while
-        // `pinned_by_peer[previous_occupant]` keeps claiming that peer is
-        // still pinned at `addr` -- the two maps disagree from this point
-        // on, wrongly refusing that peer's own ordinary route updates and
-        // letting a later pin for it evict `addr` out from under whoever
-        // holds it by then.
-        let stale_occupant = self
-            .operator_pinned
-            .get(&addr)
-            .filter(|occupant| **occupant != peer_id)
-            .cloned();
-        if let Some(occupant) = stale_occupant
-            && self.pinned_by_peer.get(&occupant) == Some(&addr)
+        // Replacing an address pin must clear the displaced peer's reverse
+        // entry too. Leaving the old `(peer -> addr)` entry behind lets a
+        // later pin for that peer evict this address even though the peer no
+        // longer owns its pin.
+        if let Some(previous_peer) = self.operator_pinned.get(&addr)
+            && previous_peer != &peer_id
+            && self.pinned_by_peer.get(previous_peer) == Some(&addr)
         {
-            self.pinned_by_peer.remove(&occupant);
+            self.pinned_by_peer.remove(previous_peer);
         }
-
         let previous = self.pinned_by_peer.insert(peer_id.clone(), addr);
         let evicted = previous.filter(|previous_addr| *previous_addr != addr);
         if let Some(evicted_addr) = evicted {
@@ -2536,16 +3310,36 @@ impl PeerRegistryOwner {
     }
 
     /// `OwnerCommand::SetOrdinaryConnectRoute`'s handler: an ordinary
-    /// `.connect()` route update performed HERE, inside the owner's own
-    /// serialized command processing, instead of the caller writing
-    /// `ConnectionPool` directly -- checked against `self.pinned_by_peer`
-    /// (the owner's own reverse map), not a lock-free mirror a caller
-    /// would otherwise have to read as a separate, non-atomic step. Runs
-    /// as part of the owner's single-threaded processing, so the check
-    /// and the write are one indivisible step. Declines when `peer_id` is
-    /// pinned to a DIFFERENT address; reuses `set_configured_peer_addr`
-    /// for the write, the same method `install_pin`/`migrate` use, adding
-    /// only the conflict check in front.
+    /// `.connect()` call's route update, performed HERE -- inside the
+    /// owner's own serialized command processing -- instead of by the
+    /// caller writing `ConnectionPool` directly.
+    ///
+    /// Checked against `self.pinned_by_peer` directly: the owner's OWN,
+    /// exclusively-owner-written reverse map, not the lock-free
+    /// `RoutingSnapshot` mirror a caller would otherwise have to read
+    /// (and could only ever read as a SEPARATE step from the write,
+    /// leaving the same class of gap `install_pin`'s own doc comment
+    /// describes -- reading a published copy and then acting on it is
+    /// never atomic with a DIFFERENT owner command that changes the pin
+    /// in between, no matter how tightly the read and the write are held
+    /// together on the caller's side). Running as part of the owner's own
+    /// single-threaded command processing, with no other command able to
+    /// run until this one returns, is what makes the check and the write
+    /// here one indivisible step instead of two.
+    ///
+    /// Declines (no mutation) when `peer_id` is operator-pinned to a
+    /// DIFFERENT address: an ordinary connect must never undo a pin's
+    /// synchronized route. Reuses `RoutingPublisher::
+    /// set_configured_peer_addr` for the actual write -- the SAME method
+    /// `install_pin`/`migrate` call -- so the write (and its own
+    /// reindex) is identical in shape to the pin-driven case; this
+    /// command only adds the conflict check in front of it, and does NOT
+    /// install a pin itself.
+    ///
+    /// Returns whether `addr` is now (or already was) the effective
+    /// route -- see `RegistryOwnerHandle::set_ordinary_connect_route`'s
+    /// doc comment for why the caller MUST consult this rather than
+    /// assume the write happened.
     fn set_ordinary_connect_route(&self, peer_id: &PeerId, addr: SocketAddr) -> bool {
         if let Some(pinned) = self.pinned_by_peer.get(peer_id)
             && *pinned != addr
@@ -2570,39 +3364,52 @@ impl PeerRegistryOwner {
 
     /// `OwnerCommand::ConfigurePeer`'s handler: the atomic transaction
     /// behind `GossipRegistry::configure_peer`. Claims `addr` for `peer_id`
-    /// and, only if accepted, installs the operator pin in the SAME
-    /// synchronous step, so by the time `install_pin` runs the claim is a
-    /// fact this exact call already committed, not merely believed. If
-    /// installing the pin evicts a DIFFERENT address this peer was
-    /// previously pinned at, that address's ownership is released in the
-    /// SAME step too, when `peer_id` still holds it.
+    /// with `ClaimKind::Verified` and, only if that claim is accepted,
+    /// installs the operator pin in the SAME synchronous step -- so no other
+    /// owner command can ever be processed between the claim taking effect
+    /// and the pin landing, and by the time `install_pin` runs, `peer_id`
+    /// claiming `addr` is not merely believed but a fact this exact call
+    /// itself just committed.
     ///
-    /// The evicted address's own `ReapReservation`, if held and NOT YET
-    /// consumed, is also invalidated here (unconditional on `evicted_pin`
-    /// alone, since it's the pin move, not the ownership fact, that makes
-    /// a sweep's verdict stale) -- otherwise a caller already
-    /// mid-destruction for the evicted address would carry on deleting a
-    /// peer's actors and emitting tombstones for a peer the operator is
-    /// actively reconfiguring elsewhere. Invalidating rather than refusing
-    /// (as `migrate` does when either endpoint is reap-reserved) is
-    /// correct here specifically because an operator reconfiguration is an
-    /// explicit human action and a reap is only a heuristic sweep: this
-    /// lets the operator win outright, discovered by the sweep's own
-    /// `is_still_valid()` re-check before every irreversible step.
+    /// If installing the pin evicts a DIFFERENT address this same peer was
+    /// previously pinned at, that address's ownership is released in this
+    /// SAME step too, when `peer_id` still holds it -- not left for a
+    /// caller to reclaim afterward through a separately-ordered `release`
+    /// call a concurrent `migrate` could race ahead of. This is what closes
+    /// the window in which the evicted address is unpinned but still
+    /// "owned" by a peer that has already moved its configuration
+    /// elsewhere.
     ///
-    /// If the evicted address's reservation is ALREADY consumed, though,
-    /// there is no "invalidate" left to do -- the reap's destructive work
-    /// is already authorized and may already be running. Checked BEFORE
-    /// `claim`/`install_pin` run, so a refusal here needs no rollback: if
-    /// `peer_id`'s current pin names a different, already-consumed
-    /// address, the whole call is refused with the same
-    /// `ClaimRejection::ReapInProgress` a direct claim against a reserved
-    /// address gets, rather than proceeding to evict an address a reap is
-    /// already committed to destructively acting on.
+    /// P1 finding (review round against `3e260a9`, `registry_owner.rs:2716`):
+    /// the evicted address's own `ReapReservation`, if a `cleanup_dead_peers`
+    /// sweep currently holds one for it, used to stay valid regardless --
+    /// this claim/pin transaction never touched `reap_reserved` at all, only
+    /// `addr_ownership`. A sweep already mid-destruction for the evicted
+    /// address (side tables and actors gated on `is_still_valid()`, which
+    /// this left untouched) would carry on deleting the peer's capabilities
+    /// and actors and emitting `ActorRemoved` tombstones for a peer the
+    /// operator is, at this exact moment, actively reconfiguring elsewhere.
     ///
+    /// `migrate` already refuses outright when either endpoint is
+    /// reap-reserved (`MigrateOutcome::ReapInProgress`). A pin-changing
+    /// configure follows the same rule for the peer's previous pin: the
+    /// owner checks it before the destination claim and returns the same
+    /// temporary rejection. The public registry path retries that rejection
+    /// after the sweep releases its reservation, so no caller-side follow-up
+    /// can evict an address while destructive cleanup still has authority to
+    /// act on it. This is stricter than invalidating the reservation after
+    /// the eviction, because a consumed reap has already crossed its own
+    /// destructive linearization point.
+    ///
+    /// P1 finding (review round against `ded8495`, `registry.rs:4982`):
     /// `expected_generation` is validated FIRST, atomically, before the
-    /// claim is even attempted -- see `configure_peer_generation`'s own
-    /// doc comment for the caller-side race this closes.
+    /// claim below is even attempted -- see `configure_peer_generation`'s
+    /// own doc comment for the caller-side race this closes. `None` (the
+    /// FIRST call for this peer) always proceeds and bumps the counter to
+    /// a new value; `Some(g)` proceeds only if `g` is still current (no
+    /// LATER call has bumped it further), otherwise this returns
+    /// `SupersededByNewerConfiguration` immediately, having touched
+    /// nothing else at all -- not even a rejected claim attempt.
     fn configure_peer(
         &mut self,
         addr: SocketAddr,
@@ -2614,18 +3421,25 @@ impl PeerRegistryOwner {
             .get(&peer_id)
             .copied()
             .unwrap_or(0);
+        // A reconfiguration also mutates the peer's previous pin: the
+        // eviction/release below must not race a reap already committed for
+        // that address. Treat the collision as the same temporary refusal as
+        // a reserved destination, before bumping the request generation or
+        // attempting the new claim.
+        if self
+            .pinned_by_peer
+            .get(&peer_id)
+            .is_some_and(|previous| *previous != addr && self.reap_reserved.contains_key(previous))
+        {
+            return ConfigurePeerCommit {
+                claim: ClaimCommit::Rejected(ClaimRejection::ReapInProgress),
+                evicted_pin: None,
+                evicted_release_seq: None,
+                generation: current_generation,
+            };
+        }
         let generation = match expected_generation {
-            // Exact match only -- not merely not-less-than. A caller can
-            // only legitimately have learned a value FROM this same fence's
-            // own prior response for this peer, so anything else is
-            // refused the same way: a value smaller than current is a
-            // stale retry a newer call already superseded; a value LARGER
-            // than current was never actually stored (see this field's own
-            // doc comment) and accepting it here would apply now while
-            // leaving the stored generation behind, permanently valid for
-            // this exact stale value to be replayed against future,
-            // genuinely newer requests.
-            Some(expected) if expected != current_generation => {
+            Some(expected) if expected < current_generation => {
                 return ConfigurePeerCommit {
                     claim: ClaimCommit::Rejected(ClaimRejection::SupersededByNewerConfiguration),
                     evicted_pin: None,
@@ -2640,37 +3454,6 @@ impl PeerRegistryOwner {
                 bumped
             }
         };
-        // What `install_pin` below would evict for `peer_id`, checked
-        // before any mutation: `pinned_by_peer` is untouched by anything
-        // between this read and `install_pin`'s own (`claim` never writes
-        // it), so this is exactly the address `install_pin`'s `evicted`
-        // return will name.
-        let would_evict = self
-            .pinned_by_peer
-            .get(&peer_id)
-            .copied()
-            .filter(|previous| *previous != addr);
-        if let Some(previous) = would_evict
-            && self
-                .reap_reserved
-                .get(&previous)
-                .is_some_and(|entry| entry.consumed)
-        {
-            trace!(
-                addr = %addr,
-                peer_id = %peer_id,
-                evicted_addr = %previous,
-                "configure_peer refused: peer's previous pinned address is already committed \
-                 to a reap's destructive work; evicting it now would race that work instead of \
-                 stopping it"
-            );
-            return ConfigurePeerCommit {
-                claim: ClaimCommit::Rejected(ClaimRejection::ReapInProgress),
-                evicted_pin: None,
-                evicted_release_seq: None,
-                generation,
-            };
-        }
         let claim = Claim {
             node_id: peer_id.clone(),
             kind: ClaimKind::Verified,
@@ -2685,18 +3468,6 @@ impl PeerRegistryOwner {
             };
         }
         let evicted_pin = self.install_pin(addr, peer_id.clone());
-        if let Some(evicted_addr) = evicted_pin {
-            // Cannot be the already-consumed case checked above:
-            // `evicted_addr` is exactly `would_evict`, already confirmed
-            // not consumed, and nothing since then (all synchronous, no
-            // `.await`, within this one command) can have consumed it.
-            let invalidated = self.invalidate_reap_reservation(evicted_addr);
-            debug_assert!(
-                invalidated || !self.reap_reserved.contains_key(&evicted_addr),
-                "evicted_addr's reservation must not have become consumed between the \
-                 pre-install_pin check above and this call"
-            );
-        }
         let evicted_release_seq = evicted_pin.and_then(|evicted_addr| {
             // Ghost connection-scoped receipts for the evicted address must
             // not survive its release either -- the same cleanup `release`
@@ -2727,21 +3498,35 @@ impl PeerRegistryOwner {
     /// Shared tail of every path that drops a recorded owner: clear its
     /// generation, purge any connection-scoped receipts still recorded
     /// against it, advance the commit order, publish the vacancy, and
-    /// retract the routing publication. Callers are responsible for
-    /// removing `owner` from `addr_ownership` before calling this.
+    /// retract the routing publication. Callers are responsible for removing
+    /// `owner` from `addr_ownership` (and for whatever ownership-match check
+    /// justified doing so) before calling this.
     ///
     /// The receipt purge is unconditional on identity, not scoped to
     /// `owner` alone: `addr` is being fully vacated, so ANY receipt still
-    /// keyed to it refers to a lifecycle generation that no longer exists.
-    /// A caller that does NOT purge its own receipts first (a generic
-    /// peer-table eviction going straight through `release`) would
-    /// otherwise leave one behind to be silently updated to a NEW
-    /// generation by the same identity's next reconnect, permanently
-    /// stranding the address once that reconnect's own teardown finds an
-    /// apparently still-live session that tore down long ago.
+    /// keyed to it -- under any identity -- refers to a lifecycle
+    /// generation that no longer exists. This is what makes receipt
+    /// reconciliation a property of every ownership retraction rather than
+    /// something each call site must remember to do itself. A caller that
+    /// already purged its own identity's receipts before calling this (e.g.
+    /// `release_dead_peer`'s ghost-receipt cleanup for a specific peer) is
+    /// unaffected -- this is a second, harmless pass over an already-empty
+    /// set for that identity. A caller that does NOT purge first (e.g. a
+    /// generic peer-table eviction going straight through `release`) is
+    /// exactly the gap this closes: left behind, such a receipt is later
+    /// silently updated to a NEW generation by the same identity's next
+    /// reconnect (see `claim_connection_scoped`'s same-peer transfer), and
+    /// that reconnect's own eventual teardown then finds an apparently
+    /// still-live second session that in fact tore down long ago --
+    /// permanently stranding the address.
     fn retract_owner(&mut self, addr: SocketAddr, owner: Owner) -> CommitSeq {
         self.claim_generation.remove(&addr);
         self.claim_committed_at.remove(&addr);
+        // Mirrors `claim_committed_at`'s own cleanup above -- prevents
+        // unbounded growth over a long-running process's lifetime as
+        // addresses churn (peer reconnects elsewhere, DNS migration,
+        // dead-peer reap). A fresh claim for this address afterward starts
+        // with no stale liveness evidence to accidentally protect it.
         self.liveness_evidence_at.remove(&addr);
         self.connection_scoped_claims.retain(|key, _| key.2 != addr);
         let commit_seq = self.advance();
@@ -2774,12 +3559,15 @@ impl PeerRegistryOwner {
         expected_source: &SourceExpectation,
         is_local_addr: bool,
     ) -> MigrateOutcome {
-        // This command mutates `addr_ownership`/`claim_committed_at` for
-        // BOTH addresses directly, without going through `claim`'s own
-        // `reap_reserved` check, so it's checked here instead, before
-        // either address's state is read: a sweep holding a reservation
-        // for either end relies on both staying fixed for its destructive
-        // work's duration.
+        // See `MigrateOutcome::ReapInProgress`'s doc comment: this command
+        // mutates `addr_ownership`/`claim_committed_at` for BOTH addresses
+        // directly, without going through `claim`'s own `reap_reserved`
+        // check, so it is checked here instead -- before `is_local_addr`,
+        // before either address's current state is even read. A sweep
+        // holding a reservation for either end is relying on both staying
+        // fixed for the duration of its destructive work; this refusal is
+        // what makes that true regardless of which owner command an
+        // in-flight mutation happens to arrive through.
         if self.reap_reserved.contains_key(&from) || self.reap_reserved.contains_key(&to) {
             trace!(
                 from = %from,
@@ -2859,30 +3647,25 @@ impl PeerRegistryOwner {
         // for one peer (see `pin`'s doc comment).
         let migrated_pin = self.operator_pinned.remove(&from);
         if let Some(pinned_peer) = migrated_pin.clone() {
-            // If a DIFFERENT peer was already pinned at `to` (a standalone
-            // pin the migrating peer's own pin is about to displace), its
-            // reverse entry must be dropped too -- the same
-            // `operator_pinned`/`pinned_by_peer` desync `install_pin`
-            // guards against for its own overwrite, one function over: see
-            // its own doc comment for the full reasoning.
-            let stale_destination_occupant = self
-                .operator_pinned
-                .get(&to)
-                .filter(|occupant| **occupant != pinned_peer)
-                .cloned();
-            if let Some(occupant) = stale_destination_occupant
-                && self.pinned_by_peer.get(&occupant) == Some(&to)
-            {
-                self.pinned_by_peer.remove(&occupant);
-            }
             self.operator_pinned.insert(to, pinned_peer.clone());
             self.pinned_by_peer.insert(pinned_peer.clone(), to);
-            // The pin's `ConnectionPool` route must move with it in this
-            // SAME command, or the owner would protect `to` while
-            // `get_required_peer_addr` kept reporting stale `from`. `from`
-            // is passed as the evicted address for the same reason
-            // `install_pin` does -- see `set_configured_peer_addr`'s doc
-            // comment.
+            // The pin's `ConnectionPool` configured/required route must move
+            // with it in this SAME command -- exactly the ordering-domain
+            // unification `pin` already applies for `configure_peer`.
+            // Leaving this publish to some later, separately-ordered step
+            // would let a DNS migration reintroduce the pin/route
+            // divergence through a different door: the owner would protect
+            // `to`, but `ConnectionPool::get_required_peer_addr` would keep
+            // reporting the stale `from` until the operator reconfigured
+            // the peer again.
+            //
+            // `from` is passed as the evicted address too, for the exact
+            // same reason `install_pin` passes its own evicted address --
+            // see `RoutingPublisher::set_configured_peer_addr`'s doc
+            // comment: this pin's `connections_by_addr[from]` alias must
+            // not survive the move, or a later, different identity
+            // claiming `from` inherits this peer's still-live connection
+            // via `get_connection_by_peer_id`'s address fallback.
             if let Some(routing) = self.routing.upgrade() {
                 routing.set_configured_peer_addr(to, &pinned_peer, Some(from));
             }
@@ -2890,15 +3673,23 @@ impl PeerRegistryOwner {
         let commit_seq = self.advance();
         self.claim_generation.remove(&from);
         self.claim_generation.insert(to, commit_seq);
-        // Connection-scoped receipts move with the ownership they back:
-        // any receipt still keyed to `from` under an identity OTHER than
-        // the one migrating no longer refers to a live generation and is
-        // dropped (same as `retract_owner`'s purge); receipts for the
-        // migrating identity are re-homed at `to` with the new generation,
-        // and any receipt already at `to` for that identity is bumped to
-        // match, since `to`'s own `claim_generation` just advanced
-        // regardless. Left alone, either shape strands a later, correct
-        // teardown that can never find a receipt at the current generation.
+        // Connection-scoped receipts move with the ownership they back, in
+        // this SAME step. `from` is now unowned in `addr_ownership` --
+        // exactly the same "this address's owner just changed" event
+        // `retract_owner` purges receipts for -- so any receipt still keyed
+        // to it, under an identity OTHER than the one migrating, no longer
+        // refers to a live generation and is dropped rather than carried
+        // anywhere. The receipts that belonged to the identity actually
+        // migrating are re-homed at `to` instead, carrying the new
+        // generation forward; any receipt already at `to` for that same
+        // identity (the same-identity merge case) is bumped to the same new
+        // generation too, since `to`'s own `claim_generation` just advanced
+        // regardless of whether anything moved onto it. Left alone, either
+        // shape strands a later, genuinely correct teardown: it can never
+        // find a receipt at the CURRENT generation to release, and the
+        // address becomes unreleasable through the connection-scoped path
+        // for good -- the same failure mode `retract_owner`'s purge closes
+        // for a plain release, just reached through a move instead.
         let mut migrated_receipts = Vec::new();
         self.connection_scoped_claims.retain(|key, generation| {
             if key.2 != from {
@@ -2918,14 +3709,26 @@ impl PeerRegistryOwner {
                 *generation = commit_seq;
             }
         }
-        // Carried over, never reset to "now": `migrate` is DNS-refresh
-        // triggered, not direct evidence of a live connection -- resetting
-        // this would let repeated DNS lookups for a peer that never
-        // reconnects keep the freshness fence perpetually satisfied. `to`
-        // may already have its own, strictly newer timestamp (the merge
-        // case, or an independent reconnect at `to` before this ran), so
-        // take the newer of the two rather than overwriting: a migration
-        // must never make an address look LESS fresh than it is.
+        // Carried over, never reset to "now": `migrate` is exclusively
+        // DNS-refresh-triggered in production (see `refresh_peer_dns`,
+        // itself run as part of a RETRY for a peer that is already
+        // failing), not direct evidence of a live connection. Resetting
+        // this here would let repeated DNS lookups for a peer that never
+        // actually reconnects keep `release_dead_peer`'s freshness fence
+        // perpetually satisfied, the same failure mode a gossip/discovery
+        // claim refreshing it would cause (see `claim`'s doc comment).
+        //
+        // `to` may already be owned by the same identity (the merge case
+        // above), and therefore may already have its OWN, strictly newer
+        // direct-evidence timestamp than `from`'s -- e.g. the peer
+        // independently (re)connected at `to` before this migration ever
+        // ran. Take the newer of the two rather than unconditionally
+        // overwriting: a migration must never make an address look LESS
+        // fresh than it actually is, the same "measuring the wrong event"
+        // shape as a gossip/discovery claim making one look MORE fresh than
+        // it actually is. If `from` never had direct evidence, `to`'s
+        // existing entry (if any) is left untouched; if `to` never had one,
+        // `from`'s is carried forward unchanged.
         if let Some(from_committed_at) = self.claim_committed_at.remove(&from) {
             self.claim_committed_at
                 .entry(to)
@@ -2936,25 +3739,30 @@ impl PeerRegistryOwner {
                 })
                 .or_insert(from_committed_at);
         }
-        if let Some(from_observed_at) = self.liveness_evidence_at.remove(&from) {
+        // Same carry-forward, same reasoning, for the complementary
+        // ordinary-liveness fence (`liveness_evidence_at`) `release_dead_peer`
+        // also checks -- see `claim_committed_at`'s handling just above.
+        if let Some(from_seen_at) = self.liveness_evidence_at.remove(&from) {
             self.liveness_evidence_at
                 .entry(to)
-                .and_modify(|to_observed_at| {
-                    if from_observed_at > *to_observed_at {
-                        *to_observed_at = from_observed_at;
+                .and_modify(|to_seen_at| {
+                    if from_seen_at > *to_seen_at {
+                        *to_seen_at = from_seen_at;
                     }
                 })
-                .or_insert(from_observed_at);
+                .or_insert(from_seen_at);
         }
         let snapshot = self.snapshot.load_full();
         let mut snapshot = snapshot
             .with_owner(from, None)
             .with_owner(to, Some((owner.clone(), commit_seq)));
         // The pin's own publication moves with it, in this SAME snapshot
-        // construction, for the same reason its route does above: a
-        // caller revalidating `pin_is_current` must never observe a
-        // window where the owner's pin bookkeeping already moved but the
-        // published snapshot still shows `from`, or shows neither.
+        // construction, for the same reason its `ConnectionPool` route
+        // does above: a caller revalidating "is my pin still current" (see
+        // `RoutingSnapshot::pin_is_current`) must never observe a window
+        // where the owner's own pin bookkeeping has already moved to `to`
+        // but the published snapshot still shows `from`, or worse, shows
+        // neither.
         if let Some(pinned_peer) = migrated_pin {
             snapshot = snapshot
                 .with_pin(from, None)
@@ -3477,43 +4285,20 @@ mod tests {
         assert!(reclaim.is_accepted());
     }
 
-    /// A connection claim's liveness timestamp belongs to the transport
-    /// event, not to the instant the owner happens to dequeue its command.
-    /// Keeping the captured instant prevents mailbox delay from making old
-    /// evidence look newer than a failure recorded while it waited.
-    #[tokio::test]
-    async fn connection_claim_preserves_evidence_time_across_owner_queueing() {
-        let (owner, _publisher) = owner_handle();
-        let node = peer("connection-claim-evidence-time");
-        let target = addr(30_216);
-        let session = addr(30_217);
-        let evidence_at = std::time::Instant::now()
-            .checked_sub(Duration::from_secs(1))
-            .expect("test clock supports a one-second history");
-
-        let claim = owner
-            .claim_connection_scoped_at(
-                target,
-                claim_of(node.clone(), ClaimKind::Verified),
-                session,
-                evidence_at,
-            )
-            .await;
-        assert!(claim.is_accepted());
-
-        let failure_at = std::time::Instant::now();
-        assert!(matches!(
-            owner.release_dead_peer(node, target, failure_at).await,
-            DeadPeerReleaseOutcome::Released(_)
-        ));
-    }
-
-    /// `release` -- the generic retraction path, not just
-    /// `release_session`'s teardown -- used to leave any connection-scoped
-    /// receipt behind, which a later reclaim by the same peer would
-    /// silently carry forward as a ghost, permanently blocking the new
-    /// session's own teardown. Asserts the ghost-revival consequence
-    /// directly (a later teardown CAN release), not merely an empty map.
+    /// P2 regression: `release` -- the generic retraction path every
+    /// non-connection-scoped eviction routes through, not just
+    /// `release_session`'s own teardown -- used to clear ownership state
+    /// but leave any connection-scoped receipt still recorded for the
+    /// address behind. If the same peer later reclaims the address,
+    /// `claim_connection_scoped`'s same-peer receipt transfer silently
+    /// carries that ghost forward to the new generation, and the new
+    /// session's own, entirely legitimate teardown then sees an apparently
+    /// still-live second session -- one that in fact tore down before the
+    /// reclaim ever happened, through a path that never called
+    /// `release_session` -- and can never release. Asserts the ghost-
+    /// revival consequence directly (a later teardown CAN release), not
+    /// merely that the receipt map happens to be empty somewhere, which is
+    /// reachable for uninteresting reasons too.
     #[tokio::test]
     async fn generic_release_purges_receipts_so_a_later_reclaim_can_still_be_released() {
         let (owner, _publisher) = owner_handle();
@@ -3573,6 +4358,94 @@ mod tests {
         );
     }
 
+    /// A connection-scoped claim's liveness timestamp is evidence from the
+    /// transport, not from the instant the owner happens to dequeue it. If
+    /// the command waits behind owner work, sampling in the handler can make
+    /// evidence that predates a recorded failure look newer and permanently
+    /// protect a dead address from cleanup.
+    #[tokio::test]
+    async fn connection_claim_preserves_evidence_time_across_owner_queueing() {
+        let (owner, _publisher) = owner_handle();
+        let node = peer("connection-claim-evidence-time");
+        let target = addr(30_216);
+        let session = addr(30_217);
+        let evidence_at = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("test clock supports a one-second history");
+
+        let claim = owner
+            .claim_connection_scoped_at(
+                target,
+                claim_of(node.clone(), ClaimKind::Verified),
+                session,
+                legacy_connection_instance_id(session),
+                evidence_at,
+            )
+            .await;
+        assert!(claim.is_accepted());
+
+        let failure_at = std::time::Instant::now();
+        assert!(
+            matches!(
+                owner
+                    .release_dead_peer(node, target, failure_at)
+                    .await,
+                DeadPeerReleaseOutcome::Released(_)
+            ),
+            "evidence recorded before the failure must not be refreshed to the owner dequeue time"
+        );
+    }
+
+    /// A socket tuple is diagnostic metadata, not a transport-session key.
+    /// When a replacement reuses the same tuple, tearing down the predecessor
+    /// must remove only the predecessor's receipt and leave the replacement's
+    /// ownership live until its own instance exits.
+    #[tokio::test]
+    async fn sequential_connection_instances_do_not_release_a_replacement() {
+        let (owner, _publisher) = owner_handle();
+        let node = peer("sequential-connection-instance");
+        let target = addr(30_218);
+        let session_source = addr(30_219);
+
+        let first = owner
+            .claim_connection_scoped_at(
+                target,
+                claim_of(node.clone(), ClaimKind::Verified),
+                session_source,
+                11,
+                std::time::Instant::now(),
+            )
+            .await;
+        assert!(first.is_accepted());
+
+        let second = owner
+            .claim_connection_scoped_at(
+                target,
+                claim_of(node.clone(), ClaimKind::Verified),
+                session_source,
+                12,
+                std::time::Instant::now(),
+            )
+            .await;
+        assert!(second.is_accepted());
+
+        assert!(
+            owner
+                .release_session_for_instance(node.clone(), session_source, 11)
+                .await
+                .is_empty(),
+            "the predecessor's teardown must not retract while the replacement receipt exists"
+        );
+        assert_eq!(owner.routes_to(&target), Some(node.clone()));
+
+        let released = owner
+            .release_session_for_instance(node.clone(), session_source, 12)
+            .await;
+        assert_eq!(released.len(), 1);
+        assert_eq!(released[0].0, target);
+        assert_eq!(owner.routes_to(&target), None);
+    }
+
     /// A disconnect/rejection callback belongs to the exact claim generation
     /// it accepted, not merely to the peer identity. The same authenticated
     /// peer can reconnect and refresh ownership before the old callback runs;
@@ -3605,6 +4478,181 @@ mod tests {
             publisher.events(),
             events_before_stale_release,
             "a stale release must publish no route retraction"
+        );
+    }
+
+    /// P1 follow-on regression: elapsed time alone (whether measured from
+    /// the last commit, or from when a caller-supplied generation snapshot
+    /// was taken) is a LEASE, not a fence -- it can "become" valid purely by
+    /// the release command sitting queued long enough (lock contention, or
+    /// earlier peers in the same sweep each doing their own owner round
+    /// trip first), even though a reconnect landed -- and was itself proven
+    /// live -- while it waited. This reproduces exactly that: the failure
+    /// evidence a sweep would act on is fixed BEFORE a reconnect, the
+    /// reconnect then commits a fresh claim, and enough wall time passes
+    /// that any elapsed-time check (measured from the RECONNECT's own
+    /// genuinely fresh commit) would no longer protect it. The release must
+    /// still be refused, because the reconnect's direct evidence is
+    /// causally AFTER the fixed failure evidence -- a fact elapsed wall
+    /// time can never undo.
+    #[tokio::test]
+    async fn release_dead_peer_is_fenced_against_evidence_causally_before_a_late_reconnect() {
+        let (owner, _publisher) = owner_handle();
+        let node = peer("late-reconnect-causal-fence");
+        let target = addr(30_040);
+        let old_session = addr(30_041);
+        let new_session = addr(30_042);
+
+        owner
+            .claim_connection_scoped(
+                target,
+                claim_of(node.clone(), ClaimKind::Verified),
+                old_session,
+            )
+            .await;
+        // What a dead-peer sweep would have fixed as the failure evidence's
+        // Instant-equivalent at selection time -- BEFORE the reconnect
+        // below, e.g. because `old_session` had already gone quiet and
+        // `gossip_state` looked dead at that exact moment.
+        let evidence_before = std::time::Instant::now();
+
+        // The reconnect: a fresh, genuinely live claim for the SAME
+        // identity, committed strictly AFTER the fixed failure evidence but
+        // well before its (delayed) release actually runs.
+        owner
+            .claim_connection_scoped(
+                target,
+                claim_of(node.clone(), ClaimKind::Verified),
+                new_session,
+            )
+            .await;
+
+        // Enough wall time now passes that any elapsed-time check, measured
+        // from the reconnect's own commit, would no longer protect it. The
+        // causal fence does not care: neither operand it compares moves as
+        // more time passes.
+        tokio::time::sleep(Duration::from_millis(40)).await;
+
+        let released = owner
+            .release_dead_peer(node.clone(), target, evidence_before)
+            .await;
+
+        assert_eq!(
+            released,
+            DeadPeerReleaseOutcome::ProvenAlive,
+            "a dead-peer release must refuse when direct evidence of life is causally after \
+             the failure evidence being acted on, regardless of how much wall-clock time has \
+             since elapsed"
+        );
+        assert_eq!(
+            owner.routes_to(&target),
+            Some(node),
+            "the reconnect's ownership must survive a stale sweep's delayed release"
+        );
+    }
+
+    /// P1 finding (review round against `95907bc`, this file around line
+    /// 2242): an EARLIER version of `note_liveness_evidence` wrote DIRECTLY
+    /// into a lock-free side table (`Arc<scc::HashMap<SocketAddr,
+    /// Instant>>`) that `release_dead_peer` merely CONSULTED via
+    /// `read_sync`. Because that write came from OUTSIDE the owner's own
+    /// serialization, nothing prevented it from landing between
+    /// `release_dead_peer`'s read of the marker and the
+    /// `addr_ownership.remove` a few lines below it -- retracting a peer
+    /// that had, by then, already proven itself alive, with
+    /// `retract_owner` deleting the fresh marker on the way out. A
+    /// lock-free structure the owner only reads has the same check-then-act
+    /// gap as every other mirror this PR found and closed --
+    /// `claim_generation`, `get_required_peer_addr`, the pin token,
+    /// `pinned_addr`, `pinned_addr_for`.
+    ///
+    /// Fixed by routing the WRITE, not just the read, through
+    /// `OwnerCommand::NoteLivenessEvidence` on the owner's own serialized
+    /// `handle()` stream (see that variant's doc comment, and
+    /// `PeerRegistryOwner::note_liveness_evidence`). Both the marker's
+    /// update and `release_dead_peer`'s check of it now run inside the
+    /// SAME single-threaded task, so whichever of the two commands the
+    /// owner dequeues first is fully committed before the other is even
+    /// looked at -- there is no third possibility where one is "in
+    /// flight" relative to the other.
+    ///
+    /// This asserts that guarantee directly, at the level the finding
+    /// cited, rather than through the full `reap_reserved_candidates`
+    /// path (see `reap_reserved_candidates_leaves_capabilities_receipts_
+    /// and_ownership_untouched_when_gossip_proves_liveness` in
+    /// `registry.rs` for that integration-level coverage): the marker is
+    /// bumped via a fully-awaited `note_liveness_evidence` call BEFORE
+    /// `release_dead_peer` is ever invoked, so FIFO order on the shared
+    /// mailbox deterministically guarantees the marker is visible to the
+    /// check -- no reliance on a real, unreproducible thread-level race.
+    ///
+    /// A genuinely adversarial reproduction of the ORIGINAL bug (the
+    /// marker's write landing at the exact machine instruction between
+    /// `release_dead_peer`'s read and its `addr_ownership.remove`) is not
+    /// constructible here: that window existed only inside
+    /// `release_dead_peer`'s own synchronous body, which contains no
+    /// `.await` point on either side of the fix for a single-threaded
+    /// test to hand-drive an interleaving into, and true OS-thread
+    /// parallelism would make the reproduction genuinely racy -- the same
+    /// "no yield point to hand-drive, real parallelism would only be
+    /// racy" shape already accepted elsewhere on this PR for
+    /// `connect_to_peer`'s TOCTOU and the owner's `run()` loop
+    /// drain-priority bug. What IS directly provable, and is asserted
+    /// here, is the fix's actual guarantee: FIFO submission order on the
+    /// shared mailbox is what now determines the outcome, not wall-clock
+    /// timing against an externally-mutable side table.
+    #[tokio::test]
+    async fn release_dead_peer_sees_liveness_evidence_committed_through_the_same_serialized_stream()
+     {
+        let (owner, _publisher) = owner_handle();
+        let node = peer("liveness-marker-owner-serialized");
+        let target = addr(30_045);
+        let session = addr(30_046);
+
+        owner
+            .claim_connection_scoped(target, claim_of(node.clone(), ClaimKind::Verified), session)
+            .await;
+
+        // Exactly what a dead-peer sweep's own selection pass would have
+        // fixed as the failure evidence's Instant-equivalent, BEFORE the
+        // response below arrives.
+        let evidence_before = std::time::Instant::now();
+
+        // A real gap, not just program order: two `Instant::now()` calls
+        // issued back-to-back with no intervening work can land on the
+        // SAME clock tick on a coarse-resolution timer, which would make
+        // the causal `>` comparison below spuriously false regardless of
+        // the fix. See `migrate_never_ages_a_destination_with_newer_
+        // direct_evidence_backwards` above for the same idiom.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // THE WINDOW: ordinary liveness evidence from the SAME
+        // already-claimed connection -- not a new claim, not an ownership
+        // change -- exactly what `mark_response_received` records. Fully
+        // awaited before `release_dead_peer` is even called, so it is
+        // guaranteed to be enqueued on the owner's shared mailbox first,
+        // and therefore processed first (single-threaded, FIFO).
+        owner
+            .note_liveness_evidence(target, std::time::Instant::now())
+            .await;
+
+        let released = owner
+            .release_dead_peer(node.clone(), target, evidence_before)
+            .await;
+
+        assert_eq!(
+            released,
+            DeadPeerReleaseOutcome::ProvenAlive,
+            "a dead-peer release must be refused once the owner's OWN serialized stream has \
+             already committed direct liveness evidence causally after the failure being \
+             acted on"
+        );
+        assert_eq!(
+            owner.routes_to(&target),
+            Some(node),
+            "ownership must not be released for a peer now proven live through the owner's \
+             own serialization -- a check-then-act gap here would have let this retract a \
+             peer that had already proven itself alive"
         );
     }
 
@@ -3678,9 +4726,14 @@ mod tests {
         );
     }
 
-    /// `migrate` must not leave `connection_scoped_claims` keyed to the
-    /// now-unowned `from`. Asserts the ghost-revival consequence directly
-    /// (a later teardown at the migrated address CAN release it).
+    /// P1 regression: `migrate` moved ownership, minted a new generation at
+    /// `to`, and carried freshness/pin state, but left
+    /// `connection_scoped_claims` untouched -- a receipt still keyed to
+    /// `from` after the move refers to an address that is no longer owned
+    /// at all. Asserts the ghost-revival consequence directly (a later
+    /// teardown at the migrated address CAN release it), not merely that
+    /// the receipt ends up under the expected key, since an empty/absent
+    /// entry is reachable for uninteresting reasons too.
     #[tokio::test]
     async fn migrate_moves_receipts_so_a_later_teardown_can_still_release() {
         let (owner, _publisher) = owner_handle();
@@ -3723,12 +4776,23 @@ mod tests {
         );
     }
 
-    /// `claim` (the shared, plain-claim path gossip/discovery refreshes
-    /// use, not only `claim_connection_scoped`) must also keep every
-    /// still-live connection-scoped receipt in sync with the new
-    /// generation, or a plain refresh between a connection's claim and its
-    /// teardown strands that receipt permanently. Same ghost-revival shape
-    /// as the `migrate` regression above, triggered by a plain claim.
+    /// P1 regression: `claim` (the shared, plain-claim path used by
+    /// gossip/discovery refreshes -- NOT only `claim_connection_scoped`)
+    /// advances `claim_generation` for every accepted same-owner claim,
+    /// including a plain refresh that never touches
+    /// `claim_connection_scoped` at all. If it does not ALSO keep every
+    /// still-live connection-scoped receipt for that same owner+address in
+    /// sync with the new generation, an ordinary plain refresh landing
+    /// between a connection's claim and its later, genuinely correct
+    /// teardown leaves that session's receipt holding a stale generation:
+    /// `release_session` finds and removes the receipt, hands its (now
+    /// stale) generation to `release`, `release`'s CAS rejects it against
+    /// the generation the plain claim advanced to, and because the receipt
+    /// is already gone there is no retry -- the address's ownership is
+    /// stranded permanently. Same ghost-revival shape, and same "assert the
+    /// later teardown can actually release it" style, as the `migrate`
+    /// regression above -- just triggered by a plain claim instead of a
+    /// migration.
     #[tokio::test]
     async fn plain_claims_keep_live_receipts_in_sync_so_teardown_can_still_release() {
         let (owner, _publisher) = owner_handle();
@@ -3772,13 +4836,26 @@ mod tests {
         );
     }
 
-    /// `release_session` performs the ownership retraction itself, in the
-    /// SAME synchronous owner command as the receipt removal, so there is
-    /// no window for a racing plain claim to strand it (an earlier version
-    /// returning candidates for a separate `release` call had exactly that
-    /// window). Proves it by racing a plain, same-identity claim directly
-    /// against the session's teardown, both submitted concurrently, and
-    /// asserting release succeeds regardless of ordering.
+    /// P1 regression: `release_session` used to return release CANDIDATES --
+    /// an address plus the receipt's now-removed generation -- for the
+    /// caller to pass to a SEPARATE, later `release` command. A plain
+    /// same-identity claim landing between those two commands advances
+    /// `claim_generation` with no receipt left to update (this session's
+    /// own receipt was already removed by the first command), so the
+    /// follow-up `release` rejected its now-stale generation. Because the
+    /// receipt is already gone, there is no retry: an unpinned address with
+    /// no receipt left that could ever release it is stranded permanently
+    /// -- the exact failure this PR exists to fix, reached through the
+    /// ordinary session-teardown path instead of the dead-peer sweep.
+    ///
+    /// `release_session` now performs the ownership retraction itself, in
+    /// the SAME synchronous owner command as the receipt removal (see its
+    /// doc comment), so there is no window between them for anything to
+    /// land in. Proves it by racing a plain, same-identity claim for the
+    /// SAME address directly against the session's teardown -- both
+    /// submitted concurrently, so the owner may serialize either one
+    /// first -- and asserting the address ends up correctly released
+    /// regardless of which order the owner actually chose.
     #[tokio::test]
     async fn release_session_atomically_retracts_ownership_so_a_racing_plain_claim_cannot_strand_it()
      {
@@ -3806,7 +4883,13 @@ mod tests {
             "the racing plain claim must still be accepted regardless of ordering"
         );
 
-        // Whichever order the owner serialized these in, this session's
+        // Whichever order the owner actually serialized these in: if the
+        // plain claim landed first, the SAME check as
+        // `plain_claims_keep_live_receipts_in_sync_...` applies (the
+        // receipt is kept in sync, so `release_session` still finds and
+        // releases it); if `release_session` landed first, it already
+        // atomically released the address before the plain claim re-claims
+        // it as a fresh, later ownership epoch. Either way, THIS session's
         // own teardown must be reported as having found and released its
         // receipt -- never silently stranded by the race.
         assert_eq!(
@@ -3817,10 +4900,13 @@ mod tests {
         );
     }
 
-    /// A DNS-triggered `migrate` that carries an operator pin from `from`
-    /// to `to` must publish `to` as the peer's `ConnectionPool` route in
-    /// the SAME command, or the owner protects `to` while
-    /// `get_required_peer_addr` keeps reporting stale `from`.
+    /// P2 regression: a DNS-triggered `migrate` that carries an operator pin
+    /// from `from` to `to` must publish `to` as the peer's `ConnectionPool`
+    /// configured/required route in the SAME command -- not leave that
+    /// publish to some later, separately-ordered step. Otherwise the owner
+    /// protects `to` while `ConnectionPool::get_required_peer_addr` keeps
+    /// reporting the stale `from`, reintroducing through `migrate` exactly
+    /// the pin/route divergence `configure_peer` was unified to prevent.
     #[tokio::test]
     async fn migrate_moves_the_configured_route_along_with_a_carried_pin() {
         let (owner, publisher) = owner_handle();
@@ -3851,7 +4937,8 @@ mod tests {
              the pin itself moves in -- and must name `from` as the evicted \
              address, so the SAME call also evicts its now-stale \
              connections_by_addr alias (see RoutingPublisher::\
-             set_configured_peer_addr's own doc comment)"
+             set_configured_peer_addr's own doc comment, P1 review round \
+             against ba2bff2)"
         );
 
         // The pin itself must have moved: `to` now refuses release, `from`
@@ -3863,7 +4950,7 @@ mod tests {
         );
     }
 
-    /// `migrate` permits `to` to already be owned by the SAME
+    /// P2 follow-on: `migrate` permits `to` to already be owned by the SAME
     /// identity (the merge case). If `to` already has its OWN, strictly
     /// newer direct-evidence timestamp than `from`'s, carrying `from`'s
     /// (older) timestamp over unconditionally would age `to` BACKWARDS --
@@ -3893,11 +4980,15 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(80)).await;
 
-        // Fixed strictly between `from`'s claim (now 80ms old) and `to`'s
-        // claim below, so a mixup between the two is distinguishable.
+        // Fixed strictly AFTER `from`'s claim (now 80ms old) but strictly
+        // BEFORE `to`'s claim below -- if `to`'s freshness incorrectly ended
+        // up reflecting `from`'s older evidence instead of its own, this is
+        // exactly the point in time that would fail to distinguish them.
         let evidence_before = std::time::Instant::now();
 
-        // `to` already has its OWN, strictly newer direct claim.
+        // `to` already has its OWN, strictly newer direct claim -- e.g. the
+        // same peer independently (re)connected there too, before this
+        // migration ever ran.
         owner
             .claim_connection_scoped(to, claim_of(node.clone(), ClaimKind::Verified), to_session)
             .await;
@@ -3909,16 +5000,15 @@ mod tests {
         );
 
         // `to`'s freshness must reflect ITS OWN newer evidence, not
-        // `from`'s older timestamp.
-        let committed_at = owner
-            .claim_committed_at_for_test(to)
-            .await
-            .expect("`to` must have a claim_committed_at entry after the merge");
-        assert!(
-            committed_at > evidence_before,
+        // `from`'s much older one: `to`'s real claim happened AFTER
+        // `evidence_before`, so a causal fence checked against it must
+        // still refuse to release `to`.
+        assert_eq!(
+            owner.release_dead_peer(node, to, evidence_before).await,
+            DeadPeerReleaseOutcome::ProvenAlive,
             "migrate must not age a destination with newer direct evidence backwards to \
-             the source's older timestamp -- a genuinely live address's claim_committed_at \
-             must not regress"
+             the source's older timestamp -- a genuinely live address must not become \
+             reapable"
         );
     }
 
@@ -3980,12 +5070,21 @@ mod tests {
         assert_eq!(publisher.events(), events_before);
     }
 
-    /// `migrate` mutates `addr_ownership`/`claim_committed_at` for BOTH
-    /// addresses directly, without going through `claim`'s own
-    /// `reap_reserved` check, so it must consult that table itself. Proves
-    /// both ends: a reservation on the SOURCE refuses the move, and one on
-    /// the DESTINATION refuses it too, both specifically with
-    /// `MigrateOutcome::ReapInProgress`, ownership at both addresses
+    /// P1 follow-up regression: `migrate` mutates `addr_ownership` and
+    /// `claim_committed_at` for BOTH addresses directly -- it does not go
+    /// through `claim`, so it used to be the one owner command that could
+    /// reach those tables without ever consulting `reap_reserved`. A
+    /// `cleanup_dead_peers` sweep relies on nothing being able to move
+    /// ownership onto or off of a reserved address for the duration of its
+    /// non-owner destructive work; a migration was the one door left
+    /// unlocked. Proves both ends: a reservation held on the SOURCE refuses
+    /// the move (ownership must not be moved away out from under a sweep
+    /// about to release or has already started destroying that peer's
+    /// state), and a reservation held on the DESTINATION refuses it too
+    /// (fresh ownership must not be installed on an address a DIFFERENT
+    /// sweep is relying on staying exactly as it observed it) -- in both
+    /// cases with `MigrateOutcome::ReapInProgress` specifically, not some
+    /// other refusal, and with ownership at both addresses completely
     /// unchanged.
     #[tokio::test]
     async fn migrate_is_refused_while_either_end_holds_a_reap_reservation() {
@@ -4063,13 +5162,31 @@ mod tests {
         }
     }
 
-    /// A bare `bool` return from `reserve_for_reap` would let a hard
-    /// `JoinHandle::abort()` of the holding task (not ordinary `select!`
-    /// cancellation) drop the reservation with no side effect, leaking
-    /// `addr` forever. Proves the RAII guard closes it: a task holding a
-    /// granted `ReapReservation`, never explicitly released, is aborted
-    /// mid-flight, and a claim for the same address afterward must still
-    /// succeed.
+    /// P1 follow-up regression: `reserve_for_reap` used to return a plain
+    /// `bool`. Nothing enforced that a caller holding `true` ever called the
+    /// matching release, and nothing ran on its behalf if the caller's task
+    /// ended before reaching it -- in particular, a hard
+    /// `JoinHandle::abort()` of the task holding the reservation (NOT
+    /// `select!` cancellation, which `cleanup_dead_peers` is already safe
+    /// against -- see its own doc comment) used to drop the reservation's
+    /// `bool` on the floor with no side effect at all, leaving
+    /// `reap_reserved` holding the address forever: every future claim for
+    /// it refused permanently, a worse outcome than the race the
+    /// reservation exists to prevent. `GossipRegistryHandle::shutdown` and
+    /// `shutdown_and_wait` both abort the exact task that runs
+    /// `cleanup_dead_peers` in production, so this is not a hypothetical
+    /// path.
+    ///
+    /// Proves the RAII guard closes it: a task is spawned holding a granted
+    /// `ReapReservation`, never explicitly released, and parked so it is
+    /// definitely suspended -- not merely about to complete -- when
+    /// aborted. Aborting it drops the task's future, including the guard,
+    /// in place. Because the guard's `Drop` impl submits the release
+    /// through the SAME owner mailbox via a synchronous `try_send` rather
+    /// than doing nothing, the address is claimable again immediately
+    /// afterward -- proven directly, by actually submitting a claim and
+    /// checking it is accepted, not merely inferred from the absence of a
+    /// panic.
     #[tokio::test]
     async fn an_aborted_task_still_releases_its_reap_reservation() {
         let (owner, _publisher) = owner_handle();
@@ -4090,8 +5207,10 @@ mod tests {
             std::future::pending::<()>().await;
         });
 
-        // Give the spawned task a chance to reach and pass the
-        // reservation's own `.await` before aborting it.
+        // Give the spawned task a chance to actually reach and pass the
+        // reservation's own `.await` before aborting it -- aborting before
+        // it has even run would prove nothing about the guard's `Drop`
+        // impl, since there would be no guard alive yet to drop.
         for _ in 0..50 {
             tokio::task::yield_now().await;
         }
@@ -4122,12 +5241,21 @@ mod tests {
         );
     }
 
+    /// P1 regression: `reserve_for_reap`'s owner-internal handler discarded
+    /// `HashSet::insert`'s return value and unconditionally reported the
+    /// reservation granted once the causal fence passed. Two concurrent
+    /// `cleanup_dead_peers` sweeps racing to reserve the SAME address
+    /// therefore both received a guard backed by ONE shared set entry:
+    /// whichever released first removed the entry while the OTHER sweep's
+    /// destructive actor/tombstone work was still relying on it staying
+    /// held, reopening the exact race the reservation exists to prevent --
+    /// reachable through the reservation mechanism itself, not around it.
+    ///
     /// Proves reservations are exclusive: two reservation requests for the
-    /// same address, submitted genuinely concurrently (the owner's own
-    /// serialization decides which lands first), must produce exactly one
-    /// grant, never two -- two grants would mean two guards sharing one
-    /// entry, unsafe since releasing either drops protection the other
-    /// still relies on.
+    /// same address, submitted genuinely concurrently (`tokio::spawn`, not
+    /// sequenced by the test -- the owner's own internal serialization is
+    /// what decides which one actually lands first, and this test does not
+    /// care which), must produce exactly one grant, never two.
     #[tokio::test]
     async fn concurrent_reap_reservations_for_the_same_address_are_mutually_exclusive() {
         let (owner, _publisher) = owner_handle();
@@ -4172,11 +5300,12 @@ mod tests {
         }
     }
 
-    /// Direct, whitebox proof of `try_consume`'s one-shot semantics --
-    /// see `ReapReservation`'s own doc comment for the full reasoning (why
-    /// the owner's own serialized check-and-set closes the check-then-act
-    /// gap a plain `is_still_valid()` load, repeated however many times,
-    /// cannot). The FIRST call against a fresh, still-valid reservation must
+    /// P1 finding (review round against `c48546d`, `registry.rs:9011`):
+    /// direct, whitebox proof of `try_consume`'s one-shot semantics --
+    /// see `ReapReservation`'s own doc comment for the full reasoning
+    /// (why a compare-and-swap closes the check-then-act gap a plain
+    /// `is_still_valid()` load, repeated however many times, cannot).
+    /// The FIRST call against a fresh, still-valid reservation must
     /// succeed; every call after that, against the SAME reservation, must
     /// fail -- proving this is a genuine one-shot claim, not a repeatable
     /// read that merely happens to answer `true` the first time.
@@ -4196,11 +5325,11 @@ mod tests {
              invalidates it"
         );
         assert!(
-            reservation.try_consume().await,
+            reservation.try_consume(),
             "the first try_consume against a valid, unconsumed reservation must succeed"
         );
         assert!(
-            !reservation.try_consume().await,
+            !reservation.try_consume(),
             "a SECOND try_consume against the SAME, already-consumed reservation must fail -- \
              otherwise this is a repeatable read, not a one-shot claim, and two callers could \
              both believe they alone were authorized to proceed"
@@ -4216,9 +5345,12 @@ mod tests {
 
     /// Companion to the sequential proof above: under GENUINE concurrent
     /// contention (many tasks racing `try_consume` against ONE shared
-    /// reservation, each its own owner round trip), still exactly one
-    /// winner -- the owner's own serialized command processing is what
-    /// makes this exclusive now, not a lock-free CAS the callers share.
+    /// reservation, not sequenced by the test), still exactly one winner.
+    /// This is what actually backs the claim in `ReapReservation`'s own
+    /// doc comment that a `try_consume` CAS needs no owner round trip and
+    /// no lock to be race-free: Rust's atomics model already guarantees a
+    /// single, total modification order for every operation on one atomic
+    /// object, regardless of which task or thread performs it.
     #[tokio::test]
     async fn try_consume_is_exclusive_under_genuinely_concurrent_attempts() {
         let (owner, _publisher) = owner_handle();
@@ -4234,7 +5366,7 @@ mod tests {
         let mut tasks = Vec::new();
         for _ in 0..16 {
             let reservation = reservation.clone();
-            tasks.push(tokio::spawn(async move { reservation.try_consume().await }));
+            tasks.push(tokio::spawn(async move { reservation.try_consume() }));
         }
 
         let mut successes = 0usize;
@@ -4261,121 +5393,37 @@ mod tests {
         reservation.release().await;
     }
 
-    /// If a reservation's destructive work is already authorized
-    /// (`try_consume` succeeded), a `configure_peer` call that would
-    /// otherwise evict that same address from the peer's pin must not
-    /// silently "invalidate" it: there is no live authorization left to
-    /// revoke, so pretending to would let the reap's destructive work run
-    /// concurrently with whatever `configure_peer` does next. Refused
-    /// outright with the same rejection a direct claim against a reserved
-    /// address gets, before any state mutates.
-    #[tokio::test]
-    async fn configure_peer_refuses_to_evict_an_already_consumed_reservation() {
-        let (owner, _publisher) = owner_handle();
-        let node = peer("configure-peer-vs-consumed-reservation");
-        let addr_a = addr(30_460);
-        let addr_b = addr(30_461);
-
-        let outcome = owner.configure_peer(addr_a, node.clone(), None).await;
-        assert!(outcome.claim.is_accepted(), "sanity: initial pin at A must succeed");
-        assert_eq!(owner.pinned_addr_for(&node), Some(addr_a));
-
-        // A dead-peer sweep reserves A exactly as `cleanup_dead_peers`'s
-        // own selection phase would, using the identity it just observed.
-        let ownership = owner.ownership_token(&addr_a);
-        let pin_owner = owner.pin_owner(&addr_a);
-        let reservation = owner
-            .reserve_for_reap(
-                addr_a,
-                std::time::Instant::now(),
-                ownership,
-                pin_owner,
-                Some(node.clone()),
-            )
-            .await
-            .expect("a freshly, unconflictedly claimed address must be reservable");
-
-        assert!(
-            reservation.try_consume().await,
-            "sanity: consumption of a fresh reservation must succeed"
-        );
-
-        // The operator tries to move the SAME peer to B, which would
-        // ordinarily evict A from the pin.
-        let outcome = owner.configure_peer(addr_b, node.clone(), None).await;
-
-        assert_eq!(
-            outcome.claim,
-            ClaimCommit::Rejected(ClaimRejection::ReapInProgress),
-            "configure_peer must refuse rather than evict an address whose reservation is \
-             already consumed"
-        );
-        assert_eq!(
-            owner.pinned_addr_for(&node),
-            Some(addr_a),
-            "a refused configure_peer call must leave the peer's pin completely untouched"
-        );
-        assert_eq!(
-            owner.routes_to(&addr_b),
-            None,
-            "B must not have been claimed either -- the whole call was refused before any \
-             mutation, not merely the pin-eviction step"
-        );
-
-        reservation.release().await;
-    }
-
-    /// Companion to the test above: when the evicted address's reservation
-    /// is still live (not yet consumed), `configure_peer` must invalidate
-    /// it and proceed normally -- the fix above narrows the refusal to
-    /// exactly the already-consumed case, not every reservation.
-    #[tokio::test]
-    async fn configure_peer_invalidates_a_still_live_reservation_and_proceeds() {
-        let (owner, _publisher) = owner_handle();
-        let node = peer("configure-peer-vs-live-reservation");
-        let addr_a = addr(30_462);
-        let addr_b = addr(30_463);
-
-        let outcome = owner.configure_peer(addr_a, node.clone(), None).await;
-        assert!(outcome.claim.is_accepted(), "sanity: initial pin at A must succeed");
-
-        let ownership = owner.ownership_token(&addr_a);
-        let pin_owner = owner.pin_owner(&addr_a);
-        let reservation = owner
-            .reserve_for_reap(
-                addr_a,
-                std::time::Instant::now(),
-                ownership,
-                pin_owner,
-                Some(node.clone()),
-            )
-            .await
-            .expect("a freshly, unconflictedly claimed address must be reservable");
-
-        let outcome = owner.configure_peer(addr_b, node.clone(), None).await;
-
-        assert!(
-            outcome.claim.is_accepted(),
-            "configure_peer must succeed against a reservation that was never consumed"
-        );
-        assert_eq!(owner.pinned_addr_for(&node), Some(addr_b));
-        assert!(
-            !reservation.is_still_valid(),
-            "the still-live reservation must have been genuinely invalidated, not left \
-             dangling"
-        );
-    }
-
-    /// Release is enqueued through the dedicated unbounded `release_tx`,
-    /// never the bounded `tx` mailbox, precisely so it stays reliable when
-    /// the ordinary mailbox is saturated (failing to RELEASE a reservation
-    /// is unlike failing to TAKE one: every later claim is refused
-    /// forever). Proves it under a genuinely, provably saturated bounded
-    /// mailbox: fills `tx` to capacity with a synchronous `try_send` loop
-    /// (no `.await`, so the owner task gets no chance to drain first),
-    /// confirms it's full, then drops the guard WITHOUT calling
-    /// `release()` -- the same path a hard task abort's cleanup runs. A
-    /// later claim for the same address must still succeed.
+    /// P1 regression: `ReapReservation::release` used to disarm
+    /// (`released = true`) BEFORE awaiting its send on the bounded `tx`
+    /// mailbox. A task aborted while that send was suspended waiting for
+    /// mailbox capacity dropped the future with `released` already `true`
+    /// -- `Drop` saw that and did nothing, and even the best-effort
+    /// fallback of that era could itself fail on the very same full
+    /// mailbox. The exact leak the RAII guard exists to prevent,
+    /// reappearing through the guard's own failure path. The governing
+    /// asymmetry: failing to TAKE a reservation is safe (the sweep just
+    /// skips the candidate), but failing to RELEASE one is not (every
+    /// later claim for that address is refused forever) -- so release must
+    /// be reliably enqueueable even when the ordinary mailbox is not.
+    ///
+    /// Proves the fix holds under a genuinely, provably saturated bounded
+    /// mailbox: grants a reservation, then fills `tx` to capacity via a
+    /// tight, SYNCHRONOUS `try_send` loop -- no `.await` anywhere between
+    /// granting the reservation and dropping its guard below, so the owner
+    /// task (a separate tokio task that can only run when this one yields)
+    /// gets no opportunity to drain any of the backlog first; `tx` is
+    /// confirmed still full, with a direct failing `try_send`, immediately
+    /// before the drop. The guard is then dropped WITHOUT calling
+    /// `release()` -- exactly the code path a hard task abort's cleanup
+    /// also runs (`Drop::drop`, no `.await` available either way; a plain
+    /// drop and an abort's cleanup are indistinguishable from the guard's
+    /// own perspective, and `an_aborted_task_still_releases_its_reap_
+    /// reservation` above already covers the task-abort framing directly
+    /// -- this test isolates the mailbox-saturation half of the bug on its
+    /// own, deterministically, which a spawn+abort would not guarantee:
+    /// the runtime could drain the backlog during the `.await` an abort
+    /// join requires, before the guard's `Drop` ever ran). A later claim
+    /// for the same address must succeed regardless.
     #[tokio::test(flavor = "current_thread")]
     async fn reap_reservation_release_survives_a_saturated_bounded_mailbox() {
         let (owner, _publisher) = owner_handle();
@@ -4423,9 +5471,10 @@ mod tests {
         // Drop without releasing -- see this test's doc comment.
         drop(reservation);
 
-        // The proof: a claim for the same address must succeed regardless
-        // -- possible only if the guard's release never depended on
-        // `tx`'s capacity at all.
+        // The mailbox backlog only starts draining once this test awaits
+        // something again, below. The proof: a claim for the same address
+        // must succeed regardless -- possible only if the guard's release
+        // never depended on `tx`'s capacity at all.
         let commit = owner
             .claim_connection_scoped(
                 target_addr,
@@ -4702,9 +5751,17 @@ mod tests {
         assert_eq!(owner.routes_to(&to), Some(node));
     }
 
-    /// `configure_peer` releases an evicted pin's ownership in the SAME
-    /// synchronous step as the eviction, not as a separate, later caller
-    /// action a concurrent `migrate` could race ahead of.
+    /// P1 regression: the OLD `configure_peer` submitted its claim and its
+    /// pin as two separately-ordered owner commands, so the eviction `pin`
+    /// reports and the release of that evicted address's ownership were
+    /// necessarily two separate steps too -- a window in which a concurrent
+    /// `migrate` could move the still-owned evicted address elsewhere
+    /// before a caller's own follow-up `release` ever ran. The atomic
+    /// `configure_peer` transaction closes this by releasing the evicted
+    /// address's ownership in the SAME synchronous step as the eviction
+    /// itself: by the time the second `configure_peer` call returns, the
+    /// first address is no longer merely unpinned but already fully
+    /// unowned, with no separate caller action required or possible to race.
     #[tokio::test]
     async fn configure_peer_atomically_releases_the_evicted_pins_ownership() {
         let (owner, _publisher) = owner_handle();
@@ -4735,12 +5792,25 @@ mod tests {
         assert_eq!(owner.routes_to(&addr_y), Some(node));
     }
 
-    /// Proves `expected_generation` is validated INSIDE the atomic
-    /// transaction, not on the caller's side before submitting: no racing
-    /// needed, deterministically -- submits a stale retry (presenting
-    /// generation 1) strictly AFTER a second, genuinely newer call has
-    /// already committed generation 2 and moved the pin to `addr_y`, and
-    /// asserts it's rejected outright with `addr_y` untouched.
+    /// P1 finding (review round against `ded8495`, `registry.rs:4982`):
+    /// `configure_peer`'s queued retry used to validate `expected_
+    /// generation` on the CALLER's own side, immediately before submitting
+    /// its owner command -- never atomic with the command itself, no
+    /// matter how close together the two were. "On a multi-threaded
+    /// runtime, retry A can pass this check, then a later call B can bump
+    /// the generation and commit its own configuration first, after which
+    /// A's stale command commits last and evicts B."
+    ///
+    /// Proves the fix requires NO racing at all, deterministically: a
+    /// stale `expected_generation` is rejected purely because
+    /// `PeerRegistryOwner::configure_peer` validates it INSIDE the same
+    /// atomic transaction that would install the pin, not because of any
+    /// timing this test would need to construct. Submits a stale retry
+    /// (presenting generation 1, the FIRST call's own value) strictly
+    /// AFTER a second, genuinely newer call has already committed
+    /// generation 2 and moved the pin to `addr_y` -- the exact ordering
+    /// the finding describes ("commits last") -- and asserts it is
+    /// rejected outright, with `addr_y`'s pin left completely untouched.
     #[tokio::test]
     async fn configure_peer_rejects_a_stale_expected_generation_even_with_no_race_at_all() {
         let (owner, _publisher) = owner_handle();
@@ -4766,7 +5836,9 @@ mod tests {
         assert_eq!(owner.routes_to(&addr_y), Some(node.clone()));
 
         // TOO LATE: a retry presenting the FIRST call's own, now-stale
-        // generation (1), submitted strictly after generation 2 committed.
+        // generation (1), submitted strictly after generation 2 already
+        // committed -- exactly the "commits last" ordering the finding
+        // describes, reproduced here with no concurrency or timing at all.
         let stale_retry = owner.configure_peer(addr_p, node.clone(), Some(1)).await;
         assert_eq!(
             *stale_retry.claim(),
@@ -4798,68 +5870,14 @@ mod tests {
         );
     }
 
-    /// `Some(expected)` used to be accepted whenever it was not LESS than
-    /// the stored generation, but a value GREATER than current is never
-    /// actually stored -- so an oversized retry stays "valid" forever,
-    /// able to clobber every later, genuinely newer call. `Some(100)` at
-    /// generation 1 must be refused outright (not silently applied while
-    /// the stored generation stays at 1); a later normal call must still
-    /// advance normally; and the SAME `Some(100)` retry, tried again after
-    /// that, must still be refused rather than now looking "current" by
-    /// coincidence.
-    #[tokio::test]
-    async fn configure_peer_rejects_an_expected_generation_larger_than_current() {
-        let (owner, _publisher) = owner_handle();
-        let node = peer("configure-peer-oversized-generation");
-        let addr_a = addr(30_072);
-        let addr_b = addr(30_073);
-
-        let first = owner.configure_peer(addr_a, node.clone(), None).await;
-        assert!(first.claim().is_accepted());
-        assert_eq!(
-            first.generation(),
-            1,
-            "sanity: a peer's first configure_peer call establishes generation 1"
-        );
-
-        let oversized = owner.configure_peer(addr_b, node.clone(), Some(100)).await;
-        assert_eq!(
-            *oversized.claim(),
-            ClaimCommit::Rejected(ClaimRejection::SupersededByNewerConfiguration),
-            "an expected_generation this fence never actually stored must be refused, not \
-             silently applied"
-        );
-        assert_eq!(
-            owner.routes_to(&addr_b),
-            None,
-            "the oversized retry must not have taken effect"
-        );
-
-        let second = owner.configure_peer(addr_a, node.clone(), None).await;
-        assert!(second.claim().is_accepted());
-        assert_eq!(
-            second.generation(),
-            2,
-            "sanity: a normal call still advances to generation 2"
-        );
-
-        let repeat = owner.configure_peer(addr_b, node.clone(), Some(100)).await;
-        assert_eq!(
-            *repeat.claim(),
-            ClaimCommit::Rejected(ClaimRejection::SupersededByNewerConfiguration),
-            "the same oversized value must still be refused after a later call moved the real \
-             generation on -- it was never valid to begin with, not merely stale now"
-        );
-        assert_eq!(
-            owner.routes_to(&addr_b),
-            None,
-            "the oversized retry must still not have taken effect"
-        );
-    }
-
-    /// `configure_peer`'s pin step only ever runs after this SAME call's
-    /// own claim just committed, so a claim rejection must leave NEITHER a
-    /// pin NOR a route behind for the rejected peer.
+    /// P1 regression: `pin` used to be processed as a command entirely
+    /// separate from the claim that was supposed to justify it, so it never
+    /// verified `peer_id` actually owned `addr` at the moment it ran. The
+    /// atomic `configure_peer` transaction closes this by construction: the
+    /// pin step only ever runs after this SAME call's own claim just
+    /// committed, so a claim rejection (a different identity already
+    /// verified-owns the address) must leave NEITHER a pin NOR a route
+    /// behind for the rejected peer.
     #[tokio::test]
     async fn configure_peer_never_pins_when_the_claim_is_rejected() {
         let (owner, publisher) = owner_handle();
@@ -4894,9 +5912,12 @@ mod tests {
             configured_routes_before,
             "a rejected claim must publish no configured-route write either"
         );
-        // The strongest check: if the rejected claim had wrongly installed
-        // a pin for `challenger`, `target` would now refuse release even
-        // though `incumbent` genuinely still owns it.
+        // The strongest check: if the rejected claim had wrongly installed a
+        // pin for `challenger` anyway, `target` would now refuse release
+        // even though `incumbent` genuinely still owns it (`release`'s
+        // FIRST check is `operator_pinned`). No pin must have been
+        // installed, so the incumbent's own, still perfectly valid release
+        // must succeed.
         assert!(
             owner
                 .release(target, incumbent, original_generation)
@@ -4908,8 +5929,8 @@ mod tests {
     }
 
     /// Replacing an address pin must remove the displaced peer's reverse
-    /// mapping. Otherwise a later pin for that peer could consult the stale
-    /// reverse entry, evict the current owner's live pin, and leave the
+    /// mapping. Otherwise a later pin for the displaced peer can consult the
+    /// stale reverse entry, evict the current owner's pin, and leave the
     /// address unprotected.
     #[tokio::test]
     async fn replacing_an_address_pin_clears_the_displaced_reverse_mapping() {
@@ -4927,19 +5948,24 @@ mod tests {
         assert_eq!(owner.pinned_addr_for(&first), None);
         assert_eq!(owner.pinned_addr_for(&second), Some(addr_a));
 
+        // If the displaced reverse entry survived, this pin would treat
+        // `addr_a` as `first`'s current pin and evict `second`'s live pin.
         assert_eq!(owner.pin(addr_b, first.clone()).await, None);
         assert_eq!(owner.pin_owner(&addr_a), Some(second));
         assert_eq!(owner.pin_owner(&addr_b), Some(first.clone()));
         assert_eq!(owner.pinned_addr_for(&first), Some(addr_b));
     }
 
-    /// If `pin` trusted a caller-supplied "previous address" instead of
-    /// its own reverse map, two concurrent `configure_peer` calls for the
-    /// SAME peer could each leave an address pinned, and since a pinned
-    /// address can never be reclaimed by `release`, the loser would stay
-    /// reserved forever. `pin` must evict whatever this peer is ACTUALLY
-    /// pinned at, so exactly one of two concurrent calls reports an
-    /// eviction and the other address stays reclaimable.
+    /// P2 regression: two concurrent `configure_peer` calls for the SAME
+    /// peer, each targeting a different new address, each read the same
+    /// "previous address" from `ConnectionPool` before either applied its
+    /// own change. If `pin` trusted that caller-supplied address instead of
+    /// its own reverse map, both addresses could end up pinned at once --
+    /// and since a pinned address can never be reclaimed by `release`, the
+    /// loser would stay reserved forever. `pin` must instead evict whatever
+    /// this peer is ACTUALLY pinned at right now, so exactly one of the two
+    /// concurrent calls reports an eviction and the other address is left
+    /// ordinarily reclaimable.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_pins_for_the_same_peer_never_leave_two_addresses_pinned() {
         for round in 0..200u16 {
@@ -4978,8 +6004,11 @@ mod tests {
             let evicted_a = evicted_a.expect("task a panicked");
             let evicted_b = evicted_b.expect("task b panicked");
 
-            // Whichever `pin` runs SECOND evicts the first one's address;
-            // exactly one of the two must report an eviction.
+            // Whichever `pin` command the owner processes FIRST evicts
+            // nothing (no prior pin exists yet); whichever it processes
+            // SECOND evicts the first one's address. Exactly one of the two
+            // must report an eviction, regardless of which order the owner
+            // actually serialized them in.
             assert_ne!(
                 evicted_a.is_some(),
                 evicted_b.is_some(),
@@ -4987,7 +6016,9 @@ mod tests {
                  the other's address"
             );
 
-            // Whichever call reported an eviction ran LAST and won.
+            // Whichever call reported an eviction ran LAST and won: its own
+            // target address is the one left pinned, and the address it
+            // evicted (the other call's target) is now reclaimable.
             let (still_pinned, now_reclaimable) = if let Some(evicted) = evicted_a {
                 (addr_a, evicted)
             } else {
@@ -5021,109 +6052,7 @@ mod tests {
         }
     }
 
-    /// A standalone `pin` for one peer at an address a DIFFERENT peer is
-    /// already pinned at must not leave the owner's own reverse map
-    /// (`pinned_by_peer`) disagreeing with the address-keyed map
-    /// (`operator_pinned`) it just overwrote. The disagreement has two
-    /// observable consequences: the displaced peer's own ordinary route
-    /// updates get wrongly refused (the stale entry makes it still look
-    /// pinned), and a later pin for that peer mistakes the old address for
-    /// its own previous one and evicts whoever now legitimately holds it.
-    #[tokio::test]
-    async fn install_pin_drops_the_previous_occupants_reverse_entry_on_conflict() {
-        let (owner, _publisher) = owner_handle();
-        let p = peer("pin-conflict-p");
-        let q = peer("pin-conflict-q");
-        let a = addr(55_000);
-        let elsewhere = addr(55_001);
-
-        owner.pin(a, p.clone()).await;
-        owner.pin(a, q.clone()).await;
-
-        assert_eq!(
-            owner.pinned_addr_for(&p),
-            None,
-            "P must no longer be reported as pinned anywhere once Q's pin displaced it at A"
-        );
-        assert_eq!(
-            owner.pinned_addr_for(&q),
-            Some(a),
-            "Q must be A's current pin"
-        );
-
-        assert!(
-            owner.set_ordinary_connect_route(p.clone(), elsewhere).await,
-            "P's ordinary route update must succeed -- P is not actually pinned anywhere \
-             after Q's conflicting pin displaced it"
-        );
-
-        let other = addr(55_002);
-        owner.pin(other, p.clone()).await;
-        assert_eq!(
-            owner.pinned_addr_for(&q),
-            Some(a),
-            "Q's pin at A must survive P being pinned elsewhere -- A was never P's own \
-             address to evict"
-        );
-    }
-
-    /// Same `operator_pinned`/`pinned_by_peer` desync as `install_pin`'s
-    /// own overwrite, one function over: `migrate` carrying a pin onto a
-    /// DIFFERENT peer's already-pinned destination must drop that peer's
-    /// reverse entry too, or its own ordinary route updates are wrongly
-    /// refused afterward, and a later pin for it can evict the
-    /// destination and clobber the migrated pin there.
-    #[tokio::test]
-    async fn migrate_drops_the_destinations_previous_occupants_reverse_entry_on_conflict() {
-        let (owner, _publisher) = owner_handle();
-        let p = peer("mig-pin-p");
-        let q = peer("mig-pin-q");
-        let from = addr(30_470);
-        let to = addr(30_471);
-        let elsewhere = addr(30_472);
-
-        // Q is pinned at `to`, independent of ownership -- exactly what
-        // the standalone `pin` API allows for an otherwise-unowned
-        // address.
-        owner.pin(to, q.clone()).await;
-
-        // P owns and is pinned at `from`.
-        let outcome = owner.configure_peer(from, p.clone(), None).await;
-        assert!(
-            outcome.claim.is_accepted(),
-            "sanity: P's claim and pin at from must succeed"
-        );
-        let source = current_source(&owner, from);
-
-        // `from` migrates to `to`, carrying P's pin onto Q's
-        // already-pinned destination.
-        let result = owner.migrate(from, to, source, false).await;
-        assert!(
-            result.moved(),
-            "sanity: migrate must succeed onto an otherwise-unowned destination"
-        );
-
-        // The observable consequence: Q's own ordinary route update must
-        // succeed -- Q is not actually pinned anywhere anymore.
-        assert!(
-            owner.set_ordinary_connect_route(q.clone(), elsewhere).await,
-            "Q's ordinary route update must succeed -- Q is not actually pinned anywhere \
-             after the migrated pin displaced it at the destination"
-        );
-
-        // And a later pin for Q must not evict the destination and
-        // clobber P's migrated pin there.
-        let other = addr(30_473);
-        owner.pin(other, q.clone()).await;
-        assert_eq!(
-            owner.pinned_addr_for(&p),
-            Some(to),
-            "P's migrated pin must survive Q being pinned elsewhere -- the destination was \
-             never Q's own address to evict"
-        );
-    }
-
-    /// A DNS-triggered `migrate` (which carries a pin from its
+    /// P2 companion: a DNS-triggered `migrate` (which carries a pin from its
     /// source to its destination) racing a concurrent `configure_peer`
     /// `pin` for the SAME peer must not leave two pins standing either --
     /// `migrate`'s pin-carry updates the same `pinned_by_peer` reverse map
