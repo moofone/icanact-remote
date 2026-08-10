@@ -634,10 +634,13 @@ impl<T> RemoteActorRef<T> {
 
         // Somebody else may have already repaired this ref concurrently -
         // if the live slot no longer points at the instance that just
-        // failed, reuse it instead of dialing again.
-        if let Some(current) = self.connection.load_full() {
-            if !Arc::ptr_eq(&current, failed) {
-                return Ok(current);
+        // failed, reuse it only when that replacement is still healthy.
+        // A closed replacement is not a heal: retain it as the CAS expected
+        // value below so this repair can replace that exact stale pointer.
+        let expected = self.connection.load_full();
+        if let Some(current) = expected.as_ref() {
+            if !Arc::ptr_eq(current, failed) && !current.is_closed() {
+                return Ok(current.clone());
             }
         }
 
@@ -646,7 +649,13 @@ impl<T> RemoteActorRef<T> {
         // get-or-create path may still have that session indexed briefly after the transport
         // reports its error; resolving first can return the same dead instance and make the CAS
         // below appear to heal while changing nothing underneath.
-        if let Some(instance_id) = failed.instance_id() {
+        if let Some(current) = expected.as_ref() {
+            if let Some(instance_id) = current.instance_id() {
+                registry
+                    .connection_pool
+                    .remove_connection_instance_for_peer(&peer_id, current.addr, instance_id);
+            }
+        } else if let Some(instance_id) = failed.instance_id() {
             registry
                 .connection_pool
                 .remove_connection_instance_for_peer(&peer_id, failed.addr, instance_id);
@@ -654,9 +663,27 @@ impl<T> RemoteActorRef<T> {
         let fresh = Self::dial_replacement(&registry, &peer_id, failed, deadline).await?;
 
         Ok(
-            match self.compare_and_set_connection(Some(failed), fresh.clone()) {
+            match self.compare_and_set_connection(expected.as_ref(), fresh.clone()) {
                 Ok(()) => fresh,
-                Err(Some(other)) => other,
+                Err(Some(other)) if !other.is_closed() => other,
+                Err(Some(other)) => {
+                    if let Some(instance_id) = other.instance_id() {
+                        registry
+                            .connection_pool
+                            .remove_connection_instance_for_peer(&peer_id, other.addr, instance_id);
+                    }
+                    match self.compare_and_set_connection(Some(&other), fresh.clone()) {
+                        Ok(()) => fresh,
+                        Err(Some(current)) if !current.is_closed() => current,
+                        Err(Some(current)) => {
+                            return Err(crate::GossipError::ConnectionClosed(current.addr));
+                        }
+                        Err(None) => {
+                            self.connection.store(Some(fresh.clone()));
+                            fresh
+                        }
+                    }
+                }
                 Err(None) => {
                     // Slot had already been cleared out from under us; nothing
                     // better than our own fresh dial is available.
@@ -680,21 +707,55 @@ impl<T> RemoteActorRef<T> {
         let Some(registry) = self.registry.upgrade() else {
             return err;
         };
-        let recovery_deadline = deadline
-            .unwrap_or_else(|| tokio::time::Instant::now() + registry.config.connection_timeout);
-        match self
-            .reheal_connection(failed, Some(recovery_deadline))
-            .await
-        {
-            Ok(_) => {}
-            Err(repair_err) => {
+        let recovery_deadline = tokio::time::Instant::now() + registry.config.connection_timeout;
+        let repair = self.reheal_connection(failed, Some(recovery_deadline));
+
+        if let Some(operation_deadline) = deadline {
+            match Self::remaining_until(operation_deadline) {
+                Ok(remaining) => match tokio::time::timeout(remaining, repair).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(repair_err)) => {
+                        tracing::debug!(
+                            error = ?repair_err,
+                            "failed to repair cached connection after ambiguous ask failure"
+                        );
+                    }
+                    Err(_) => {
+                        self.spawn_ambiguous_ask_recovery(Arc::clone(failed), recovery_deadline);
+                    }
+                },
+                Err(_) => {
+                    self.spawn_ambiguous_ask_recovery(Arc::clone(failed), recovery_deadline);
+                }
+            }
+        } else if let Err(repair_err) = repair.await {
+            tracing::debug!(
+                error = ?repair_err,
+                "failed to repair cached connection after ambiguous ask failure"
+            );
+        }
+        err
+    }
+
+    fn spawn_ambiguous_ask_recovery(
+        &self,
+        failed: Arc<RemoteConnection>,
+        deadline: tokio::time::Instant,
+    ) {
+        let remote = RemoteActorRef::<()> {
+            location: self.location.clone(),
+            connection: Arc::clone(&self.connection),
+            registry: self.registry.clone(),
+            _marker: PhantomData,
+        };
+        tokio::spawn(async move {
+            if let Err(repair_err) = remote.reheal_connection(&failed, Some(deadline)).await {
                 tracing::debug!(
                     error = ?repair_err,
                     "failed to repair cached connection after ambiguous ask failure"
                 );
             }
-        }
-        err
+        });
     }
 
     /// Create a new RemoteActorRef with optional connection and registry reference (for auto-reconnection)
@@ -1054,7 +1115,7 @@ impl<T> RemoteActorRef<T> {
     {
         // Check if registry has been shut down
         if let Some(registry) = self.registry.upgrade() {
-            if registry.shutdown.load(Ordering::Relaxed) {
+            if registry.shutdown.load(Ordering::Acquire) {
                 return Err(crate::GossipError::Shutdown);
             }
         } else {
