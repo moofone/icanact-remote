@@ -494,6 +494,16 @@ pub struct RoutedPubSub {
     last_route_provider_revision: AtomicU64,
     #[cfg(test)]
     control_plane_refreshes: AtomicU64,
+    /// Test-only gate for opening the exact gap between the revision check and
+    /// construction of the control-plane select. A provider notification can
+    /// be consumed in this window, so the provider wait future itself must
+    /// re-check the revision instead of relying on the permit.
+    #[cfg(test)]
+    control_plane_wait_hook_enabled: AtomicBool,
+    #[cfg(test)]
+    control_plane_wait_hook_entered: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    control_plane_wait_hook_release: Arc<tokio::sync::Notify>,
 }
 
 /// Fires the test-only subscriber-map RMW hook (see
@@ -555,6 +565,12 @@ impl RoutedPubSub {
             last_route_provider_revision: AtomicU64::new(u64::MAX),
             #[cfg(test)]
             control_plane_refreshes: AtomicU64::new(0),
+            #[cfg(test)]
+            control_plane_wait_hook_enabled: AtomicBool::new(false),
+            #[cfg(test)]
+            control_plane_wait_hook_entered: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            control_plane_wait_hook_release: Arc::new(tokio::sync::Notify::new()),
         });
         this.registry
             .set_pubsub_ingress_handler(Arc::clone(&this))
@@ -1638,6 +1654,16 @@ impl RoutedPubSub {
                     continue;
                 }
 
+                #[cfg(test)]
+                if let Some(this) = weak.upgrade()
+                    && this
+                        .control_plane_wait_hook_enabled
+                        .swap(false, Ordering::AcqRel)
+                {
+                    this.control_plane_wait_hook_entered.notify_one();
+                    this.control_plane_wait_hook_release.notified().await;
+                }
+
                 tokio::select! {
                     _ = actor_state.wait_for_pubsub_routing_change(actor_revision) => false,
                     _ = connection_pool.wait_for_routing_change(connection_revision) => false,
@@ -2146,6 +2172,9 @@ mod tests {
             last_connection_routing_revision: AtomicU64::new(u64::MAX),
             last_route_provider_revision: AtomicU64::new(u64::MAX),
             control_plane_refreshes: AtomicU64::new(0),
+            control_plane_wait_hook_enabled: AtomicBool::new(false),
+            control_plane_wait_hook_entered: Arc::new(tokio::sync::Notify::new()),
+            control_plane_wait_hook_release: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -2276,6 +2305,27 @@ mod tests {
         }
     }
 
+    struct NotifyingRouteProvider {
+        calls: AtomicU64,
+        called: Arc<tokio::sync::Notify>,
+    }
+
+    impl PubSubRouteProvider for NotifyingRouteProvider {
+        fn group_destinations(
+            &self,
+            _topic_key: u64,
+            destinations: &[PeerId],
+        ) -> HashMap<PeerId, Arc<[PeerId]>> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            self.called.notify_one();
+            destinations
+                .iter()
+                .cloned()
+                .map(|peer| (peer.clone(), Arc::from(vec![peer].into_boxed_slice())))
+                .collect()
+        }
+    }
+
     struct BlockingRouteProvider {
         calls: AtomicU64,
         first_call_started: Arc<std::sync::Barrier>,
@@ -2371,27 +2421,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_provider_revision_wait_survives_a_consumed_notification() {
+    async fn control_plane_provider_revision_recheck_survives_consumed_notification() {
         let pubsub = test_pubsub("pubsub-provider-revision-wait");
-        let after = pubsub.route_provider_revision.load(Ordering::Acquire);
-        pubsub.set_route_provider(Arc::new(CountingRouteProvider {
+        let initial_provider = Arc::new(CountingRouteProvider {
             calls: AtomicU64::new(0),
-        }));
+        });
+        pubsub.set_route_provider(initial_provider.clone());
+        let interested_peer =
+            crate::KeyPair::new_for_testing("pubsub-provider-revision-peer").peer_id();
+        pubsub
+            .registry
+            .register_actor(
+                interest_name(topic_key("provider-revision"), &interested_peer),
+                RemoteActorLocation::new_with_peer(
+                    "127.0.0.1:19009".parse().unwrap(),
+                    interested_peer,
+                ),
+            )
+            .await
+            .unwrap();
 
-        // Model another select branch consuming the single Notify permit.
+        // Pause the real control-plane task after its revision pre-check and
+        // before it constructs the select. This is the race in which another
+        // branch can consume the provider Notify permit.
+        pubsub
+            .control_plane_wait_hook_enabled
+            .store(true, Ordering::Release);
+        RoutedPubSub::spawn_control_plane(&pubsub);
+        pubsub.control_plane_wait_hook_entered.notified().await;
+        assert_eq!(initial_provider.calls.load(Ordering::Acquire), 1);
+        let refreshes_before_change = pubsub.control_plane_refreshes.load(Ordering::Acquire);
+
+        let replacement_called = Arc::new(tokio::sync::Notify::new());
+        let replacement_provider = Arc::new(NotifyingRouteProvider {
+            calls: AtomicU64::new(0),
+            called: Arc::clone(&replacement_called),
+        });
+        pubsub.set_route_provider(replacement_provider.clone());
+
+        // Consume the only notification while the control-plane task is held
+        // before select construction. A revision-only implementation would
+        // now park until the one-second fallback; the wait future's revision
+        // check must still wake this actual control-plane turn.
         pubsub.route_provider_change_notify.notified().await;
+        pubsub.control_plane_wait_hook_release.notify_one();
 
-        let observed = tokio::time::timeout(
-            Duration::from_millis(10),
-            wait_for_route_provider_change(
-                pubsub.route_provider_revision.as_ref(),
-                pubsub.route_provider_change_notify.as_ref(),
-                after,
-            ),
-        )
-        .await
-        .expect("the revision check must recover a consumed provider notification");
-        assert_ne!(observed, after);
+        tokio::time::timeout(Duration::from_millis(100), replacement_called.notified())
+            .await
+            .expect("provider revision change must rebuild without the fallback timer");
+        assert!(replacement_provider.calls.load(Ordering::Acquire) > 0);
+        assert!(
+            pubsub.control_plane_refreshes.load(Ordering::Acquire) > refreshes_before_change,
+            "the provider revision change must drive an actual control-plane refresh"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
