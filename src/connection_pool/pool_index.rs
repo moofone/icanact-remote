@@ -135,6 +135,18 @@ impl OutboundDialRetry {
         state.retry_not_before = None;
     }
 
+    fn record_neutral(&self, attempt: OutboundDialAttempt) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.generation != attempt.generation {
+            return;
+        }
+        state.generation = state.generation.wrapping_add(1);
+        state.retry_not_before = None;
+    }
+
     fn record_published_connection(&self) {
         let mut state = self
             .state

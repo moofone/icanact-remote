@@ -1048,9 +1048,36 @@ async fn connection_published_after_retry_claim_is_reused_before_dial() {
         .expect("publish outbound connection");
 
     assert!(
+        pool.reuse_published_connection(&session).is_some(),
+        "a connection published while the retry floor is active must be reused before WouldBlock"
+    );
+    assert!(
         pool.reuse_published_connection_after_retry_claim(&session, attempt)
             .is_some(),
         "a connection published after the initial lookup must be reused before dialing"
+    );
+}
+
+#[test]
+fn neutral_outbound_completion_releases_reservation_without_resetting_streak() {
+    let retry = OutboundDialRetry::with_retry_floor(Duration::from_secs(1));
+    let attempt = retry
+        .try_claim_attempt()
+        .expect("initial attempt must claim");
+    retry.record_failure(attempt);
+
+    let neutral_attempt = retry
+        .try_claim_attempt()
+        .expect("first retry must remain immediate");
+    retry.record_neutral(neutral_attempt);
+
+    let failed_attempt = retry
+        .try_claim_attempt()
+        .expect("neutral completion must release its reservation");
+    retry.record_failure(failed_attempt);
+    assert!(
+        retry.try_claim_attempt().is_none(),
+        "neutral completion must preserve the prior failure streak"
     );
 }
 

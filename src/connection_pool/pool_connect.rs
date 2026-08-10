@@ -144,14 +144,21 @@ impl<T> ConnectionPool<T> {
         None
     }
 
+    fn reuse_published_connection(
+        &self,
+        session: &Arc<PeerSession>,
+    ) -> Option<ConnectionHandle<T>> {
+        let connection = session.current_connection()?;
+        connection.update_last_used();
+        self.make_connection_handle(connection.addr, &connection)
+    }
+
     fn reuse_published_connection_after_retry_claim(
         &self,
         session: &Arc<PeerSession>,
         attempt: OutboundDialAttempt,
     ) -> Option<ConnectionHandle<T>> {
-        let connection = session.current_connection()?;
-        connection.update_last_used();
-        let handle = self.make_connection_handle(connection.addr, &connection)?;
+        let handle = self.reuse_published_connection(session)?;
         session.outbound_dial_retry.record_success(attempt);
         Some(handle)
     }
@@ -1693,6 +1700,13 @@ impl<T> ConnectionPool<T> {
                         .as_ref()
                         .map(|session| session.outbound_dial_retry.try_claim_attempt());
                     if retry_attempt.as_ref().is_some_and(Option::is_none) {
+                        if let Some(handle) = retry_session
+                            .as_ref()
+                            .and_then(|session| self.reuse_published_connection(session))
+                        {
+                            gate_completion.finish(true);
+                            return Ok(handle);
+                        }
                         // This caller did not attempt a socket, so release the
                         // address ownership gate without extending the peer's
                         // failure streak/deadline.
@@ -1729,8 +1743,10 @@ impl<T> ConnectionPool<T> {
                                     error.kind(),
                                     std::io::ErrorKind::WouldBlock
                                         | std::io::ErrorKind::InvalidInput
-                                ) => {}
-                            Err(crate::GossipError::Shutdown) => {}
+                                ) => session.outbound_dial_retry.record_neutral(attempt),
+                            Err(crate::GossipError::Shutdown) => {
+                                session.outbound_dial_retry.record_neutral(attempt)
+                            }
                             Err(_) => session.outbound_dial_retry.record_failure(attempt),
                         }
                     }
