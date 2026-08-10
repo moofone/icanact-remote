@@ -7463,6 +7463,93 @@ async fn delta_gossip_with_mismatched_sender_identity_is_ignored() {
     );
 }
 
+/// `DeltaGossipResponse` has the same self-reported sender field as
+/// `DeltaGossip`. It must enforce the authenticated transport identity before
+/// resolving the claimed address or recording owner-side liveness; otherwise
+/// an authenticated attacker can keep a dead victim's address permanently
+/// immune from reap by sending forged responses.
+#[tokio::test]
+async fn delta_gossip_response_with_mismatched_sender_identity_is_ignored() {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing(
+                "lrr_delta_response_impersonation_local",
+            )),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let attacker_id = crate::KeyPair::new_for_testing("lrr_delta_response_attacker").peer_id();
+    let attacker_addr: SocketAddr = "10.77.0.71:9307".parse().unwrap();
+    let victim_id = crate::KeyPair::new_for_testing("lrr_delta_response_victim").peer_id();
+    let victim_addr: SocketAddr = "10.77.0.72:9308".parse().unwrap();
+
+    // Make the victim claim resolvable. Without this mapping the pre-fix
+    // handler would fall back to the attacker's transport address, making the
+    // test pass without proving that the forged victim address was protected.
+    let _ = registry
+        .connection_pool
+        .peer_id_to_addr
+        .upsert_sync(victim_id.clone(), victim_addr);
+
+    let stale_time = crate::current_timestamp_millis().saturating_sub(3_600_000);
+    {
+        let mut state = registry.gossip_state.lock().await;
+        state
+            .peers
+            .insert(victim_addr, stale_peer_info(victim_addr, stale_time));
+    }
+
+    let evidence_before = std::time::Instant::now();
+    assert!(
+        !registry
+            .registry_owner
+            .has_newer_liveness_evidence(victim_addr, evidence_before)
+            .await,
+        "sanity: no evidence recorded for the victim's address yet"
+    );
+
+    let msg = crate::registry::RegistryMessage::DeltaGossipResponse {
+        delta: crate::registry::RegistryDelta {
+            since_sequence: 0,
+            current_sequence: 1,
+            changes: Vec::new(),
+            sender_peer_id: victim_id.clone(),
+            wall_clock_time: crate::current_timestamp(),
+            precise_timing_nanos: crate::current_timestamp_nanos(),
+        },
+        extensions: None,
+    };
+    super::handle_incoming_message(
+        registry.clone(),
+        attacker_addr,
+        attacker_addr,
+        Some(attacker_id),
+        msg,
+    )
+    .await
+    .expect("a forged DeltaGossipResponse must be silently ignored, not an error");
+
+    assert!(
+        !registry
+            .registry_owner
+            .has_newer_liveness_evidence(victim_addr, evidence_before)
+            .await,
+        "the victim's address must not gain owner-side liveness from a response forged by the attacker"
+    );
+    let state = registry.gossip_state.lock().await;
+    let victim_info = state
+        .peers
+        .get(&victim_addr)
+        .expect("victim's gossip_state entry must survive untouched");
+    assert_eq!(
+        victim_info.failures, 1,
+        "a forged response must not clear the victim's failure bookkeeping"
+    );
+}
+
 /// DRY consolidation: the per-peer consecutive-timeout streak eviction
 /// mechanism now lives in icanact-remote (the caller supplies only the
 /// classification). Evict only once the streak threshold is reached; a success

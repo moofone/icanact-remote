@@ -8956,24 +8956,6 @@ impl<T: 'static> GossipRegistry<T> {
             // IMPORTANT: We do NOT remove the peer itself - it stays in the peer list
             // This allows us to reconnect when the peer comes back online
 
-            // Side tables FIRST -- the least harmful to get wrong (see
-            // this function's own doc comment): silently self-repopulated
-            // by the next capability handshake or clock probe, never
-            // gossiped to another node. Address ownership itself -- and
-            // any lingering connection-scoped receipts a missed teardown
-            // left behind -- is handled LAST, at the end of this
-            // candidate's own block.
-            //
-            // No per-step re-check of `try_consume`/`is_still_valid` here:
-            // `try_consume` above remains this candidate's single,
-            // irrevocable authorization for the reservation-gated sequence
-            // itself. See below, immediately before
-            // actor destruction, for a SEPARATE, ADDITIONAL check, reading
-            // the owner's own liveness/generation fence rather
-            // than the reservation's flag.
-            self.clear_peer_capabilities(&peer_addr);
-            self.remove_clock_state_for_addr(&peer_addr);
-
             // Actors, and their ActorRemoved tombstones, SECOND. Re-check
             // current ownership first because peer_to_actors is a side table and
             // may still contain a stale entry after the actor moved to another peer.
@@ -9052,6 +9034,18 @@ impl<T: 'static> GossipRegistry<T> {
                     reservation.release().await;
                     continue;
                 }
+
+                // The fresh activity check above is the last point at which
+                // this candidate can be abandoned without touching any
+                // state. Keep the address-keyed capability and clock tables
+                // behind it: an authenticated liveness update or
+                // reconfiguration that lands after `try_consume` but before
+                // this check must leave a still-connected peer's side state
+                // intact. These tables are self-repopulating, but a live
+                // session may not perform another handshake before it needs
+                // them (notably for peer-list gossip).
+                self.clear_peer_capabilities(&peer_addr);
+                self.remove_clock_state_for_addr(&peer_addr);
 
                 if let Some(actor_names) = gossip_state.peer_to_actors.get(&peer_addr).cloned() {
                     // Deliberately a FRESH read, not the reservation-validated
@@ -22458,6 +22452,20 @@ mod tests {
             .known_actors
             .upsert_sync(actor_name.to_string(), location);
 
+        // Keep the address-keyed side tables populated so the test proves
+        // the fresh liveness check protects them too, not only actors and
+        // ownership. These are the exact tables a live session may still
+        // need before another capability handshake or clock probe occurs.
+        let _ = registry
+            .peer_capability_addr_to_node
+            .upsert_sync(peer_addr, peer_id.to_node_id());
+        let _ = registry.clock_probe_state.upsert_sync(
+            peer_addr,
+            PeerClockProbeState {
+                last_probe_sent_wall_ns: 1,
+            },
+        );
+
         let ownership = registry.registry_owner.ownership_token(&peer_addr);
         let pin_owner = registry.registry_owner.pin_owner(&peer_addr);
         let reservation = registry
@@ -22527,6 +22535,16 @@ mod tests {
                 .is_none(),
             "no RemovedActorTombstone may be recorded -- nothing was destroyed for this \
              candidate"
+        );
+        assert!(
+            registry
+                .peer_capability_addr_to_node
+                .contains_sync(&peer_addr),
+            "capability state must survive when fresh liveness abandons the reap"
+        );
+        assert!(
+            registry.clock_probe_state.contains_sync(&peer_addr),
+            "clock-calibration state must survive when fresh liveness abandons the reap"
         );
         {
             let gossip_state = registry.gossip_state.lock().await;

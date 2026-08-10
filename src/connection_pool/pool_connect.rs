@@ -5159,6 +5159,32 @@ pub(crate) fn handle_incoming_message(
                     changes = delta.changes.len(),
                     "received delta gossip response on bidirectional connection"
                 );
+
+                // `sender_peer_id` is a wire claim, not an authority for
+                // identity. A response can arrive on an authenticated
+                // connection whose peer claims to be a different victim;
+                // reject that claim before resolving its address, recording
+                // extensions, or refreshing the owner's dead-peer liveness
+                // fence. This is the same trust boundary enforced by the
+                // DeltaGossip and FullSync arms above.
+                let Some(authenticated_sender_peer_id) = authenticated_peer_id.as_ref() else {
+                    warn!(
+                        tcp_source = %_peer_addr,
+                        claimed_sender = %delta.sender_peer_id,
+                        "Ignoring DeltaGossipResponse without an authenticated transport identity"
+                    );
+                    return Ok(());
+                };
+                if authenticated_sender_peer_id != &delta.sender_peer_id {
+                    warn!(
+                        tcp_source = %_peer_addr,
+                        authenticated_sender = %authenticated_sender_peer_id,
+                        claimed_sender = %delta.sender_peer_id,
+                        "Ignoring DeltaGossipResponse whose claimed sender does not match the authenticated transport"
+                    );
+                    return Ok(());
+                }
+
                 let sender_socket_addr =
                     resolve_peer_state_addr(&registry, Some(&delta.sender_peer_id), _peer_addr)
                         .await;
