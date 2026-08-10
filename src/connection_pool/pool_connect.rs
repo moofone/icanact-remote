@@ -4884,6 +4884,7 @@ pub(crate) fn handle_incoming_message(
                         sequence,
                         wall_clock_time,
                         commit_seq,
+                        Some(authenticated_sender_peer_id),
                     )
                     .await;
 
@@ -5302,6 +5303,7 @@ pub(crate) fn handle_incoming_message(
                         sequence,
                         wall_clock_time,
                         commit_seq,
+                        Some(authenticated_sender_peer_id),
                     )
                     .await;
 

@@ -1849,24 +1849,25 @@ pub struct ActorState {
     /// read only by `cleanup_stale_actors`/`lookup_actor`'s TTL freshness
     /// checks, never fed back into conflict resolution.
     ///
-    /// The recorded owner matters: `known_actors` is keyed only by actor
-    /// NAME, and a genuine ownership transfer (owner B's location replacing
-    /// owner A's under the same name, via the normal higher-vector-clock
-    /// apply path) upserts in place without clearing this row. A row
-    /// consulted without checking whose liveness it actually recorded would
-    /// let A's last-known-reachable timestamp keep B's now-current, possibly
-    /// long-dead location looking fresh. `effective_actor_wall_clock_time`
-    /// only honours a row whose owner still matches the current entry.
+    /// The recorded owner and vector-clock version matter:
+    /// `known_actors` is keyed only by actor NAME, and a genuine ownership or
+    /// incarnation transfer (a replacement location under the same name, via
+    /// the normal vector-clock apply path) upserts in place without clearing
+    /// this row. A row consulted without checking which owner/version it
+    /// actually recorded would let an earlier incarnation's last-known-
+    /// reachable timestamp keep a replacement location looking fresh.
+    /// `effective_actor_wall_clock_time` only honours a row whose owner and
+    /// vector-clock version still match the current entry.
     ///
     /// Entries are garbage-collected by `cleanup_stale_actors` for any name
-    /// no longer present in `known_actors`, or whose recorded owner no
-    /// longer matches the current entry there, regardless of which path
+    /// no longer present in `known_actors`, or whose recorded owner/version
+    /// no longer matches the current entry there, regardless of which path
     /// caused either; until then a stale-but-still-matching-owner entry is
     /// harmless (its value is only ever taken as a floor via `max`, so it
     /// can make an actor look no less fresh than its own `wall_clock_time`,
     /// never falsely stale), and an owner-mismatched one is simply ignored
     /// on read rather than acted on.
-    reannouncement_liveness: SccHashMap<String, (crate::PeerId, u64)>,
+    reannouncement_liveness: SccHashMap<String, (crate::PeerId, crate::VectorClock, u64)>,
     /// Test hook. Fired inside [`GossipRegistry::cleanup_stale_actors`] after
     /// it snapshots which actors look stale but before the removal loop
     /// re-validates and removes them, so a test can land a concurrent
@@ -2106,6 +2107,13 @@ impl GossipState {
                             existing.current_session_connection.clone();
                         moved.current_session_epoch = existing.current_session_epoch;
                         moved.accept_lower_sequence_from = existing.accept_lower_sequence_from;
+                        // `peer_address` belongs to the connection instance
+                        // represented by the winning session tuple.  The
+                        // migrated entry came from the draining ephemeral
+                        // source, so retaining its value would create a
+                        // hybrid record whose session and actual connection
+                        // refer to different instances.
+                        moved.peer_address = existing.peer_address;
                     }
 
                     // Every remaining field is independent, currently-tracked
@@ -6448,18 +6456,41 @@ impl<T: 'static> GossipRegistry<T> {
                             None => wire_addr,
                         };
                         location.address = resolved.to_string();
-                        let Some((clear_tombstone, is_update)) = self.current_actor_upsert_plan(
+                        let upsert_plan = self.current_actor_upsert_plan(
                             name.as_str(),
                             &location,
                             &sender_peer_id,
-                        ) else {
-                            if sender_is_authenticated {
-                                self.refresh_wall_clock_on_unchanged_reannouncement(
-                                    name.as_str(),
-                                    &location,
-                                    &sender_peer_id,
-                                );
+                        );
+                        let upsert_plan = match upsert_plan {
+                            Some(plan) => Some(plan),
+                            None if sender_is_authenticated => {
+                                let refreshed = self
+                                    .refresh_wall_clock_on_unchanged_reannouncement(
+                                        name.as_str(),
+                                        &location,
+                                        &sender_peer_id,
+                                        authenticated_sender_peer_id,
+                                    );
+                                if refreshed {
+                                    None
+                                } else {
+                                    // Cleanup may have removed the entry after
+                                    // `current_actor_upsert_plan` read it but
+                                    // before the lease refresh. Re-read the
+                                    // plan so an authenticated owner
+                                    // reannouncement is admitted instead of
+                                    // leaving the actor absent until a later
+                                    // gossip round.
+                                    self.current_actor_upsert_plan(
+                                        name.as_str(),
+                                        &location,
+                                        &sender_peer_id,
+                                    )
+                                }
                             }
+                            None => None,
+                        };
+                        let Some((clear_tombstone, is_update)) = upsert_plan else {
                             continue;
                         };
                         let transfers_admission =
@@ -7001,8 +7032,45 @@ impl<T: 'static> GossipRegistry<T> {
         name: &str,
         location: &RemoteActorLocation,
         sender_peer_id: &PeerId,
-    ) {
-        let is_owner_issued_tie = self
+        authenticated_sender_peer_id: Option<&PeerId>,
+    ) -> bool {
+        let is_owner_issued_tie = authenticated_sender_peer_id == Some(sender_peer_id)
+            && self
+                .actor_state
+                .known_actors
+                .read_sync(name, |_, existing| {
+                    location.peer_id == existing.peer_id
+                        && *sender_peer_id == existing.peer_id
+                        && matches!(
+                            location.vector_clock.compare(&existing.vector_clock),
+                            crate::ClockOrdering::Equal
+                        )
+                })
+                .is_some_and(|matches| matches);
+        if !is_owner_issued_tie {
+            return false;
+        }
+
+        let now = current_timestamp();
+        let owner = location.peer_id.clone();
+        let owner_for_entry = owner.clone();
+        let _ = self
+            .actor_state
+            .reannouncement_liveness
+            .entry_sync(name.to_string())
+            .and_modify(|(recorded_owner, recorded_version, liveness)| {
+                *recorded_owner = owner_for_entry.clone();
+                *recorded_version = location.vector_clock.clone();
+                *liveness = (*liveness).max(now);
+            })
+            .or_insert((location.peer_id.clone(), location.vector_clock.clone(), now));
+
+        // The actor and liveness maps are independent lock-free maps. The
+        // actor can be removed after the first read but before the side-table
+        // write. Revalidate the exact owner/tie after publishing the lease so
+        // callers can retry admission instead of leaving an orphan lease for
+        // an actor that cleanup already removed.
+        let still_owner_issued_tie = self
             .actor_state
             .known_actors
             .read_sync(name, |_, existing| {
@@ -7013,20 +7081,24 @@ impl<T: 'static> GossipRegistry<T> {
                         crate::ClockOrdering::Equal
                     )
             })
-            .unwrap_or(false);
-        if is_owner_issued_tie {
-            let now = current_timestamp();
-            let owner = location.peer_id.clone();
-            let _ = self
-                .actor_state
-                .reannouncement_liveness
-                .entry_sync(name.to_string())
-                .and_modify(|(recorded_owner, liveness)| {
-                    *recorded_owner = owner.clone();
-                    *liveness = (*liveness).max(now);
-                })
-                .or_insert((owner, now));
+            .is_some_and(|matches| matches);
+        if still_owner_issued_tie {
+            return true;
         }
+
+        // Remove only the row this invocation could have installed. A newer
+        // owner-issued refresh wins the conditional check and remains for the
+        // next cleanup pass; no cross-map lock is taken while holding the
+        // liveness shard.
+        let _ = self.actor_state.reannouncement_liveness.remove_if_sync(
+            name,
+            |(recorded_owner, recorded_version, recorded_at)| {
+                *recorded_owner == owner
+                    && *recorded_version == location.vector_clock
+                    && *recorded_at <= now
+            },
+        );
+        false
     }
 
     fn current_actor_removal_plan(
@@ -8194,6 +8266,42 @@ impl<T: 'static> GossipRegistry<T> {
             sequence,
             wall_clock_time,
             None,
+            None,
+        )
+        .await
+    }
+
+    /// Merge a FullSync whose transport identity has already been
+    /// authenticated by the connection layer.  Only this identity is allowed
+    /// to refresh the separate reannouncement-liveness lease for an exact
+    /// actor tie; the payload's `sender_peer_id` is merely data and may have
+    /// been relayed.  The ownership watermark is intentionally not involved
+    /// in this convenience path, which is used by the authenticated session
+    /// handler before its address projection is finalized.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn merge_full_sync_from_authenticated(
+        &self,
+        remote_local: HashMap<String, RemoteActorLocation>,
+        remote_known: HashMap<String, RemoteActorLocation>,
+        sender_peer_id: crate::PeerId,
+        sender_addr: SocketAddr,
+        verified_sender_addr: Option<SocketAddr>,
+        session_source: Option<SocketAddr>,
+        sequence: u64,
+        wall_clock_time: u64,
+        authenticated_sender_peer_id: &crate::PeerId,
+    ) -> bool {
+        self.merge_full_sync_from_guarded(
+            remote_local,
+            remote_known,
+            sender_peer_id,
+            sender_addr,
+            verified_sender_addr,
+            session_source,
+            sequence,
+            wall_clock_time,
+            None,
+            Some(authenticated_sender_peer_id),
         )
         .await
     }
@@ -8213,6 +8321,7 @@ impl<T: 'static> GossipRegistry<T> {
         sequence: u64,
         wall_clock_time: u64,
         ownership_commit: CommitSeq,
+        authenticated_sender_peer_id: Option<&crate::PeerId>,
     ) -> bool {
         self.merge_full_sync_from_guarded(
             remote_local,
@@ -8224,6 +8333,7 @@ impl<T: 'static> GossipRegistry<T> {
             sequence,
             wall_clock_time,
             Some(ownership_commit),
+            authenticated_sender_peer_id,
         )
         .await
     }
@@ -8240,9 +8350,11 @@ impl<T: 'static> GossipRegistry<T> {
         sequence: u64,
         _wall_clock_time: u64,
         ownership_commit: Option<CommitSeq>,
+        authenticated_sender_peer_id: Option<&crate::PeerId>,
     ) -> bool {
         let repair_addr = verified_sender_addr.unwrap_or(sender_addr);
         let session_source = session_source.or(verified_sender_addr);
+        let sender_is_authenticated = authenticated_sender_peer_id == Some(&sender_peer_id);
         // Don't add peer here - peers are managed through handle_connection
 
         // Record comprehensive node activity
@@ -8535,17 +8647,35 @@ impl<T: 'static> GossipRegistry<T> {
                 }
                 let upsert_plan =
                     self.current_actor_upsert_plan(name.as_str(), location, &sender_peer_id);
+                let upsert_plan = match upsert_plan {
+                    Some(plan) => Some(plan),
+                    None if known_exists && sender_is_authenticated => {
+                        // A cleanup pass can win between the plan read and
+                        // the lease refresh. If the entry is still present,
+                        // refresh its owner-issued lease; if it vanished,
+                        // retry admission against the live map instead of
+                        // silently filing the name under a peer that no
+                        // longer owns an actor entry.
+                        let refreshed = self.refresh_wall_clock_on_unchanged_reannouncement(
+                            name.as_str(),
+                            location,
+                            &sender_peer_id,
+                            authenticated_sender_peer_id,
+                        );
+                        if refreshed {
+                            None
+                        } else {
+                            self.current_actor_upsert_plan(name.as_str(), location, &sender_peer_id)
+                        }
+                    }
+                    None => None,
+                };
                 if upsert_plan.is_none() {
                     // An exact duplicate is still an admitted advertisement
                     // when the actor already exists. Other rejected candidates
                     // must not create phantom peer_to_actors entries.
                     if known_exists {
                         peer_actors.insert(name.clone());
-                        self.refresh_wall_clock_on_unchanged_reannouncement(
-                            name.as_str(),
-                            location,
-                            &sender_peer_id,
-                        );
                     }
                     continue;
                 }
@@ -8716,18 +8846,19 @@ impl<T: 'static> GossipRegistry<T> {
     /// confirmation is tracked separately instead of mutating
     /// `wall_clock_time` in place.
     ///
-    /// The recorded row is honoured only when its owner still matches
-    /// `location.peer_id`: `known_actors` upserts a genuine ownership
-    /// transfer in place without clearing this row, so an unscoped read
-    /// would apply the PREVIOUS owner's liveness to the CURRENT owner's
-    /// entry -- keeping a new, possibly already-dead owner's location
-    /// looking fresh on the strength of evidence that was never about it.
+    /// The recorded row is honoured only when its owner and vector-clock
+    /// version still match `location`: `known_actors` upserts a genuine
+    /// ownership/incarnation transfer in place without clearing this row, so
+    /// an unscoped read would apply an earlier location's liveness to the
+    /// CURRENT entry -- keeping a new, possibly already-dead location fresh
+    /// on the strength of evidence that was never about it.
     fn effective_actor_wall_clock_time(&self, name: &str, location: &RemoteActorLocation) -> u64 {
         let liveness = self
             .actor_state
             .reannouncement_liveness
-            .read_sync(name, |_, (owner, recorded)| {
-                (*owner == location.peer_id).then_some(*recorded)
+            .read_sync(name, |_, (owner, version, recorded)| {
+                (*owner == location.peer_id && *version == location.vector_clock)
+                    .then_some(*recorded)
             })
             .flatten()
             .unwrap_or(0);
@@ -8792,7 +8923,7 @@ impl<T: 'static> GossipRegistry<T> {
         // delta -- or superseded IN PLACE by a genuine ownership transfer
         // under the same name, which upserts `known_actors` without
         // clearing this row (`effective_actor_wall_clock_time` ignores an
-        // owner-mismatched row on read, but nothing stops it lingering
+        // owner/version-mismatched row on read, but nothing stops it lingering
         // here indefinitely otherwise). Rather than one removal/transfer
         // call site remembering to clear this row and every other one
         // risking forgetting to, sweep every row that is either absent
@@ -8800,22 +8931,43 @@ impl<T: 'static> GossipRegistry<T> {
         // than the one currently there. Bounded by the same pass that
         // already walks `known_actors`, so this never runs more often
         // than the TTL sweep above.
+        // Snapshot actor owners before taking any liveness shard. The stale
+        // actor pass above takes the maps in the opposite order
+        // (known_actors, then liveness); consulting known_actors from inside
+        // a liveness iter_sync callback would create a lock-order cycle when
+        // cleanup passes overlap.
+        let mut current_owners = HashMap::with_capacity(self.actor_state.known_actors.len());
+        self.actor_state.known_actors.iter_sync(|name, location| {
+            current_owners.insert(
+                name.clone(),
+                (location.peer_id.clone(), location.vector_clock.clone()),
+            );
+            true
+        });
+
         let mut orphaned_liveness = Vec::new();
-        self.actor_state
-            .reannouncement_liveness
-            .iter_sync(|name, (recorded_owner, _)| {
-                let current_owner = self
-                    .actor_state
-                    .known_actors
-                    .read_sync(name.as_str(), |_, location| location.peer_id.clone());
-                if current_owner.as_ref() != Some(recorded_owner) {
-                    orphaned_liveness.push(name.clone());
+        self.actor_state.reannouncement_liveness.iter_sync(
+            |name, (recorded_owner, recorded_version, recorded_at)| {
+                let owner_matches =
+                    current_owners
+                        .get(name)
+                        .is_some_and(|(current_owner, current_version)| {
+                            current_owner == recorded_owner && current_version == recorded_version
+                        });
+                if !owner_matches {
+                    orphaned_liveness.push((
+                        name.clone(),
+                        recorded_owner.clone(),
+                        recorded_version.clone(),
+                        *recorded_at,
+                    ));
                 }
                 true
-            });
+            },
+        );
         #[cfg(test)]
         self.actor_state.fire_liveness_sweep_race_hook();
-        for name in orphaned_liveness {
+        for (name, expected_owner, expected_version, expected_at) in orphaned_liveness {
             // Re-check the same condition inside the atomic removal itself
             // rather than trusting the snapshot above: a concurrent
             // reannouncement or ownership transfer landing in the gap
@@ -8825,12 +8977,10 @@ impl<T: 'static> GossipRegistry<T> {
             // and only removes if the predicate still holds.
             let _ = self.actor_state.reannouncement_liveness.remove_if_sync(
                 name.as_str(),
-                |(recorded_owner, _)| {
-                    let current_owner = self
-                        .actor_state
-                        .known_actors
-                        .read_sync(name.as_str(), |_, location| location.peer_id.clone());
-                    current_owner.as_ref() != Some(recorded_owner)
+                |(recorded_owner, recorded_version, recorded_at)| {
+                    *recorded_owner == expected_owner
+                        && *recorded_version == expected_version
+                        && *recorded_at == expected_at
                 },
             );
         }
@@ -12470,7 +12620,7 @@ mod tests {
             RemoteActorLocation::new_with_peer("0.0.0.0:9400".parse().unwrap(), owner.clone()),
         );
 
-        reg.merge_full_sync_from(
+        reg.merge_full_sync_from_authenticated(
             local_actors,
             HashMap::new(),
             owner.clone(),
@@ -12479,6 +12629,7 @@ mod tests {
             None,
             1,
             current_timestamp(),
+            &owner,
         )
         .await;
 
@@ -12517,7 +12668,7 @@ mod tests {
         let current_owner = test_peer_id("owner-scope-new");
 
         let mut current_location =
-            RemoteActorLocation::new_with_peer(test_addr(11_191), current_owner);
+            RemoteActorLocation::new_with_peer(test_addr(11_191), current_owner.clone());
         // Long past any reasonable TTL on its own.
         current_location.wall_clock_time = current_timestamp().saturating_sub(1_000_000);
 
@@ -12526,7 +12677,11 @@ mod tests {
         // unscoped read would wrongly keep B's entry looking alive.
         let _ = registry.actor_state.reannouncement_liveness.upsert_sync(
             actor_name.to_string(),
-            (displaced_owner, current_timestamp()),
+            (
+                displaced_owner,
+                current_location.vector_clock.clone(),
+                current_timestamp(),
+            ),
         );
 
         let effective = registry.effective_actor_wall_clock_time(actor_name, &current_location);
@@ -12534,6 +12689,21 @@ mod tests {
             effective, current_location.wall_clock_time,
             "a liveness row recorded for a DIFFERENT owner than the current entry must be \
              ignored entirely, not taken as a freshness floor for an owner it was never about"
+        );
+
+        // The same owner can also restart with a new vector-clock
+        // incarnation. A lease from the prior version must not make that
+        // replacement look freshly observed.
+        let previous_version = crate::VectorClock::new();
+        previous_version.increment(current_owner.to_node_id());
+        let _ = registry.actor_state.reannouncement_liveness.upsert_sync(
+            actor_name.to_string(),
+            (current_owner, previous_version, current_timestamp()),
+        );
+        let effective = registry.effective_actor_wall_clock_time(actor_name, &current_location);
+        assert_eq!(
+            effective, current_location.wall_clock_time,
+            "a liveness row from an older actor incarnation must not refresh a replacement"
         );
     }
 
@@ -12573,7 +12743,7 @@ mod tests {
         let mut remote_known = HashMap::new();
         remote_known.insert(actor_name.to_string(), location.clone());
 
-        reg.merge_full_sync_from(
+        reg.merge_full_sync_from_authenticated(
             HashMap::new(),
             remote_known.clone(),
             owner.clone(),
@@ -12582,6 +12752,7 @@ mod tests {
             None,
             1,
             current_timestamp(),
+            &owner,
         )
         .await;
 
@@ -12596,15 +12767,16 @@ mod tests {
         );
 
         let before_reannounce = current_timestamp();
-        reg.merge_full_sync_from(
+        reg.merge_full_sync_from_authenticated(
             HashMap::new(),
             remote_known,
-            owner,
+            owner.clone(),
             owner_addr,
             None,
             None,
             2,
             current_timestamp(),
+            &owner,
         )
         .await;
 
@@ -12658,15 +12830,16 @@ mod tests {
         remote_known.insert(actor_name.to_string(), location.clone());
 
         // Genuine first admission, authenticated as sent by the owner itself.
-        reg.merge_full_sync_from(
+        reg.merge_full_sync_from_authenticated(
             HashMap::new(),
             remote_known.clone(),
-            owner,
+            owner.clone(),
             owner_addr,
             None,
             None,
             1,
             current_timestamp(),
+            &owner,
         )
         .await;
         let stored_wall_clock_time = reg
@@ -12678,15 +12851,16 @@ mod tests {
         // The identical entry arrives again -- byte-for-byte the same
         // payload, exact vector-clock tie -- but authenticated as sent by
         // `relay`, a completely different peer, not the owner it names.
-        reg.merge_full_sync_from(
+        reg.merge_full_sync_from_authenticated(
             HashMap::new(),
             remote_known,
-            relay,
+            relay.clone(),
             owner_addr,
             None,
             None,
             2,
             current_timestamp(),
+            &relay,
         )
         .await;
 
@@ -14333,6 +14507,8 @@ mod tests {
         // The bind-keyed entry already has a real high-water mark and an
         // armed session from an earlier, still-current connection.
         let mut established = peer_info_with_node_id(bind_addr, node_id);
+        let established_connection_addr = test_addr(9502);
+        established.peer_address = Some(established_connection_addr);
         established.last_sequence = 42;
         established.last_sent_sequence = 17;
         established.current_session_epoch = 5;
@@ -14367,6 +14543,11 @@ mod tests {
             migrated.current_session_source,
             Some(bind_addr),
             "migration must not clear an already-armed session source"
+        );
+        assert_eq!(
+            migrated.peer_address,
+            Some(established_connection_addr),
+            "the connection address must remain paired with the winning bind-keyed session"
         );
         assert!(
             !gossip_state.peers.contains_key(&ephemeral_addr),
@@ -19827,7 +20008,7 @@ mod tests {
 
         let _ = registry.actor_state.reannouncement_liveness.upsert_sync(
             orphaned_actor.to_string(),
-            (stale_owner, current_timestamp()),
+            (stale_owner, crate::VectorClock::new(), current_timestamp()),
         );
         assert!(
             !registry
@@ -19876,7 +20057,11 @@ mod tests {
             .upsert_sync(actor_name.to_string(), current_location.clone());
         let _ = registry.actor_state.reannouncement_liveness.upsert_sync(
             actor_name.to_string(),
-            (displaced_owner, current_timestamp()),
+            (
+                displaced_owner,
+                current_location.vector_clock.clone(),
+                current_timestamp(),
+            ),
         );
 
         registry.cleanup_stale_actors().await;
@@ -19919,16 +20104,21 @@ mod tests {
         let _ = registry
             .actor_state
             .known_actors
-            .upsert_sync(actor_name.to_string(), location);
+            .upsert_sync(actor_name.to_string(), location.clone());
         // Looks orphaned at scan time: recorded for a DIFFERENT owner than
         // the one currently in `known_actors`.
         let _ = registry.actor_state.reannouncement_liveness.upsert_sync(
             actor_name.to_string(),
-            (stale_recorded_owner, current_timestamp()),
+            (
+                stale_recorded_owner,
+                location.vector_clock.clone(),
+                current_timestamp(),
+            ),
         );
 
         let actor_state = registry.actor_state.clone();
         let owner_for_hook = owner.clone();
+        let version_for_hook = location.vector_clock.clone();
         registry.actor_state.set_liveness_sweep_race_hook(move || {
             // A concurrent reannouncement lands in the scan-to-removal
             // gap, replacing the row with fresh, owner-MATCHING
@@ -19936,7 +20126,11 @@ mod tests {
             // unchanged re-advertisement would install.
             let _ = actor_state.reannouncement_liveness.upsert_sync(
                 actor_name.to_string(),
-                (owner_for_hook.clone(), current_timestamp()),
+                (
+                    owner_for_hook.clone(),
+                    version_for_hook.clone(),
+                    current_timestamp(),
+                ),
             );
         });
 
@@ -19946,7 +20140,7 @@ mod tests {
             registry
                 .actor_state
                 .reannouncement_liveness
-                .read_sync(actor_name, |_, (recorded_owner, _)| {
+                .read_sync(actor_name, |_, (recorded_owner, _, _)| {
                     *recorded_owner == owner
                 })
                 .unwrap_or(false),
@@ -27386,6 +27580,7 @@ mod tests {
                     1,
                     current_timestamp(),
                     generation,
+                    None,
                 )
                 .await,
             "a claim generation released by the owner actor must be rejected immediately"
