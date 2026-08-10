@@ -1999,15 +1999,15 @@ async fn get_connection_by_peer_id_recovers_live_alias_connection() {
 
     let routing_revision = pool.routing_revision();
     pool.index_connection_by_addr(alias_addr, connection.clone());
-    assert!(
-        pool.routing_revision() > routing_revision,
-        "address-only connection publication must wake route consumers"
+    assert_eq!(
+        pool.routing_revision(),
+        routing_revision,
+        "an address index must not wake route consumers before its owner alias is resolvable"
     );
-    let address_index_revision = pool.routing_revision();
     pool.add_addr_to_peer_id(alias_addr, peer_id.clone());
     assert!(
-        pool.routing_revision() > address_index_revision,
-        "alias ownership publication must wake route consumers after the alias is resolvable"
+        pool.routing_revision() > routing_revision,
+        "the paired address/owner publication must wake route consumers after the alias is resolvable"
     );
 
     let resolved = pool

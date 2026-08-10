@@ -338,7 +338,7 @@ impl<T> ConnectionPool<T> {
     }
 
     #[inline]
-    fn mark_routing_changed(&self) {
+    pub(crate) fn mark_routing_changed(&self) {
         self.routing_revision.fetch_add(1, Ordering::AcqRel);
         self.routing_change_notify.notify_waiters();
     }
@@ -726,15 +726,20 @@ impl<T> ConnectionPool<T> {
             }
             true
         });
+        let mut routing_changed = false;
         for addr in alias_addrs {
             let removed = self
                 .connections_by_addr
                 .remove_if_sync(&addr, |v| Arc::ptr_eq(v, expected))
                 .is_some();
             if removed {
+                routing_changed = true;
                 let _ = self.addr_to_peer_id.remove_sync(&addr);
                 self.clear_capabilities_for_addr(&addr);
             }
+        }
+        if routing_changed {
+            self.mark_routing_changed();
         }
         self.release_counted_connection(expected);
         // `expected.correlation` is a SESSION-level
@@ -2229,7 +2234,28 @@ impl<T> ConnectionPool<T> {
             addr
         );
         let _ = self.connections_by_addr.upsert_sync(addr, connection);
-        self.mark_routing_changed();
+        // An address-indexed connection is not peer-routable until its
+        // ownership alias is published. Defer the wake when the owner is not
+        // present yet; `add_addr_to_peer_id` publishes the revision after the
+        // two indexes are resolvable as one route-visible state. A configured
+        // address whose connection already carries the authenticated peer id
+        // is resolvable without the alias map, so retain the immediate wake
+        // for that valid fallback path.
+        let owner_published = self
+            .addr_to_peer_id
+            .read_sync(&addr, |_, owner| owner.clone());
+        let configured_fallback = self
+            .connections_by_addr
+            .read_sync(&addr, |_, current| current.embedded_peer_id.clone())
+            .flatten()
+            .and_then(|peer_id| {
+                self.get_configured_peer_addr(&peer_id)
+                    .map(|configured| (peer_id, configured))
+            })
+            .is_some_and(|(_, configured)| configured == addr);
+        if owner_published.is_some() || configured_fallback {
+            self.mark_routing_changed();
+        }
     }
 
     /// Send header + payload to a peer by ID without concatenating payload bytes.
@@ -2336,6 +2362,12 @@ impl<T> ConnectionPool<T> {
 
             // H-004: Abort background tasks (writer, reader) to prevent resource leaks
             connection.abort_tasks();
+
+            // `clear_current_peer_connection_if_matches` may have notified
+            // before the alias sweep above. Publish once more after every
+            // address/index projection is gone so consumers cannot park on a
+            // partially torn-down route.
+            self.mark_routing_changed();
 
             Some(connection)
         } else {
@@ -2514,6 +2546,11 @@ impl<T> ConnectionPool<T> {
                 self.clear_capabilities_for_addr(addr);
             }
 
+            // The primary-slot clear above can notify before these aliases
+            // are removed. A final revision after the complete sweep is the
+            // routing event consumers must incorporate.
+            self.mark_routing_changed();
+
             self.release_counted_connection(&connection);
 
             // H-004: Abort background tasks (writer, reader) to prevent resource leaks
@@ -2612,6 +2649,7 @@ impl<T> ConnectionPool<T> {
                     // still-live sibling's in-flight asks.
                 }
             }
+            self.mark_routing_changed();
         }
         // Abort the writer/reader tasks regardless of whether the address
         // removal above found this exact instance still indexed — the
@@ -3075,15 +3113,20 @@ impl<T> ConnectionPool<T> {
             }
             true
         });
+        let mut routing_changed = false;
         for addr in alias_addrs {
             let removed = self
                 .connections_by_addr
                 .remove_if_sync(&addr, |v| Arc::ptr_eq(v, current))
                 .is_some();
             if removed {
+                routing_changed = true;
                 let _ = self.addr_to_peer_id.remove_sync(&addr);
                 self.clear_capabilities_for_addr(&addr);
             }
+        }
+        if routing_changed {
+            self.mark_routing_changed();
         }
 
         self.release_displaced_connection_count(failed_instance_id);
@@ -3317,7 +3360,9 @@ impl<T> ConnectionPool<T> {
             .read_sync(&addr, |_, v| v.clone())?;
         if !conn.is_connected() {
             debug!(addr = %addr, "removing disconnected connection");
-            let _ = self.connections_by_addr.remove_sync(&addr);
+            if self.connections_by_addr.remove_sync(&addr).is_some() {
+                self.mark_routing_changed();
+            }
             return None;
         }
 
@@ -3479,7 +3524,9 @@ impl<T> ConnectionPool<T> {
                         if stream_handle.exit_flag.load(Ordering::Acquire) {
                             debug!(addr = %addr, "found closed stream handle, removing stale connection");
                             conn.set_state(ConnectionState::Disconnected);
-                            let _ = self.connections_by_addr.remove_sync(&addr);
+                            if self.connections_by_addr.remove_sync(&addr).is_some() {
+                                self.mark_routing_changed();
+                            }
                         } else {
                             conn.update_last_used();
                             debug!(addr = %addr, "found existing lock-free connection, reusing handle");
@@ -3498,7 +3545,9 @@ impl<T> ConnectionPool<T> {
                     }
                 } else {
                     debug!(addr = %addr, "removing disconnected connection");
-                    let _ = self.connections_by_addr.remove_sync(&addr);
+                    if self.connections_by_addr.remove_sync(&addr).is_some() {
+                        self.mark_routing_changed();
+                    }
                 }
             }
 

@@ -1074,137 +1074,164 @@ impl RoutedPubSub {
     }
 
     pub async fn refresh_control_plane(&self) {
-        self.refresh_control_plane_inner(true).await;
+        self.refresh_control_plane_inner().await;
     }
 
     async fn refresh_control_plane_if_changed(&self) {
-        self.refresh_control_plane_inner(false).await;
+        self.refresh_control_plane_inner().await;
     }
 
-    async fn refresh_control_plane_inner(&self, force_provider_refresh: bool) {
+    async fn refresh_control_plane_inner(&self) {
         let _refresh_guard = self.control_plane_refresh_lock.lock().await;
         #[cfg(test)]
         self.control_plane_refreshes.fetch_add(1, Ordering::Relaxed);
 
-        let actor_revision = self.registry.actor_state.pubsub_routing_revision();
-        let connection_revision = self.registry.connection_pool.routing_revision();
-        let provider_revision = self.route_provider_revision.load(Ordering::Acquire);
-        let has_provider = self.route_provider.load().is_some();
-        if self.last_actor_routing_revision.load(Ordering::Acquire) == actor_revision
-            && self
-                .last_connection_routing_revision
-                .load(Ordering::Acquire)
-                == connection_revision
-            && self.last_route_provider_revision.load(Ordering::Acquire) == provider_revision
-            && self.conns.load().values().all(|conn| !conn.is_closed())
-            && !(force_provider_refresh && has_provider)
-        {
-            return;
-        }
-
-        let mut interests: HashMap<TopicKey, HashSet<PeerId>> = HashMap::new();
-        for (name, _) in self.registry.snapshot_known_actors() {
-            if let Some((topic, peer)) = parse_interest_name(&name) {
-                interests.entry(topic).or_default().insert(peer);
+        // A route rebuild reads several independently revisioned projections.
+        // Keep the refresh lock across the whole operation, then verify that
+        // none of those revisions changed while the snapshot was assembled.
+        // Publishing the route map with a revision captured before a concurrent
+        // mutation would acknowledge that mutation without incorporating it;
+        // the control-plane loop could then park until the fallback timer.
+        loop {
+            let actor_revision = self.registry.actor_state.pubsub_routing_revision();
+            let connection_revision = self.registry.connection_pool.routing_revision();
+            let provider_revision = self.route_provider_revision.load(Ordering::Acquire);
+            let has_provider = self.route_provider.load().is_some();
+            if self.last_actor_routing_revision.load(Ordering::Acquire) == actor_revision
+                && self
+                    .last_connection_routing_revision
+                    .load(Ordering::Acquire)
+                    == connection_revision
+                && self.last_route_provider_revision.load(Ordering::Acquire) == provider_revision
+                && self.conns.load().values().all(|conn| !conn.is_closed())
+                // A provider is intentionally re-evaluated on every actual
+                // refresh. Its public trait accepts `&self`, so interior
+                // mutable topology has no revision to wake this loop; the
+                // one-second fallback is the provider's invalidation path.
+                && !has_provider
+            {
+                return;
             }
-        }
 
-        let provider = self.route_provider.load_full();
-        let mut next_routes = HashMap::new();
-        let mut next_conns = (*self.conns.load_full()).clone();
-        for (topic, peers) in interests {
-            let peers: Vec<PeerId> = peers
-                .into_iter()
-                .filter(|peer| peer != &self.local_peer_id)
+            let mut interests: HashMap<TopicKey, HashSet<PeerId>> = HashMap::new();
+            for (name, _) in self.registry.snapshot_known_actors() {
+                if let Some((topic, peer)) = parse_interest_name(&name) {
+                    interests.entry(topic).or_default().insert(peer);
+                }
+            }
+
+            let provider = self.route_provider.load_full();
+            let mut next_routes = HashMap::new();
+            let mut next_conns = (*self.conns.load_full()).clone();
+            for (topic, peers) in interests {
+                let peers: Vec<PeerId> = peers
+                    .into_iter()
+                    .filter(|peer| peer != &self.local_peer_id)
+                    .collect();
+                if peers.is_empty() {
+                    continue;
+                }
+                let grouped = if let Some(provider) = provider.as_ref() {
+                    provider.group_destinations(topic, &peers)
+                } else {
+                    peers
+                        .into_iter()
+                        .map(|peer| (peer.clone(), Arc::from(vec![peer].into_boxed_slice())))
+                        .collect()
+                };
+
+                // Subscriptions are gated on the pool already holding a live
+                // connection to each next-hop. We deliberately do NOT call
+                // `client.lookup_peer` here: it goes through
+                // `pool.get_connection_to_peer` → `get_connection_by_peer_id`,
+                // which warn-logs the "No connection found for peer" pair on
+                // every miss (`connection_pool::pool_connect.rs:669-682`).
+                // Before route changes became event-driven, this refresh ticked
+                // every 25 ms. An unreachable peer whose interest entry is being
+                // re-gossiped to us produces ~80 warn lines/sec — observed on
+                // `stratum-devnet-a` 2026-05-11.
+                //
+                // Connection lifecycle belongs to the gossip/peer-discovery
+                // layer (`peer_discovery.rs`), not to pubsub. We just
+                // observe pool state via the non-warning
+                // `lookup_connected_peer` and route only to next-hops the
+                // pool currently has a usable connection for. When a peer
+                // (re)connects, the next refresh tick picks it up. When a
+                // peer drops, the next refresh tick removes it — the user's
+                // "subscription terminates on disconnect; re-subscribes on
+                // reconnect" invariant.
+                let mut routable: HashMap<PeerId, Arc<[PeerId]>> = HashMap::new();
+                for (next_hop, destinations) in grouped {
+                    let cached_live = next_conns
+                        .get(&next_hop)
+                        .map(|conn| !conn.is_closed())
+                        .unwrap_or(false);
+                    if cached_live {
+                        routable.insert(next_hop, destinations);
+                        continue;
+                    }
+                    // Silent pre-check: only call into pool lookup paths
+                    // (which warn on miss inside
+                    // `get_connection_by_peer_id`) when the pool already
+                    // holds a usable connection. `has_connection_by_peer_id`
+                    // is the only non-warning peer-presence test on the pool.
+                    if !self
+                        .registry
+                        .connection_pool
+                        .has_connection_by_peer_id(&next_hop)
+                    {
+                        next_conns.remove(&next_hop);
+                        continue;
+                    }
+                    if let Some(peer_ref) = self.client.lookup_connected_peer(&next_hop)
+                        && let Some(conn) = peer_ref.connection_ref()
+                    {
+                        next_conns.insert(next_hop.clone(), conn);
+                        routable.insert(next_hop, destinations);
+                    } else {
+                        next_conns.remove(&next_hop);
+                    }
+                }
+                if !routable.is_empty() {
+                    next_routes.insert(topic, Arc::new(routable));
+                }
+            }
+            // ACTOR_REM_2 R13(b): the conns cache is cloned forward each tick and
+            // only next-hops in the current interest set are visited above, so a
+            // peer that stops being any topic's next-hop would be carried forever.
+            // Retain only next-hops referenced by a current route (they are
+            // re-added by the loop above when interest and a live connection
+            // return), keeping the cache bounded by live routes, not history.
+            let live_next_hops: std::collections::HashSet<PeerId> = next_routes
+                .values()
+                .flat_map(|groups| groups.keys().cloned())
                 .collect();
-            if peers.is_empty() {
+            next_conns.retain(|next_hop, _| live_next_hops.contains(next_hop));
+
+            // Do not acknowledge a revision that changed while the snapshot
+            // was being built. The next pass incorporates that mutation before
+            // this refresh publishes any state or baseline.
+            let actor_after = self.registry.actor_state.pubsub_routing_revision();
+            let connection_after = self.registry.connection_pool.routing_revision();
+            let provider_after = self.route_provider_revision.load(Ordering::Acquire);
+            if actor_after != actor_revision
+                || connection_after != connection_revision
+                || provider_after != provider_revision
+            {
                 continue;
             }
-            let grouped = if let Some(provider) = provider.as_ref() {
-                provider.group_destinations(topic, &peers)
-            } else {
-                peers
-                    .into_iter()
-                    .map(|peer| (peer.clone(), Arc::from(vec![peer].into_boxed_slice())))
-                    .collect()
-            };
 
-            // Subscriptions are gated on the pool already holding a live
-            // connection to each next-hop. We deliberately do NOT call
-            // `client.lookup_peer` here: it goes through
-            // `pool.get_connection_to_peer` → `get_connection_by_peer_id`,
-            // which warn-logs the "No connection found for peer" pair on
-            // every miss (`connection_pool::pool_connect.rs:669-682`).
-            // Before route changes became event-driven, this refresh ticked
-            // every 25 ms. An unreachable peer whose interest entry is being
-            // re-gossiped to us produces ~80 warn lines/sec — observed on
-            // `stratum-devnet-a` 2026-05-11.
-            //
-            // Connection lifecycle belongs to the gossip/peer-discovery
-            // layer (`peer_discovery.rs`), not to pubsub. We just
-            // observe pool state via the non-warning
-            // `lookup_connected_peer` and route only to next-hops the
-            // pool currently has a usable connection for. When a peer
-            // (re)connects, the next refresh tick picks it up. When a
-            // peer drops, the next refresh tick removes it — the user's
-            // "subscription terminates on disconnect; re-subscribes on
-            // reconnect" invariant.
-            let mut routable: HashMap<PeerId, Arc<[PeerId]>> = HashMap::new();
-            for (next_hop, destinations) in grouped {
-                let cached_live = next_conns
-                    .get(&next_hop)
-                    .map(|conn| !conn.is_closed())
-                    .unwrap_or(false);
-                if cached_live {
-                    routable.insert(next_hop, destinations);
-                    continue;
-                }
-                // Silent pre-check: only call into pool lookup paths
-                // (which warn on miss inside
-                // `get_connection_by_peer_id`) when the pool already
-                // holds a usable connection. `has_connection_by_peer_id`
-                // is the only non-warning peer-presence test on the pool.
-                if !self
-                    .registry
-                    .connection_pool
-                    .has_connection_by_peer_id(&next_hop)
-                {
-                    next_conns.remove(&next_hop);
-                    continue;
-                }
-                if let Some(peer_ref) = self.client.lookup_connected_peer(&next_hop)
-                    && let Some(conn) = peer_ref.connection_ref()
-                {
-                    next_conns.insert(next_hop.clone(), conn);
-                    routable.insert(next_hop, destinations);
-                } else {
-                    next_conns.remove(&next_hop);
-                }
-            }
-            if !routable.is_empty() {
-                next_routes.insert(topic, Arc::new(routable));
-            }
+            self.refresh_hot_route_groups(&next_routes, &next_conns);
+            self.route_groups.store(Arc::new(next_routes));
+            self.conns.store(Arc::new(next_conns));
+            self.last_actor_routing_revision
+                .store(actor_revision, Ordering::Release);
+            self.last_connection_routing_revision
+                .store(connection_revision, Ordering::Release);
+            self.last_route_provider_revision
+                .store(provider_revision, Ordering::Release);
+            return;
         }
-        // ACTOR_REM_2 R13(b): the conns cache is cloned forward each tick and
-        // only next-hops in the current interest set are visited above, so a
-        // peer that stops being any topic's next-hop would be carried forever.
-        // Retain only next-hops referenced by a current route (they are
-        // re-added by the loop above when interest and a live connection
-        // return), keeping the cache bounded by live routes, not history.
-        let live_next_hops: std::collections::HashSet<PeerId> = next_routes
-            .values()
-            .flat_map(|groups| groups.keys().cloned())
-            .collect();
-        next_conns.retain(|next_hop, _| live_next_hops.contains(next_hop));
-        self.refresh_hot_route_groups(&next_routes, &next_conns);
-        self.route_groups.store(Arc::new(next_routes));
-        self.conns.store(Arc::new(next_conns));
-        self.last_actor_routing_revision
-            .store(actor_revision, Ordering::Release);
-        self.last_connection_routing_revision
-            .store(connection_revision, Ordering::Release);
-        self.last_route_provider_revision
-            .store(provider_revision, Ordering::Release);
     }
 
     fn refresh_hot_route_groups(
@@ -1583,7 +1610,7 @@ impl RoutedPubSub {
             drop(initial);
 
             loop {
-                let force_provider_refresh = tokio::select! {
+                tokio::select! {
                     _ = actor_state.wait_for_pubsub_routing_change(actor_revision) => false,
                     _ = connection_pool.wait_for_routing_change(connection_revision) => false,
                     _ = wait_for_route_provider_change(
@@ -1596,11 +1623,12 @@ impl RoutedPubSub {
                 let Some(this) = weak.upgrade() else {
                     return;
                 };
-                if force_provider_refresh {
-                    this.refresh_control_plane().await;
-                } else {
-                    this.refresh_control_plane_if_changed().await;
-                }
+                // Both event-driven and fallback passes use the same stable
+                // snapshot builder. A provider has no revision contract for
+                // interior state, so every actual pass re-evaluates it; the
+                // fallback is the bounded polling path when no notification
+                // exists for that state change.
+                this.refresh_control_plane_if_changed().await;
                 actor_revision = this.last_actor_routing_revision.load(Ordering::Acquire);
                 connection_revision = this
                     .last_connection_routing_revision
@@ -2280,6 +2308,40 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn fallback_refresh_rechecks_stateful_route_provider() {
+        let pubsub = test_pubsub("pubsub-stateful-route-provider-fallback");
+        let provider = Arc::new(CountingRouteProvider {
+            calls: AtomicU64::new(0),
+        });
+        pubsub.set_route_provider(provider.clone());
+        let interested_peer =
+            crate::KeyPair::new_for_testing("pubsub-stateful-fallback-peer").peer_id();
+        pubsub
+            .registry
+            .register_actor(
+                interest_name(topic_key("stateful-fallback"), &interested_peer),
+                RemoteActorLocation::new_with_peer(
+                    "127.0.0.1:19008".parse().unwrap(),
+                    interested_peer,
+                ),
+            )
+            .await
+            .unwrap();
+
+        RoutedPubSub::spawn_control_plane(&pubsub);
+        tokio::task::yield_now().await;
+        let before_fallback = provider.calls.load(Ordering::Acquire);
+        tokio::time::advance(CONTROL_PLANE_FALLBACK_INTERVAL).await;
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        assert!(
+            provider.calls.load(Ordering::Acquire) > before_fallback,
+            "the fallback tick must re-evaluate an installed provider whose interior state has no revision"
+        );
+    }
+
     #[tokio::test]
     async fn route_provider_revision_wait_survives_a_consumed_notification() {
         let pubsub = test_pubsub("pubsub-provider-revision-wait");
@@ -2348,6 +2410,60 @@ mod tests {
         first.await.unwrap();
         second.await.unwrap();
         assert_eq!(provider.calls.load(Ordering::Acquire), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn refresh_retries_when_actor_revision_changes_during_snapshot() {
+        let pubsub = test_pubsub("pubsub-refresh-retries-on-actor-change");
+        let first_call_started = Arc::new(std::sync::Barrier::new(2));
+        let first_call_release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let provider = Arc::new(BlockingRouteProvider {
+            calls: AtomicU64::new(0),
+            first_call_started: Arc::clone(&first_call_started),
+            first_call_release: Arc::clone(&first_call_release),
+        });
+        pubsub.set_route_provider(provider.clone());
+        let first_peer = crate::KeyPair::new_for_testing("pubsub-refresh-first-peer").peer_id();
+        pubsub
+            .registry
+            .register_actor(
+                interest_name(topic_key("refresh-first"), &first_peer),
+                RemoteActorLocation::new_with_peer("127.0.0.1:19006".parse().unwrap(), first_peer),
+            )
+            .await
+            .unwrap();
+
+        let refresh_pubsub = Arc::clone(&pubsub);
+        let refresh = tokio::spawn(async move {
+            refresh_pubsub.refresh_control_plane().await;
+        });
+        first_call_started.wait();
+
+        let second_peer = crate::KeyPair::new_for_testing("pubsub-refresh-second-peer").peer_id();
+        pubsub
+            .registry
+            .register_actor(
+                interest_name(topic_key("refresh-second"), &second_peer),
+                RemoteActorLocation::new_with_peer("127.0.0.1:19007".parse().unwrap(), second_peer),
+            )
+            .await
+            .unwrap();
+
+        let (release_lock, release_notify) = &*first_call_release;
+        *release_lock.lock().unwrap() = true;
+        release_notify.notify_all();
+        refresh.await.unwrap();
+
+        assert_eq!(
+            provider.calls.load(Ordering::Acquire),
+            3,
+            "a routing mutation during snapshot assembly must force a retry"
+        );
+        assert_eq!(
+            pubsub.last_actor_routing_revision.load(Ordering::Acquire),
+            pubsub.registry.actor_state.pubsub_routing_revision(),
+            "the published route baseline must be the revision actually incorporated"
+        );
     }
 
     #[tokio::test]

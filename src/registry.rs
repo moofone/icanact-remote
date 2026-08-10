@@ -3383,6 +3383,15 @@ impl<T: 'static> GossipRegistry<T> {
                 }
             }
         }
+        if !snapshot.pool.is_empty() {
+            // The projection restore above intentionally writes the pool's
+            // lock-free indexes directly so the speculative claim can be
+            // rolled back as one coherent snapshot. Publish one connection
+            // revision only after every index has been restored; otherwise a
+            // waiter can consume the speculative notification, observe the
+            // partially restored state, and park with the stale route.
+            self.connection_pool.mark_routing_changed();
+        }
 
         still_candidate
     }
@@ -15672,8 +15681,8 @@ mod tests {
     /// which is exactly why the source-keyed identity here has no other
     /// alias to be ranked against.
     #[tokio::test]
-    async fn gossip_peer_list_excludes_sole_transport_source_keyed_alias_with_no_live_connection()
-    {
+    async fn gossip_peer_list_excludes_sole_transport_source_keyed_alias_with_no_live_connection(
+    ) {
         let mut config =
             test_config_with_seed("periodic-gossip-sole-source-keyed-no-live-connection");
         config.enable_peer_discovery = true;
