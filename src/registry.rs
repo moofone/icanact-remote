@@ -6256,6 +6256,11 @@ impl<T: 'static> GossipRegistry<T> {
                         .actor_state
                         .local_actors
                         .upsert_sync(name.to_string(), location.clone());
+                    // The removal was already published before this second
+                    // shutdown check. Publish the compensating restoration so
+                    // route consumers cannot acknowledge the temporary
+                    // absence and then park forever with a stale snapshot.
+                    self.actor_state.mark_routing_changed_for_actor(name);
                     return Err(GossipError::Shutdown);
                 }
 
@@ -21632,6 +21637,58 @@ mod tests {
         assert!(
             !registry.actor_state.local_actors.contains_sync(actor_name),
             "failed registration must not leave a local actor behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn unregister_actor_publishes_shutdown_rollback_revision() {
+        let registry = Arc::new(GossipRegistry::<()>::new(test_addr(7142), test_config()));
+        let actor_name = "actor.unregister.shutdown.rollback";
+        registry
+            .register_actor(actor_name.to_string(), test_location(test_addr(7143)))
+            .await
+            .unwrap();
+        let before_unregistration = registry.actor_state.routing_revision();
+
+        // Hold the gossip lock after the actor has been removed. This makes
+        // the second shutdown check deterministic: the task has already
+        // published the removal, but cannot commit its gossip change yet.
+        let held = registry.gossip_state.lock().await;
+        let unregister_registry = Arc::clone(&registry);
+        let unregister_handle =
+            tokio::spawn(async move { unregister_registry.unregister_actor(actor_name).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !registry.actor_state.local_actors.contains_sync(actor_name) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unregister did not publish its removal in time");
+        let after_removal = registry.actor_state.routing_revision();
+        assert!(
+            after_removal > before_unregistration,
+            "unregistration must publish the temporary removal before its commit check"
+        );
+
+        registry.shutdown.store(true, Ordering::Release);
+        drop(held);
+
+        let err = tokio::time::timeout(Duration::from_secs(2), unregister_handle)
+            .await
+            .expect("unregister did not finish in time")
+            .unwrap()
+            .expect_err("unregistration should observe shutdown");
+        assert!(matches!(err, GossipError::Shutdown));
+        assert!(
+            registry.actor_state.local_actors.contains_sync(actor_name),
+            "shutdown rollback must restore the local actor"
+        );
+        assert!(
+            registry.actor_state.routing_revision() > after_removal,
+            "shutdown rollback must publish a compensating actor revision"
         );
     }
 
