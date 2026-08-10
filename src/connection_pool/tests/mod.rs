@@ -13247,6 +13247,149 @@ async fn disconnect_connection_by_peer_id_still_cancels_correlation_on_final_tea
     guard.disarm();
 }
 
+/// `unpublish_rejected_outbound_candidate`'s `_` (fallback) match arm covers
+/// the far more common reject shape -- a still-live rival that lives at a
+/// DIFFERENT address than the candidate's own dial address, so there is no
+/// index row to restore (see the function's own doc). Before this fix, that
+/// arm left `keep_correlation` at its default `false`, so discarding the
+/// candidate unconditionally cancelled the shared, SESSION-level correlation
+/// tracker -- cancelling the still-live rival's in-flight asks too, even
+/// though the rival itself was never touched.
+///
+/// RED (pre-fix): the rival's in-flight slot is cancelled back to
+/// `SLOT_EMPTY`. GREEN (post-fix): the slot survives, still `SLOT_WAITING`.
+#[tokio::test]
+async fn unpublish_rejected_outbound_candidate_preserves_shared_correlation_for_rival_at_different_address()
+ {
+    let peer_id = crate::KeyPair::new_for_testing("rc-unpublish-diff-addr-peer").peer_id();
+    let rival_addr: SocketAddr = "127.0.0.1:7501".parse().unwrap();
+    let candidate_addr: SocketAddr = "127.0.0.1:7502".parse().unwrap();
+
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let tracker = pool.get_or_create_correlation_tracker(&peer_id);
+
+    // The still-live rival, indexed and published at its OWN address --
+    // different from the candidate's dial address below.
+    let rival = make_live_connection_with_correlation(
+        rival_addr,
+        ConnectionDirection::Inbound,
+        tracker.clone(),
+    )
+    .await;
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), rival_addr, rival.clone()));
+
+    // The rejected outbound candidate, provisionally indexed at its OWN dial
+    // address, sharing the same peer-session tracker every connection
+    // attempt for this peer gets from `get_or_create_correlation_tracker`.
+    let candidate = make_live_connection_with_correlation(
+        candidate_addr,
+        ConnectionDirection::Outbound,
+        tracker.clone(),
+    )
+    .await;
+    let _ = pool
+        .connections_by_addr
+        .upsert_sync(candidate_addr, candidate.clone());
+
+    // An in-flight ask slot on the shared tracker, as if the RIVAL had an ask
+    // in flight when the candidate's connection attempt was rejected.
+    let guard = tracker.allocate().expect("slot should allocate");
+    let id = guard.id();
+    let slot = CorrelationTracker::slot_index(id);
+    assert_eq!(
+        tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_WAITING
+    );
+
+    pool.unpublish_rejected_outbound_candidate(candidate_addr, &candidate, &peer_id, Some(&rival));
+
+    assert_eq!(
+        tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_WAITING,
+        "discarding the rejected candidate cancelled the shared correlation tracker's in-flight \
+         slot -- this kills the still-live rival's in-flight asks, even though the rival lives \
+         at a different address and was never itself touched"
+    );
+    assert!(
+        rival.has_live_stream(),
+        "the still-live rival's own background tasks must not be touched by the reject"
+    );
+
+    guard.disarm();
+}
+
+/// A rejected candidate can lose the address-removal CAS because a fresh
+/// connection reindexed the same address first.  That lost removal must not
+/// change the correlation decision: the still-live rival can still share the
+/// session tracker, so cancelling the candidate must not cancel the rival's
+/// in-flight asks.
+#[tokio::test]
+async fn unpublish_rejected_outbound_candidate_preserves_shared_correlation_when_removal_loses()
+{
+    let peer_id = crate::KeyPair::new_for_testing("rc-unpublish-cas-loss-peer").peer_id();
+    let rival_addr: SocketAddr = "127.0.0.1:7503".parse().unwrap();
+    let candidate_addr: SocketAddr = "127.0.0.1:7504".parse().unwrap();
+
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let tracker = pool.get_or_create_correlation_tracker(&peer_id);
+
+    let rival = make_live_connection_with_correlation(
+        rival_addr,
+        ConnectionDirection::Inbound,
+        tracker.clone(),
+    )
+    .await;
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), rival_addr, rival.clone()));
+
+    let candidate = make_live_connection_with_correlation(
+        candidate_addr,
+        ConnectionDirection::Outbound,
+        tracker.clone(),
+    )
+    .await;
+    let replacement = make_live_connection_with_correlation(
+        candidate_addr,
+        ConnectionDirection::Inbound,
+        tracker.clone(),
+    )
+    .await;
+    let _ = pool
+        .connections_by_addr
+        .upsert_sync(candidate_addr, replacement.clone());
+
+    let guard = tracker.allocate().expect("slot should allocate");
+    let id = guard.id();
+    let slot = CorrelationTracker::slot_index(id);
+    assert_eq!(
+        tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_WAITING
+    );
+
+    // `remove_if_sync` loses: the candidate has already been replaced at the
+    // same address.  The live rival is at a different address, so there is
+    // no restoration branch to accidentally set the preservation flag.
+    pool.unpublish_rejected_outbound_candidate(
+        candidate_addr,
+        &candidate,
+        &peer_id,
+        Some(&rival),
+    );
+
+    assert_eq!(
+        tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_WAITING,
+        "a lost candidate-removal CAS must not cancel the live rival's shared tracker"
+    );
+    assert!(
+        pool.get_lock_free_connection(candidate_addr)
+            .as_ref()
+            .is_some_and(|connection| Arc::ptr_eq(connection, &replacement)),
+        "the fresh replacement that won the address CAS must remain indexed"
+    );
+
+    guard.disarm();
+}
+
 /// RED-first: skipping the DIRECT `correlation.cancel_all()` call in
 /// `abort_tasks_keep_correlation` is not sufficient on its own. The
 /// connection's real IO task carries its own `ExitGuard`, which cancels the

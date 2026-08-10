@@ -48,6 +48,16 @@ pub enum PeerState {
         attempts: u8,
         /// Delay used by the preceding failure window.
         previous_retry_delay_seconds: u64,
+        /// Monotonic counter (`PeerDiscovery::next_claim_generation`)
+        /// stamped fresh every time an address transitions INTO `Pending`.
+        /// `since` has only whole-second resolution -- too coarse to
+        /// reliably distinguish "the same claim a caller captured earlier"
+        /// from "a brand new claim that happens to land in the same
+        /// second" -- so this is the actual generation/nonce identifying
+        /// exactly WHICH `Pending` claim on this address a caller is
+        /// looking at. See `DiscoveryTaskTracker` and
+        /// `clear_pending_if_generation`.
+        claim_generation: u64,
     },
     /// Connection attempt failed, in backoff
     Failed {
@@ -82,6 +92,18 @@ impl PeerState {
     pub fn pending_since(&self) -> Option<u64> {
         match self {
             PeerState::Pending { since, .. } => Some(*since),
+            _ => None,
+        }
+    }
+
+    /// Get the claim generation if in Pending state -- see
+    /// `Pending::claim_generation`'s doc for why this exists alongside
+    /// `pending_since`.
+    pub fn pending_claim_generation(&self) -> Option<u64> {
+        match self {
+            PeerState::Pending {
+                claim_generation, ..
+            } => Some(*claim_generation),
             _ => None,
         }
     }
@@ -189,6 +211,10 @@ pub struct PeerDiscovery {
     additional_self_addr: Option<SocketAddr>,
     /// The sole peer-discovery state map.
     peer_states: HashMap<SocketAddr, PeerState>,
+    /// Monotonic source for `PeerState::Pending::claim_generation`. Plain
+    /// `u64`, not an atomic: `PeerDiscovery` lives behind `GossipState`'s
+    /// single `Mutex`, never accessed concurrently.
+    next_claim_generation: u64,
 }
 
 impl PeerDiscovery {
@@ -199,6 +225,7 @@ impl PeerDiscovery {
             local_addr,
             additional_self_addr: None,
             peer_states: HashMap::new(),
+            next_claim_generation: 0,
         }
     }
 
@@ -325,12 +352,14 @@ impl PeerDiscovery {
                 }) => (*attempts, *retry_delay_seconds),
                 _ => (0, MIN_BACKOFF_SECONDS),
             };
+            self.next_claim_generation += 1;
             self.peer_states.insert(
                 *addr,
                 PeerState::Pending {
                     since: now,
                     attempts,
                     previous_retry_delay_seconds,
+                    claim_generation: self.next_claim_generation,
                 },
             );
         }
@@ -501,6 +530,35 @@ impl PeerDiscovery {
         }
     }
 
+    /// Same as [`clear_pending`](Self::clear_pending), but only acts if the
+    /// address is STILL `Pending` with exactly the given `claim_generation`
+    /// -- i.e. nobody has re-claimed it since the caller captured this
+    /// value. A fresh `Pending` marking always carries a new, strictly
+    /// increasing generation (`PeerDiscovery::next_claim_generation`), so a
+    /// mismatch proves a newer claim has superseded the one the caller is
+    /// trying to release. `since` (whole-second resolution) is NOT used for
+    /// this comparison -- two distinct claims landing in the same second
+    /// would be indistinguishable by `since` alone.
+    ///
+    /// Used by `DiscoveryTaskTracker::set`'s displaced-candidate cleanup: a
+    /// displaced dial task's candidate list was captured when it was
+    /// spawned, but by the time it is actually displaced (which can be
+    /// arbitrarily later -- nothing updates the tracker when a task
+    /// finishes naturally), one of its candidates may have already
+    /// resolved and been legitimately re-selected and re-marked `Pending`
+    /// by an entirely different, newer task. Clearing unconditionally would
+    /// strand that newer task's reservation as untracked, defeating
+    /// pending/`max_peers` accounting for it.
+    pub fn clear_pending_if_generation(&mut self, addr: &SocketAddr, claim_generation: u64) {
+        match self.peer_states.get(addr) {
+            Some(PeerState::Pending {
+                claim_generation: current_generation,
+                ..
+            }) if *current_generation == claim_generation => self.clear_pending(addr),
+            _ => {}
+        }
+    }
+
     /// Get configuration
     pub fn config(&self) -> &PeerDiscoveryConfig {
         &self.config
@@ -560,6 +618,7 @@ impl PeerDiscovery {
                     since,
                     attempts,
                     previous_retry_delay_seconds,
+                    ..
                 } if pending_ttl > 0 && now.saturating_sub(*since) > pending_ttl => {
                     stats.pending_removed += 1;
                     if *attempts == 0 {
@@ -1109,6 +1168,7 @@ mod tests {
                 since: 1,
                 attempts: 3,
                 previous_retry_delay_seconds: 7,
+                claim_generation: 0,
             },
         );
 
@@ -1172,6 +1232,7 @@ mod tests {
                 since: 0,
                 attempts: 0,
                 previous_retry_delay_seconds: MIN_BACKOFF_SECONDS,
+                claim_generation: 0,
             },
         );
         discovery.peer_states.insert(
@@ -1214,6 +1275,7 @@ mod tests {
                 since: 0,
                 attempts: 4,
                 previous_retry_delay_seconds: 7,
+                claim_generation: 0,
             },
         );
 
@@ -1256,6 +1318,7 @@ mod tests {
                 since: 0,
                 attempts: 2,
                 previous_retry_delay_seconds: 5,
+                claim_generation: 0,
             },
         );
 
@@ -1615,6 +1678,7 @@ mod tests {
                 since: 0,
                 attempts: 0,
                 previous_retry_delay_seconds: MIN_BACKOFF_SECONDS,
+                claim_generation: 0,
             },
         );
         discovery.peer_states.insert(

@@ -2549,17 +2549,32 @@ impl<T> ConnectionPool<T> {
         // `candidate.abort_tasks()` from also cancelling every in-flight ask
         // on that live, restored connection. Only cancel the shared tracker
         // when `existing` does not depend on it.
-        let mut keep_correlation = false;
+        //
+        // Compute this independently of `removed`: a concurrent publisher
+        // can replace/reindex `addr` before the identity-scoped removal, so
+        // the removal may lose even while the live sibling still shares the
+        // session tracker. Basing this only on the successful-removal branch
+        // would cancel that sibling's in-flight asks.
+        let keep_correlation = existing_before.is_some_and(|existing| {
+            existing.has_live_stream() && candidate.shares_correlation_tracker(existing)
+        });
         if removed {
             match existing_before {
                 Some(existing) if existing.addr == addr && existing.has_live_stream() => {
                     let _ = self.connections_by_addr.upsert_sync(addr, existing.clone());
                     let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
-                    keep_correlation = candidate.shares_correlation_tracker(existing);
                 }
                 _ => {
                     let _ = self.addr_to_peer_id.remove_sync(&addr);
                     self.clear_capabilities_for_addr(&addr);
+                    // The far more common reject shape: a rival that lives at
+                    // some OTHER address entirely (see this function's doc),
+                    // so there is no index row to restore here — but it may
+                    // still be alive and share `candidate`'s SESSION-level
+                    // correlation tracker (both resolve through
+                    // `get_or_create_correlation_tracker(peer_id)`).
+                    // Discarding this slot must not silently cancel that
+                    // still-live sibling's in-flight asks.
                 }
             }
         }
@@ -4163,7 +4178,6 @@ impl<T> ConnectionPool<T> {
             || self.aliased_connection_by_peer_id(peer_id).is_some()
     }
 
-    /// Clean up stale connections
     pub fn cleanup_stale_connections(&self) {
         // Find disconnected peers and use peer-id-based removal to clean up all maps
         let mut stale_peer_ids: Vec<crate::PeerId> = Vec::new();
@@ -4647,6 +4661,15 @@ pub(crate) fn handle_incoming_message(
                         delta,
                         Some(_peer_addr),
                         captured_epoch.map(|generation| (sender_socket_addr, generation)),
+                        // The identity bound to THIS transport by the
+                        // authenticated handshake, independent of whatever
+                        // `delta.sender_peer_id` claims -- gates the
+                        // TTL-liveness refresh on an unchanged
+                        // reannouncement to owner-issued deltas only (see
+                        // `apply_delta_from`'s doc). Everything else in
+                        // this arm keeps using the payload's claimed
+                        // `sender_peer_id`, matching prior behavior.
+                        authenticated_peer_id.as_ref(),
                     )
                     .await?;
 
@@ -4776,23 +4799,23 @@ pub(crate) fn handle_incoming_message(
                         crate::current_timestamp_nanos(),
                     );
 
-                    // FIX: If the resolved bind address differs from the TCP source address,
-                    // migrate the PeerInfo from the ephemeral port entry to the bind address.
-                    // This preserves node_id, sequence, and failure state learned during TLS handshake.
+                    // If the resolved bind address differs from the TCP source address,
+                    // migrate the PeerInfo from the ephemeral port entry to the bind
+                    // address. `migrate_peer_entry` merges rather than overwrites when
+                    // a bind-keyed entry already exists, so an already-established
+                    // replay high-water mark / armed session there is never regressed.
                     if sender_socket_addr != _peer_addr && _peer_addr != registry.bind_addr {
-                        if let Some(mut old_peer_info) = gossip_state.peers.remove(&_peer_addr) {
+                        if let Some(node_id) =
+                            gossip_state.peers.get(&_peer_addr).and_then(|p| p.node_id)
+                        {
                             info!(
                                 old_addr = %_peer_addr,
                                 new_addr = %sender_socket_addr,
-                                node_id = ?old_peer_info.node_id,
+                                node_id = ?node_id,
                                 "🔄 Migrating peer info from ephemeral TCP source to bind address from FullSync"
                             );
-                            // Update the address field and preserve the connection address
-                            old_peer_info.address = sender_socket_addr;
-                            old_peer_info.peer_address = Some(_peer_addr);
-                            // Insert with new key (bind address), preserving all state
-                            gossip_state.peers.insert(sender_socket_addr, old_peer_info);
                         }
+                        gossip_state.migrate_peer_entry(_peer_addr, sender_socket_addr);
                     }
 
                     // Add the sender as a peer if not already present (inlined to avoid separate lock)
@@ -4865,6 +4888,7 @@ pub(crate) fn handle_incoming_message(
                         sequence,
                         wall_clock_time,
                         commit_seq,
+                        Some(authenticated_sender_peer_id),
                     )
                     .await;
 
@@ -5171,6 +5195,7 @@ pub(crate) fn handle_incoming_message(
                         delta,
                         Some(_peer_addr),
                         captured_epoch.map(|generation| (sender_socket_addr, generation)),
+                        authenticated_peer_id.as_ref(),
                     )
                     .await
                 {
@@ -5282,6 +5307,7 @@ pub(crate) fn handle_incoming_message(
                         sequence,
                         wall_clock_time,
                         commit_seq,
+                        Some(authenticated_sender_peer_id),
                     )
                     .await;
 
@@ -5320,23 +5346,23 @@ pub(crate) fn handle_incoming_message(
                     );
                 }
 
-                // FIX: If the resolved bind address differs from the TCP source address,
-                // migrate the PeerInfo from the ephemeral port entry to the bind address.
-                // This preserves node_id, sequence, and failure state learned during TLS handshake.
+                // If the resolved bind address differs from the TCP source address,
+                // migrate the PeerInfo from the ephemeral port entry to the bind
+                // address. `migrate_peer_entry` merges rather than overwrites when
+                // a bind-keyed entry already exists, so an already-established
+                // replay high-water mark / armed session there is never regressed.
                 if sender_socket_addr != _peer_addr && _peer_addr != registry.bind_addr {
-                    if let Some(mut old_peer_info) = gossip_state.peers.remove(&_peer_addr) {
+                    if let Some(node_id) =
+                        gossip_state.peers.get(&_peer_addr).and_then(|p| p.node_id)
+                    {
                         info!(
                             old_addr = %_peer_addr,
                             new_addr = %sender_socket_addr,
-                            node_id = ?old_peer_info.node_id,
+                            node_id = ?node_id,
                             "🔄 Migrating peer info from ephemeral TCP source to bind address from FullSyncResponse"
                         );
-                        // Update the address field and preserve the connection address
-                        old_peer_info.address = sender_socket_addr;
-                        old_peer_info.peer_address = Some(_peer_addr);
-                        // Insert with new key (bind address), preserving all state
-                        gossip_state.peers.insert(sender_socket_addr, old_peer_info);
                     }
+                    gossip_state.migrate_peer_entry(_peer_addr, sender_socket_addr);
                 }
 
                 // Failure/health bookkeeping must only be attributable to
@@ -5408,9 +5434,10 @@ pub(crate) fn handle_incoming_message(
                     return Ok(());
                 }
 
+                let candidates_for_tracker = candidates.clone();
                 let registry_clone = registry.clone();
                 let discovery_handle = tokio::spawn(async move {
-                    for addr in candidates {
+                    for (addr, _claim_generation) in candidates {
                         // PeerListGossip is only a discovery hint. Keep its
                         // claimed identity in `known_peers` (where
                         // `on_peer_list_gossip` put it), but create no
@@ -5431,8 +5458,9 @@ pub(crate) fn handle_incoming_message(
                     }
                 });
 
-                // Track the discovery task (H-004): keep at most one dial task alive.
-                registry.discovery_task.set(discovery_handle.abort_handle());
+                registry
+                    .track_discovery_task(discovery_handle.abort_handle(), candidates_for_tracker)
+                    .await;
 
                 Ok(())
             }

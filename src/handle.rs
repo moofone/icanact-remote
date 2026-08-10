@@ -2683,6 +2683,112 @@ mod tests {
         Ok(())
     }
 
+    /// `LockFreeConnection::new`'s default (`session_source == addr`)
+    /// only matches the inbound invariant -- `session_source` must be the
+    /// remote's own ephemeral TCP source -- when the connection happens to
+    /// be keyed by that same source. Once address arbitration already knows
+    /// this peer's advertised bind address, the connection is keyed by THAT
+    /// address instead (`peer_state_addr` != `peer_addr`), and the
+    /// unmodified default silently diverges from `ReadContext::session_source`
+    /// (built from the raw `peer_addr` a few lines above the connection
+    /// itself). That divergence breaks `peer_info_is_from_current_session`'s
+    /// case-3 self-heal: `current.session_source` no longer matches a live
+    /// inbound successor's own traffic, so a stale, superseded session's
+    /// exemption can never expire and the successor's FullSyncs are rejected
+    /// forever.
+    ///
+    /// Same `peer_state_addr` != `peer_addr` setup as
+    /// `inbound_accept_ephemeral_alias_evicted_midwindow_leaves_no_stale_alias`
+    /// above, without the mid-window eviction -- this only needs the accepted
+    /// connection to be published, then inspects its `session_source`
+    /// directly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbound_accept_session_source_is_the_ephemeral_tcp_source_not_the_bind_key()
+    -> crate::Result<()> {
+        let (remote_keypair, local_keypair) =
+            ordered_keypairs("session-source-remote-lower", "session-source-local-higher");
+        let remote_peer_id = remote_keypair.peer_id();
+        let mut config = test_cfg();
+        config.key_pair = Some(local_keypair.clone());
+        let handle = GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:0".parse().unwrap(),
+            local_keypair.to_secret_key(),
+            Some(config),
+            TestNoopBootstrap,
+        )
+        .await?;
+
+        // The raw TCP source address the accept arrives from — deliberately
+        // different from the advertised bind address below, so
+        // `peer_state_addr` (the connection's index key) and the ephemeral
+        // `peer_addr` genuinely differ.
+        let attacker_addr: SocketAddr = "127.0.0.1:41423".parse().unwrap();
+        let advertised_bind_addr: SocketAddr = "127.0.0.1:41424".parse().unwrap();
+        assert_ne!(
+            attacker_addr, advertised_bind_addr,
+            "test precondition: peer_addr and peer_state_addr must genuinely differ"
+        );
+
+        // Reserve the advertised address as operator-owned so it resolves to
+        // a Verified claim and `peer_state_addr` becomes `advertised_bind_addr`,
+        // not the raw TCP source.
+        handle
+            .registry
+            .configure_peer(remote_peer_id.clone(), advertised_bind_addr)
+            .await;
+
+        let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+        let msg = crate::registry::RegistryMessage::FullSyncRequest {
+            sender_peer_id: remote_peer_id.clone(),
+            sender_bind_addr: Some(advertised_bind_addr.to_string()),
+            sequence: 1,
+            wall_clock_time: crate::current_timestamp(),
+        };
+        write_initial_gossip(&mut writer, &msg).await;
+
+        // The accepted case keeps the accept task alive reading further
+        // traffic on the still-open duplex stream, so it is spawned rather
+        // than awaited directly — the assertions below only need the
+        // connection to reach the pool, not the task to finish.
+        let _accept_task = tokio::spawn(handle_incoming_connection_tls(
+            reader,
+            attacker_addr,
+            handle.registry.clone(),
+            Some(Arc::downgrade(&handle.registry)),
+            Some(remote_keypair.peer_id().to_node_id()),
+            None,
+        ));
+
+        let published = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(conn) = handle
+                    .registry
+                    .connection_pool
+                    .get_connection_by_peer_id(&remote_peer_id)
+                {
+                    return conn;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the inbound connection must be published within the timeout");
+
+        assert_eq!(
+            published.addr, advertised_bind_addr,
+            "test precondition: the connection must be keyed by the advertised bind address"
+        );
+        assert_eq!(
+            published.session_source, attacker_addr,
+            "session_source must be the connection's own ephemeral TCP source, matching \
+             ReadContext::session_source, not the bind-address key it's indexed under"
+        );
+
+        drop(writer);
+        handle.shutdown_and_wait().await;
+        Ok(())
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn inbound_gossip_rejects_sender_not_bound_to_tls_certificate() -> crate::Result<()> {
         let (local_keypair, claimed_keypair) =
@@ -4138,6 +4244,16 @@ where
             peer_state_addr,
             crate::connection_pool::ConnectionDirection::Inbound,
         );
+        // `LockFreeConnection::new`'s default only matches the inbound
+        // case when `addr == session_source` -- true when `peer_state_addr`
+        // (the arbitration-resolved key, possibly the peer's advertised bind
+        // address) happens to equal the raw TCP source, but NOT in the
+        // common case where arbitration already knows this peer's bind
+        // address and keys the connection by it instead. Set it explicitly
+        // to `peer_addr`, matching `ReadContext::session_source` above --
+        // both must agree for `peer_info_is_from_current_session`'s case-3
+        // self-heal to recognize this connection as the live successor.
+        connection.session_source = peer_addr;
         connection.stream_handle = Some(stream_handle);
         connection.set_state(crate::connection_pool::ConnectionState::Connected);
         connection.update_last_used();
@@ -5016,9 +5132,15 @@ pub(crate) async fn handle_response_message(
     // FALLBACK: Use shared correlation tracker by peer_id.
     if let Some(peer_id) = pool.get_peer_id_by_addr(&peer_addr) {
         if let Some(correlation) = pool.get_shared_correlation_tracker(&peer_id) {
-            let _ = correlation.complete(correlation_id, &mut payload);
+            if correlation.complete(correlation_id, &mut payload) {
+                return;
+            }
         }
     }
+
+    // No tier claimed this correlation_id -- the ask it was meant for has
+    // already timed out and been evicted, or this is spurious traffic.
+    registry.note_unmatched_response();
 }
 
 /// Deliver an ask NACK to whichever correlation tracker is waiting on
@@ -5052,9 +5174,15 @@ pub(crate) async fn handle_response_nack_message(
 
     if let Some(peer_id) = pool.get_peer_id_by_addr(&peer_addr) {
         if let Some(correlation) = pool.get_shared_correlation_tracker(&peer_id) {
-            let _ = correlation.complete_nack(correlation_id, reason);
+            if correlation.complete_nack(correlation_id, reason) {
+                return;
+            }
         }
     }
+
+    // No tier claimed this correlation_id -- the ask it was meant for has
+    // already timed out and been evicted, or this is spurious traffic.
+    registry.note_unmatched_response();
 }
 
 /// Parse a complete V5 frame. The control word owns kind and body length, so
