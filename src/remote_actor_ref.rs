@@ -2,7 +2,7 @@ use crate::RemoteActorLocation;
 use arc_swap::ArcSwapOption;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -374,6 +374,7 @@ pub struct RemoteActorRef<T = ()> {
     /// Registry weak reference - doesn't prevent registry shutdown/cleanup
     /// Used for reconnection after DNS changes
     registry: Weak<crate::registry::GossipRegistry>,
+    recovery_in_flight: Arc<AtomicBool>,
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -422,6 +423,14 @@ impl Drop for ActorAskCancellationGuard {
             evicted,
             "actor ask cancelled; evicted the specific peer transport session instance it ran on"
         );
+    }
+}
+
+struct AmbiguousRecoveryGuard(Arc<AtomicBool>);
+
+impl Drop for AmbiguousRecoveryGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 
@@ -528,11 +537,11 @@ impl<T> RemoteActorRef<T> {
 
         match (candidate.instance_id(), failed.instance_id()) {
             (Some(candidate_id), Some(failed_id)) => candidate_id == failed_id,
-            // A handle without a stream instance cannot be a usable replacement. Treat a
-            // same-address no-instance candidate as the same unhealed session rather than
-            // installing a handle that can only fail with NotConnected on the next call.
-            (None, None) => candidate.addr == failed.addr,
-            _ => false,
+            // A handle without a stream instance cannot be a usable replacement. It may have
+            // lost its stream between pool lookup and this check, so reject it regardless of
+            // whether the failed handle had an instance of its own.
+            (None, _) => true,
+            (Some(_), None) => false,
         }
     }
 
@@ -707,6 +716,9 @@ impl<T> RemoteActorRef<T> {
         let Some(registry) = self.registry.upgrade() else {
             return err;
         };
+        let Some(claim) = self.claim_ambiguous_ask_recovery() else {
+            return err;
+        };
         let recovery_deadline = tokio::time::Instant::now() + registry.config.connection_timeout;
         let repair = self.reheal_connection(failed, Some(recovery_deadline));
 
@@ -721,11 +733,15 @@ impl<T> RemoteActorRef<T> {
                         );
                     }
                     Err(_) => {
-                        self.spawn_ambiguous_ask_recovery(Arc::clone(failed), recovery_deadline);
+                        self.spawn_ambiguous_ask_recovery(
+                            Arc::clone(failed),
+                            recovery_deadline,
+                            claim,
+                        );
                     }
                 },
                 Err(_) => {
-                    self.spawn_ambiguous_ask_recovery(Arc::clone(failed), recovery_deadline);
+                    self.spawn_ambiguous_ask_recovery(Arc::clone(failed), recovery_deadline, claim);
                 }
             }
         } else if let Err(repair_err) = repair.await {
@@ -737,18 +753,28 @@ impl<T> RemoteActorRef<T> {
         err
     }
 
+    fn claim_ambiguous_ask_recovery(&self) -> Option<AmbiguousRecoveryGuard> {
+        self.recovery_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| AmbiguousRecoveryGuard(Arc::clone(&self.recovery_in_flight)))
+    }
+
     fn spawn_ambiguous_ask_recovery(
         &self,
         failed: Arc<RemoteConnection>,
         deadline: tokio::time::Instant,
+        claim: AmbiguousRecoveryGuard,
     ) {
         let remote = RemoteActorRef::<()> {
             location: self.location.clone(),
             connection: Arc::clone(&self.connection),
             registry: self.registry.clone(),
+            recovery_in_flight: Arc::clone(&self.recovery_in_flight),
             _marker: PhantomData,
         };
         tokio::spawn(async move {
+            let _claim = claim;
             if let Err(repair_err) = remote.reheal_connection(&failed, Some(deadline)).await {
                 tracing::debug!(
                     error = ?repair_err,
@@ -770,6 +796,7 @@ impl<T> RemoteActorRef<T> {
             location,
             connection: Arc::new(ArcSwapOption::from(connection.map(Arc::new))),
             registry: Arc::downgrade(&registry), // Weak reference - prevents cycle
+            recovery_in_flight: Arc::new(AtomicBool::new(false)),
             _marker: PhantomData,
         }
     }
