@@ -2106,6 +2106,92 @@ const OWNERSHIP_WATERMARK_CAPACITY: usize = 8192;
 const OWNERSHIP_WATERMARK_TARGET: usize = 6144;
 
 impl GossipState {
+    /// Move a peer entry from its authenticated transport source to the
+    /// peer's advertised bind address without discarding state already
+    /// accumulated at that bind key. A separate connection can resolve the
+    /// same peer's bind address after another session has already established
+    /// replay/session state there; replacing the bind entry wholesale would
+    /// regress those monotonic guards.
+    pub(crate) fn migrate_peer_entry(&mut self, old_addr: SocketAddr, new_addr: SocketAddr) {
+        let Some(mut moved) = self.peers.remove(&old_addr) else {
+            return;
+        };
+        moved.address = new_addr;
+        moved.peer_address = Some(old_addr);
+        moved.transport_source_keyed = false;
+
+        match self.peers.entry(new_addr) {
+            std::collections::hash_map::Entry::Occupied(mut slot) => {
+                let existing = slot.get();
+                let same_identity = moved.node_id.is_some() && moved.node_id == existing.node_id;
+                if same_identity {
+                    moved.last_sequence = moved.last_sequence.max(existing.last_sequence);
+                    moved.last_sent_sequence =
+                        moved.last_sent_sequence.max(existing.last_sent_sequence);
+                    if existing.current_session_epoch > moved.current_session_epoch {
+                        moved.current_session_source = existing.current_session_source;
+                        moved.current_session_connection =
+                            existing.current_session_connection.clone();
+                        moved.current_session_epoch = existing.current_session_epoch;
+                        moved.accept_lower_sequence_from = existing.accept_lower_sequence_from;
+                        moved.peer_address = existing.peer_address;
+                    }
+
+                    let PeerInfo {
+                        address: _,
+                        peer_address: _,
+                        inbound_observed: existing_inbound_observed,
+                        outbound_dial_success: existing_outbound_dial_success,
+                        node_id: _,
+                        dns_name: existing_dns_name,
+                        failures: existing_failures,
+                        last_attempt: existing_last_attempt,
+                        last_success: existing_last_success,
+                        last_sequence: _,
+                        last_sent_sequence: _,
+                        consecutive_deltas: existing_consecutive_deltas,
+                        last_failure_time: existing_last_failure_time,
+                        last_failure_instant: existing_last_failure_instant,
+                        last_dns_refresh_attempt: existing_last_dns_refresh_attempt,
+                        last_response_received_ms: existing_last_response_received_ms,
+                        accept_lower_sequence_from: _,
+                        current_session_source: _,
+                        current_session_connection: _,
+                        current_session_epoch: _,
+                        identity_verified: existing_identity_verified,
+                        transport_source_keyed: _,
+                    } = existing.clone();
+
+                    moved.inbound_observed |= existing_inbound_observed;
+                    moved.outbound_dial_success |= existing_outbound_dial_success;
+                    moved.identity_verified |= existing_identity_verified;
+                    if moved.dns_name.is_none() {
+                        moved.dns_name = existing_dns_name;
+                    }
+                    moved.last_dns_refresh_attempt = moved
+                        .last_dns_refresh_attempt
+                        .max(existing_last_dns_refresh_attempt);
+                    moved.last_response_received_ms = moved
+                        .last_response_received_ms
+                        .max(existing_last_response_received_ms);
+                    moved.consecutive_deltas =
+                        moved.consecutive_deltas.max(existing_consecutive_deltas);
+                    if existing_last_attempt > moved.last_attempt {
+                        moved.failures = existing_failures;
+                        moved.last_failure_time = existing_last_failure_time;
+                        moved.last_failure_instant = existing_last_failure_instant;
+                    }
+                    moved.last_attempt = moved.last_attempt.max(existing_last_attempt);
+                    moved.last_success = moved.last_success.max(existing_last_success);
+                }
+                *slot.get_mut() = moved;
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(moved);
+            }
+        }
+    }
+
     fn ownership_projection_can_admit(&self, peer_addr: SocketAddr, commit_seq: CommitSeq) -> bool {
         self.ownership_commit_seq
             .get(&peer_addr)
@@ -2476,21 +2562,42 @@ impl<T> Clone for GossipRegistry<T> {
     }
 }
 
+/// One tracked discovery task and the exact `Pending` generations it owns.
+/// Aborting a task does not run its dial-loop cleanup, so the displaced
+/// candidates must be released by the caller that replaces this record.
+#[derive(Debug)]
+struct TrackedDiscoveryTask {
+    abort: AbortHandle,
+    candidates: Vec<(SocketAddr, u64)>,
+}
+
 #[derive(Debug, Default)]
 pub struct DiscoveryTaskTracker {
-    handle: ArcSwapOption<AbortHandle>,
+    task: ArcSwapOption<TrackedDiscoveryTask>,
 }
 
 impl DiscoveryTaskTracker {
-    pub fn set(&self, handle: AbortHandle) {
-        if let Some(old) = self.handle.swap(Some(Arc::new(handle))) {
-            old.abort();
+    pub fn set(
+        &self,
+        handle: AbortHandle,
+        candidates: Vec<(SocketAddr, u64)>,
+    ) -> Vec<(SocketAddr, u64)> {
+        let displaced = self.task.swap(Some(Arc::new(TrackedDiscoveryTask {
+            abort: handle,
+            candidates,
+        })));
+        match displaced {
+            Some(old) => {
+                old.abort.abort();
+                old.candidates.clone()
+            }
+            None => Vec::new(),
         }
     }
 
     pub fn abort(&self) {
-        if let Some(handle) = self.handle.swap(None) {
-            handle.abort();
+        if let Some(task) = self.task.swap(None) {
+            task.abort.abort();
         }
     }
 }
@@ -9229,7 +9336,7 @@ impl<T: 'static> GossipRegistry<T> {
         {
             let before_count = self.actor_state.known_actors.len();
 
-            let mut to_remove = Vec::new();
+            let mut to_remove: Vec<(String, RemoteActorLocation)> = Vec::new();
             self.actor_state.known_actors.iter_sync(|k, location| {
                 if now.saturating_sub(location.wall_clock_time) >= ttl_secs
                     // R-1: do not TTL-reap an actor whose owning peer is
@@ -9237,19 +9344,28 @@ impl<T: 'static> GossipRegistry<T> {
                     // unreachable peers.
                     && !self.owner_peer_is_connected(location)
                 {
-                    to_remove.push(k.clone());
+                    to_remove.push((k.clone(), location.clone()));
                 }
                 true
             });
 
             let mut gossip_state = self.gossip_state.lock().await;
-            for name in &to_remove {
-                if self
-                    .actor_state
-                    .known_actors
-                    .remove_sync(name.as_str())
-                    .is_some()
-                {
+            for (name, stale_location) in &to_remove {
+                let removed =
+                    self.actor_state
+                        .known_actors
+                        .remove_if_sync(name.as_str(), |current| {
+                            // The scan above is only a candidate list. A
+                            // reannouncement or ownership transfer may have
+                            // replaced this exact location while we waited for
+                            // the gossip lock; remove only the same stale value,
+                            // and re-check staleness/connection liveness against
+                            // the current value at the destructive boundary.
+                            current == stale_location
+                                && now.saturating_sub(current.wall_clock_time) >= ttl_secs
+                                && !self.owner_peer_is_connected(current)
+                        });
+                if removed.is_some() {
                     gossip_state.release_actor_admission(name);
                 }
             }
@@ -11873,6 +11989,28 @@ impl<T: 'static> GossipRegistry<T> {
         );
 
         tasks
+    }
+
+    /// Replace the tracked discovery dial task and release any candidates
+    /// stranded by aborting the displaced task. The generation is captured
+    /// by `on_peer_list_gossip`; cleanup must compare it rather than clearing
+    /// by address, because the same address may already have been re-claimed
+    /// by a newer discovery round.
+    pub(crate) async fn track_discovery_task(
+        &self,
+        handle: tokio::task::AbortHandle,
+        candidates: Vec<(SocketAddr, u64)>,
+    ) {
+        let mut gossip_state = self.gossip_state.lock().await;
+        let displaced = self.discovery_task.set(handle, candidates);
+        if displaced.is_empty() {
+            return;
+        }
+        if let Some(discovery) = gossip_state.peer_discovery.as_mut() {
+            for (addr, claim_generation) in displaced {
+                discovery.clear_pending_if_generation(&addr, claim_generation);
+            }
+        }
     }
 
     /// Handle incoming peer list gossip
@@ -14941,6 +15079,91 @@ mod tests {
             identity_verified: true,
             transport_source_keyed: false,
         }
+    }
+
+    #[tokio::test]
+    async fn migrate_peer_entry_preserves_existing_bind_session_state() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_290), test_config());
+        let old_addr = test_addr(20_291);
+        let bind_addr = test_addr(20_292);
+        let node_id = test_peer_id("migration-session-state").to_node_id();
+
+        let mut moved = peer_info_with_node_id(old_addr, node_id);
+        moved.last_sequence = 3;
+        moved.last_sent_sequence = 2;
+        moved.current_session_epoch = 1;
+        moved.current_session_source = Some(old_addr);
+
+        let mut existing = peer_info_with_node_id(bind_addr, node_id);
+        existing.last_sequence = 99;
+        existing.last_sent_sequence = 88;
+        existing.current_session_epoch = 7;
+        existing.current_session_source = Some(test_addr(20_293));
+        existing.peer_address = Some(test_addr(20_293));
+        existing.accept_lower_sequence_from = Some(test_addr(20_294));
+
+        let mut gossip_state = registry.gossip_state.lock().await;
+        gossip_state.peers.insert(old_addr, moved);
+        gossip_state.peers.insert(bind_addr, existing);
+        gossip_state.migrate_peer_entry(old_addr, bind_addr);
+
+        let migrated = gossip_state
+            .peers
+            .get(&bind_addr)
+            .expect("migration must retain a bind-keyed entry");
+        assert_eq!(migrated.last_sequence, 99);
+        assert_eq!(migrated.last_sent_sequence, 88);
+        assert_eq!(migrated.current_session_epoch, 7);
+        assert_eq!(migrated.current_session_source, Some(test_addr(20_293)));
+        assert_eq!(migrated.accept_lower_sequence_from, Some(test_addr(20_294)));
+        assert_eq!(migrated.peer_address, Some(test_addr(20_293)));
+    }
+
+    #[tokio::test]
+    async fn displaced_discovery_task_releases_its_pending_generation() {
+        let config = GossipConfig {
+            enable_peer_discovery: true,
+            allow_loopback_discovery: true,
+            max_peers: 8,
+            ..test_config_with_seed("displaced-discovery-generation")
+        };
+        let registry = GossipRegistry::<()>::new(test_addr(20_295), config);
+        let stranded_addr = test_addr(20_296);
+        let peers = vec![PeerInfoGossip {
+            address: stranded_addr.to_string(),
+            peer_address: None,
+            node_id: None,
+            failures: 0,
+            last_attempt: 0,
+            last_success: 0,
+            dns_name: None,
+        }];
+
+        let first_round = registry
+            .on_peer_list_gossip(peers, "127.0.0.1:9997", 1)
+            .await;
+        assert_eq!(first_round.len(), 1);
+        let first_task = tokio::spawn(std::future::pending::<()>());
+        registry
+            .track_discovery_task(first_task.abort_handle(), first_round)
+            .await;
+
+        let second_task = tokio::spawn(std::future::pending::<()>());
+        registry
+            .track_discovery_task(second_task.abort_handle(), vec![(test_addr(20_297), 0)])
+            .await;
+
+        let gossip_state = registry.gossip_state.lock().await;
+        assert!(
+            !gossip_state
+                .peer_discovery
+                .as_ref()
+                .expect("discovery is enabled")
+                .get_peer_state(&stranded_addr)
+                .is_some_and(crate::peer_discovery::PeerState::is_pending)
+        );
+        first_task.abort();
+        second_task.abort();
     }
 
     /// `mark_transport_source_keyed_fallback`'s gate is a fact its caller
@@ -20074,6 +20297,46 @@ mod tests {
 
         // Verify old actor was removed
         assert!(!registry.actor_state.known_actors.contains_sync("old_actor"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_stale_actors_does_not_remove_reannounced_location() {
+        let mut config = test_config();
+        config.actor_ttl = Duration::from_secs(1);
+        let registry = Arc::new(GossipRegistry::<()>::new(test_addr(8082), config));
+        let actor_name = "reannounced_actor";
+        let mut stale_location = test_location(test_addr(9002));
+        stale_location.wall_clock_time = 0;
+        let _ = registry
+            .actor_state
+            .known_actors
+            .upsert_sync(actor_name.to_string(), stale_location);
+
+        // Force cleanup to take its stale snapshot before it reaches the
+        // destructive removal loop. The replacement must survive that gap.
+        let gossip_guard = registry.gossip_state.lock().await;
+        let cleanup_registry = Arc::clone(&registry);
+        let cleanup = tokio::spawn(async move {
+            cleanup_registry.cleanup_stale_actors().await;
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+
+        let fresh_location = test_location(test_addr(9003));
+        let _ = registry
+            .actor_state
+            .known_actors
+            .upsert_sync(actor_name.to_string(), fresh_location.clone());
+        drop(gossip_guard);
+        cleanup.await.expect("cleanup task must finish");
+
+        let current = registry
+            .actor_state
+            .known_actors
+            .read_sync(actor_name, |_, location| location.clone())
+            .expect("fresh reannouncement must survive cleanup");
+        assert_eq!(current, fresh_location);
     }
 
     #[tokio::test]

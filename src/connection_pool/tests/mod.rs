@@ -1675,6 +1675,49 @@ fn disconnect_by_peer_id_preserves_session_correlation_tracker() {
     assert_eq!(pool.get_configured_peer_addr(&peer_id), Some(addr));
 }
 
+#[tokio::test]
+async fn rejected_candidate_preserves_rival_correlation_at_another_address() {
+    let peer_id = crate::KeyPair::new_for_testing("reject-shared-correlation").peer_id();
+    let rival_addr: SocketAddr = "127.0.0.1:40570".parse().unwrap();
+    let candidate_addr: SocketAddr = "127.0.0.1:40571".parse().unwrap();
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let tracker = pool.get_or_create_correlation_tracker(&peer_id);
+    let rival = make_live_connection_with_correlation(
+        rival_addr,
+        ConnectionDirection::Inbound,
+        tracker.clone(),
+    )
+    .await;
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), rival_addr, rival.clone()));
+    let candidate = make_live_connection_with_correlation(
+        candidate_addr,
+        ConnectionDirection::Outbound,
+        tracker.clone(),
+    )
+    .await;
+    let _ = pool
+        .connections_by_addr
+        .upsert_sync(candidate_addr, candidate.clone());
+
+    let guard = tracker
+        .allocate()
+        .expect("correlation slot should allocate");
+    let slot = CorrelationTracker::slot_index(guard.id());
+    assert_eq!(
+        tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_WAITING
+    );
+
+    pool.unpublish_rejected_outbound_candidate(candidate_addr, &candidate, &peer_id, Some(&rival));
+
+    assert_eq!(
+        tracker.pending[slot].state.load(Ordering::Acquire),
+        SLOT_WAITING,
+        "retiring a candidate must not cancel a live rival's shared ask slot"
+    );
+    guard.disarm();
+}
+
 /// Earlier versions of `configure_peer`'s follow-up
 /// checked the pin, then separately (even if compare-and-applied against
 /// a dedicated mirror updated in the same owner command) mutated

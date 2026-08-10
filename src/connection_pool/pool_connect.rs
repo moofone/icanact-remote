@@ -2601,13 +2601,19 @@ impl<T> ConnectionPool<T> {
         // `candidate.abort_tasks()` from also cancelling every in-flight ask
         // on that live, restored connection. Only cancel the shared tracker
         // when `existing` does not depend on it.
-        let mut keep_correlation = false;
+        // Compute this independently of `removed`: a concurrent publisher
+        // may replace/reindex `addr` before the identity-scoped removal, so
+        // the removal can lose while the live rival still shares the
+        // session-level correlation tracker.  Aborting the candidate's
+        // tasks must not cancel that rival's in-flight asks.
+        let keep_correlation = existing_before.is_some_and(|existing| {
+            existing.has_live_stream() && candidate.shares_correlation_tracker(existing)
+        });
         if removed {
             match existing_before {
                 Some(existing) if existing.addr == addr && existing.has_live_stream() => {
                     let _ = self.connections_by_addr.upsert_sync(addr, existing.clone());
                     let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
-                    keep_correlation = candidate.shares_correlation_tracker(existing);
                 }
                 _ => {
                     let _ = self.addr_to_peer_id.remove_sync(&addr);
@@ -4902,23 +4908,21 @@ pub(crate) fn handle_incoming_message_with_instance(
                         crate::current_timestamp_nanos(),
                     );
 
-                    // FIX: If the resolved bind address differs from the TCP source address,
-                    // migrate the PeerInfo from the ephemeral port entry to the bind address.
-                    // This preserves node_id, sequence, and failure state learned during TLS handshake.
+                    // If the resolved bind address differs from the TCP source address,
+                    // migrate the peer entry without overwriting state already
+                    // established at the bind key.
                     if sender_socket_addr != _peer_addr && _peer_addr != registry.bind_addr {
-                        if let Some(mut old_peer_info) = gossip_state.peers.remove(&_peer_addr) {
+                        if let Some(node_id) =
+                            gossip_state.peers.get(&_peer_addr).and_then(|peer| peer.node_id)
+                        {
                             info!(
                                 old_addr = %_peer_addr,
                                 new_addr = %sender_socket_addr,
-                                node_id = ?old_peer_info.node_id,
+                                node_id = ?node_id,
                                 "🔄 Migrating peer info from ephemeral TCP source to bind address from FullSync"
                             );
-                            // Update the address field and preserve the connection address
-                            old_peer_info.address = sender_socket_addr;
-                            old_peer_info.peer_address = Some(_peer_addr);
-                            // Insert with new key (bind address), preserving all state
-                            gossip_state.peers.insert(sender_socket_addr, old_peer_info);
                         }
+                        gossip_state.migrate_peer_entry(_peer_addr, sender_socket_addr);
                     }
 
                     // Add the sender as a peer if not already present (inlined to avoid separate lock)
@@ -5447,23 +5451,21 @@ pub(crate) fn handle_incoming_message_with_instance(
                     );
                 }
 
-                // FIX: If the resolved bind address differs from the TCP source address,
-                // migrate the PeerInfo from the ephemeral port entry to the bind address.
-                // This preserves node_id, sequence, and failure state learned during TLS handshake.
+                // If the resolved bind address differs from the TCP source address,
+                // migrate the peer entry without overwriting state already
+                // established at the bind key.
                 if sender_socket_addr != _peer_addr && _peer_addr != registry.bind_addr {
-                    if let Some(mut old_peer_info) = gossip_state.peers.remove(&_peer_addr) {
+                    if let Some(node_id) =
+                        gossip_state.peers.get(&_peer_addr).and_then(|peer| peer.node_id)
+                    {
                         info!(
                             old_addr = %_peer_addr,
                             new_addr = %sender_socket_addr,
-                            node_id = ?old_peer_info.node_id,
+                            node_id = ?node_id,
                             "🔄 Migrating peer info from ephemeral TCP source to bind address from FullSyncResponse"
                         );
-                        // Update the address field and preserve the connection address
-                        old_peer_info.address = sender_socket_addr;
-                        old_peer_info.peer_address = Some(_peer_addr);
-                        // Insert with new key (bind address), preserving all state
-                        gossip_state.peers.insert(sender_socket_addr, old_peer_info);
                     }
+                    gossip_state.migrate_peer_entry(_peer_addr, sender_socket_addr);
                 }
 
                 // Failure/health bookkeeping must only be attributable to
@@ -5535,6 +5537,7 @@ pub(crate) fn handle_incoming_message_with_instance(
                     return Ok(());
                 }
 
+                let candidates_for_tracker = candidates.clone();
                 let registry_clone = registry.clone();
                 let discovery_handle = tokio::spawn(async move {
                     for (addr, _claim_generation) in candidates {
@@ -5558,8 +5561,11 @@ pub(crate) fn handle_incoming_message_with_instance(
                     }
                 });
 
-                // Track the discovery task (H-004): keep at most one dial task alive.
-                registry.discovery_task.set(discovery_handle.abort_handle());
+                // Track the discovery task (H-004): keep at most one dial
+                // task alive and release generations stranded by its abort.
+                registry
+                    .track_discovery_task(discovery_handle.abort_handle(), candidates_for_tracker)
+                    .await;
 
                 Ok(())
             }
