@@ -4470,6 +4470,27 @@ pub(crate) fn handle_incoming_message(
                     crate::current_timestamp_nanos(),
                 );
 
+                // Publish the authoritative owner-side liveness fence before
+                // touching volatile failure bookkeeping. If the bounded owner
+                // mailbox is full/closed, this returns false and the whole
+                // message is discarded without making the peer look healthy
+                // to a later dead-peer sweep.
+                if !registry
+                    .mark_authenticated_inbound_liveness(
+                        sender_socket_addr,
+                        &delta.sender_peer_id,
+                        session_source,
+                        crate::current_timestamp_millis(),
+                    )
+                    .await
+                {
+                    debug!(
+                        peer = %sender_socket_addr,
+                        "ignoring delta gossip after authenticated liveness fence publication failed"
+                    );
+                    return Ok(());
+                }
+
                 // Captured alongside session validation below so
                 // `apply_delta_from` can atomically recheck it under its
                 // own lock, immediately before applying any change --
@@ -4525,12 +4546,11 @@ pub(crate) fn handle_incoming_message(
                     // a pre-restart high-water mark after the new session's
                     // reset, which would make the new session's own
                     // low-sequence syncs look stale again with the one-shot
-                    // exemption already spent. This also covers ALL
-                    // failure/health bookkeeping below (including the
-                    // "previously failed peer" pending-failure clear, folded
-                    // in here rather than checked unconditionally before
-                    // this gate): none of it may be attributable to a
-                    // connection that isn't the peer's current session.
+                    // exemption already spent. Sequence/consecutive-delta
+                    // bookkeeping below is also gated here; the owner fence
+                    // and failure/health reset already happened above on the
+                    // same authenticated session, so none of this can be
+                    // attributed to a stale connection.
                     let mut from_current_session = true;
                     if let Some(peer_info) = gossip_state.peers.get_mut(&sender_socket_addr) {
                         from_current_session = registry.peer_info_is_from_current_session(
@@ -4539,38 +4559,7 @@ pub(crate) fn handle_incoming_message(
                             Some(session_source),
                         );
                         captured_epoch = Some(peer_info.current_session_epoch);
-                        if !from_current_session {
-                            // The post-lock guard below rejects stale sessions.
-                        } else {
-                            let was_failed =
-                                peer_info.failures >= registry.config.max_peer_failures;
-                            if was_failed {
-                                info!(
-                                    peer = %delta.sender_peer_id,
-                                    "✅ Received delta from previously failed peer - connection restored!"
-                                );
-                            }
-                            // Always reset failure state when we receive messages from the peer
-                            // This proves the peer is alive and communicating
-                            let had_failures = peer_info.failures > 0;
-                            if had_failures {
-                                info!(peer = %delta.sender_peer_id,
-                              prev_failures = peer_info.failures,
-                              "🔄 Resetting failure state after receiving DeltaGossip");
-                                peer_info.failures = 0;
-                                peer_info.last_failure_time = None;
-                                peer_info.last_failure_instant = None;
-                            }
-                            peer_info.last_success = crate::current_timestamp();
-                            // Inbound payload from peer — proves app-level liveness.
-                            // The response-asymmetry detector in
-                            // `apply_gossip_results` reads this field to decide
-                            // whether outbound writes that returned `Ok(None)`
-                            // were actually heard by the peer's application
-                            // layer. Mirror the inline-response path in
-                            // `GossipRegistry::handle_gossip_response`.
-                            peer_info.last_response_received_ms = crate::current_timestamp_millis();
-
+                        if from_current_session {
                             peer_info.last_sequence =
                                 std::cmp::max(peer_info.last_sequence, delta.current_sequence);
                             peer_info.consecutive_deltas += 1;
@@ -4587,47 +4576,6 @@ pub(crate) fn handle_incoming_message(
                     }
 
                     gossip_state.delta_exchanges += 1;
-                }
-
-                // Reaching here means `from_current_session` was true (the
-                // block above returns early otherwise) -- a `DeltaGossip`
-                // genuinely arrived on `sender_peer_id`'s current,
-                // authenticated session, which the block above already used
-                // to clear `gossip_state`'s OWN failure bookkeeping
-                // (`failures`/`last_failure_time`/`last_failure_instant`).
-                // That clearing alone does not reach the OWNER's own
-                // `liveness_evidence_at` fence -- which `reap_reserved_
-                // candidates`'s selection, its early verdict, and its fresh
-                // pre-destruction re-check all actually read, not
-                // `gossip_state`. `cleanup_dead_peers` deliberately stopped
-                // re-deriving liveness from `gossip_state` directly (see
-                // `reap_reserved_candidates`'s own doc comment), so a delta
-                // arriving after this exact peer was already selected as a
-                // dead-peer candidate must still update the owner's fence,
-                // or the sweep could destroy and irreversibly tombstone
-                // this peer's actors moments after it proved itself alive.
-                //
-                // Revalidate the session and capture the monotonic evidence
-                // instant under `gossip_state` immediately before publishing
-                // it to the owner. The first session check above protects
-                // delta bookkeeping, but an old connection can be replaced
-                // in the gap before this point; recording `Instant::now()`
-                // after that replacement would make stale traffic look newer
-                // than the successor's failure and fence cleanup forever.
-                if !registry
-                    .mark_authenticated_inbound_liveness(
-                        sender_socket_addr,
-                        &delta.sender_peer_id,
-                        session_source,
-                        crate::current_timestamp_millis(),
-                    )
-                    .await
-                {
-                    debug!(
-                        peer = %sender_socket_addr,
-                        "ignoring delta gossip liveness from a superseded authenticated session"
-                    );
-                    return Ok(());
                 }
 
                 // Apply the delta using the canonical registry logic (vector clocks +
@@ -4828,17 +4776,32 @@ pub(crate) fn handle_incoming_message(
                         }
                     }
 
-                    // Failure/health bookkeeping (failures, last_failure_time,
-                    // last_success, last_response_received_ms,
-                    // consecutive_deltas) is deliberately NOT reset here.
-                    // Resetting it proves peer liveness, which must only be
-                    // attributable to the CURRENT authenticated session --
+                    // Failure/health bookkeeping is deliberately NOT reset
+                    // in this address-setup block. Resetting it proves peer
+                    // liveness, so the owner fence must be published first;
                     // an old, still-draining connection's in-flight FullSync
                     // must not be able to mask real unresponsiveness or
                     // perturb `should_use_delta_state`'s strategy choice.
-                    // Moved to after `merge_full_sync_from` below, gated on
-                    // its return value (the same `from_current_session`
-                    // verdict the actor/sequence state is already gated on).
+                }
+
+                // Publish the authoritative liveness fence before merging
+                // actor state. A full/closed owner mailbox is a hard failure:
+                // do not accept a FullSync that cleanup cannot observe as
+                // live, and do not clear any failure bookkeeping first.
+                if !registry
+                    .mark_authenticated_inbound_liveness(
+                        sender_socket_addr,
+                        &sender_peer_id,
+                        session_source,
+                        crate::current_timestamp_millis(),
+                    )
+                    .await
+                {
+                    debug!(
+                        peer = %sender_socket_addr,
+                        "ignoring FullSync after authenticated liveness fence publication failed"
+                    );
+                    return Ok(());
                 }
 
                 debug!(
@@ -4866,7 +4829,7 @@ pub(crate) fn handle_incoming_message(
                     )
                     .await;
 
-                let admitted_current_session = if from_current_session {
+                if from_current_session {
                     let mut gossip_state = registry.gossip_state.lock().await;
                     // Same guard, same check: peer/session bookkeeping is
                     // address-keyed and must not be applied on behalf of a
@@ -4897,39 +4860,15 @@ pub(crate) fn handle_incoming_message(
                         .get_mut(&sender_socket_addr)
                         .filter(|_| admitted)
                     {
-                        let prev_failures = peer_info.failures;
-                        if peer_info.failures > 0 {
-                            info!(peer = %sender_socket_addr,
-                              prev_failures = prev_failures,
-                              "🔄 Resetting failure state after receiving FullSync");
-                            peer_info.failures = 0;
-                            peer_info.last_failure_time = None;
-                            peer_info.last_failure_instant = None;
-                        }
-                        peer_info.last_success = crate::current_timestamp();
-                        // Inbound payload from peer — proves app-level liveness.
-                        // See `handle_incoming_message::DeltaGossip` for the
-                        // full rationale.
-                        peer_info.last_response_received_ms = crate::current_timestamp_millis();
+                        // `mark_authenticated_inbound_liveness` above already
+                        // published the owner fence and cleared failures.
+                        // This remaining counter is actor-state bookkeeping,
+                        // and is safe only after the full sync was admitted.
                         peer_info.consecutive_deltas = 0;
                     }
                     if admitted {
                         gossip_state.full_sync_exchanges += 1;
                     }
-                    admitted
-                } else {
-                    false
-                };
-
-                if admitted_current_session {
-                    registry
-                        .mark_authenticated_inbound_liveness(
-                            sender_socket_addr,
-                            &sender_peer_id,
-                            session_source,
-                            crate::current_timestamp_millis(),
-                        )
-                        .await;
                 }
 
                 // Send back our state as a response so the sender can receive our actors
@@ -5352,6 +5291,26 @@ pub(crate) fn handle_incoming_message(
                     );
                 }
 
+                // Publish the owner-side liveness fence before merging the
+                // response's actor state. If this fallible publication fails,
+                // the response must be discarded rather than accepted while
+                // cleanup still sees an unfenced peer.
+                if !registry
+                    .mark_authenticated_inbound_liveness(
+                        sender_socket_addr,
+                        &sender_peer_id,
+                        session_source,
+                        crate::current_timestamp_millis(),
+                    )
+                    .await
+                {
+                    debug!(
+                        peer = %sender_socket_addr,
+                        "ignoring FullSyncResponse after authenticated liveness fence publication failed"
+                    );
+                    return Ok(());
+                }
+
                 debug!(
                     sender = %sender_peer_id,
                     bind_addr = %sender_socket_addr,
@@ -5455,16 +5414,6 @@ pub(crate) fn handle_incoming_message(
                 }
 
                 drop(gossip_state);
-                if from_current_session {
-                    registry
-                        .mark_authenticated_inbound_liveness(
-                            sender_socket_addr,
-                            &sender_peer_id,
-                            session_source,
-                            crate::current_timestamp_millis(),
-                        )
-                        .await;
-                }
                 Ok(())
             }
             RegistryMessage::PeerListGossip {

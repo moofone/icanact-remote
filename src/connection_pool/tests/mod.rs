@@ -7684,6 +7684,81 @@ async fn delta_gossip_response_with_mismatched_sender_identity_is_ignored() {
     );
 }
 
+/// `FullSyncResponse` carries the same wire sender claim as the delta arms.
+/// The authenticated transport identity must be checked before resolving the
+/// claimed address or publishing liveness for it.
+#[tokio::test]
+async fn full_sync_response_with_mismatched_sender_identity_is_ignored() {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        bind_addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing(
+                "lrr_full_sync_response_impersonation_local",
+            )),
+            ..crate::GossipConfig::default()
+        },
+    ));
+
+    let attacker_id = crate::KeyPair::new_for_testing("lrr_full_sync_response_attacker").peer_id();
+    let attacker_addr: SocketAddr = "10.77.0.75:9311".parse().unwrap();
+    let victim_id = crate::KeyPair::new_for_testing("lrr_full_sync_response_victim").peer_id();
+    let victim_addr: SocketAddr = "10.77.0.76:9312".parse().unwrap();
+    let _ = registry
+        .connection_pool
+        .peer_id_to_addr
+        .upsert_sync(victim_id.clone(), victim_addr);
+
+    let stale_time = crate::current_timestamp_millis().saturating_sub(3_600_000);
+    {
+        let mut state = registry.gossip_state.lock().await;
+        state
+            .peers
+            .insert(victim_addr, stale_peer_info(victim_addr, stale_time));
+    }
+
+    let evidence_before = std::time::Instant::now();
+    let msg = crate::registry::RegistryMessage::FullSyncResponse {
+        local_actors: Vec::new(),
+        known_actors: Vec::new(),
+        sender_peer_id: victim_id.clone(),
+        sender_bind_addr: Some(victim_addr.to_string()),
+        sequence: 1,
+        wall_clock_time: crate::current_timestamp(),
+        extensions: None,
+    };
+    super::handle_incoming_message(
+        registry.clone(),
+        attacker_addr,
+        attacker_addr,
+        Some(attacker_id),
+        msg,
+    )
+    .await
+    .expect("a forged FullSyncResponse must be silently ignored, not an error");
+
+    assert!(
+        !registry
+            .registry_owner
+            .has_newer_liveness_evidence(victim_addr, evidence_before)
+            .await,
+        "a forged FullSyncResponse must not refresh the victim's owner-side liveness"
+    );
+    let state = registry.gossip_state.lock().await;
+    let victim_info = state
+        .peers
+        .get(&victim_addr)
+        .expect("victim's gossip_state entry must survive untouched");
+    assert_eq!(
+        victim_info.failures, 1,
+        "a forged FullSyncResponse must not clear the victim's failure bookkeeping"
+    );
+    assert_eq!(
+        state.full_sync_exchanges, 0,
+        "a forged FullSyncResponse must not enter the authenticated response path"
+    );
+}
+
 /// DRY consolidation: the per-peer consecutive-timeout streak eviction
 /// mechanism now lives in icanact-remote (the caller supplies only the
 /// classification). Evict only once the streak threshold is reached; a success

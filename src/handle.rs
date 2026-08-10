@@ -3340,13 +3340,12 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
                         let peer_addr = task.peer_addr;
                         let sent_sequence = task.current_sequence;
                         let session_source = task.session_source;
+                        let task_session_instance_id = task.session_instance_id;
                         let future = tokio::spawn(async move {
                             // Send the message using zero-copy persistent connections
                             let outcome = send_gossip_message_zero_copy(task, registry_clone).await;
-                            let session_instance_id = match &outcome {
-                                Ok(Some(instance_id)) => Some(*instance_id),
-                                Ok(None) | Err(_) => None,
-                            };
+                            let session_instance_id =
+                                gossip_result_session_instance_id(task_session_instance_id, &outcome);
                             GossipResult {
                                 peer_addr,
                                 sent_sequence,
@@ -5942,9 +5941,19 @@ fn gossip_send_outcome_to_result(
     outcome.map(|_| None)
 }
 
+fn gossip_result_session_instance_id(
+    task_session_instance_id: Option<u64>,
+    outcome: &Result<Option<u64>>,
+) -> Option<u64> {
+    match outcome {
+        Ok(Some(instance_id)) => Some(*instance_id),
+        Ok(None) | Err(_) => task_session_instance_id,
+    }
+}
+
 #[cfg(test)]
 mod gossip_send_outcome_tests {
-    use super::gossip_send_outcome_to_result;
+    use super::{gossip_result_session_instance_id, gossip_send_outcome_to_result};
 
     /// Pins the invariant `handle_gossip_response`'s `FullSyncResponse` arm
     /// relies on: the periodic gossip loop can never observe a real
@@ -5966,6 +5975,15 @@ mod gossip_send_outcome_tests {
             gossip_send_outcome_to_result(Err(err)),
             Err(crate::GossipError::Shutdown)
         ));
+    }
+
+    #[test]
+    fn gossip_error_preserves_task_session_instance_id() {
+        let outcome = Err(crate::GossipError::Timeout);
+        assert_eq!(
+            gossip_result_session_instance_id(Some(42), &outcome),
+            Some(42)
+        );
     }
 }
 
