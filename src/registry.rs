@@ -984,6 +984,65 @@ pub struct RegistryDelta {
     pub precise_timing_nanos: u64,     // High precision timing for latency measurements
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ReceivedActorTiming {
+    /// Elapsed time from the sender's delta timestamp to this receiver.
+    propagation_time_ms: Option<f64>,
+    /// The same wire-observable interval; no separate receiver-side processing
+    /// timestamp exists in the protocol, so this is intentionally not split.
+    network_processing_time_ms: Option<f64>,
+    /// Reserved for compatibility with existing diagnostics. It is unavailable
+    /// rather than inferred from actor age.
+    processing_only_time_ms: Option<f64>,
+    /// Approximate age of the actor registration, not propagation latency.
+    actor_age_ms: Option<f64>,
+    clock_skew: bool,
+    timing_valid: bool,
+    clock_calibrated: bool,
+}
+
+fn compute_received_actor_timing(
+    received_timestamp: u64,
+    delta_send_timestamp: u64,
+    actor_registration_timestamp: u128,
+    sender_clock_offset_ns: Option<i64>,
+) -> ReceivedActorTiming {
+    let received_ns = i128::from(received_timestamp);
+    let actor_registration_ns = i128::try_from(actor_registration_timestamp).ok();
+    let actor_age_ns = actor_registration_ns.and_then(|registration| {
+        received_ns
+            .checked_sub(registration)
+            .filter(|elapsed| *elapsed >= 0)
+    });
+
+    let clock_calibrated = sender_clock_offset_ns.is_some();
+    let sender_timestamp_ns = (delta_send_timestamp != 0).then(|| {
+        i128::from(delta_send_timestamp) - i128::from(sender_clock_offset_ns.unwrap_or_default())
+    });
+    let sender_elapsed_ns = sender_timestamp_ns.and_then(|sender| {
+        received_ns
+            .checked_sub(sender)
+            .filter(|elapsed| *elapsed >= 0)
+    });
+
+    let to_ms = |nanos: i128| nanos as f64 / 1_000_000.0;
+    let propagation_time_ms = sender_elapsed_ns.map(to_ms);
+    let actor_age_ms = actor_age_ns.map(to_ms);
+    let actor_clock_skew = actor_registration_ns.is_some() && actor_age_ns.is_none();
+    let sender_clock_skew = sender_timestamp_ns.is_some() && sender_elapsed_ns.is_none();
+    let clock_skew = actor_clock_skew || sender_clock_skew;
+
+    ReceivedActorTiming {
+        propagation_time_ms,
+        network_processing_time_ms: propagation_time_ms,
+        processing_only_time_ms: None,
+        actor_age_ms,
+        clock_skew,
+        timing_valid: propagation_time_ms.is_some(),
+        clock_calibrated,
+    }
+}
+
 #[derive(Archive, RkyvSerialize, RkyvDeserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClockProbeV1 {
     pub sample_id: u64,
@@ -7239,30 +7298,38 @@ impl<T: 'static> GossipRegistry<T> {
             log_adds
         };
 
-        // Emit per-actor timing logs outside the critical section.
-        //
-        // All three timestamps are sourced from `SystemTime::now()` on
-        // different machines, so clock skew between sender and receiver can
-        // make `received_timestamp` less than either reference, which would
-        // wrap a `u128` subtraction to ~2^128 and produce nonsense values
-        // (e.g. ~3.4e32 ms). Compute as `i128` to detect skew, clamp negative
-        // values to zero, and annotate the log so dashboards can filter.
+        // A fresh clock sample lets us express the sender's timestamp in this
+        // receiver's wall-clock domain. The sample is keyed by the verified
+        // transport address, never by an advertised actor address.
+        let sender_clock_offset_ns = verified_sender_addr
+            .and_then(|addr| self.peer_clock_snapshot(&addr))
+            .filter(|snapshot| !snapshot.is_stale_at(received_timestamp))
+            .map(|snapshot| snapshot.offset_ns);
+
+        // Emit per-actor timing logs outside the critical section. The old
+        // implementation called the age of the actor's registration
+        // `propagation_time_ms`; a long-lived actor therefore reported weeks
+        // of "propagation" on every re-gossip. Propagation is the elapsed
+        // sender-delta-to-receiver interval. Registration age is logged
+        // separately and is never subtracted from it.
         for (name, location) in log_adds {
-            let propagation_delta_ns =
-                received_timestamp as i128 - location.local_registration_time as i128;
-            let network_delta_ns = received_timestamp as i128 - delta.precise_timing_nanos as i128;
-            let clock_skew = propagation_delta_ns < 0 || network_delta_ns < 0;
-            let propagation_time_ms = propagation_delta_ns.max(0) as f64 / 1_000_000.0;
-            let network_processing_time_ms = network_delta_ns.max(0) as f64 / 1_000_000.0;
-            let processing_only_time_ms =
-                (propagation_time_ms - network_processing_time_ms).max(0.0);
+            let timing = compute_received_actor_timing(
+                received_timestamp,
+                delta.precise_timing_nanos,
+                location.local_registration_time,
+                sender_clock_offset_ns,
+            );
             info!(
                 actor_name = %name,
                 priority = ?location.priority,
-                propagation_time_ms = propagation_time_ms,
-                network_processing_time_ms = network_processing_time_ms,
-                processing_only_time_ms = processing_only_time_ms,
-                clock_skew = clock_skew,
+                propagation_time_ms = timing.propagation_time_ms.unwrap_or(0.0),
+                network_processing_time_ms = timing.network_processing_time_ms.unwrap_or(0.0),
+                processing_only_time_ms = timing.processing_only_time_ms.unwrap_or(0.0),
+                actor_age_ms = timing.actor_age_ms.unwrap_or(0.0),
+                clock_skew = timing.clock_skew,
+                timing_valid = timing.timing_valid,
+                clock_calibrated = timing.clock_calibrated,
+                processing_only_time_valid = timing.processing_only_time_ms.is_some(),
                 "RECEIVED_ACTOR"
             );
         }
@@ -12882,6 +12949,49 @@ mod tests {
 
     fn test_config() -> GossipConfig {
         test_config_with_seed("registry_tests")
+    }
+
+    #[test]
+    fn received_actor_timing_uses_delta_send_time_not_registration_age() {
+        let metrics = super::compute_received_actor_timing(
+            1_800_000_000_005_000_000,
+            1_800_000_000_000_000_000,
+            1_700_000_000_000_000_000,
+            None,
+        );
+
+        assert_eq!(metrics.propagation_time_ms, Some(5.0));
+        assert_eq!(metrics.network_processing_time_ms, Some(5.0));
+        assert_eq!(metrics.processing_only_time_ms, None);
+        assert!(metrics.actor_age_ms.unwrap() > 1_000_000_000.0);
+        assert!(!metrics.clock_skew);
+        assert!(metrics.timing_valid);
+        assert!(!metrics.clock_calibrated);
+    }
+
+    #[test]
+    fn received_actor_timing_applies_sender_clock_offset() {
+        let metrics = super::compute_received_actor_timing(
+            1_800_000_000_010_000_000,
+            1_800_000_000_008_000_000,
+            1_800_000_000_000_000_000,
+            Some(1_000_000),
+        );
+
+        assert_eq!(metrics.propagation_time_ms, Some(3.0));
+        assert!(metrics.clock_calibrated);
+        assert!(!metrics.clock_skew);
+        assert!(metrics.timing_valid);
+    }
+
+    #[test]
+    fn received_actor_timing_rejects_future_timestamps_without_wrapping() {
+        let metrics = super::compute_received_actor_timing(1_000_000, 1_001_000, 1_001_000, None);
+
+        assert_eq!(metrics.propagation_time_ms, None);
+        assert_eq!(metrics.actor_age_ms, None);
+        assert!(metrics.clock_skew);
+        assert!(!metrics.timing_valid);
     }
 
     fn clock_caps() -> crate::handshake::PeerCapabilities {
