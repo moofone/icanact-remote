@@ -6586,21 +6586,21 @@ impl<T: 'static> GossipRegistry<T> {
             .await
     }
 
-    /// Register a local actor after dropping any learned remote owner for the same name.
+    /// Register a local actor after replacing a learned remote owner for the same name.
     ///
     /// This is for operator-configured services that are known to be singleton owners
-    /// after binding their advertised socket. It does not ignore local duplicates.
+    /// after binding their advertised socket. The replacement merges the learned owner's
+    /// vector clock before registering, so it causally dominates that route throughout the
+    /// mesh instead of relying on concurrent-update tie breaking. It does not ignore local
+    /// duplicates.
     pub async fn register_actor_replacing_known(
         &self,
         name: String,
-        location: RemoteActorLocation,
+        mut location: RemoteActorLocation,
     ) -> Result<()> {
-        if self
-            .actor_state
-            .known_actors
-            .remove_sync(name.as_str())
-            .is_some()
+        if let Some((_, known_location)) = self.actor_state.known_actors.remove_sync(name.as_str())
         {
+            location.vector_clock.merge(&known_location.vector_clock);
             self.actor_state.mark_routing_changed_for_actor(&name);
             let mut gossip_state = self.gossip_state.lock().await;
             gossip_state.release_actor_admission(&name);
@@ -17329,11 +17329,15 @@ mod tests {
         let registry = GossipRegistry::<()>::new(test_addr(8080), test_config());
         let actor_name = "test_actor_replace_known";
         let remote_peer = test_peer_id("replace-known-owner");
+        let remote_node = remote_peer.to_node_id();
+        let remote_location = RemoteActorLocation::new_with_peer(test_addr(9002), remote_peer);
+        remote_location.vector_clock.increment(remote_node);
+        let remote_clock = remote_location.vector_clock.clone();
 
-        registry.actor_state.known_actors.upsert_sync(
-            actor_name.to_string(),
-            RemoteActorLocation::new_with_peer(test_addr(9002), remote_peer),
-        );
+        registry
+            .actor_state
+            .known_actors
+            .upsert_sync(actor_name.to_string(), remote_location);
 
         let result = registry
             .register_actor_replacing_known(actor_name.to_string(), test_location(test_addr(9001)))
@@ -17342,6 +17346,16 @@ mod tests {
         assert!(result.is_ok());
         assert!(registry.actor_state.local_actors.contains_sync(actor_name));
         assert!(!registry.actor_state.known_actors.contains_sync(actor_name));
+        let replacement_clock = registry
+            .actor_state
+            .local_actors
+            .read_sync(actor_name, |_, location| location.vector_clock.clone())
+            .expect("replacement route must be present");
+        assert_eq!(
+            replacement_clock.compare(&remote_clock),
+            crate::ClockOrdering::After,
+            "replacement must causally dominate the learned owner so every peer converges"
+        );
     }
 
     #[tokio::test]
