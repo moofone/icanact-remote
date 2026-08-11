@@ -1026,7 +1026,13 @@ fn compute_received_actor_timing(
     });
 
     let to_ms = |nanos: i128| nanos as f64 / 1_000_000.0;
-    let propagation_time_ms = sender_elapsed_ns.map(to_ms);
+    // A sender timestamp and a receiver timestamp are not comparable across
+    // hosts until a fresh peer clock sample puts them in one clock domain.
+    // Keep the raw elapsed result out of the public metric when calibration is
+    // absent or stale; otherwise clock offset is reported as network latency.
+    let propagation_time_ms = clock_calibrated
+        .then(|| sender_elapsed_ns.map(to_ms))
+        .flatten();
     let actor_age_ms = actor_age_ns.map(to_ms);
     let actor_clock_skew = actor_registration_ns.is_some() && actor_age_ns.is_none();
     let sender_clock_skew = sender_timestamp_ns.is_some() && sender_elapsed_ns.is_none();
@@ -1038,7 +1044,7 @@ fn compute_received_actor_timing(
         processing_only_time_ms: None,
         actor_age_ms,
         clock_skew,
-        timing_valid: propagation_time_ms.is_some(),
+        timing_valid: clock_calibrated && propagation_time_ms.is_some(),
         clock_calibrated,
     }
 }
@@ -12957,7 +12963,7 @@ mod tests {
             1_800_000_000_005_000_000,
             1_800_000_000_000_000_000,
             1_700_000_000_000_000_000,
-            None,
+            Some(0),
         );
 
         assert_eq!(metrics.propagation_time_ms, Some(5.0));
@@ -12966,7 +12972,7 @@ mod tests {
         assert!(metrics.actor_age_ms.unwrap() > 1_000_000_000.0);
         assert!(!metrics.clock_skew);
         assert!(metrics.timing_valid);
-        assert!(!metrics.clock_calibrated);
+        assert!(metrics.clock_calibrated);
     }
 
     #[test]
@@ -12982,6 +12988,21 @@ mod tests {
         assert!(metrics.clock_calibrated);
         assert!(!metrics.clock_skew);
         assert!(metrics.timing_valid);
+    }
+
+    #[test]
+    fn received_actor_timing_rejects_uncalibrated_cross_host_latency() {
+        let metrics = super::compute_received_actor_timing(
+            1_800_000_000_005_000_000,
+            1_700_000_000_000_000_000,
+            1_700_000_000_000_000_000,
+            None,
+        );
+
+        assert_eq!(metrics.propagation_time_ms, None);
+        assert_eq!(metrics.network_processing_time_ms, None);
+        assert!(!metrics.timing_valid);
+        assert!(!metrics.clock_calibrated);
     }
 
     #[test]
