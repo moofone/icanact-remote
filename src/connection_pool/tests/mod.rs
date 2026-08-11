@@ -4447,6 +4447,24 @@ async fn outbound_retry_allows_one_immediate_retry_then_reopens_after_floor() {
 }
 
 #[tokio::test]
+async fn cancelled_outbound_dial_releases_its_retry_reservation() {
+    let session = Arc::new(PeerSession::new());
+    let attempt = session
+        .outbound_dial_retry
+        .try_claim_attempt()
+        .expect("the first dial must claim the retry slot");
+
+    {
+        let _completion = OutboundDialRetryGuard::new(Arc::clone(&session), attempt);
+    }
+
+    assert!(
+        session.outbound_dial_retry.try_claim_attempt().is_some(),
+        "cancelling a dial must not strand the peer behind the retry floor"
+    );
+}
+
+#[tokio::test]
 async fn stale_outbound_completion_cannot_replace_a_newer_reservation() {
     let retry = OutboundDialRetry::with_retry_floor(Duration::from_millis(10));
 

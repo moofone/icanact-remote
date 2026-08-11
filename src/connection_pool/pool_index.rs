@@ -191,6 +191,20 @@ impl OutboundDialRetry {
         state.consecutive_failures = 0;
         state.retry_not_before = None;
     }
+
+    /// An explicit peer disconnect is an operator-directed lifecycle event,
+    /// not another failed dial. Drop any stale cooldown that an exit task may
+    /// have recorded for the session being torn down, and invalidate its
+    /// completion generation before a fresh self-heal attempt starts.
+    fn reset_after_explicit_disconnect(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.generation = state.generation.wrapping_add(1);
+        state.consecutive_failures = 0;
+        state.retry_not_before = None;
+    }
 }
 
 impl PeerSession {
