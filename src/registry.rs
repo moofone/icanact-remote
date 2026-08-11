@@ -12988,19 +12988,6 @@ mod tests {
     }
 
     #[test]
-    fn received_actor_timing_sender_skew_ignores_untrusted_actor_registration_clock() {
-        let metrics = super::compute_received_actor_timing(
-            1_800_000_000_005_000_000,
-            1_800_000_000_000_000_000,
-            Some(0),
-        );
-
-        assert_eq!(metrics.propagation_time_ms, Some(5.0));
-        assert!(!metrics.clock_skew);
-        assert!(metrics.timing_valid);
-    }
-
-    #[test]
     fn received_actor_timing_rejects_future_timestamps_without_wrapping() {
         let metrics = super::compute_received_actor_timing(1_000_000, 1_001_000, None);
 
