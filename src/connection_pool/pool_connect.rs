@@ -275,6 +275,41 @@ impl<'a, T> Drop for IdentifyGateGuard<'a, T> {
     }
 }
 
+/// Clears a peer's outbound retry reservation if the dial future is dropped
+/// before it reports an outcome. A caller such as ref-level self-healing may
+/// bound a dial with `tokio::time::timeout`; without this guard, cancellation
+/// leaves the one-second retry floor armed until it expires and strands every
+/// subsequent repair attempt even though no socket is still in flight.
+struct OutboundDialRetryGuard {
+    session: Arc<PeerSession>,
+    attempt: OutboundDialAttempt,
+    armed: bool,
+}
+
+impl OutboundDialRetryGuard {
+    fn new(session: Arc<PeerSession>, attempt: OutboundDialAttempt) -> Self {
+        Self {
+            session,
+            attempt,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OutboundDialRetryGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.session
+                .outbound_dial_retry
+                .record_neutral(self.attempt);
+        }
+    }
+}
+
 impl<T> ConnectionPool<T> {
     pub fn new(max_connections: usize, connection_timeout: Duration) -> Self {
         Self::new_with_aligned_pool_size(
@@ -632,9 +667,7 @@ impl<T> ConnectionPool<T> {
                 .as_ref()
                 .is_some_and(|cur| Arc::ptr_eq(cur, &connection))
             {
-                session
-                    .outbound_dial_retry
-                    .record_published_connection();
+                session.outbound_dial_retry.record_published_connection();
                 let _ = self
                     .connections_by_peer
                     .upsert_sync(peer_id.clone(), connection);
@@ -644,9 +677,7 @@ impl<T> ConnectionPool<T> {
             return Err(current);
         }
 
-        session
-            .outbound_dial_retry
-            .record_published_connection();
+        session.outbound_dial_retry.record_published_connection();
 
         let stream_instance_id = connection
             .stream_handle
@@ -2497,6 +2528,9 @@ impl<T> ConnectionPool<T> {
                 },
             );
             self.clear_current_peer_connection(peer_id);
+            self.get_or_create_peer_session(peer_id)
+                .outbound_dial_retry
+                .reset_after_explicit_disconnect();
             // Preserve the configured peer address so reconnect logic keeps a stable destination.
 
             // Remove every address alias for this peer. Do not rely only
@@ -3531,6 +3565,7 @@ impl<T> ConnectionPool<T> {
                     let retry_attempt = retry_session
                         .as_ref()
                         .map(|session| session.outbound_dial_retry.try_claim_attempt());
+                    let claimed_attempt = retry_attempt.as_ref().and_then(|attempt| *attempt);
                     if retry_attempt.as_ref().is_some_and(Option::is_none) {
                         if let Some(handle) = retry_session
                             .as_ref()
@@ -3548,10 +3583,9 @@ impl<T> ConnectionPool<T> {
                             "outbound retry floor active",
                         )));
                     }
-                    if let (Some(session), Some(attempt)) = (
-                        retry_session.as_ref(),
-                        retry_attempt.as_ref().copied().flatten(),
-                    ) {
+                    if let (Some(session), Some(attempt)) =
+                        (retry_session.as_ref(), claimed_attempt)
+                    {
                         if let Some(handle) =
                             self.reuse_published_connection_after_retry_claim(session, attempt)
                         {
@@ -3559,6 +3593,13 @@ impl<T> ConnectionPool<T> {
                             return Ok(handle);
                         }
                     }
+                    let mut retry_completion =
+                        retry_session
+                            .as_ref()
+                            .zip(claimed_attempt)
+                            .map(|(session, attempt)| {
+                                OutboundDialRetryGuard::new(Arc::clone(session), attempt)
+                            });
                     let result = self
                         .connect_via_stream(
                             addr,
@@ -3568,8 +3609,7 @@ impl<T> ConnectionPool<T> {
                             registry_weak.clone(),
                         )
                         .await;
-                    if let (Some(session), Some(attempt)) = (retry_session, retry_attempt.flatten())
-                    {
+                    if let (Some(session), Some(attempt)) = (retry_session, claimed_attempt) {
                         match &result {
                             Ok(_) => session.outbound_dial_retry.record_success(attempt),
                             Err(crate::GossipError::Network(error))
@@ -3577,12 +3617,18 @@ impl<T> ConnectionPool<T> {
                                     error.kind(),
                                     std::io::ErrorKind::WouldBlock
                                         | std::io::ErrorKind::InvalidInput
-                                ) => session.outbound_dial_retry.record_neutral(attempt),
+                                ) =>
+                            {
+                                session.outbound_dial_retry.record_neutral(attempt)
+                            }
                             Err(crate::GossipError::Shutdown) => {
                                 session.outbound_dial_retry.record_neutral(attempt)
                             }
                             Err(_) => session.outbound_dial_retry.record_failure(attempt),
                         }
+                    }
+                    if let Some(completion) = retry_completion.as_mut() {
+                        completion.disarm();
                     }
                     gate_completion.finish(result.is_ok());
                     return result;
@@ -4912,8 +4958,10 @@ pub(crate) fn handle_incoming_message_with_instance(
                     // migrate the peer entry without overwriting state already
                     // established at the bind key.
                     if sender_socket_addr != _peer_addr && _peer_addr != registry.bind_addr {
-                        if let Some(node_id) =
-                            gossip_state.peers.get(&_peer_addr).and_then(|peer| peer.node_id)
+                        if let Some(node_id) = gossip_state
+                            .peers
+                            .get(&_peer_addr)
+                            .and_then(|peer| peer.node_id)
                         {
                             info!(
                                 old_addr = %_peer_addr,
@@ -5455,8 +5503,10 @@ pub(crate) fn handle_incoming_message_with_instance(
                 // migrate the peer entry without overwriting state already
                 // established at the bind key.
                 if sender_socket_addr != _peer_addr && _peer_addr != registry.bind_addr {
-                    if let Some(node_id) =
-                        gossip_state.peers.get(&_peer_addr).and_then(|peer| peer.node_id)
+                    if let Some(node_id) = gossip_state
+                        .peers
+                        .get(&_peer_addr)
+                        .and_then(|peer| peer.node_id)
                     {
                         info!(
                             old_addr = %_peer_addr,

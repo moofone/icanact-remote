@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
+use tokio::sync::watch;
 
 /// High-level connection view used by `RemoteActorRef`.
 #[derive(Clone)]
@@ -400,6 +401,10 @@ pub struct RemoteActorRef<T = ()> {
     /// Used for reconnection after DNS changes
     registry: Weak<crate::registry::GossipRegistry>,
     recovery_in_flight: Arc<AtomicBool>,
+    /// Monotonic completion signal for a recovery attempt. A watch channel is
+    /// used instead of a bare Notify so a waiter cannot miss a completion
+    /// that races with subscribing.
+    recovery_completed: watch::Sender<u64>,
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -451,11 +456,17 @@ impl Drop for ActorAskCancellationGuard {
     }
 }
 
-struct AmbiguousRecoveryGuard(Arc<AtomicBool>);
+struct AmbiguousRecoveryGuard {
+    in_flight: Arc<AtomicBool>,
+    completed: watch::Sender<u64>,
+}
 
 impl Drop for AmbiguousRecoveryGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        self.in_flight.store(false, Ordering::Release);
+        self.completed.send_modify(|generation| {
+            *generation = generation.wrapping_add(1);
+        });
     }
 }
 
@@ -493,6 +504,47 @@ impl<T> RemoteActorRef<T> {
                 self.location.address
             ))
         })
+    }
+
+    /// Return a usable cached connection, waiting for an already-running
+    /// self-heal when the slot still contains a closed transport. The first
+    /// request that observes a closed slot owns the repair; later requests do
+    /// not fail spuriously with `ConnectionClosed` while that repair is in
+    /// flight. Waiting is bounded by the caller's deadline when one exists.
+    async fn current_connection_for_operation(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> crate::Result<Arc<RemoteConnection>> {
+        let mut completed = self.recovery_completed.subscribe();
+        loop {
+            let current = self.current_connection_or_not_listening()?;
+            if !current.is_closed() {
+                return Ok(current);
+            }
+
+            // Preserve ask/tell safety semantics: the first operation on a
+            // known-closed cached transport must fail and initiate recovery
+            // through its existing error path. Only a later operation that
+            // arrives while that recovery is already in flight waits here;
+            // it must never replay the earlier ambiguous request.
+            if !self.recovery_in_flight.load(Ordering::Acquire) {
+                return Ok(current);
+            }
+
+            let wait = completed.changed();
+            match deadline {
+                Some(operation_deadline) => {
+                    let remaining = Self::remaining_until(operation_deadline)?;
+                    tokio::time::timeout(remaining, wait)
+                        .await
+                        .map_err(|_| crate::GossipError::Timeout)?
+                        .map_err(|_| crate::GossipError::Shutdown)?;
+                }
+                None => {
+                    wait.await.map_err(|_| crate::GossipError::Shutdown)?;
+                }
+            }
+        }
     }
 
     /// Classify whether `err` indicates a dead/broken transport session (as
@@ -746,7 +798,14 @@ impl<T> RemoteActorRef<T> {
         let Some(claim) = self.claim_ambiguous_ask_recovery() else {
             return err;
         };
-        let recovery_deadline = tokio::time::Instant::now() + registry.config.connection_timeout;
+        // If the caller's budget expires while the dial is still in flight,
+        // keep the detached repair alive for one full additional connection
+        // window. Otherwise a short ask timeout cancels the first repair just
+        // before the peer's preferred-inbound path completes, and every
+        // subsequent cached-ref operation observes the same closed slot.
+        let recovery_deadline = deadline
+            .map(|operation_deadline| operation_deadline + registry.config.connection_timeout)
+            .unwrap_or_else(|| tokio::time::Instant::now() + registry.config.connection_timeout);
         let repair = self.reheal_connection(failed, Some(recovery_deadline));
 
         if let Some(operation_deadline) = deadline {
@@ -781,10 +840,15 @@ impl<T> RemoteActorRef<T> {
     }
 
     fn claim_ambiguous_ask_recovery(&self) -> Option<AmbiguousRecoveryGuard> {
-        self.recovery_in_flight
+        let claim = self
+            .recovery_in_flight
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()
-            .map(|_| AmbiguousRecoveryGuard(Arc::clone(&self.recovery_in_flight)))
+            .map(|_| AmbiguousRecoveryGuard {
+                in_flight: Arc::clone(&self.recovery_in_flight),
+                completed: self.recovery_completed.clone(),
+            });
+        claim
     }
 
     fn spawn_ambiguous_ask_recovery(
@@ -799,6 +863,7 @@ impl<T> RemoteActorRef<T> {
             connection_slot: Arc::clone(&self.connection_slot),
             registry: self.registry.clone(),
             recovery_in_flight: Arc::clone(&self.recovery_in_flight),
+            recovery_completed: self.recovery_completed.clone(),
             _marker: PhantomData,
         };
         tokio::spawn(async move {
@@ -820,12 +885,14 @@ impl<T> RemoteActorRef<T> {
         registry: Arc<crate::registry::GossipRegistry>,
     ) -> Self {
         let connection = connection.map(RemoteConnection::from_handle);
+        let (recovery_completed, _) = watch::channel(0);
         Self {
             location,
             connection: connection.clone(),
             connection_slot: Arc::new(ArcSwapOption::from(connection.map(Arc::new))),
             registry: Arc::downgrade(&registry), // Weak reference - prevents cycle
             recovery_in_flight: Arc::new(AtomicBool::new(false)),
+            recovery_completed,
             _marker: PhantomData,
         }
     }
@@ -963,7 +1030,7 @@ impl<T> RemoteActorRef<T> {
 
     /// Send a fire-and-forget message using owned bytes (no payload copy at this layer).
     pub async fn tell_bytes(&self, message: bytes::Bytes) -> crate::Result<()> {
-        let conn = self.current_connection_or_not_listening()?;
+        let conn = self.current_connection_for_operation(None).await?;
 
         // Direct call - ZERO LOCKS
         // ConnectionHandle.tell_bytes() avoids an extra payload clone.
@@ -994,7 +1061,7 @@ impl<T> RemoteActorRef<T> {
         type_hash: u32,
         payload: bytes::Bytes,
     ) -> crate::Result<()> {
-        let conn = self.current_connection_or_not_listening()?;
+        let conn = self.current_connection_for_operation(None).await?;
         match conn.tell_actor_frame(actor_id, type_hash, payload).await {
             Err(err) if Self::is_transport_failure(&err) => {
                 Err(self.preserve_ambiguous_ask_error(&conn, err, None).await)
@@ -1024,8 +1091,10 @@ impl<T> RemoteActorRef<T> {
         payload: bytes::Bytes,
         timeout: std::time::Duration,
     ) -> crate::Result<bytes::Bytes> {
-        let conn = self.current_connection_or_not_listening()?;
         let deadline = tokio::time::Instant::now() + timeout;
+        let conn = self
+            .current_connection_for_operation(Some(deadline))
+            .await?;
         let mut guard = self.actor_ask_cancellation_guard(&conn);
         let remaining = Self::remaining_until(deadline)?;
         let result = Self::ask_actor_frame_with_deadline(
@@ -1088,7 +1157,7 @@ impl<T> RemoteActorRef<T> {
         type_hash: u32,
         payload: bytes::Bytes,
     ) -> crate::Result<bytes::Bytes> {
-        let conn = self.current_connection_or_not_listening()?;
+        let conn = self.current_connection_for_operation(None).await?;
         match conn
             .ask_actor_frame_no_timeout(actor_id, type_hash, payload)
             .await
@@ -1108,7 +1177,7 @@ impl<T> RemoteActorRef<T> {
     ///
     /// Returns error if registry has shut down or no connection is available.
     pub async fn ask(&self, request: bytes::Bytes) -> crate::Result<bytes::Bytes> {
-        let conn = self.current_connection_or_not_listening()?;
+        let conn = self.current_connection_for_operation(None).await?;
         // Direct call - ZERO LOCKS
         match conn.ask(request).await {
             Err(err) if Self::is_transport_failure(&err) => {
@@ -1127,8 +1196,10 @@ impl<T> RemoteActorRef<T> {
         request: bytes::Bytes,
         timeout: std::time::Duration,
     ) -> crate::Result<bytes::Bytes> {
-        let conn = self.current_connection_or_not_listening()?;
         let deadline = tokio::time::Instant::now() + timeout;
+        let conn = self
+            .current_connection_for_operation(Some(deadline))
+            .await?;
         match conn.ask_with_timeout_bytes(request, timeout).await {
             Err(err) if Self::is_transport_failure(&err) => Err(self
                 .preserve_ambiguous_ask_error(&conn, err, Some(deadline))
@@ -1143,8 +1214,10 @@ impl<T> RemoteActorRef<T> {
         request: bytes::Bytes,
         timeout: std::time::Duration,
     ) -> crate::Result<bytes::Bytes> {
-        let conn = self.current_connection_or_not_listening()?;
         let deadline = tokio::time::Instant::now() + timeout;
+        let conn = self
+            .current_connection_for_operation(Some(deadline))
+            .await?;
         match conn.ask_direct(request, timeout).await {
             Err(err) if Self::is_transport_failure(&err) => Err(self
                 .preserve_ambiguous_ask_error(&conn, err, Some(deadline))
@@ -1158,7 +1231,7 @@ impl<T> RemoteActorRef<T> {
         &self,
         request: bytes::Bytes,
     ) -> crate::Result<bytes::Bytes> {
-        let conn = self.current_connection_or_not_listening()?;
+        let conn = self.current_connection_for_operation(None).await?;
         match conn.ask_direct_no_timeout(request).await {
             Err(err) if Self::is_transport_failure(&err) => {
                 Err(self.preserve_ambiguous_ask_error(&conn, err, None).await)
@@ -1173,7 +1246,7 @@ impl<T> RemoteActorRef<T> {
     ///
     /// ZERO-LOCK: Uses cached connection directly with no mutex overhead.
     pub async fn ask_deferred(&self, request: bytes::Bytes) -> crate::Result<crate::DeferredAsk> {
-        let conn = self.current_connection_or_not_listening()?;
+        let conn = self.current_connection_for_operation(None).await?;
         match conn.ask_deferred(request).await {
             Err(err) if Self::is_transport_failure(&err) => {
                 Err(self.preserve_ambiguous_ask_error(&conn, err, None).await)
@@ -1196,7 +1269,7 @@ impl<T> RemoteActorRef<T> {
             return Err(crate::GossipError::Shutdown);
         }
 
-        let conn = self.current_connection_or_not_listening()?;
+        let conn = self.current_connection_for_operation(None).await?;
         match conn.tell_typed(message).await {
             Err(err) if Self::is_transport_failure(&err) => {
                 Err(self.preserve_ambiguous_ask_error(&conn, err, None).await)
@@ -1220,7 +1293,7 @@ impl<T> RemoteActorRef<T> {
                 >,
             > + rkyv::Deserialize<R, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>>,
     {
-        let conn = self.current_connection_or_not_listening()?;
+        let conn = self.current_connection_for_operation(None).await?;
         match conn.ask_typed(request).await {
             Err(err) if Self::is_transport_failure(&err) => {
                 Err(self.preserve_ambiguous_ask_error(&conn, err, None).await)
@@ -1248,7 +1321,7 @@ impl<T> RemoteActorRef<T> {
                 >,
             >,
     {
-        let conn = self.current_connection_or_not_listening()?;
+        let conn = self.current_connection_for_operation(None).await?;
         match conn.ask_typed_archived(request).await {
             Err(err) if Self::is_transport_failure(&err) => {
                 Err(self.preserve_ambiguous_ask_error(&conn, err, None).await)
@@ -1277,8 +1350,10 @@ impl<T> RemoteActorRef<T> {
                 >,
             >,
     {
-        let conn = self.current_connection_or_not_listening()?;
         let deadline = tokio::time::Instant::now() + timeout;
+        let conn = self
+            .current_connection_for_operation(Some(deadline))
+            .await?;
         match conn.ask_typed_archived_with_timeout(request, timeout).await {
             Err(err) if Self::is_transport_failure(&err) => Err(self
                 .preserve_ambiguous_ask_error(&conn, err, Some(deadline))
@@ -1300,8 +1375,10 @@ impl<T> RemoteActorRef<T> {
         type_hash: u32,
         timeout: std::time::Duration,
     ) -> crate::Result<bytes::Bytes> {
-        let conn = self.current_connection_or_not_listening()?;
         let deadline = tokio::time::Instant::now() + timeout;
+        let conn = self
+            .current_connection_for_operation(Some(deadline))
+            .await?;
         // Direct call - ZERO LOCKS
         match conn
             .ask_streaming_bytes(payload, type_hash, actor_id, timeout)
@@ -1524,5 +1601,26 @@ mod tests {
 
         handle_a.shutdown().await;
         handle_b.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn recovery_completion_signal_cannot_be_missed_by_a_waiter() {
+        let in_flight = Arc::new(AtomicBool::new(true));
+        let (completed, _) = watch::channel(0_u64);
+        let mut waiter = completed.subscribe();
+        let guard = AmbiguousRecoveryGuard {
+            in_flight: Arc::clone(&in_flight),
+            completed,
+        };
+
+        // The waiter subscribes before the owner finishes. Dropping the
+        // owner must publish a generation change that remains observable even
+        // when the wake-up races the waiter entering `changed()`.
+        drop(guard);
+        tokio::time::timeout(Duration::from_millis(100), waiter.changed())
+            .await
+            .expect("recovery completion must wake a waiter")
+            .expect("completion sender must remain alive for the waiter");
+        assert!(!in_flight.load(Ordering::Acquire));
     }
 }

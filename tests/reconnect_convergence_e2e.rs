@@ -14,6 +14,7 @@ const TEST_ACTOR_ID: u64 = 0x51A7_1C00;
 const TEST_TYPE_HASH: u32 = 0x51A7_1C01;
 const RECONNECT_SLA: Duration = Duration::from_millis(500);
 const ASK_TIMEOUT: Duration = Duration::from_millis(75);
+const HEAL_ASK_TIMEOUT: Duration = Duration::from_millis(500);
 
 type TlsHandle = GossipRegistryHandle<BuilderTlsBootstrap>;
 
@@ -612,7 +613,7 @@ async fn cached_ref_self_heals_after_disconnect_bare_connection_fails_closed()
             TEST_ACTOR_ID,
             TEST_TYPE_HASH,
             Bytes::from_static(b"healed-ref"),
-            ASK_TIMEOUT,
+            HEAL_ASK_TIMEOUT,
         )
         .await;
     assert_eq!(
