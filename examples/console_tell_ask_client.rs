@@ -1,5 +1,8 @@
-use anyhow::Result;
+#[path = "support/error.rs"]
+mod example_error;
+
 use bytes::Bytes;
+use example_error::{Error, Result};
 use futures::future::BoxFuture;
 use icanact_remote::registry::PeerDisconnectHandler;
 use icanact_remote::{GossipConfig, GossipNodeId, GossipRegistryHandle, SecretKey, wire_type};
@@ -149,7 +152,7 @@ async fn main() -> Result<()> {
     let conn = registry.lookup_address(server_addr).await?;
     let conn_handle = conn
         .connection_ref()
-        .ok_or_else(|| anyhow::anyhow!("No connection handle for {}", server_addr))?;
+        .ok_or(Error::MissingConnection { addr: server_addr })?;
 
     println!("✅ Connected to {}", server_addr);
     println!("Sending tell + ask via Actor frames...\n");
@@ -348,7 +351,9 @@ async fn main() -> Result<()> {
                         warmup_rx
                             .changed()
                             .await
-                            .map_err(|_| anyhow::anyhow!("warmup start dropped"))?;
+                            .map_err(|_| Error::CoordinationClosed {
+                                phase: "warmup start",
+                            })?;
                     }
                     let warmup_result = if use_direct {
                         if use_direct_timeout {
@@ -396,7 +401,9 @@ async fn main() -> Result<()> {
                         measure_rx
                             .changed()
                             .await
-                            .map_err(|_| anyhow::anyhow!("measure start dropped"))?;
+                            .map_err(|_| Error::CoordinationClosed {
+                                phase: "measurement start",
+                            })?;
                     }
                     loop {
                         let idx = remaining.fetch_add(1, Ordering::Relaxed);
@@ -441,7 +448,7 @@ async fn main() -> Result<()> {
                     if !*shutdown_rx.borrow() {
                         let _ = shutdown_rx.changed().await;
                     }
-                    Ok::<(), anyhow::Error>(())
+                    Ok::<(), Error>(())
                 }));
             }
 
@@ -451,15 +458,19 @@ async fn main() -> Result<()> {
                     .await
                     .is_err()
                 {
-                    return Err(anyhow::anyhow!(
-                        "warmup timed out after 5s (done {}/{})",
-                        warmup_done.load(Ordering::Relaxed),
-                        worker_count
-                    ));
+                    return Err(Error::TimedOut {
+                        phase: "warmup",
+                        seconds: 5,
+                        completed: warmup_done.load(Ordering::Relaxed),
+                        total: worker_count,
+                    });
                 }
             }
             if let Some(err) = warmup_error.lock().unwrap().take() {
-                return Err(anyhow::anyhow!("warmup failed: {err}"));
+                return Err(Error::BenchmarkFailed {
+                    phase: "warmup",
+                    message: err,
+                });
             }
 
             remaining.store(0, Ordering::Relaxed);
@@ -472,17 +483,19 @@ async fn main() -> Result<()> {
                 while done_count.load(Ordering::Relaxed) < worker_count {
                     done_notify.notified().await;
                 }
-                Ok::<(), anyhow::Error>(())
+                Ok::<(), Error>(())
             };
 
             match tokio::time::timeout(bench_timeout, wait_done).await {
                 Ok(Ok(())) => {}
                 Ok(Err(e)) => return Err(e),
                 Err(_) => {
-                    return Err(anyhow::anyhow!(
-                        "ask benchmark timed out after {}s",
-                        bench_timeout.as_secs()
-                    ));
+                    return Err(Error::TimedOut {
+                        phase: "ask benchmark",
+                        seconds: bench_timeout.as_secs(),
+                        completed: done_count.load(Ordering::Relaxed),
+                        total: worker_count,
+                    });
                 }
             }
 
@@ -518,7 +531,7 @@ async fn main() -> Result<()> {
         .await;
         println!("🛑 [CLIENT] Enter received, shutting down registry...");
         registry.shutdown().await;
-        Ok::<(), anyhow::Error>(())
+        Ok::<(), Error>(())
     };
 
     tokio::select! {
@@ -561,7 +574,7 @@ where
                 std::process::exit(0);
             }
             _ if arg.starts_with('-') => {
-                return Err(anyhow::anyhow!("Unknown flag: {arg}"));
+                return Err(Error::UnknownFlag(arg));
             }
             _ => {
                 if let Some(count) = parse_human_count(&arg) {
@@ -569,9 +582,7 @@ where
                 } else if server_pub_path.is_none() {
                     server_pub_path = Some(arg);
                 } else {
-                    return Err(anyhow::anyhow!(
-                        "Unexpected extra argument (already have server pub path): {arg}"
-                    ));
+                    return Err(Error::UnexpectedArgument(arg));
                 }
             }
         }
@@ -582,9 +593,7 @@ where
         ask_count = numeric_args.get(1).copied();
         ask_concurrency = numeric_args.get(2).copied();
         if numeric_args.len() > 3 {
-            return Err(anyhow::anyhow!(
-                "Too many numeric args: expected [tell_count] [ask_count] [ask_concurrency]"
-            ));
+            return Err(Error::TooManyNumericArguments(numeric_args.len()));
         }
     }
 
@@ -654,14 +663,13 @@ fn load_node_id(path: &str) -> Result<GossipNodeId> {
     let pub_key_bytes = hex::decode(pub_key_hex.trim())?;
 
     if pub_key_bytes.len() != 32 {
-        return Err(anyhow::anyhow!(
-            "Invalid public key length: expected 32, got {}",
-            pub_key_bytes.len()
-        ));
+        return Err(Error::InvalidKeyLength {
+            kind: "public key",
+            actual: pub_key_bytes.len(),
+        });
     }
 
-    GossipNodeId::from_bytes(&pub_key_bytes)
-        .map_err(|e| anyhow::anyhow!("Invalid GossipNodeId: {}", e))
+    Ok(GossipNodeId::from_bytes(&pub_key_bytes)?)
 }
 
 fn load_or_generate_key(path: &str) -> Result<SecretKey> {
@@ -672,10 +680,10 @@ fn load_or_generate_key(path: &str) -> Result<SecretKey> {
         let key_bytes = hex::decode(key_hex.trim())?;
 
         if key_bytes.len() != 32 {
-            return Err(anyhow::anyhow!(
-                "Invalid key length: expected 32, got {}",
-                key_bytes.len()
-            ));
+            return Err(Error::InvalidKeyLength {
+                kind: "secret key",
+                actual: key_bytes.len(),
+            });
         }
 
         let mut arr = [0u8; 32];

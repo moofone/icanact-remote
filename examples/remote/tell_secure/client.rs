@@ -1,4 +1,7 @@
-use anyhow::Result;
+#[path = "../../support/error.rs"]
+mod example_error;
+
+use example_error::{Error, Result};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -166,11 +169,13 @@ fn load_node_id(path: &str) -> Result<GossipNodeId> {
     let pub_key_bytes = hex::decode(pub_key_hex.trim())?;
     
     if pub_key_bytes.len() != 32 {
-        return Err(anyhow::anyhow!("Invalid public key length: expected 32, got {}", pub_key_bytes.len()));
+        return Err(Error::InvalidKeyLength {
+            kind: "public key",
+            actual: pub_key_bytes.len(),
+        });
     }
     
-    GossipNodeId::from_bytes(&pub_key_bytes)
-        .map_err(|e| anyhow::anyhow!("Invalid GossipNodeId: {}", e))
+    Ok(GossipNodeId::from_bytes(&pub_key_bytes)?)
 }
 
 /// Load or generate TLS keypair
@@ -183,7 +188,10 @@ async fn load_or_generate_tls_key(key_path: &str) -> Result<SecretKey> {
         let key_bytes = hex::decode(key_hex.trim())?;
         
         if key_bytes.len() != 32 {
-            return Err(anyhow::anyhow!("Invalid key length: expected 32, got {}", key_bytes.len()));
+            return Err(Error::InvalidKeyLength {
+                kind: "secret key",
+                actual: key_bytes.len(),
+            });
         }
         
         let mut arr = [0u8; 32];

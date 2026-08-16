@@ -1,4 +1,7 @@
-use anyhow::Result;
+#[path = "../support/error.rs"]
+mod example_error;
+
+use example_error::Result;
 use std::fs;
 use std::path::Path;
 use icanact_remote::{GossipNodeId, SecretKey};

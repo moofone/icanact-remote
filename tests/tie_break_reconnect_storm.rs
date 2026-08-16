@@ -455,6 +455,10 @@ async fn pre_handshake_eof_churn_does_not_arm_tie_break_cooldown() -> icanact_re
     let (bad_addr, bad_listener) = pre_handshake_eof_listener().await;
     let mut config = churn_config();
     config.connection_timeout = Duration::from_millis(80);
+    // This test drives `supervise_configured_peers` manually. Quiesce the
+    // 25ms background supervisor so the pre-handshake failures observed
+    // before the cooldown assertion have one owner.
+    config.peer_supervisor_interval = Duration::from_secs(3600);
     config.tie_break_reconnect_cooldown = Duration::from_millis(500);
     let node = start_node(
         "127.0.0.1:0".parse().unwrap(),
@@ -464,7 +468,12 @@ async fn pre_handshake_eof_churn_does_not_arm_tie_break_cooldown() -> icanact_re
     .await?;
     let bad_peer = KeyPair::new_for_testing("half-open-eof-peer").peer_id();
 
-    configure_required_peer(&node, &bad_peer, bad_addr).await;
+    // Pin the route without using `Peer::connect`: this test owns each
+    // supervisor tick explicitly, including the initial attempt.
+    node.registry
+        .configure_peer(bad_peer.clone(), bad_addr)
+        .await;
+    node.registry.supervise_configured_peers().await;
     let after_first = counters.outbound_starts.load(Ordering::SeqCst);
     assert!(
         after_first >= 1,
@@ -476,16 +485,9 @@ async fn pre_handshake_eof_churn_does_not_arm_tie_break_cooldown() -> icanact_re
         "pre-handshake EOF churn is not a duplicate-connection tie-break"
     );
 
-    // This call is deliberately inside tie_break_reconnect_cooldown. If
-    // generic socket/TLS EOF failures accidentally arm the tie-break storm
-    // guard, the supervisor will skip this tick and the outbound count will
-    // not increase. The desired contract is narrower: only repeated
-    // duplicate-connection tie-break evictions can gate reconnect.
-    node.registry.supervise_configured_peers().await;
-    let after_second = counters.outbound_starts.load(Ordering::SeqCst);
     assert!(
-        after_second > after_first,
-        "ordinary half-open/pre-handshake EOF failure must not be throttled by tie-break cooldown"
+        !icanact_remote::test_helpers::tie_break_cooldown_active(&node, &bad_peer),
+        "ordinary half-open/pre-handshake EOF failure must not arm tie-break cooldown"
     );
 
     set_transport_lifecycle_recorder(None);

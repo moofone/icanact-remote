@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Mutex, OnceLock};
 use tokio::sync::Notify;
@@ -198,51 +197,59 @@ pub async fn fire_pubsub_interest_dispatch_hook(topic_key: u64, present: bool) {
     }
 }
 
-/// Test-only seam letting a test atomically overwrite a peer's
-/// `last_response_received_ms` inside `apply_gossip_results`'s own
-/// per-result `gossip_state` lock acquisition, immediately before its
-/// response-asymmetry check reads that field. Exists because backdating the
-/// timestamp from outside that lock — drop the lock, then call
-/// `apply_gossip_results`, which re-acquires it — leaves a window in which a
-/// peer's still-live connection can independently refresh the field before
-/// the call re-acquires the lock. Repeating that outside write immediately
-/// before every round only narrows the window; it can never close it, since
-/// the write and the read it races are still two separate critical sections.
-/// Setting the override here instead, consumed inside the same lock
-/// acquisition `apply_gossip_results` already uses for the read, makes the
-/// two atomic with respect to each other: no concurrent writer holding the
-/// same `gossip_state` mutex can land between them.
-///
-/// One-shot per peer: consumed (removed) the first time it is read, so a
-/// test that wants to backdate multiple rounds must set it again before each
-/// `apply_gossip_results` call.
 #[cfg(any(test, feature = "test-helpers"))]
-static RESPONSE_ASYMMETRY_BACKDATE: OnceLock<Mutex<HashMap<SocketAddr, u64>>> = OnceLock::new();
-
-#[cfg(any(test, feature = "test-helpers"))]
-fn response_asymmetry_backdate_slot() -> &'static Mutex<HashMap<SocketAddr, u64>> {
-    RESPONSE_ASYMMETRY_BACKDATE.get_or_init(|| Mutex::new(HashMap::new()))
+pub struct SilentPooledConnection {
+    _peer: tokio::io::DuplexStream,
 }
 
-/// Sets the one-shot `last_response_received_ms` override `apply_gossip_
-/// results` applies for `peer_addr` the next time it processes a result for
-/// that peer, atomically with its own response-asymmetry read.
+/// Installs a connected pooled stream whose peer endpoint remains open but
+/// never reads or writes. This models a paused process or UDP black hole
+/// without a live registry whose legitimate background traffic can race the
+/// liveness assertion.
 #[cfg(any(test, feature = "test-helpers"))]
-pub fn set_response_asymmetry_backdate(peer_addr: SocketAddr, last_response_received_ms: u64) {
-    response_asymmetry_backdate_slot()
-        .lock()
-        .expect("response-asymmetry backdate mutex poisoned")
-        .insert(peer_addr, last_response_received_ms);
+pub fn install_silent_pooled_connection(
+    registry: &crate::GossipRegistryHandle,
+    peer_id: crate::PeerId,
+    peer_addr: SocketAddr,
+) -> SilentPooledConnection {
+    use crate::connection_pool::{
+        BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+        LockFreeStreamHandle,
+    };
+    use std::sync::Arc;
+
+    let (local, peer) = tokio::io::duplex(64 * 1024);
+    let (stream_handle, writer, reader) = LockFreeStreamHandle::new(
+        local,
+        peer_addr,
+        ChannelId::TellAsk,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let mut connection = LockFreeConnection::new(peer_addr, ConnectionDirection::Outbound);
+    connection.set_state(ConnectionState::Connected);
+    connection.stream_handle = Some(Arc::new(stream_handle));
+    connection.embedded_peer_id = Some(peer_id.clone());
+    connection.task_tracker.set_writer(writer.abort_handle());
+    if let Some(reader) = reader {
+        connection.task_tracker.set_reader(reader.abort_handle());
+    }
+    registry.registry.connection_pool.add_connection_by_peer_id(
+        peer_id,
+        peer_addr,
+        Arc::new(connection),
+    );
+
+    SilentPooledConnection { _peer: peer }
 }
 
-/// Consumes (removes) the pending backdate override for `peer_addr`, if any.
-/// Called only from `apply_gossip_results`, never from test code directly.
 #[cfg(any(test, feature = "test-helpers"))]
-pub fn take_response_asymmetry_backdate(peer_addr: SocketAddr) -> Option<u64> {
-    response_asymmetry_backdate_slot()
-        .lock()
-        .expect("response-asymmetry backdate mutex poisoned")
-        .remove(&peer_addr)
+pub fn tie_break_cooldown_active(
+    registry: &crate::GossipRegistryHandle,
+    peer_id: &crate::PeerId,
+) -> bool {
+    registry.registry.tie_break_cooldown_active(peer_id)
 }
 
 pub async fn wait_for_raw_payload(timeout: Duration) -> Option<Bytes> {

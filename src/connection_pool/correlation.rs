@@ -445,7 +445,8 @@ impl CorrelationTracker {
         timeout: Duration,
     ) -> Result<crate::AlignedBytes> {
         if timeout.is_zero() {
-            return self.wait_for_response_no_timeout(correlation_id).await;
+            self.cancel(correlation_id);
+            return Err(crate::GossipError::Timeout);
         }
         let slot = Self::slot_index(correlation_id);
         let slot_ref = &self.pending[slot];

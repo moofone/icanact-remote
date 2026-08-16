@@ -471,6 +471,15 @@ impl Drop for AmbiguousRecoveryGuard {
 }
 
 impl<T> RemoteActorRef<T> {
+    fn deadline_after(timeout: std::time::Duration) -> crate::Result<tokio::time::Instant> {
+        if timeout.is_zero() {
+            return Err(crate::GossipError::Timeout);
+        }
+        tokio::time::Instant::now()
+            .checked_add(timeout)
+            .ok_or(crate::GossipError::Timeout)
+    }
+
     fn remaining_until(deadline: tokio::time::Instant) -> crate::Result<std::time::Duration> {
         deadline
             .checked_duration_since(tokio::time::Instant::now())
@@ -840,15 +849,13 @@ impl<T> RemoteActorRef<T> {
     }
 
     fn claim_ambiguous_ask_recovery(&self) -> Option<AmbiguousRecoveryGuard> {
-        let claim = self
-            .recovery_in_flight
+        self.recovery_in_flight
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()
             .map(|_| AmbiguousRecoveryGuard {
                 in_flight: Arc::clone(&self.recovery_in_flight),
                 completed: self.recovery_completed.clone(),
-            });
-        claim
+            })
     }
 
     fn spawn_ambiguous_ask_recovery(
@@ -1091,7 +1098,7 @@ impl<T> RemoteActorRef<T> {
         payload: bytes::Bytes,
         timeout: std::time::Duration,
     ) -> crate::Result<bytes::Bytes> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = Self::deadline_after(timeout)?;
         let conn = self
             .current_connection_for_operation(Some(deadline))
             .await?;
@@ -1115,7 +1122,11 @@ impl<T> RemoteActorRef<T> {
                 // the next operation but do not replay this potentially
                 // non-idempotent ask. The timeout-retry policy is the explicit
                 // caller opt-in to one replay after recovery.
-                let recovery_deadline = tokio::time::Instant::now() + timeout;
+                // Retrying a timed-out, potentially delivered actor ask is an
+                // explicit caller opt-in. That replay intentionally receives a
+                // fresh budget; ordinary connection recovery below remains
+                // bounded by the original operation deadline.
+                let recovery_deadline = Self::deadline_after(timeout)?;
                 match self
                     .recover_connection_after_actor_ask_timeout(recovery_deadline, &conn)
                     .await
@@ -1196,11 +1207,12 @@ impl<T> RemoteActorRef<T> {
         request: bytes::Bytes,
         timeout: std::time::Duration,
     ) -> crate::Result<bytes::Bytes> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = Self::deadline_after(timeout)?;
         let conn = self
             .current_connection_for_operation(Some(deadline))
             .await?;
-        match conn.ask_with_timeout_bytes(request, timeout).await {
+        let remaining = Self::remaining_until(deadline)?;
+        match conn.ask_with_timeout_bytes(request, remaining).await {
             Err(err) if Self::is_transport_failure(&err) => Err(self
                 .preserve_ambiguous_ask_error(&conn, err, Some(deadline))
                 .await),
@@ -1214,11 +1226,12 @@ impl<T> RemoteActorRef<T> {
         request: bytes::Bytes,
         timeout: std::time::Duration,
     ) -> crate::Result<bytes::Bytes> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = Self::deadline_after(timeout)?;
         let conn = self
             .current_connection_for_operation(Some(deadline))
             .await?;
-        match conn.ask_direct(request, timeout).await {
+        let remaining = Self::remaining_until(deadline)?;
+        match conn.ask_direct(request, remaining).await {
             Err(err) if Self::is_transport_failure(&err) => Err(self
                 .preserve_ambiguous_ask_error(&conn, err, Some(deadline))
                 .await),
@@ -1350,11 +1363,15 @@ impl<T> RemoteActorRef<T> {
                 >,
             >,
     {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = Self::deadline_after(timeout)?;
         let conn = self
             .current_connection_for_operation(Some(deadline))
             .await?;
-        match conn.ask_typed_archived_with_timeout(request, timeout).await {
+        let remaining = Self::remaining_until(deadline)?;
+        match conn
+            .ask_typed_archived_with_timeout(request, remaining)
+            .await
+        {
             Err(err) if Self::is_transport_failure(&err) => Err(self
                 .preserve_ambiguous_ask_error(&conn, err, Some(deadline))
                 .await),
@@ -1375,13 +1392,14 @@ impl<T> RemoteActorRef<T> {
         type_hash: u32,
         timeout: std::time::Duration,
     ) -> crate::Result<bytes::Bytes> {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = Self::deadline_after(timeout)?;
         let conn = self
             .current_connection_for_operation(Some(deadline))
             .await?;
+        let remaining = Self::remaining_until(deadline)?;
         // Direct call - ZERO LOCKS
         match conn
-            .ask_streaming_bytes(payload, type_hash, actor_id, timeout)
+            .ask_streaming_bytes(payload, type_hash, actor_id, remaining)
             .await
         {
             Err(err) if Self::is_transport_failure(&err) => Err(self

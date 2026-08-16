@@ -1000,6 +1000,13 @@ async fn dropped_transport_during_actor_ask_self_heals_and_reconnects() -> icana
     wait_until_connected(&local, &remote.registry.peer_id).await?;
 
     let remote_ref = local.lookup_peer(&remote.registry.peer_id).await?;
+    let published_before_drop = count_events(&events, |event| {
+        matches!(
+            event,
+            TransportLifecycleEvent::SessionPublished { peer, .. }
+                if peer == &remote.registry.peer_id
+        )
+    });
     // A transport-class failure on `ask_actor_frame` is never replayed by
     // `RemoteActorRef` itself: the request may already have reached the
     // remote, so the original error is always what this call returns: only
@@ -1102,9 +1109,14 @@ async fn dropped_transport_during_actor_ask_self_heals_and_reconnects() -> icana
             session_published_count(
                 events,
                 &remote.registry.peer_id,
-                TransportDirection::Inbound,
-            ) >= 2,
-            "peer should publish a fresh inbound session after reconnect"
+                TransportDirection::Inbound
+            ) + session_published_count(
+                events,
+                &remote.registry.peer_id,
+                TransportDirection::Outbound,
+            ) > published_before_drop,
+            "peer should publish a fresh session after reconnect; direction tie-breaking is \
+             covered by the dedicated convergence tests"
         );
     });
 
