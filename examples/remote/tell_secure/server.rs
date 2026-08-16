@@ -1,4 +1,7 @@
-use anyhow::Result;
+#[path = "../../support/error.rs"]
+mod example_error;
+
+use example_error::{Error, Result};
 use std::collections::HashSet;
 use std::fs;
 use std::net::SocketAddr;
@@ -117,7 +120,10 @@ async fn load_or_generate_tls_key(key_path: &str) -> Result<SecretKey> {
         let key_bytes = hex::decode(key_hex.trim())?;
         
         if key_bytes.len() != 32 {
-            return Err(anyhow::anyhow!("Invalid key length: expected 32, got {}", key_bytes.len()));
+            return Err(Error::InvalidKeyLength {
+                kind: "secret key",
+                actual: key_bytes.len(),
+            });
         }
         
         let mut arr = [0u8; 32];

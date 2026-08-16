@@ -22,6 +22,12 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Enforce strict linting
         run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Enforce warning-free documentation
+        run: cargo rustdoc --all-features -- -D warnings
+      - name: Install unused-dependency checker
+        run: cargo install cargo-machete --version 0.7.0 --locked
+      - name: Reject unused direct dependencies
+        run: cargo machete
 
   test:
     runs-on: ubuntu-latest

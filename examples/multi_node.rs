@@ -1,7 +1,10 @@
 // examples/multi_node.rs
 // Run with: cargo run --example multi_node
 
-use anyhow::Result;
+#[path = "support/error.rs"]
+mod example_error;
+
+use example_error::Result;
 use icanact_remote::{GossipConfig, GossipRegistryHandle, KeyPair};
 use tokio::time::{Duration, sleep};
 use tracing_subscriber::EnvFilter;

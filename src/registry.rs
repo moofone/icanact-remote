@@ -5059,7 +5059,7 @@ impl<T: 'static> GossipRegistry<T> {
     /// Configure a peer by peer ID and its expected connection address.
     ///
     /// P1 finding (review round against `c111380`, `registry.rs:4538`):
-    /// this used to return [`ConfigurePeerOutcome`] directly -- a public
+    /// this used to return `ConfigurePeerOutcome` directly -- a public
     /// return-type change, the fourth public-API break this PR produced
     /// (after the framing builders on #183, `connect_to_peer`, and
     /// `PeerConnectHandler`). The remedy applied then was to restore the
@@ -5085,21 +5085,21 @@ impl<T: 'static> GossipRegistry<T> {
     /// denies `unused_must_use` all break on a `Result` return that did not
     /// exist before. Reverted to `()`, genuinely unchanged from `main`, per
     /// the same precedent [`Self::connect_to_peer`] /
-    /// [`Self::connect_to_peer_with_outcome`] already established for this
+    /// `Self::connect_to_peer_with_outcome` already established for this
     /// exact tension: the public signature stays stable, and the richer,
     /// honestly-reporting form lives under a distinct, `pub(crate)` name
-    /// for callers that need it -- [`Self::configure_peer_with_outcome`],
+    /// for callers that need it -- `Self::configure_peer_with_outcome`,
     /// unchanged in shape from the previous round.
     ///
     /// That reopens the silent-drop problem `()` alone cannot signal its
     /// way out of, so THIS round closes it differently: `()` now GUARANTEES
     /// eventual application rather than merely attempting it once.
-    /// [`Self::configure_peer_with_outcome`]'s own `CONFIGURE_PEER_REAP_
+    /// `Self::configure_peer_with_outcome`'s own `CONFIGURE_PEER_REAP_
     /// RETRY_BUDGET`-bounded attempt runs first, synchronously, exactly as
-    /// before; if THAT attempt still reports [`ConfigurePeerOutcome::
-    /// TemporarilyBlocked`] (its budget elapsed while still refused by a
+    /// before; if THAT attempt still reports
+    /// `ConfigurePeerOutcome::TemporarilyBlocked` (its budget elapsed while still refused by a
     /// live reap reservation), this call does NOT give up -- it hands the
-    /// same request to [`Self::queue_configure_peer_until_applied`], a
+    /// same request to `Self::queue_configure_peer_until_applied`, a
     /// detached background retry that keeps making fresh
     /// budget-bounded attempts, indefinitely, until the reservation clears
     /// and the pin genuinely applies (or the claim is permanently
@@ -6596,7 +6596,7 @@ impl<T: 'static> GossipRegistry<T> {
     pub async fn register_actor_replacing_known(
         &self,
         name: String,
-        mut location: RemoteActorLocation,
+        location: RemoteActorLocation,
     ) -> Result<()> {
         if let Some((_, known_location)) = self.actor_state.known_actors.remove_sync(name.as_str())
         {
@@ -8273,20 +8273,6 @@ impl<T: 'static> GossipRegistry<T> {
                         if let Some(peer_info) = gossip_state.peers.get_mut(&result.peer_addr) {
                             peer_info.last_attempt = current_time;
                             peer_info.last_sent_sequence = result.sent_sequence;
-
-                            // Test-only: apply a pending response-asymmetry
-                            // backdate override in the same critical section
-                            // as the read below. This keeps deterministic
-                            // integration coverage from racing an inbound
-                            // response writer between two separate locks.
-                            #[cfg(any(test, feature = "test-helpers"))]
-                            if let Some(backdated) =
-                                crate::test_helpers::take_response_asymmetry_backdate(
-                                    result.peer_addr,
-                                )
-                            {
-                                peer_info.last_response_received_ms = backdated;
-                            }
 
                             // Only update last_success if we're not in a failed state.
                             // Note: with persistent connections, `Ok(_)` doesn't prove

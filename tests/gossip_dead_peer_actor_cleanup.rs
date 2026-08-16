@@ -919,12 +919,12 @@ fn socket_close_does_not_trigger_actor_removed_broadcast() -> Result<(), DynErro
     })
 }
 
-/// Stale-connection teardown over a *real, still-open* pooled connection — the
+/// Stale-connection teardown over a *real, still-open* pooled stream — the
 /// UDP black-hole regression guard.
 ///
 /// The synthetic-peer tests above prove the failure-consensus *accounting*
 /// (failures++, actors retained, no premature tombstone) but they never
-/// establish a real transport connection, so they cannot observe the other half
+/// establish a pooled transport connection, so they cannot observe the other half
 /// of the contract: when a connected peer crosses `max_peer_failures` via
 /// **response-asymmetry** (we keep sending, it stops answering) the now-stale
 /// pooled connection must be **torn down** so the next send/connect
@@ -938,64 +938,31 @@ fn socket_close_does_not_trigger_actor_removed_broadcast() -> Result<(), DynErro
 /// peer is gone is that it stopped answering gossip. Before the fix that left
 /// the dead connection lingering in the pool for 90 s+, so `has_connection*`
 /// reported a dead peer as connected and jobs silently black-holed. To isolate
-/// that exact path this test keeps the subscriber **alive** (socket open, no
-/// FIN, connection stays usable) and quiets background gossip, so the
+/// that exact path this test keeps a silent duplex peer endpoint **open** (no
+/// FIN, pooled connection stays usable) and avoids a second live registry, so the
 /// response-asymmetry verdict in `apply_gossip_results` is the sole thing that
 /// can remove the connection.
 #[test]
 fn stale_peer_failure_tears_down_connection_but_retains_actors() -> Result<(), DynError> {
     run_gossip_test(async {
-        let mut config = GossipConfig {
-            // Quiet background gossip on BOTH nodes: no automatic round can
-            // reset `last_response_received_ms` (which would defeat the
-            // no-response simulation) or redial. The connection is established
-            // by an explicit bootstrap dial below, independent of this.
+        let config = GossipConfig {
+            // Quiet background gossip: the liveness results below are the
+            // only activity associated with the silent fixture.
             gossip_interval: Duration::from_secs(3600),
-            peer_gossip_interval: Some(Duration::from_millis(250)),
+            peer_gossip_interval: None,
             peer_retry_interval: Duration::from_secs(3600),
-            // FLAKE FIX: the peer supervisor must be quiesced too, not just
-            // gossip and retry.
-            //
-            // This test back-dates `last_response_received_ms` to synthesize
-            // peer silence. It left `peer_supervisor_interval` at its default
-            // of 1s (DEFAULT_PEER_SUPERVISOR_SECONDS), so
-            // `supervise_configured_peers` re-dialled the (required, and
-            // genuinely alive) peer roughly every second and
-            // `connect_to_peer`'s success path reset both `failures` and
-            // `last_response_received_ms` — wiping the synthetic silence
-            // within the same millisecond. Under concurrent test-binary load
-            // that tick lands inside the assertion window: reproduced 16/80,
-            // never in 15 isolated runs.
-            //
-            // This is not a timing workaround: the test's own doc comment
-            // already states the intent to quiet all background activity, and
-            // this knob is the single configuration asymmetry between this
-            // test and its non-flaky sibling
-            // (`required_peer_drops_after_two_liveness_failures_and_recovers_on_reconnect`,
-            // gossip_required_peer_liveness_chaos.rs), which sets it.
             peer_supervisor_interval: Duration::from_secs(3600),
             peer_liveness_window: Duration::from_millis(500),
             connection_timeout: Duration::from_millis(500),
             max_peer_failures: 3,
             ..Default::default()
         };
-        // Required peers floor the response-asymmetry window to two regular
-        // gossip intervals. Normalize the test's deliberately quiesced
-        // cadence before deriving the synthetic silence below, matching the
-        // configuration the registry actually enforces.
-        config.normalize();
-
         let publisher = create_node(config.clone()).await?;
-        let subscriber = create_node(config.clone()).await?;
-        let sub_addr = subscriber.registry.bind_addr;
-        let sub_peer_id = subscriber.registry.peer_id.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let sub_addr = listener.local_addr()?;
+        drop(listener);
+        let sub_peer_id = SecretKey::generate().to_keypair().peer_id();
 
-        // Establish a REAL connection by an explicit *blocking* dial (not
-        // gossip-driven, so it works even with gossip quiesced; and blocking, so
-        // it is deterministic under parallel-test handshake contention). The
-        // subscriber stays up for the whole test, so this connection never
-        // receives a FIN and the read-loop never tears it down — exactly the UDP
-        // "no close signal" condition.
         publisher
             .registry
             .add_peer_with_node_id(
@@ -1004,28 +971,15 @@ fn stale_peer_failure_tears_down_connection_but_retains_actors() -> Result<(), D
                 icanact_remote::addr_ownership::ClaimKind::Verified,
             )
             .await;
-        publisher
-            .registry
-            .configure_peer(sub_peer_id.clone(), sub_addr)
-            .await;
+        let _silent_peer = icanact_remote::test_helpers::install_silent_pooled_connection(
+            &publisher,
+            sub_peer_id.clone(),
+            sub_addr,
+        );
         let pool = &publisher.registry.connection_pool;
-        let connected_before = {
-            let start = Instant::now();
-            loop {
-                let _ = publisher.registry.connect_to_peer(&sub_peer_id).await;
-                if pool.has_connection(&sub_addr) || pool.has_connection_by_peer_id(&sub_peer_id) {
-                    break true;
-                }
-                if start.elapsed() > Duration::from_secs(20) {
-                    break false;
-                }
-                sleep(Duration::from_millis(100)).await;
-            }
-        };
         assert!(
-            connected_before,
-            "test precondition: publisher must hold a real, usable pooled connection to the \
-             (still-running) subscriber"
+            pool.has_connection(&sub_addr) && pool.has_connection_by_peer_id(&sub_peer_id),
+            "test precondition: publisher must hold the silent pooled connection"
         );
 
         // Attribute a known actor to the real subscriber's addr/peer-id so the
@@ -1043,46 +997,32 @@ fn stale_peer_failure_tears_down_connection_but_retains_actors() -> Result<(), D
                 .insert(DEAD_ACTOR_NAME.to_string());
         }
 
-        // How far in the past to backdate `last_response_received_ms` so the
-        // no-response rounds below trip the response-asymmetry detector.
-        // Older than the normalized liveness window is enough in principle,
-        // but `connect_to_peer`'s own success path (called above, in a loop,
-        // to establish `connected_before`) unconditionally resets this same
-        // field to "now" on every `Ok` — and it is not the only writer: any
-        // inbound payload processed on this real, still-alive TLS connection
-        // (e.g. a one-time handshake-adjacent exchange with the subscriber,
-        // not gated by any of the quiesced background intervals above) can
-        // independently reset it too.
-        //
-        // Backdating from outside `apply_gossip_results`'s own lock
-        // acquisition — drop the lock, then call `apply_gossip_results`,
-        // which re-acquires it — leaves a window between the write and the
-        // response-asymmetry read that any of those writers can land in.
-        // Repeating the write immediately before every round only narrows
-        // that window; it cannot close it, since the write and the read it
-        // races remain two separate critical sections no matter how close
-        // together they run. `set_response_asymmetry_backdate` instead arms
-        // a one-shot override that `apply_gossip_results` itself applies
-        // inside the SAME lock acquisition its response-asymmetry check
-        // reads from, making the two atomic with respect to each other: no
-        // concurrent writer holding that same `gossip_state` mutex can ever
-        // land between them.
+        // An expected node identity makes this a required peer. Required
+        // peers floor liveness at two regular-gossip intervals, so backdate
+        // beyond that effective window rather than only the raw configured
+        // liveness duration.
+        let effective_liveness = config
+            .peer_liveness_window
+            .max(config.gossip_interval.saturating_mul(2));
         let silence_ms = u64::try_from(
-            config
-                .peer_liveness_window
+            effective_liveness
                 .saturating_add(Duration::from_millis(1))
                 .as_millis(),
         )
         .unwrap_or(u64::MAX);
 
-        // Drive the verdict deterministically: the subscriber is alive at the
-        // socket level (connection stays "usable") but is treated as having
-        // stopped answering at the app level — the UDP black-hole shape.
+        {
+            let mut state = publisher.registry.gossip_state.lock().await;
+            state
+                .peers
+                .get_mut(&sub_addr)
+                .expect("silent peer must be present")
+                .last_response_received_ms =
+                icanact_remote::current_timestamp_millis().saturating_sub(silence_ms);
+        }
+
+        // The duplex endpoint remains open, but no task can refresh liveness.
         for sequence in 0..config.max_peer_failures {
-            icanact_remote::test_helpers::set_response_asymmetry_backdate(
-                sub_addr,
-                icanact_remote::current_timestamp_millis().saturating_sub(silence_ms),
-            );
             publisher
                 .registry
                 .apply_gossip_results(vec![icanact_remote::registry::GossipResult {
@@ -1112,7 +1052,6 @@ fn stale_peer_failure_tears_down_connection_but_retains_actors() -> Result<(), D
         assert_transport_failure_retains_actor(&publisher, sub_addr, DEAD_ACTOR_NAME).await;
 
         publisher.shutdown().await;
-        subscriber.shutdown().await;
         Ok(())
     })
 }

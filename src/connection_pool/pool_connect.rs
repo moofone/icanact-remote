@@ -582,15 +582,6 @@ impl<T> ConnectionPool<T> {
         out
     }
 
-    pub(crate) fn set_current_peer_connection(
-        &self,
-        peer_id: &crate::PeerId,
-        connection: Option<Arc<LockFreeConnection>>,
-    ) {
-        self.get_or_create_peer_session(peer_id)
-            .set_current_connection(connection);
-    }
-
     pub(crate) fn publish_current_peer_connection(
         &self,
         peer_id: &crate::PeerId,

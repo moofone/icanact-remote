@@ -20,6 +20,15 @@ pub struct ConnectionHandle<T = ()> {
     _marker: PhantomData<fn() -> T>,
 }
 
+#[inline]
+fn require_positive_timeout(timeout: Duration) -> Result<()> {
+    if timeout.is_zero() {
+        Err(crate::GossipError::Timeout)
+    } else {
+        Ok(())
+    }
+}
+
 impl<T> std::fmt::Debug for ConnectionHandle<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnectionHandle")
@@ -737,6 +746,7 @@ impl<T> ConnectionHandle<T> {
         timeout: Duration,
         request_id: Option<u64>,
     ) -> Result<crate::AlignedBytes> {
+        require_positive_timeout(timeout)?;
         let started_at = Instant::now();
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
@@ -863,6 +873,7 @@ impl<T> ConnectionHandle<T> {
         payload: bytes::Bytes,
         timeout: Duration,
     ) -> Result<PendingAsk> {
+        require_positive_timeout(timeout)?;
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
         if let Err(e) = self
@@ -997,6 +1008,7 @@ impl<T> ConnectionHandle<T> {
                 >,
             > + rkyv::Deserialize<Resp, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>>,
     {
+        require_positive_timeout(timeout)?;
         let payload = crate::typed::encode_typed_pooled(request)?;
         let (payload, prefix, payload_len) = crate::typed::typed_payload_parts::<Req>(payload);
         let response = self
@@ -1052,6 +1064,7 @@ impl<T> ConnectionHandle<T> {
                 >,
             >,
     {
+        require_positive_timeout(timeout)?;
         let payload = crate::typed::encode_typed_pooled(request)?;
         let (payload, prefix, payload_len) = crate::typed::typed_payload_parts::<Req>(payload);
         let response = self
@@ -1067,6 +1080,7 @@ impl<T> ConnectionHandle<T> {
         payload_len: usize,
         timeout: Duration,
     ) -> Result<bytes::Bytes> {
+        require_positive_timeout(timeout)?;
         self.reject_oversize_inline(framing::ASK_RESPONSE_HEADER_LEN, payload_len)?;
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
@@ -1116,6 +1130,7 @@ impl<T> ConnectionHandle<T> {
         request: bytes::Bytes,
         timeout: Duration,
     ) -> Result<bytes::Bytes> {
+        require_positive_timeout(timeout)?;
         self.reject_oversize_inline(framing::ASK_RESPONSE_HEADER_LEN, request.len())?;
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
@@ -1164,6 +1179,7 @@ impl<T> ConnectionHandle<T> {
         request: bytes::Bytes,
         timeout: Duration,
     ) -> Result<bytes::Bytes> {
+        require_positive_timeout(timeout)?;
         self.reject_oversize_inline(framing::DIRECT_ASK_HEADER_LEN, request.len())?;
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
@@ -1184,6 +1200,7 @@ impl<T> ConnectionHandle<T> {
         request: bytes::Bytes,
         timeout: Duration,
     ) -> Result<bytes::Bytes> {
+        require_positive_timeout(timeout)?;
         if request_id == 0 {
             return Err(GossipError::InvalidConfig(
                 "ask_direct_with_id: request_id must be nonzero".to_string(),
@@ -1260,6 +1277,7 @@ impl<T> ConnectionHandle<T> {
         actor_id: u64,
         timeout: Duration,
     ) -> Result<bytes::Bytes> {
+        require_positive_timeout(timeout)?;
         let stream_handle = self.stream_handle().map_err(|_| {
             GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -1359,6 +1377,7 @@ impl<T> ConnectionHandle<T> {
         request: bytes::Bytes,
         timeout: Duration,
     ) -> Result<PendingAsk> {
+        require_positive_timeout(timeout)?;
         self.reject_oversize_inline(framing::ASK_RESPONSE_HEADER_LEN, request.len())?;
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
@@ -1398,6 +1417,7 @@ impl<T> ConnectionHandle<T> {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
+        require_positive_timeout(timeout)?;
 
         // Validate every request's encoded size *before* touching the
         // allocator. `reject_oversize_inline` used to run inside the loop
@@ -2183,5 +2203,106 @@ mod oversized_inline_send_gate_tests {
         peer.read_exact(&mut received)
             .await
             .expect("the whole batch must reach the wire in one piece");
+    }
+}
+
+/// A zero duration on a timeout-bearing API is an already-expired deadline,
+/// not an alias for the separately named no-timeout APIs. It must fail before
+/// reserving a correlation slot or enqueueing any bytes: once a request is on
+/// the wire, returning `Timeout` is necessarily ambiguous to the caller.
+#[cfg(test)]
+mod zero_timeout_gate_tests {
+    use super::*;
+
+    fn test_addr() -> SocketAddr {
+        "127.0.0.1:29997".parse().expect("valid test addr")
+    }
+
+    fn make_handle() -> ConnectionHandle {
+        let (client, _peer) = tokio::io::duplex(64 * 1024);
+        let (stream_handle, _task, _) = LockFreeStreamHandle::new(
+            client,
+            test_addr(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        ConnectionHandle::new_stream(
+            test_addr(),
+            ConnectionDirection::Outbound,
+            Arc::new(stream_handle),
+            CorrelationTracker::new(),
+        )
+    }
+
+    async fn assert_immediate_timeout<F>(conn: &ConnectionHandle, operation: F)
+    where
+        F: Future<Output = Result<bytes::Bytes>>,
+    {
+        let written_before = conn.bytes_written();
+        let result = tokio::time::timeout(Duration::from_millis(50), operation)
+            .await
+            .expect("zero timeout must return immediately, not wait without a deadline");
+        assert!(
+            matches!(result, Err(GossipError::Timeout)),
+            "zero timeout must return the concrete Timeout error, got {result:?}"
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(
+            conn.bytes_written(),
+            written_before,
+            "an already-expired ask must not write a request"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_timeout_bytes_ask_fails_before_write() {
+        let conn = make_handle();
+        assert_immediate_timeout(
+            &conn,
+            conn.ask_with_timeout_bytes(bytes::Bytes::from_static(b"bytes"), Duration::ZERO),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn zero_timeout_direct_ask_fails_before_write() {
+        let conn = make_handle();
+        assert_immediate_timeout(
+            &conn,
+            conn.ask_direct(bytes::Bytes::from_static(b"direct"), Duration::ZERO),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn zero_timeout_actor_ask_fails_before_write() {
+        let conn = make_handle();
+        assert_immediate_timeout(
+            &conn,
+            conn.ask_actor_frame(
+                7,
+                9,
+                bytes::Bytes::from_static(b"actor"),
+                Duration::ZERO,
+            ),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn zero_timeout_streaming_ask_fails_before_write() {
+        let conn = make_handle();
+        assert_immediate_timeout(
+            &conn,
+            conn.ask_streaming_bytes(
+                bytes::Bytes::from_static(b"stream"),
+                9,
+                7,
+                Duration::ZERO,
+            ),
+        )
+        .await;
     }
 }
