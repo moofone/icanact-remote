@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use std::net::SocketAddr;
 use std::sync::{Mutex, OnceLock};
 use tokio::sync::Notify;
 use tokio::time::{Duration, sleep};
