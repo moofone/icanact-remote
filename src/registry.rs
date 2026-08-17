@@ -1769,6 +1769,7 @@ impl PeerInfo {
             current_session_source: None,
             current_session_connection: None,
             current_session_epoch: 0,
+            session_restart_confirmed: false,
             identity_verified: false,
             transport_source_keyed: false,
         }
@@ -2087,6 +2088,10 @@ pub enum TombstoneKind {
     /// restart -- that would resurrect an actor its owner intentionally
     /// took down.
     ExplicitUnregister,
+    /// The actor was not present locally when the removal arrived, so this
+    /// observer cannot verify whether it was owner-requested or inferred.
+    /// Unknown provenance is fail-closed and never restart-bypassable.
+    Unknown,
 }
 
 #[derive(Debug, Clone)]
@@ -2094,33 +2099,53 @@ pub struct RemovedActorTombstone {
     pub vector_clock: crate::VectorClock,
     pub removed_at: u64,
     pub kind: TombstoneKind,
+    /// Owner identity captured while the live actor record still existed.
+    /// This lets a later owner removal refine an earlier peer-death tombstone.
+    pub owner_node_id: Option<crate::GossipNodeId>,
 }
 
 impl RemovedActorTombstone {
     /// Peer-death tombstone (the predominant, historical shape): recorded by
     /// an observer, not the owner itself. Use `new_explicit_unregister` for
     /// a deliberate removal the owner itself requested.
+    #[allow(dead_code)]
     fn new(vector_clock: crate::VectorClock) -> Self {
-        Self {
-            vector_clock,
-            removed_at: current_timestamp(),
-            kind: TombstoneKind::PeerDeath,
-        }
+        Self::with_kind_and_owner(vector_clock, TombstoneKind::PeerDeath, None)
     }
 
+    fn new_with_owner(
+        vector_clock: crate::VectorClock,
+        owner_node_id: crate::GossipNodeId,
+    ) -> Self {
+        Self::with_kind_and_owner(vector_clock, TombstoneKind::PeerDeath, Some(owner_node_id))
+    }
+
+    #[allow(dead_code)]
     fn new_explicit_unregister(vector_clock: crate::VectorClock) -> Self {
-        Self {
-            vector_clock,
-            removed_at: current_timestamp(),
-            kind: TombstoneKind::ExplicitUnregister,
-        }
+        Self::with_kind_and_owner(vector_clock, TombstoneKind::ExplicitUnregister, None)
     }
 
-    fn with_kind(vector_clock: crate::VectorClock, kind: TombstoneKind) -> Self {
+    fn new_explicit_unregister_by_owner(
+        vector_clock: crate::VectorClock,
+        owner_node_id: crate::GossipNodeId,
+    ) -> Self {
+        Self::with_kind_and_owner(
+            vector_clock,
+            TombstoneKind::ExplicitUnregister,
+            Some(owner_node_id),
+        )
+    }
+
+    fn with_kind_and_owner(
+        vector_clock: crate::VectorClock,
+        kind: TombstoneKind,
+        owner_node_id: Option<crate::GossipNodeId>,
+    ) -> Self {
         Self {
             vector_clock,
             removed_at: current_timestamp(),
             kind,
+            owner_node_id,
         }
     }
 }
@@ -2167,11 +2192,14 @@ fn tombstone_kind_for_removal(
 /// merge, or a legitimately-unregistered actor could still end up
 /// resurrectable by a restart exemption.
 fn merge_tombstone_kind(existing: Option<TombstoneKind>, new: TombstoneKind) -> TombstoneKind {
-    if existing == Some(TombstoneKind::ExplicitUnregister) || new == TombstoneKind::ExplicitUnregister
-    {
-        TombstoneKind::ExplicitUnregister
-    } else {
-        new
+    match (existing, new) {
+        (Some(TombstoneKind::ExplicitUnregister), _) | (_, TombstoneKind::ExplicitUnregister) => {
+            TombstoneKind::ExplicitUnregister
+        }
+        (Some(TombstoneKind::PeerDeath), _) | (_, TombstoneKind::PeerDeath) => {
+            TombstoneKind::PeerDeath
+        }
+        _ => TombstoneKind::Unknown,
     }
 }
 
@@ -2365,6 +2393,7 @@ impl GossipState {
                         current_session_source: _,
                         current_session_connection: _,
                         current_session_epoch: _,
+                        session_restart_confirmed: _,
                         identity_verified: existing_identity_verified,
                         transport_source_keyed: _,
                     } = existing.clone();
@@ -7014,7 +7043,10 @@ impl<T: 'static> GossipRegistry<T> {
                 // later restart-looking session (see `TombstoneKind`).
                 let _ = self.actor_state.removed_actors.upsert_sync(
                     name.to_string(),
-                    RemovedActorTombstone::new_explicit_unregister(removal_clock.clone()),
+                    RemovedActorTombstone::new_explicit_unregister_by_owner(
+                        removal_clock.clone(),
+                        self.peer_id.to_node_id(),
+                    ),
                 );
 
                 let change = RegistryChange::ActorRemoved {
@@ -7304,12 +7336,13 @@ impl<T: 'static> GossipRegistry<T> {
             // closed to `false`: the restart exemption in
             // `owner_recovery_wins_tombstone` must never fire for a message
             // with no authenticated-current-session evidence backing it.
-            let owner_restart_authenticated = session_guard.is_some_and(|(session_peer_addr, _)| {
-                gossip_state
-                    .peers
-                    .get(&session_peer_addr)
-                    .is_some_and(|peer_info| peer_info.session_restart_confirmed)
-            });
+            let owner_restart_authenticated =
+                session_guard.is_some_and(|(session_peer_addr, _)| {
+                    gossip_state
+                        .peers
+                        .get(&session_peer_addr)
+                        .is_some_and(|peer_info| peer_info.session_restart_confirmed)
+                });
 
             let mut log_adds = Vec::new();
             let mut sender_actors = bookkeeping_addr
@@ -7426,10 +7459,15 @@ impl<T: 'static> GossipRegistry<T> {
                         // silently changed just because a later,
                         // concurrently-merged report happens to classify
                         // differently from ITS OWN sender's perspective.
-                        let existing_kind = self
+                        let existing_tombstone = self
                             .actor_state
                             .removed_actors
-                            .read_sync(name.as_str(), |_, tombstone| tombstone.kind);
+                            .read_sync(name.as_str(), |_, tombstone| tombstone.clone());
+                        let existing_kind =
+                            existing_tombstone.as_ref().map(|tombstone| tombstone.kind);
+                        let existing_owner_node_id = existing_tombstone
+                            .as_ref()
+                            .and_then(|tombstone| tombstone.owner_node_id);
                         // `owner_node_id` is `None` in two very different
                         // situations that must not be conflated: the actor
                         // was never known here at all (no tombstone exists
@@ -7454,7 +7492,25 @@ impl<T: 'static> GossipRegistry<T> {
                                 existing_kind,
                                 tombstone_kind_for_removal(owner, removing_node_id),
                             ),
-                            None => existing_kind.unwrap_or(TombstoneKind::ExplicitUnregister),
+                            None => {
+                                let inferred_kind = match existing_owner_node_id {
+                                    Some(owner) if owner == removing_node_id => {
+                                        TombstoneKind::ExplicitUnregister
+                                    }
+                                    _ => existing_kind.unwrap_or(TombstoneKind::Unknown),
+                                };
+                                merge_tombstone_kind(existing_kind, inferred_kind)
+                            }
+                        };
+                        let tombstone_owner_node_id = match owner_node_id {
+                            Some(owner) => Some(owner),
+                            None => match existing_owner_node_id {
+                                Some(owner) => Some(owner),
+                                None => match kind {
+                                    TombstoneKind::ExplicitUnregister => Some(removing_node_id),
+                                    TombstoneKind::PeerDeath | TombstoneKind::Unknown => None,
+                                },
+                            },
                         };
 
                         let Some((removal_clock, tombstone_only)) = self
@@ -7476,7 +7532,11 @@ impl<T: 'static> GossipRegistry<T> {
                         if tombstone_only {
                             let _ = self.actor_state.removed_actors.upsert_sync(
                                 name.clone(),
-                                RemovedActorTombstone::with_kind(removal_clock, kind),
+                                RemovedActorTombstone::with_kind_and_owner(
+                                    removal_clock,
+                                    kind,
+                                    tombstone_owner_node_id,
+                                ),
                             );
                             gossip_state
                                 .pending_changes
@@ -7495,7 +7555,11 @@ impl<T: 'static> GossipRegistry<T> {
                             applied_count += 1;
                             let _ = self.actor_state.removed_actors.upsert_sync(
                                 name,
-                                RemovedActorTombstone::with_kind(removal_clock, kind),
+                                RemovedActorTombstone::with_kind_and_owner(
+                                    removal_clock,
+                                    kind,
+                                    tombstone_owner_node_id,
+                                ),
                             );
                             gossip_state
                                 .pending_changes
@@ -10567,7 +10631,10 @@ impl<T: 'static> GossipRegistry<T> {
                                 removal_clock.increment(self.peer_id.to_node_id());
                                 let _ = self.actor_state.removed_actors.upsert_sync(
                                     actor_name.clone(),
-                                    RemovedActorTombstone::new(removal_clock.clone()),
+                                    RemovedActorTombstone::new_with_owner(
+                                        removal_clock.clone(),
+                                        location.node_id,
+                                    ),
                                 );
 
                                 let change = RegistryChange::ActorRemoved {
@@ -20886,6 +20953,7 @@ mod tests {
                 vector_clock: old_clock,
                 removed_at: current_timestamp().saturating_sub(11),
                 kind: TombstoneKind::PeerDeath,
+                owner_node_id: None,
             },
         );
         let _ = registry.actor_state.removed_actors.upsert_sync(
@@ -23305,6 +23373,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -23963,10 +24032,8 @@ mod tests {
     /// `TombstoneKind::PeerDeath` may be bypassed by the restart exemption.
     #[tokio::test]
     async fn apply_delta_restarted_owner_does_not_recover_through_explicit_unregister_tombstone() {
-        let reg = GossipRegistry::<()>::new(
-            test_addr(7909),
-            test_config_with_seed("rt-explicit-unreg"),
-        );
+        let reg =
+            GossipRegistry::<()>::new(test_addr(7909), test_config_with_seed("rt-explicit-unreg"));
         let actor = "actor.delta.explicit-unregister";
         let owner = test_peer_id("rt-explicit-unreg-owner");
         let owner_node = owner.to_node_id();
@@ -24090,10 +24157,10 @@ mod tests {
             removal_clock.increment(owner_node);
         }
         removal_clock.increment(observer_node);
-        let _ = reg.actor_state.removed_actors.upsert_sync(
-            actor.to_string(),
-            RemovedActorTombstone::new(removal_clock),
-        );
+        let _ = reg
+            .actor_state
+            .removed_actors
+            .upsert_sync(actor.to_string(), RemovedActorTombstone::new(removal_clock));
 
         // The owner connects for the first time ever (never seen before --
         // `last_sequence` starts at 0) and its session is armed, exactly
@@ -24242,7 +24309,11 @@ mod tests {
         {
             let state = reg.gossip_state.lock().await;
             assert!(
-                state.peers.get(&peer_addr).unwrap().session_restart_confirmed,
+                state
+                    .peers
+                    .get(&peer_addr)
+                    .unwrap()
+                    .session_restart_confirmed,
                 "sanity: the original session's restart must be confirmed first"
             );
         }
@@ -24568,11 +24639,17 @@ mod tests {
     #[test]
     fn merge_tombstone_kind_prefers_explicit_unregister() {
         assert_eq!(
-            merge_tombstone_kind(Some(TombstoneKind::PeerDeath), TombstoneKind::ExplicitUnregister),
+            merge_tombstone_kind(
+                Some(TombstoneKind::PeerDeath),
+                TombstoneKind::ExplicitUnregister
+            ),
             TombstoneKind::ExplicitUnregister
         );
         assert_eq!(
-            merge_tombstone_kind(Some(TombstoneKind::ExplicitUnregister), TombstoneKind::PeerDeath),
+            merge_tombstone_kind(
+                Some(TombstoneKind::ExplicitUnregister),
+                TombstoneKind::PeerDeath
+            ),
             TombstoneKind::ExplicitUnregister
         );
         assert_eq!(
@@ -24586,6 +24663,122 @@ mod tests {
         assert_eq!(
             merge_tombstone_kind(None, TombstoneKind::ExplicitUnregister),
             TombstoneKind::ExplicitUnregister
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_removal_provenance_is_recorded_fail_closed() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(9436),
+            test_config_with_seed("unknown-removal-provenance"),
+        );
+        let actor = "actor.unknown-removal-provenance";
+        let reporter = test_peer_id("unknown-removal-reporter");
+        let clock = crate::VectorClock::new();
+        clock.increment(reporter.to_node_id());
+
+        reg.apply_delta(RegistryDelta {
+            since_sequence: 0,
+            current_sequence: 1,
+            changes: vec![RegistryChange::ActorRemoved {
+                name: actor.to_string(),
+                vector_clock: clock,
+                removing_node_id: reporter.to_node_id(),
+                priority: RegistrationPriority::Normal,
+            }],
+            sender_peer_id: reporter,
+            wall_clock_time: current_timestamp(),
+            precise_timing_nanos: 0,
+        })
+        .await
+        .unwrap();
+
+        let tombstone = reg
+            .actor_state
+            .removed_actors
+            .read_sync(actor, |_, tombstone| tombstone.clone())
+            .expect("unknown removal must still be retained as a tombstone");
+        assert_eq!(tombstone.kind, TombstoneKind::Unknown);
+        assert!(tombstone.owner_node_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn owner_removal_upgrades_prior_peer_death_using_tombstone_provenance() {
+        let reg = GossipRegistry::<()>::new(
+            test_addr(7916),
+            test_config_with_seed("tombstone-owner-provenance"),
+        );
+        let actor = "actor.removal.owner-provenance";
+        let owner = test_peer_id("tombstone-owner-provenance-owner");
+        let owner_node = owner.to_node_id();
+        let observer = test_peer_id("tombstone-owner-provenance-observer");
+        let observer_node = observer.to_node_id();
+
+        let known = RemoteActorLocation::new_with_peer(test_addr(9926), owner.clone());
+        known.vector_clock.increment(owner_node);
+        let _ = reg
+            .actor_state
+            .known_actors
+            .upsert_sync(actor.to_string(), known);
+
+        let peer_death_clock = crate::VectorClock::new();
+        peer_death_clock.increment(owner_node);
+        peer_death_clock.increment(observer_node);
+        reg.apply_delta(RegistryDelta {
+            since_sequence: 0,
+            current_sequence: 1,
+            changes: vec![RegistryChange::ActorRemoved {
+                name: actor.to_string(),
+                vector_clock: peer_death_clock.clone(),
+                removing_node_id: observer_node,
+                priority: RegistrationPriority::Normal,
+            }],
+            sender_peer_id: observer,
+            wall_clock_time: 0,
+            precise_timing_nanos: 0,
+        })
+        .await
+        .unwrap();
+
+        let peer_death = reg
+            .actor_state
+            .removed_actors
+            .read_sync(actor, |_, tombstone| tombstone.clone())
+            .expect("peer-death removal must leave a tombstone");
+        assert_eq!(peer_death.kind, TombstoneKind::PeerDeath);
+        assert_eq!(peer_death.owner_node_id, Some(owner_node));
+
+        let explicit_clock = peer_death_clock;
+        explicit_clock.increment(owner_node);
+        reg.apply_delta(RegistryDelta {
+            since_sequence: 1,
+            current_sequence: 2,
+            changes: vec![RegistryChange::ActorRemoved {
+                name: actor.to_string(),
+                vector_clock: explicit_clock,
+                removing_node_id: owner_node,
+                priority: RegistrationPriority::Normal,
+            }],
+            sender_peer_id: owner.clone(),
+            wall_clock_time: 0,
+            precise_timing_nanos: 0,
+        })
+        .await
+        .unwrap();
+
+        let tombstone = reg
+            .actor_state
+            .removed_actors
+            .read_sync(actor, |_, tombstone| tombstone.clone())
+            .expect("owner removal must retain the tombstone");
+        assert_eq!(tombstone.kind, TombstoneKind::ExplicitUnregister);
+        assert_eq!(tombstone.owner_node_id, Some(owner_node));
+
+        let reset_location = RemoteActorLocation::new_with_peer(test_addr(9926), owner.clone());
+        reset_location.vector_clock.increment(owner_node);
+        assert!(
+            !owner_recovery_wins_tombstone(&reset_location, &owner, &tombstone, true),
+            "restart evidence must not bypass the upgraded explicit-removal tombstone"
         );
     }
 
@@ -26835,6 +27028,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -27159,6 +27353,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -27267,6 +27462,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -27413,6 +27609,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -27632,6 +27829,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -27834,6 +28032,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -28106,6 +28305,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -28330,6 +28530,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -28515,6 +28716,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -28676,6 +28878,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -28857,6 +29060,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
@@ -29067,6 +29271,7 @@ mod tests {
                     current_session_source: None,
                     current_session_connection: None,
                     current_session_epoch: 0,
+                    session_restart_confirmed: false,
                     identity_verified: false,
                     transport_source_keyed: false,
                 },
