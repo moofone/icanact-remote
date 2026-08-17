@@ -1,30 +1,14 @@
-//! A stale address alias must not tear down its identity's live connection.
+//! A healthy multi-alias relationship must remain connected.
 //!
-//! Failure accounting in `apply_gossip_results` is keyed by `SocketAddr`, but
-//! the teardown it triggers is keyed by identity: `newly_dead` holds addresses,
-//! and for each one `registry.rs:8457` resolves `addr -> peer_id` and calls
-//! `disconnect_connection_by_peer_id`, which drops that peer's *current*
-//! connection regardless of which address that connection is on.
+//! This is an observation/regression guard, not a reproduction of the devnet
+//! flap. The original alias-starvation hypothesis was refuted: gossip selection
+//! deduplicates by identity before building tasks, so a non-selected alias never
+//! enters `apply_gossip_results` and cannot accrue failures merely by losing the
+//! selection slot.
 //!
-//! Those two keyings disagree whenever a peer is known under more than one
-//! address, which is the normal steady state: a node that both dials a peer and
-//! accepts a connection from it holds that peer under the advertised bind
-//! address *and* under the ephemeral TCP source address of the accepted socket.
-//!
-//! Only one of those aliases can be refreshed. `select_best_alias_per_identity`
-//! deliberately gives each identity exactly one gossip slot per round, and
-//! `last_response_received_ms` is refreshed per connection -- so the aliases that
-//! lose the slot receive no gossip, get no response, and can never refresh. They
-//! accrue response-asymmetry failures on a timer until they cross
-//! `max_peer_failures`, at which point a *stale* alias executes an
-//! identity-scoped teardown of a *healthy* connection.
-//!
-//! This is self-sustaining. Each teardown is followed by a reconnect from a new
-//! ephemeral source port, which adds another alias, which becomes another stale
-//! timer. Devnet's collector accumulated six aliases for one relay
-//! (`10.77.0.38:38188`, `:53950`, `:53404`, `:33924`, `:58236`, `:52978`, all
-//! peer_id `3e4773bd...`) and flapped every 30-60s indefinitely, with
-//! `stale_side_table_entries` climbing 69 -> 75 as the reaper fell behind.
+//! The test still matters as a high-level invariant: multiple address aliases
+//! are normal when a node both dials and accepts a connection, and a quiet,
+//! healthy identity must remain reachable throughout that steady state.
 
 use icanact_remote::{BuilderTlsBootstrap, GossipConfig, GossipRegistryHandle, KeyPair};
 use std::net::SocketAddr;
@@ -132,12 +116,7 @@ async fn stale_alias_does_not_tear_down_its_identitys_live_connection() -> icana
         assert!(
             a.registry.has_connection_to_peer(&b_id).await,
             "connection to a healthy peer was torn down while both nodes were \
-             up and idle. A holds {alias_count} address aliases for this \
-             identity; only the one that wins `select_best_alias_per_identity` \
-             is ever refreshed, so the losing aliases accrue response-asymmetry \
-             failures until one of them crosses the threshold and executes an \
-             identity-scoped `disconnect_connection_by_peer_id` against the live \
-             connection"
+             up and idle and A held {alias_count} address aliases for the identity"
         );
         sleep(Duration::from_millis(50)).await;
     }

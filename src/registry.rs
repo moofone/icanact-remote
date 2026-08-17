@@ -1499,14 +1499,12 @@ pub struct PeerInfo {
     pub last_failure_instant: Option<std::time::Instant>,
     /// Last time we attempted a DNS refresh for this peer (rate limiting).
     pub last_dns_refresh_attempt: Option<u64>,
-    /// Last time we received a gossip response *payload* from this peer
-    /// (not merely sent to). Used by the response-asymmetry liveness
-    /// detector: if we keep sending and never see a response within
-    /// `config.peer_liveness_window`, treat the peer as failed even when
-    /// the persistent-connection write succeeds at the kernel level.
-    /// `0` means "no response observed yet" — treated as new-peer (no
-    /// stale verdict until either we get one or the configured grace
-    /// expires from `last_attempt`).
+    /// Last time we received a gossip response payload from this peer.
+    ///
+    /// This is diagnostic/direct-evidence bookkeeping, not a failure-detector
+    /// deadline. Periodic registry gossip is fire-and-forget; SWIM owns
+    /// application-level peer liveness and transport IO owns exact-session
+    /// socket teardown. `0` means no response has been observed yet.
     pub last_response_received_ms: u64,
     /// R-11: one-shot "accept a lower-sequence FullSync than `last_sequence`",
     /// scoped to the exact connection that armed it.
@@ -2003,6 +2001,10 @@ pub struct GossipTask {
 pub struct GossipResult {
     pub peer_addr: SocketAddr,
     pub sent_sequence: u64,
+    /// Periodic production gossip is fire-and-forget: a successful send is
+    /// `Ok(None)` because no inline response was requested. `None` is neutral,
+    /// never a failed liveness probe. `Some` is reserved for synthetic/direct
+    /// callers that actually carry an inline response.
     pub outcome: Result<Option<RegistryMessage>>,
 }
 
@@ -2791,33 +2793,6 @@ impl<T: 'static> GossipRegistry<T> {
     /// reading `self.bind_addr` directly.
     pub(crate) fn advertised_addr(&self) -> SocketAddr {
         self.config.advertise_address.unwrap_or(self.bind_addr)
-    }
-
-    fn duration_millis_u64(duration: Duration) -> u64 {
-        u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-    }
-
-    fn effective_peer_liveness_window_ms(&self, peer_addr: SocketAddr) -> u64 {
-        let configured = Self::duration_millis_u64(self.config.peer_liveness_window);
-        let peer_id = self
-            .connection_pool
-            .addr_to_peer_id
-            .read_sync(&peer_addr, |_, peer_id| peer_id.clone());
-        // Required (configured) peers are floored against the cadence that
-        // actually refreshes `last_response_received_ms` — the regular
-        // gossip round (`gossip_interval`), not peer-list discovery gossip
-        // (`peer_gossip_interval`). See `crate::config::required_peer_liveness_floor_ms`.
-        let required_peer_floor = peer_id
-            .as_ref()
-            .filter(|peer_id| self.connection_pool.is_required_peer(peer_id))
-            .map(|_| {
-                crate::config::required_peer_liveness_floor_ms(
-                    self.config.gossip_interval,
-                    self.config.peer_gossip_interval,
-                )
-            })
-            .unwrap_or(0);
-        configured.max(required_peer_floor)
     }
 
     pub(crate) fn trigger_immediate_peer_gossip(&self) {
@@ -8256,110 +8231,34 @@ impl<T: 'static> GossipRegistry<T> {
         let current_time = current_timestamp();
         let current_time_ms = crate::current_timestamp_millis();
 
-        // Collect peers that crossed the death threshold in this batch; we
-        // fire `handle_peer_death` after dropping the `gossip_state` lock
-        // to avoid lock-ordering issues (it acquires the same lock to
-        // reset `last_sequence`).
-        let mut newly_dead: Vec<SocketAddr> = Vec::new();
-
         for result in results {
             match result.outcome {
                 Ok(response_opt) => {
-                    let liveness_window_ms =
-                        self.effective_peer_liveness_window_ms(result.peer_addr);
-                    let mut crossed_threshold = false;
                     {
                         let mut gossip_state = self.gossip_state.lock().await;
                         if let Some(peer_info) = gossip_state.peers.get_mut(&result.peer_addr) {
                             peer_info.last_attempt = current_time;
                             peer_info.last_sent_sequence = result.sent_sequence;
 
-                            // Only update last_success if we're not in a failed state.
-                            // Note: with persistent connections, `Ok(_)` doesn't prove
-                            // the peer is alive — only that our kernel buffer accepted
-                            // the bytes. Response-asymmetry detection below catches
-                            // the half-open / paused-peer case.
+                            // A successful fire-and-forget gossip write is transport
+                            // progress, but it is not a liveness-probe response. The
+                            // production sender uses `tell()`, so `response_opt` is
+                            // always `None` for real wire traffic: no response was
+                            // requested. Treating that `None` as a failed response
+                            // created a second, weaker failure detector alongside SWIM
+                            // and tore healthy, quiescent mesh connections down on a
+                            // timer. SWIM owns application-level Ping/Ack/PingReq and
+                            // suspicion; this layer only accounts actual send/socket
+                            // errors.
                             if peer_info.failures < self.config.max_peer_failures {
                                 peer_info.last_success = current_time;
-                            }
-
-                            // Response-asymmetry liveness check (Part 3b in the
-                            // gossip-protocol-native cleanup plan):
-                            //
-                            // If we haven't received any inbound payload from
-                            // this peer (delta response, full sync, etc.) for
-                            // the effective liveness window, treat the next
-                            // no-response round as a soft failure. Configured
-                            // peers floor this window to two regular-gossip
-                            // (`gossip_interval`) intervals — the cadence
-                            // that actually refreshes
-                            // `last_response_received_ms` — so one delayed
-                            // inbound gossip response cannot false-fail a
-                            // required direct route. This still catches
-                            // "outbound writes succeed at the kernel level but
-                            // the peer isn't reading anymore" — the scenario
-                            // that kept `538a99…` alive on `stratum-devnet-a`
-                            // for 66 minutes.
-                            //
-                            // `last_response_received_ms` is initialised to the
-                            // peer's creation time, so a brand-new peer doesn't
-                            // immediately look stale; it has at least one
-                            // `peer_liveness_window` to be observed responding.
-                            let silence_ms =
-                                current_time_ms.saturating_sub(peer_info.last_response_received_ms);
-                            if response_opt.is_none()
-                                && silence_ms > liveness_window_ms
-                                && peer_info.failures < self.config.max_peer_failures
-                            {
-                                peer_info.failures += 1;
-                                info!(
-                                    peer = %result.peer_addr,
-                                    silence_ms,
-                                    liveness_window_ms,
-                                    new_failures = peer_info.failures,
-                                    "no response within effective peer liveness window; \
-                                     incrementing failures"
-                                );
-                                if peer_info.failures == self.config.max_peer_failures {
-                                    peer_info.last_failure_time = Some(current_time);
-                                    // Captured HERE, under this exact write,
-                                    // not hoisted from the top of the batch:
-                                    // this loop awaits per-item (below, and
-                                    // in earlier iterations), so a
-                                    // batch-start instant can be arbitrarily
-                                    // stale by the time THIS peer's failure
-                                    // is actually recorded -- the same
-                                    // class of "time value that doesn't
-                                    // correspond to the event it
-                                    // represents" bug as the whole-second
-                                    // `last_failure_time` reconstruction
-                                    // this field replaced. A too-early
-                                    // instant here makes a later, genuinely
-                                    // unrelated reconnect look like it
-                                    // happened after this failure, wrongly
-                                    // and permanently blocking cleanup.
-                                    peer_info.last_failure_instant =
-                                        Some(std::time::Instant::now());
-                                    crossed_threshold = true;
-                                    info!(peer = %result.peer_addr,
-                                          "peer reached max failures \
-                                           (response-asymmetry)");
-                                }
                             }
                         }
                     }
 
-                    if crossed_threshold {
-                        newly_dead.push(result.peer_addr);
-                    }
-
-                    // Process response if we got one. Only inbound
-                    // payload counts as proof of liveness — a successful
-                    // send only means the kernel buffer accepted the
-                    // bytes, which is exactly what the
-                    // response-asymmetry detector above is designed to
-                    // catch. Reset failures here, not on every
-                    // successful send.
+                    // Kept for synthetic/direct callers that can supply an inline
+                    // response. The production periodic sender is fire-and-forget,
+                    // so its response arrives independently through the read loop.
                     if let Some(response) = response_opt {
                         self.mark_response_received(result.peer_addr, current_time_ms)
                             .await;
@@ -8378,15 +8277,14 @@ impl<T: 'static> GossipRegistry<T> {
                     warn!(peer = %result.peer_addr, error = %err,
                           hard_socket_err,
                           "failed to gossip to peer");
-                    let mut crossed_threshold = false;
                     {
                         let mut gossip_state = self.gossip_state.lock().await;
                         if let Some(peer_info) = gossip_state.peers.get_mut(&result.peer_addr) {
                             // Hard socket termination (BrokenPipe, ConnectionReset,
                             // ConnectionAborted, NotConnected, RefusedConnection) is
-                            // unambiguous evidence the peer is gone — jump straight
-                            // to threshold instead of waiting for `max_peer_failures`
-                            // separate gossip rounds.
+                            // unambiguous evidence this send path failed — jump retry
+                            // accounting straight to threshold. The stream IO owner,
+                            // which has exact instance identity, owns teardown.
                             //
                             // For other errors (Timeout, DecodingError, etc.) keep
                             // the existing one-failure-at-a-time accumulation, so a
@@ -8407,13 +8305,10 @@ impl<T: 'static> GossipRegistry<T> {
                                 // Mark failure time if this puts us at max failures
                                 if peer_info.failures >= self.config.max_peer_failures {
                                     peer_info.last_failure_time = Some(current_time);
-                                    // See the matching comment in the `Ok`
-                                    // arm above: captured here, under this
-                                    // write, not hoisted from the batch
-                                    // start.
+                                    // Capture the causal instant under the same
+                                    // state write as the failure verdict.
                                     peer_info.last_failure_instant =
                                         Some(std::time::Instant::now());
-                                    crossed_threshold = true;
                                     info!(peer = %result.peer_addr,
                                           hard_socket_err,
                                           "peer reached max failures");
@@ -8427,75 +8322,15 @@ impl<T: 'static> GossipRegistry<T> {
                             peer_info.last_attempt = current_time;
                         }
                     }
-                    if crossed_threshold {
-                        newly_dead.push(result.peer_addr);
-                    }
                 }
             }
-        }
-
-        // Crossing the failure threshold is a transport-local verdict,
-        // not an actor-liveness verdict. Keep remote actors available
-        // for reconnect/failover and let `cleanup_dead_peers` reclaim
-        // them only after the dead-peer timeout. This keeps the gossip
-        // table stable during short disconnects and avoids publishing
-        // ActorRemoved tombstones before the consensus path has even run.
-        newly_dead.sort_by_key(|a| (a.ip(), a.port()));
-        newly_dead.dedup();
-        for addr in newly_dead {
-            // The peer crossed the failure threshold via response-asymmetry: we
-            // kept sending but received nothing back for `peer_liveness_window`.
-            // Tear down the now-stale connection so the very next send/connect
-            // re-establishes a fresh one (self-correcting), and so
-            // `get_connected_connection_to_peer` stops reporting a dead peer as
-            // connected. Only the transport connection is removed — actor state is
-            // RETAINED so a reconnecting peer keeps its actors (a returning peer's
-            // re-negotiation handshake replaces the entry even sooner via
-            // `publish_current_peer_connection`).
-            //
-            let pool = &self.connection_pool;
-            let peer_id = pool.addr_to_peer_id.read_sync(&addr, |_, v| v.clone());
-            let mut torn_down_via_peer_id = false;
-            if let Some(peer_id) = peer_id
-                && pool.disconnect_connection_by_peer_id(&peer_id).is_some()
-            {
-                info!(
-                    peer = %addr,
-                    %peer_id,
-                    "peer reached failure threshold; tore down stale connection \
-                     (actors retained for reconnection)"
-                );
-                torn_down_via_peer_id = true;
-            }
-            if !torn_down_via_peer_id {
-                if pool.has_connection(&addr) {
-                    pool.remove_connection(addr);
-                    info!(
-                        peer = %addr,
-                        "peer reached failure threshold; removed stale connection by address \
-                         (actors retained for reconnection)"
-                    );
-                } else {
-                    info!(
-                        peer = %addr,
-                        "peer reached failure threshold; no live connection to tear down \
-                         (actors retained for reconnection)"
-                    );
-                }
-            }
-
-            // Same guarded discovery clear as the other two teardown paths
-            // -- see `clear_discovery_state_if_no_live_connection`'s
-            // comment for the full rationale.
-            self.clear_discovery_state_if_no_live_connection(addr).await;
-            self.trigger_immediate_peer_gossip();
         }
     }
 
-    /// Record that we received a response payload from a peer. Updates
-    /// `last_response_received_ms` so the response-asymmetry detector in
-    /// `apply_gossip_results` knows the peer is alive at the application
-    /// layer, not just the kernel-buffer-accepted layer.
+    /// Record that we received a response payload from a peer. Updates the
+    /// diagnostic response timestamp and resets transport-send failure
+    /// accounting. Application-level failure detection belongs to SWIM and
+    /// does not infer a verdict from this registry-specific timestamp.
     ///
     /// Also the SOURCE of `RegistryOwnerHandle::note_liveness_evidence`:
     /// an inbound response is genuinely DIRECT evidence the peer occupying
@@ -8564,9 +8399,9 @@ impl<T: 'static> GossipRegistry<T> {
                     // `merge_full_sync` behavior.
                     peer_info.last_sequence = peer_info.last_sequence.max(delta_sequence);
                     peer_info.consecutive_deltas += 1;
-                    // Inbound payload from peer — proves app-level liveness.
-                    // Used by the response-asymmetry detector in
-                    // `apply_gossip_results`.
+                    // Preserve the response high-water mark as direct inbound
+                    // evidence for diagnostics/address ownership. SWIM, not
+                    // registry gossip, owns the peer-liveness verdict.
                     peer_info.last_response_received_ms =
                         peer_info.last_response_received_ms.max(now);
                 }
@@ -12568,11 +12403,11 @@ impl<T: 'static> GossipRegistry<T> {
             peer.peer_address = Some(source);
         }
         peer.last_success = peer.last_success.max(now);
-        // Inbound payload is real liveness evidence — the framing layer
-        // has decoded and dispatched at least one valid message on this
-        // socket. Refresh the response-asymmetry timestamp and clear
-        // the death verdict unconditionally (mirrors mark_peer_connected;
-        // softer signals like record_peer_activity stay gated).
+        // The framing layer decoded and dispatched a valid inbound message on
+        // this socket. Advance the diagnostic/direct-evidence timestamp and
+        // clear transport-send failures (mirrors mark_peer_connected; softer
+        // signals like record_peer_activity stay gated). SWIM owns the
+        // application-level peer-liveness verdict.
         peer.last_response_received_ms = peer.last_response_received_ms.max(now_ms);
         peer.failures = 0;
         peer.last_failure_time = None;
@@ -15098,41 +14933,6 @@ mod tests {
             Some(peer.to_node_id()),
             "a configured peer's GossipNodeId must be resolvable by address so the \
              dial pins it in the SNI instead of using a placeholder"
-        );
-    }
-
-    /// Liveness-window clamp bug: raising `gossip_interval` (the cadence that
-    /// actually refreshes `last_response_received_ms` via delta/full-sync
-    /// responses) far above `peer_gossip_interval` must still raise the
-    /// required-peer floor. Before the fix, the floor was computed from
-    /// `peer_gossip_interval*2` only, so a required peer with a slow
-    /// `gossip_interval` would be false-failed by the response-asymmetry
-    /// detector well before any inbound payload was actually overdue.
-    #[tokio::test]
-    async fn effective_liveness_window_floors_required_peer_to_gossip_interval_not_peer_gossip_interval()
-     {
-        let mut config = test_config_with_seed("effective-liveness-window-required-peer");
-        config.gossip_interval = Duration::from_secs(30);
-        config.peer_gossip_interval = Some(Duration::from_secs(5));
-        config.peer_liveness_window = Duration::from_secs(10);
-        let registry = GossipRegistry::<()>::new(test_addr(9500), config);
-        let peer = test_peer_id("effective-liveness-window-required-peer-remote");
-        let peer_addr = test_addr(9501);
-
-        registry
-            .connection_pool
-            .set_configured_peer_addr(&peer, peer_addr);
-        registry
-            .connection_pool
-            .add_addr_to_peer_id(peer_addr, peer.clone());
-
-        let effective = registry.effective_peer_liveness_window_ms(peer_addr);
-
-        assert!(
-            effective >= 60_000,
-            "required-peer floor must reflect the gossip_interval (30s) cadence that \
-             actually refreshes last_response_received_ms, not peer_gossip_interval (5s); \
-             got {effective}ms"
         );
     }
 
@@ -18272,14 +18072,12 @@ mod tests {
         assert_eq!(discovery.remaining_slots(), 1);
     }
 
-    /// The third real connection-teardown path: `apply_gossip_results`'s
-    /// response-asymmetry/hard-socket-error handling tears down a peer's
-    /// connection once it crosses `max_peer_failures`, independent of either
-    /// failure handler above. It must reclaim the discovery slot the same
-    /// way once no live connection remains.
+    /// An address-scoped gossip result has no connection-instance identity, so
+    /// it may update retry accounting but must not clear discovery or tear down
+    /// a possibly newer session. The exact stream IO failure handler owns that
+    /// lifecycle transition.
     #[tokio::test]
-    async fn apply_gossip_results_clears_discovery_when_threshold_crossed_and_no_live_connection_remains()
-     {
+    async fn apply_gossip_results_defers_discovery_clear_to_exact_stream_failure_handler() {
         let mut config = test_config_with_seed("discovery-disconnect-threshold");
         config.enable_peer_discovery = true;
         config.max_peers = 1;
@@ -18312,11 +18110,25 @@ mod tests {
         let discovery = state.peer_discovery.as_ref().unwrap();
         assert_eq!(
             discovery.connected_peer_count(),
-            0,
-            "crossing the failure threshold with no live connection remaining must clear \
-             discovery's Connected state"
+            1,
+            "an address-scoped batch result must not mutate connection lifecycle state"
         );
-        assert_eq!(discovery.remaining_slots(), 1);
+        assert_eq!(discovery.remaining_slots(), 0);
+        drop(state);
+
+        registry
+            .handle_peer_connection_failure(peer_addr, None)
+            .await
+            .unwrap();
+
+        let state = registry.gossip_state.lock().await;
+        let discovery = state.peer_discovery.as_ref().unwrap();
+        assert_eq!(discovery.connected_peer_count(), 0);
+        assert_eq!(
+            discovery.remaining_slots(),
+            1,
+            "the exact stream failure path must reclaim the discovery slot"
+        );
     }
 
     /// The direct-liveness guard's core invariant: a live connection for the

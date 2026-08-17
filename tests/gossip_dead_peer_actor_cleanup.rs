@@ -17,10 +17,13 @@
 //!    drops). Gossip rounds fail to dial it. `failures` crosses
 //!    threshold. Assert its actor entries are retained until timeout.
 //!
-//! 2. **stale case**: peer's TCP listener stays alive but it does NOT
-//!    process incoming gossip frames (deadlocked / paused). Gossip
-//!    RPCs time out. Same `failures++` path → same retained-actor
-//!    assertion.
+//! 2. **fire-and-forget contract**: `Ok(None)` means no response was
+//!    requested. It never increments failures or tears down a live session.
+//!    SWIM owns application-level peer liveness.
+//!
+//! 3. **address/instance boundary**: an address-scoped send result may update
+//!    retry accounting, but it cannot peer-wide disconnect a possibly newer
+//!    session. The failed stream's IO owner performs exact-instance teardown.
 
 use std::future::Future;
 use std::sync::Once;
@@ -242,15 +245,15 @@ async fn assert_transport_failure_retains_actor(
 /// In an in-process loopback test on a clean shutdown, the kernel
 /// keeps accepting bytes into its send buffer for many seconds, so
 /// the failure signal never reaches our gossip layer within the test
-/// window. The stale-peer test below exercises the same failure accounting
-/// via a deterministic gossip-RPC result path.
+/// window. The direct hard-socket-error and disconnect-handler tests below
+/// exercise the same failure accounting deterministically.
 ///
 /// Ignored by default. To exercise this case end-to-end, run with
 /// `--ignored` and a long timeout — production stratum at
 /// `stratum-devnet-a` reproduces the death-detection naturally after
 /// the gossip layer's keepalive trips (observed at `failures=3` in
 /// real logs).
-#[ignore = "requires real-network TCP keepalive timing; covered behaviorally by the stale-peer test below"]
+#[ignore = "requires real-network TCP keepalive timing; covered by direct hard-error and disconnect-handler tests"]
 #[test]
 fn known_actors_owned_by_dropped_peer_are_retained() -> Result<(), DynError> {
     run_gossip_test(async {
@@ -261,8 +264,7 @@ fn known_actors_owned_by_dropped_peer_are_retained() -> Result<(), DynError> {
             peer_retry_interval: Duration::from_millis(200),
             connection_timeout: Duration::from_millis(250),
             response_timeout: Duration::from_millis(250),
-            // Default liveness window is 10 s; tighten for deterministic
-            // response-asymmetry detection in CI.
+            // Short side-table retention horizon for the test fixture.
             peer_liveness_window: Duration::from_millis(500),
             max_peer_failures: 3,
             ..Default::default()
@@ -309,24 +311,23 @@ fn known_actors_owned_by_dropped_peer_are_retained() -> Result<(), DynError> {
     })
 }
 
-/// Case 2: peer's TCP stays accepting but it never processes incoming
-/// gossip frames (deadlocked, paused, app-level hang).
+/// A successful periodic gossip send is not a liveness probe result.
 ///
-/// We simulate this by applying successful send results with no gossip
-/// response while `last_response_received_ms` is already outside the liveness
-/// window. Gossip rounds on the publisher side see "kernel accepted write,
-/// but the peer gave no app-level response" and the same `failures++` path
-/// fires. Same assertion as case 1.
+/// The production sender uses `tell()`, so every successful wire send reaches
+/// this boundary as `Ok(None)`: the `None` means "no response was requested",
+/// not "a requested response timed out". SWIM owns application-level peer
+/// liveness above this transport; only an actual send/socket error may add a
+/// transport failure here.
 #[test]
-fn known_actors_owned_by_stale_peer_are_retained() -> Result<(), DynError> {
+fn fire_and_forget_success_is_neutral_even_when_response_timestamp_is_stale() -> Result<(), DynError>
+{
     run_gossip_test(async {
         let config = GossipConfig {
             gossip_interval: Duration::from_millis(100),
             // Default retry_interval is 5 s, which makes "three failed
             // rounds" take ~10 s. Shrink so the test finishes quickly.
             peer_retry_interval: Duration::from_millis(200),
-            // Default liveness window is 10 s; tighten for deterministic
-            // response-asymmetry detection in CI.
+            // Short side-table retention horizon for the test fixture.
             peer_liveness_window: Duration::from_millis(500),
             // Default dial timeout is 10 s; tighten so each failed
             // redial to the accept-and-drop dummy listener completes
@@ -366,9 +367,9 @@ fn known_actors_owned_by_stale_peer_are_retained() -> Result<(), DynError> {
 
         assert_eq!(
             peer_failures(&publisher, sub_addr).await,
-            config.max_peer_failures,
-            "publisher's gossip should mark stale subscriber dead after \
-             max_peer_failures no-response rounds"
+            0,
+            "Ok(None) means a fire-and-forget send completed without requesting a \
+             response; it must not be reinterpreted as a failed liveness probe"
         );
 
         assert_transport_failure_retains_actor(&publisher, sub_addr, DEAD_ACTOR_NAME).await;
@@ -378,8 +379,164 @@ fn known_actors_owned_by_stale_peer_are_retained() -> Result<(), DynError> {
     })
 }
 
+/// Highest-level regression: repeated successful fire-and-forget results must
+/// not tear down a real, healthy pooled TLS connection, even if the legacy
+/// registry-response timestamp is arbitrarily stale. SWIM traffic and actor
+/// traffic use this same authenticated transport and own their own response
+/// semantics; registry gossip must not compete with them as a second failure
+/// detector.
 #[test]
-fn subsecond_liveness_window_counts_no_response() -> Result<(), DynError> {
+fn fire_and_forget_success_does_not_disconnect_a_healthy_pooled_peer() -> Result<(), DynError> {
+    run_gossip_test(async {
+        let config = GossipConfig {
+            // Keep background rounds out of this deterministic boundary test.
+            gossip_interval: Duration::from_secs(3_600),
+            peer_gossip_interval: None,
+            cleanup_interval: Duration::from_secs(3_600),
+            peer_retry_interval: Duration::from_secs(3_600),
+            peer_supervisor_interval: Duration::from_secs(3_600),
+            max_peer_failures: 2,
+            ..Default::default()
+        };
+
+        let observer = create_node(config.clone()).await?;
+        let peer = create_node(config.clone()).await?;
+        let peer_addr = peer.registry.bind_addr;
+        let peer_id = peer.registry.peer_id.clone();
+
+        observer
+            .registry
+            .add_peer_with_node_id(
+                peer_addr,
+                Some(peer_id.to_node_id()),
+                icanact_remote::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+        observer
+            .registry
+            .configure_peer(peer_id.clone(), peer_addr)
+            .await;
+        observer.registry.connect_to_peer(&peer_id).await?;
+        assert!(
+            observer.lookup_peer(&peer_id).await.is_ok(),
+            "test precondition: the healthy peer must be connected"
+        );
+
+        {
+            let mut state = observer.registry.gossip_state.lock().await;
+            state
+                .peers
+                .get_mut(&peer_addr)
+                .expect("connected peer must be tracked")
+                .last_response_received_ms = 0;
+        }
+
+        for sequence in 0..config.max_peer_failures {
+            observer
+                .registry
+                .apply_gossip_results(vec![icanact_remote::registry::GossipResult {
+                    peer_addr,
+                    sent_sequence: sequence as u64,
+                    outcome: Ok(None),
+                }])
+                .await;
+        }
+
+        assert_eq!(
+            peer_failures(&observer, peer_addr).await,
+            0,
+            "successful fire-and-forget sends must not accrue transport failures"
+        );
+        assert!(
+            observer.lookup_peer(&peer_id).await.is_ok(),
+            "registry gossip must not tear down a healthy TLS session; SWIM owns \
+             application-level liveness"
+        );
+
+        observer.shutdown().await;
+        peer.shutdown().await;
+        Ok(())
+    })
+}
+
+/// A gossip result is address-scoped and carries no connection-instance
+/// identity. It may record a hard transport failure for retry accounting, but
+/// it cannot safely tear down whatever session is current for that identity:
+/// the failed write's IO owner performs the exact-instance teardown, while a
+/// replacement may already have been published by the time this batch applies.
+#[test]
+fn address_scoped_hard_error_does_not_disconnect_the_current_peer_session() -> Result<(), DynError>
+{
+    run_gossip_test(async {
+        let config = GossipConfig {
+            gossip_interval: Duration::from_secs(3_600),
+            peer_gossip_interval: None,
+            cleanup_interval: Duration::from_secs(3_600),
+            peer_retry_interval: Duration::from_secs(3_600),
+            peer_supervisor_interval: Duration::from_secs(3_600),
+            max_peer_failures: 2,
+            ..Default::default()
+        };
+        let observer = create_node(config.clone()).await?;
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let peer_addr = listener.local_addr()?;
+        drop(listener);
+        let peer_id = SecretKey::generate().to_keypair().peer_id();
+
+        observer
+            .registry
+            .add_peer_with_node_id(
+                peer_addr,
+                Some(peer_id.to_node_id()),
+                icanact_remote::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+        let _current_session = icanact_remote::test_helpers::install_silent_pooled_connection(
+            &observer,
+            peer_id.clone(),
+            peer_addr,
+        );
+        assert!(
+            observer
+                .registry
+                .connection_pool
+                .has_connection_by_peer_id(&peer_id),
+            "test precondition: a current peer session must be published"
+        );
+
+        observer
+            .registry
+            .apply_gossip_results(vec![icanact_remote::registry::GossipResult {
+                peer_addr,
+                sent_sequence: 0,
+                outcome: Err(icanact_remote::GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "simulated stale write result",
+                ))),
+            }])
+            .await;
+
+        assert_eq!(
+            peer_failures(&observer, peer_addr).await,
+            config.max_peer_failures,
+            "hard send errors must still update transport retry accounting"
+        );
+        assert!(
+            observer
+                .registry
+                .connection_pool
+                .has_connection_by_peer_id(&peer_id),
+            "an address-scoped batch result must not peer-wide disconnect the current \
+             session; the failed instance's IO owner performs exact-instance teardown"
+        );
+
+        observer.shutdown().await;
+        Ok(())
+    })
+}
+
+#[test]
+fn liveness_window_does_not_turn_fire_and_forget_success_into_a_probe() -> Result<(), DynError> {
     run_gossip_test(async {
         let config = GossipConfig {
             gossip_interval: Duration::from_millis(100),
@@ -415,9 +572,9 @@ fn subsecond_liveness_window_counts_no_response() -> Result<(), DynError> {
 
         assert_eq!(
             peer_failures(&publisher, sub_addr).await,
-            1,
-            "a 500ms peer_liveness_window must be evaluated in milliseconds, \
-             not rounded down to a whole-second boundary"
+            0,
+            "peer_liveness_window must not reinterpret Ok(None) as a timed-out \
+             probe: periodic gossip never requested a response"
         );
 
         publisher.shutdown().await;
@@ -567,7 +724,7 @@ fn configured_peer_live_connection_is_not_failed_by_peer_gossip_cadence_gap() ->
 }
 
 #[test]
-fn discovered_non_required_peer_still_uses_response_asymmetry_liveness() -> Result<(), DynError> {
+fn discovered_peer_fire_and_forget_success_is_not_liveness_evidence() -> Result<(), DynError> {
     run_gossip_test(async {
         let config = GossipConfig {
             gossip_interval: Duration::from_millis(100),
@@ -604,9 +761,9 @@ fn discovered_non_required_peer_still_uses_response_asymmetry_liveness() -> Resu
 
         assert_eq!(
             peer_failures(&publisher, peer_addr).await,
-            config.max_peer_failures,
-            "non-required discovered peers should still use response-asymmetry liveness; \
-             the configured-peer exception must not disable discovery failure detection"
+            0,
+            "discovered peers use the same fire-and-forget contract: Ok(None) means \
+             no response was requested, not that a liveness probe failed"
         );
 
         publisher.shutdown().await;
@@ -919,31 +1076,12 @@ fn socket_close_does_not_trigger_actor_removed_broadcast() -> Result<(), DynErro
     })
 }
 
-/// Stale-connection teardown over a *real, still-open* pooled stream — the
-/// UDP black-hole regression guard.
-///
-/// The synthetic-peer tests above prove the failure-consensus *accounting*
-/// (failures++, actors retained, no premature tombstone) but they never
-/// establish a pooled transport connection, so they cannot observe the other half
-/// of the contract: when a connected peer crosses `max_peer_failures` via
-/// **response-asymmetry** (we keep sending, it stops answering) the now-stale
-/// pooled connection must be **torn down** so the next send/connect
-/// re-establishes a fresh one (self-correcting).
-///
-/// Why response-asymmetry specifically — and why the peer must stay *up*: over
-/// TCP a dead peer sends a FIN, the read-loop observes the close, and
-/// `handle_peer_connection_failure` tears the connection down on its own (the
-/// `#[ignore]`d drop test). **Over UDP there is no FIN** — the socket stays
-/// "usable" forever, the read-loop never fires, and the *only* signal that the
-/// peer is gone is that it stopped answering gossip. Before the fix that left
-/// the dead connection lingering in the pool for 90 s+, so `has_connection*`
-/// reported a dead peer as connected and jobs silently black-holed. To isolate
-/// that exact path this test keeps a silent duplex peer endpoint **open** (no
-/// FIN, pooled connection stays usable) and avoids a second live registry, so the
-/// response-asymmetry verdict in `apply_gossip_results` is the sole thing that
-/// can remove the connection.
+/// A fire-and-forget result over a real, still-open pooled stream remains
+/// neutral. The silent duplex endpoint deliberately supplies no inbound
+/// registry message, proving that an absent response to a request that was
+/// never made cannot become a transport or membership verdict.
 #[test]
-fn stale_peer_failure_tears_down_connection_but_retains_actors() -> Result<(), DynError> {
+fn no_response_result_does_not_tear_down_a_silent_pooled_connection() -> Result<(), DynError> {
     run_gossip_test(async {
         let config = GossipConfig {
             // Quiet background gossip: the liveness results below are the
@@ -997,31 +1135,17 @@ fn stale_peer_failure_tears_down_connection_but_retains_actors() -> Result<(), D
                 .insert(DEAD_ACTOR_NAME.to_string());
         }
 
-        // An expected node identity makes this a required peer. Required
-        // peers floor liveness at two regular-gossip intervals, so backdate
-        // beyond that effective window rather than only the raw configured
-        // liveness duration.
-        let effective_liveness = config
-            .peer_liveness_window
-            .max(config.gossip_interval.saturating_mul(2));
-        let silence_ms = u64::try_from(
-            effective_liveness
-                .saturating_add(Duration::from_millis(1))
-                .as_millis(),
-        )
-        .unwrap_or(u64::MAX);
-
         {
             let mut state = publisher.registry.gossip_state.lock().await;
             state
                 .peers
                 .get_mut(&sub_addr)
                 .expect("silent peer must be present")
-                .last_response_received_ms =
-                icanact_remote::current_timestamp_millis().saturating_sub(silence_ms);
+                .last_response_received_ms = 0;
         }
 
-        // The duplex endpoint remains open, but no task can refresh liveness.
+        // The duplex endpoint remains open, but no task refreshes the legacy
+        // registry-response timestamp.
         for sequence in 0..config.max_peer_failures {
             publisher
                 .registry
@@ -1033,22 +1157,19 @@ fn stale_peer_failure_tears_down_connection_but_retains_actors() -> Result<(), D
                 .await;
         }
 
-        assert!(
-            peer_failures(&publisher, sub_addr).await >= config.max_peer_failures,
-            "publisher should mark the silent subscriber failed after no-response rounds"
+        assert_eq!(
+            peer_failures(&publisher, sub_addr).await,
+            0,
+            "a silent fixture does not turn a fire-and-forget send into a failed probe"
         );
 
-        // First half of the contract: the stale connection is torn down even
-        // though the socket never closed. This is what fails on the pre-fix
-        // code (the connection lingered as "usable").
         assert!(
-            !pool.has_connection(&sub_addr) && !pool.has_connection_by_peer_id(&sub_peer_id),
-            "stale connection to a peer past max_peer_failures must be torn down so the \
-             next send/connect self-corrects (UDP black-hole regression)"
+            pool.has_connection(&sub_addr) && pool.has_connection_by_peer_id(&sub_peer_id),
+            "address-scoped Ok(None) results must not tear down the current identity-scoped \
+             session; SWIM owns application-level liveness"
         );
 
-        // Second half (must still hold): tearing down the transport connection
-        // must NOT evict the peer's actors.
+        // Neutral registry results also leave actor routing untouched.
         assert_transport_failure_retains_actor(&publisher, sub_addr, DEAD_ACTOR_NAME).await;
 
         publisher.shutdown().await;

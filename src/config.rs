@@ -261,22 +261,16 @@ pub struct GossipConfig {
     /// When set, this DNS name is included in gossip messages so peers can re-resolve
     /// the address if the underlying IP changes (e.g., Kubernetes pod restarts)
     pub advertise_dns: Option<String>,
-    /// How long to keep writing to a peer that never sends responses
-    /// back before treating subsequent rounds as failures.
+    /// Retention horizon used for dynamic peer-liveness side-table entries.
     ///
-    /// `apply_gossip_results` records a round as `Ok(_)` whenever the
-    /// outbound write returned successfully — but on a persistent
-    /// connection that may just mean the kernel buffered the bytes for
-    /// a peer that has since stopped reading. The response-asymmetry
-    /// detector compares `current_time - last_response_received_ms` to
-    /// this window: if we've been writing into a black hole for longer
-    /// than this window without ever seeing an inbound response, the
-    /// next no-response round increments `failures`, eventually
-    /// tripping `max_peer_failures` and firing the dead-peer cleanup
-    /// hook in `registry::handle_peer_death`.
+    /// Kept under its existing public name for configuration compatibility.
+    /// Registry gossip does not use this value to decide whether a peer is
+    /// alive: periodic gossip is fire-and-forget and therefore has no response
+    /// deadline. Transport EOF/socket errors own connection-instance teardown;
+    /// the actor framework's SWIM layer owns application-level Ping/Ack/PingReq,
+    /// suspicion, and Dead verdicts.
     ///
-    /// Default: 10 s. Set very small (e.g., 500 ms) in tests for
-    /// determinism.
+    /// Default: 10 s.
     pub peer_liveness_window: Duration,
     /// Maximum number of inbound connections allowed to be in the
     /// post-accept/pre-identified handshake stage simultaneously. Caps half-open
@@ -398,46 +392,11 @@ impl Default for GossipConfig {
     }
 }
 
-/// Minimum safe `peer_liveness_window`, in milliseconds, given the cadence
-/// that actually refreshes `last_response_received_ms` for a peer.
-///
-/// `last_response_received_ms` is refreshed only by inbound payloads from
-/// the *regular* gossip round (delta-gossip responses, full-sync responses)
-/// — driven by `gossip_interval`. Peer-list discovery gossip (driven by
-/// `peer_gossip_interval`) is a separate, slower, fire-and-forget cadence
-/// used only to discover new peers: it has no response message and never
-/// touches `last_response_received_ms` (see
-/// `GossipRegistry::on_peer_list_gossip`). So the response-asymmetry
-/// detector's window must be floored against `gossip_interval`, not
-/// `peer_gossip_interval`.
-///
-/// `peer_gossip_interval` is accepted for call-site symmetry with the
-/// invariant callers enforce (and in case a future refresh path is ever
-/// added on that cadence) but does not currently affect the result.
-pub(crate) fn required_peer_liveness_floor_ms(
-    gossip_interval: Duration,
-    peer_gossip_interval: Option<Duration>,
-) -> u64 {
-    let _ = peer_gossip_interval;
-    u64::try_from(gossip_interval.saturating_mul(2).as_millis()).unwrap_or(u64::MAX)
-}
-
 impl GossipConfig {
     /// Enforce runtime invariants on a consumer-supplied config, clamping
     /// unsafe values to safe ones with a warning rather than silently honoring
     /// them. Called once when the config enters the registry; never on the hot
     /// path.
-    ///
-    /// Invariant: `peer_liveness_window >= gossip_interval * 2`. The
-    /// response-asymmetry detector compares elapsed time-since-last-response to
-    /// `peer_liveness_window`. `last_response_received_ms` is refreshed by the
-    /// regular gossip round, which runs on `gossip_interval` — not by peer-list
-    /// discovery gossip (`peer_gossip_interval`), which is a separate,
-    /// fire-and-forget cadence with no response message. If the window is
-    /// shorter than two regular-gossip intervals, a single delayed inbound
-    /// gossip response can false-fail an otherwise healthy peer. A consumer
-    /// that sets a too-small window would silently lose this protection;
-    /// clamp it up instead.
     ///
     /// # Errors
     ///
@@ -465,20 +424,6 @@ impl GossipConfig {
     /// identity. Builders may call this while assembling a partial config;
     /// registry construction still uses [`Self::validate_and_normalize`].
     pub fn normalize(&mut self) {
-        let min_window_ms =
-            required_peer_liveness_floor_ms(self.gossip_interval, self.peer_gossip_interval);
-        let min_window = Duration::from_millis(min_window_ms);
-        if self.peer_liveness_window < min_window {
-            tracing::warn!(
-                peer_liveness_window_ms = self.peer_liveness_window.as_millis(),
-                gossip_interval_ms = self.gossip_interval.as_millis(),
-                clamped_to_ms = min_window.as_millis(),
-                "peer_liveness_window < gossip_interval*2; clamping up to avoid \
-false-failing healthy peers on a single delayed inbound gossip response"
-            );
-            self.peer_liveness_window = min_window;
-        }
-
         // Keep the preferred-inbound wait strictly under the supervisor's
         // per-attempt budget so a single supervisor tick can wait out the
         // preferred-inbound window AND still complete the fallback dial. If the
@@ -591,11 +536,7 @@ mod tests {
         assert!(config.allow_private_discovery);
         assert!(!config.allow_loopback_discovery);
         assert!(!config.allow_link_local_discovery);
-        assert!(
-            config.peer_liveness_window >= config.peer_gossip_interval.unwrap() * 2,
-            "peer_liveness_window must allow at least two peer-gossip intervals; \
-otherwise healthy peers can be false-failed by one delayed inbound peer-gossip payload"
-        );
+        assert_eq!(config.peer_liveness_window, Duration::from_secs(10));
         assert_eq!(config.fail_ttl, Duration::from_secs(6 * 60 * 60));
         assert_eq!(config.pending_ttl, Duration::from_secs(60 * 60));
         assert_eq!(config.stale_ttl, Duration::from_secs(24 * 60 * 60));
@@ -604,105 +545,19 @@ otherwise healthy peers can be false-failed by one delayed inbound peer-gossip p
     }
 
     #[test]
-    fn validate_and_normalize_clamps_too_small_liveness_window() {
-        let mut config = valid_config();
-        config.peer_gossip_interval = Some(Duration::from_secs(5));
-        // Violate the invariant: window < gossip_interval*2 (10s, since the
-        // default `gossip_interval` is 5s).
-        config.peer_liveness_window = Duration::from_secs(3);
-
-        config.validate_and_normalize().expect("valid config");
-
-        assert_eq!(
-            config.peer_liveness_window,
-            Duration::from_secs(10),
-            "window must be clamped up to gossip_interval*2, since regular gossip \
-             (not peer-gossip) is what refreshes last_response_received_ms"
-        );
-    }
-
-    #[test]
-    fn validate_and_normalize_clamps_to_gossip_interval_when_larger_than_peer_gossip_interval() {
-        // Reproduces the reported bug: an operator raises `gossip_interval`
-        // (the cadence that actually refreshes `last_response_received_ms`
-        // via delta/full-sync responses) far above `peer_gossip_interval`,
-        // while `peer_liveness_window` stays at a value that was only safe
-        // relative to the old (incorrect) `peer_gossip_interval*2` floor.
+    fn validate_and_normalize_preserves_peer_liveness_retention_horizon() {
         let mut config = valid_config();
         config.gossip_interval = Duration::from_secs(30);
-        config.peer_gossip_interval = Some(Duration::from_secs(5));
-        config.peer_liveness_window = Duration::from_secs(10);
-
-        config.validate_and_normalize().expect("valid config");
-
-        assert!(
-            config.peer_liveness_window >= Duration::from_secs(60),
-            "peer_liveness_window must be clamped to at least 2x gossip_interval (60s) \
-             so a slow regular-gossip cadence cannot false-fail a healthy peer; got {:?}",
-            config.peer_liveness_window
-        );
-    }
-
-    #[test]
-    fn validate_and_normalize_still_clamps_when_peer_gossip_disabled() {
-        // `peer_gossip_interval` is irrelevant to the invariant: peer-list
-        // discovery gossip never refreshes `last_response_received_ms`
-        // (it is fire-and-forget with no response message), so the floor
-        // must be enforced purely from `gossip_interval`, even when peer
-        // discovery is disabled entirely.
-        let mut config = valid_config();
         config.peer_gossip_interval = None;
-        config.gossip_interval = Duration::from_secs(10);
-        config.peer_liveness_window = Duration::from_secs(1);
+        config.peer_liveness_window = Duration::from_millis(250);
 
         config.validate_and_normalize().expect("valid config");
 
         assert_eq!(
             config.peer_liveness_window,
-            Duration::from_secs(20),
-            "regular gossip drives the last_response_received_ms refresh regardless of \
-             peer_gossip_interval; the floor must still apply"
-        );
-    }
-
-    #[test]
-    fn required_peer_liveness_floor_uses_gossip_interval_when_larger() {
-        let floor_ms =
-            required_peer_liveness_floor_ms(Duration::from_secs(30), Some(Duration::from_secs(5)));
-        assert_eq!(floor_ms, 60_000);
-    }
-
-    #[test]
-    fn required_peer_liveness_floor_ignores_larger_peer_gossip_interval() {
-        // peer_gossip_interval never drives the refresh, so a larger
-        // peer_gossip_interval must not raise the floor above 2x gossip_interval.
-        let floor_ms =
-            required_peer_liveness_floor_ms(Duration::from_secs(5), Some(Duration::from_secs(30)));
-        assert_eq!(
-            floor_ms, 10_000,
-            "peer-gossip cadence never refreshes last_response_received_ms, so it must \
-             not raise the floor"
-        );
-    }
-
-    #[test]
-    fn required_peer_liveness_floor_handles_no_peer_gossip_interval() {
-        let floor_ms = required_peer_liveness_floor_ms(Duration::from_secs(7), None);
-        assert_eq!(floor_ms, 14_000);
-    }
-
-    #[test]
-    fn validate_and_normalize_leaves_conforming_config_unchanged() {
-        let mut config = valid_config();
-        config.peer_gossip_interval = Some(Duration::from_secs(5));
-        config.peer_liveness_window = Duration::from_secs(30); // >= 10s, conforming.
-
-        config.validate_and_normalize().expect("valid config");
-
-        assert_eq!(
-            config.peer_liveness_window,
-            Duration::from_secs(30),
-            "conforming window must be left unchanged"
+            Duration::from_millis(250),
+            "registry gossip has no response deadline to normalize against; this \
+             value is only a side-table retention horizon"
         );
     }
 
