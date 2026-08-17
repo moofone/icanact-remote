@@ -12868,6 +12868,28 @@ impl<T: 'static> GossipRegistry<T> {
             .unwrap_or(false)
     }
 
+    /// How many distinct `SocketAddr` aliases are currently tracked for
+    /// `peer_id`.
+    ///
+    /// More than one is ordinary, not a fault: a peer we have both dialled and
+    /// accepted a connection from is known under its advertised bind address
+    /// and under that accepted socket's ephemeral source address. The count
+    /// matters because per-identity gossip target selection
+    /// (`select_best_alias_per_identity`) grants each identity a single slot per
+    /// round, so every alias beyond the first is one that receives no gossip.
+    pub async fn peer_alias_count(&self, peer_id: &crate::PeerId) -> usize {
+        let gossip_state = self.gossip_state.lock().await;
+        gossip_state
+            .peers
+            .values()
+            .filter(|peer| {
+                peer.node_id
+                    .map(|node_id| node_id.to_peer_id())
+                    .is_some_and(|candidate| &candidate == peer_id)
+            })
+            .count()
+    }
+
     /// Check if we already have a connection to a peer by peer ID
     pub async fn has_connection_to_peer(&self, peer_id: &crate::PeerId) -> bool {
         let pool = &self.connection_pool;
