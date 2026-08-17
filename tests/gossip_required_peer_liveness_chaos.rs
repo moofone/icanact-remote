@@ -133,7 +133,8 @@ fn peer_lifecycle_event_counts() -> &'static Mutex<HashMap<PeerId, u64>> {
 /// intentionally excluded from quiescence tracking.
 fn lifecycle_event_peer(event: &TransportLifecycleEvent) -> Option<&PeerId> {
     match event {
-        TransportLifecycleEvent::OutboundStart { peer, .. } => peer.as_ref(),
+        TransportLifecycleEvent::OutboundStart { peer, .. }
+        | TransportLifecycleEvent::SocketFailurePoolTeardownComplete { peer, .. } => peer.as_ref(),
         TransportLifecycleEvent::ConnectionCountMarkerAttempt { .. }
         | TransportLifecycleEvent::ConnectionCountIncrementAttempt { .. } => None,
         TransportLifecycleEvent::OutboundSuppressedWaitInbound { peer, .. }
