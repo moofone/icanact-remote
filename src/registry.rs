@@ -8250,8 +8250,16 @@ impl<T: 'static> GossipRegistry<T> {
                             // timer. SWIM owns application-level Ping/Ack/PingReq and
                             // suspicion; this layer only accounts actual send/socket
                             // errors.
-                            if peer_info.failures < self.config.max_peer_failures {
-                                peer_info.last_success = current_time;
+                            peer_info.last_success = current_time;
+                            // `failures` is a consecutive transport-send error
+                            // streak, not a peer-liveness verdict. A later
+                            // successful write ends that streak even though it
+                            // does not prove the remote application processed
+                            // the frame or refresh the response timestamp.
+                            if peer_info.failures > 0 {
+                                peer_info.failures = 0;
+                                peer_info.last_failure_time = None;
+                                peer_info.last_failure_instant = None;
                             }
                         }
                     }

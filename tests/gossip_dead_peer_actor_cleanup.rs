@@ -375,6 +375,67 @@ fn fire_and_forget_success_is_neutral_even_when_response_timestamp_is_stale() ->
     })
 }
 
+/// A successful transport write clears the consecutive send-error streak even
+/// though it does not constitute an application-level liveness response.
+#[test]
+fn fire_and_forget_success_clears_transport_send_failure_streak() -> Result<(), DynError> {
+    run_gossip_test(async {
+        let config = GossipConfig {
+            gossip_interval: Duration::from_secs(3_600),
+            peer_gossip_interval: None,
+            peer_retry_interval: Duration::from_secs(3_600),
+            peer_supervisor_interval: Duration::from_secs(3_600),
+            cleanup_interval: Duration::from_secs(3_600),
+            max_peer_failures: 3,
+            ..Default::default()
+        };
+        let publisher = create_node(config.clone()).await?;
+        let (peer_addr, _) =
+            seed_known_actor_for_synthetic_peer(&publisher, DEAD_ACTOR_NAME).await?;
+
+        publisher
+            .registry
+            .apply_gossip_results(vec![icanact_remote::registry::GossipResult {
+                peer_addr,
+                sent_sequence: 1,
+                outcome: Err(icanact_remote::GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "simulated transport write failure",
+                ))),
+            }])
+            .await;
+        {
+            let state = publisher.registry.gossip_state.lock().await;
+            let peer = state.peers.get(&peer_addr).expect("synthetic peer exists");
+            assert_eq!(peer.failures, config.max_peer_failures);
+            assert!(peer.last_failure_time.is_some());
+            assert!(peer.last_failure_instant.is_some());
+        }
+
+        publisher
+            .registry
+            .apply_gossip_results(vec![icanact_remote::registry::GossipResult {
+                peer_addr,
+                sent_sequence: 2,
+                outcome: Ok(None),
+            }])
+            .await;
+
+        let state = publisher.registry.gossip_state.lock().await;
+        let peer = state.peers.get(&peer_addr).expect("synthetic peer exists");
+        assert_eq!(
+            peer.failures, 0,
+            "successful transport progress must clear the consecutive send-error streak"
+        );
+        assert!(peer.last_failure_time.is_none());
+        assert!(peer.last_failure_instant.is_none());
+        drop(state);
+
+        publisher.shutdown().await;
+        Ok(())
+    })
+}
+
 /// Highest-level regression: repeated successful fire-and-forget results must
 /// not tear down a real, healthy pooled TLS connection, even if the legacy
 /// registry-response timestamp is arbitrarily stale. SWIM traffic and actor
