@@ -6721,9 +6721,9 @@ fn count_waiting_slots(tracker: &CorrelationTracker) -> usize {
         .count()
 }
 
-/// Build a `PeerInfo` whose `last_response_received_ms` is set to `stale_time`
-/// and that has the gossip protocol's response-asymmetry detector partway
-/// through tripping (one accumulated failure).
+/// Build a `PeerInfo` with old inbound-response diagnostics and one accumulated
+/// transport-send failure. Used to verify authenticated inbound traffic resets
+/// only the current session's bookkeeping.
 fn stale_peer_info(addr: SocketAddr, stale_time: u64) -> crate::registry::PeerInfo {
     crate::registry::PeerInfo {
         address: addr,
@@ -7058,25 +7058,12 @@ async fn full_sync_response_body_len_with_gossip_header_overhead_over_limit_is_r
     );
 }
 
-// Regression test for the FullSyncResponse / DeltaGossip / FullSync inbound
-// reset paths in `handle_incoming_message`. These paths previously reset
-// `failures` and `last_success` when a peer sent us a message over the
-// persistent bidirectional connection, but forgot to refresh
-// `last_response_received_ms`. Because `apply_gossip_results` uses
-// `last_response_received_ms` as its application-layer liveness signal (the
-// response-asymmetry detector at registry.rs:3475), the omission caused a
-// permanent log-spam loop on peers whose responses only ever arrived via
-// the bidirectional path:
-//
-//   - outbound gossip round sees `Ok(None)` (no inline reply) and stale
-//     `last_response_received_ms` → bumps `failures` from 0 to 1
-//   - FullSyncResponse arrives moments later over the persistent stream →
-//     resets `failures` back to 0
-//   - `last_response_received_ms` never moves, so the next round repeats.
-//
-// These tests pin the post-fix invariant: any inbound payload from a peer
-// must update `last_response_received_ms`, mirroring the inline response path
-// in `GossipRegistry::handle_gossip_response`.
+// Regression tests for the FullSyncResponse / DeltaGossip / FullSync inbound
+// bookkeeping paths in `handle_incoming_message`. Any authenticated inbound
+// payload advances `last_response_received_ms`, preserving a useful diagnostic
+// and direct address-ownership evidence high-water mark. The timestamp is not
+// a registry-level failure deadline: periodic gossip is fire-and-forget and
+// SWIM owns application-level peer liveness.
 #[tokio::test]
 async fn full_sync_response_updates_last_response_received_ms() {
     let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -9416,9 +9403,9 @@ async fn stale_third_connection_cannot_self_heal_while_a_different_successor_is_
 /// those fields were reset UNCONDITIONALLY, before (FullSync) or
 /// independent of (FullSyncResponse) the session-scoped merge -- so even
 /// though the merge itself correctly dropped the stale content, the
-/// failure-state reset had already applied, masking real peer
-/// unresponsiveness and perturbing `should_use_delta_state`'s strategy
-/// choice via a stale `consecutive_deltas`.
+/// failure-state reset had already applied, attributing stale-session inbound
+/// evidence to the replacement and perturbing `should_use_delta_state`'s
+/// strategy choice via a stale `consecutive_deltas`.
 #[tokio::test]
 async fn stale_full_sync_and_response_on_old_connection_do_not_reset_health_bookkeeping() {
     use crate::{GossipConfig, registry::GossipRegistry};

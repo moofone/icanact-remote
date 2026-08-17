@@ -1,5 +1,4 @@
 use bytes::Bytes;
-use std::net::SocketAddr;
 use std::sync::{Mutex, OnceLock};
 use tokio::sync::Notify;
 use tokio::time::{Duration, sleep};
@@ -210,7 +209,7 @@ pub struct SilentPooledConnection {
 pub fn install_silent_pooled_connection(
     registry: &crate::GossipRegistryHandle,
     peer_id: crate::PeerId,
-    peer_addr: SocketAddr,
+    peer_addr: std::net::SocketAddr,
 ) -> SilentPooledConnection {
     use crate::connection_pool::{
         BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,

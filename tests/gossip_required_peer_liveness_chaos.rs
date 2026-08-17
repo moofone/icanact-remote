@@ -800,20 +800,13 @@ async fn configured_peers_retry_until_late_peer_comes_online() -> Result<(), Dyn
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn required_peer_drops_after_two_liveness_failures_and_recovers_on_reconnect()
--> Result<(), DynError> {
+async fn required_peer_is_not_dropped_by_fire_and_forget_gossip_results() -> Result<(), DynError> {
     let mut config = cadence_chaos_config();
     config.peer_gossip_interval = Some(Duration::from_millis(250));
     config.peer_liveness_window = Duration::from_millis(100);
     config.peer_supervisor_interval = Duration::from_secs(3600);
     config.peer_retry_interval = Duration::from_secs(3600);
     config.max_peer_failures = 2;
-    // The registry normalizes required-peer liveness to at least two regular
-    // gossip intervals. Keep the synthetic silence aligned with the effective
-    // runtime configuration while the one-hour cadence suppresses background
-    // rounds during this deterministic test.
-    config.normalize();
-
     let asks_a = Arc::new(AtomicU64::new(0));
     let asks_b = Arc::new(AtomicU64::new(0));
     let node_a = node(config.clone(), "a", asks_a).await?;
@@ -834,79 +827,28 @@ async fn required_peer_drops_after_two_liveness_failures_and_recovers_on_reconne
         b"b:before-drop"
     );
 
-    make_peer_silent(
-        &node_a,
-        node_b.registry.bind_addr,
-        config
-            .peer_liveness_window
-            .saturating_add(Duration::from_millis(1)),
-    )
-    .await;
+    make_peer_silent(&node_a, node_b.registry.bind_addr, Duration::from_secs(60)).await;
     apply_no_response_rounds(&node_a, node_b.registry.bind_addr, 2).await;
     assert_eq!(
         peer_failures(&node_a, node_b.registry.bind_addr).await,
-        2,
-        "two consecutive post-window no-response rounds should mark the peer failed"
+        0,
+        "Ok(None) reports a successful fire-and-forget send, not a failed SWIM probe"
     );
     assert!(
         node_a
             .client()
             .lookup_connected_peer(&node_b.registry.peer_id)
-            .is_none(),
-        "failed peer connection should be dropped from direct lookup cache"
-    );
-    let stale_alias = "127.0.0.1:9".parse()?;
-    {
-        let mut state = node_a.registry.gossip_state.lock().await;
-        let mut alias = state
-            .peers
-            .get(&node_b.registry.bind_addr)
-            .expect("canonical peer must remain tracked")
-            .clone();
-        alias.address = stale_alias;
-        alias.failures = 2;
-        alias.last_failure_time = Some(icanact_remote::current_timestamp());
-        alias.last_failure_instant = Some(std::time::Instant::now());
-        state.peers.insert(stale_alias, alias);
-    }
-
-    node_a
-        .registry
-        .connect_to_peer(&node_b.registry.peer_id)
-        .await?;
-    assert_eq!(
-        peer_failures(&node_a, node_b.registry.bind_addr).await,
-        0,
-        "successful reconnect must immediately clear liveness failures"
+            .is_some(),
+        "registry gossip must leave the healthy SWIM transport session connected"
     );
     assert_eq!(
-        peer_failures(&node_a, stale_alias).await,
-        2,
-        "successful reconnect must not clear stale same-node-id aliases"
-    );
-    // Same class of race as `configured_peers_retry_until_late_peer_comes_
-    // online`: `connect_to_peer` returning above proves the reconnect
-    // attempt succeeded, not that the resulting session has settled past
-    // whatever tie-break/finalization the fresh connection is still
-    // completing. A single `ask_peer` here flaked for exactly that reason;
-    // `ask_peer_until_success` is this file's established fix for asking
-    // through a freshly (re)established connection (see
-    // `indirect_peer_is_rediscovered_immediately_when_seen_by_direct_
-    // neighbor`'s doc comment) — at-least-once, so the ask count below
-    // allows for a legitimate extra retry rather than asserting exactly 2.
-    assert_eq!(
-        ask_peer_until_success(
-            &node_a,
-            &node_b.registry.peer_id,
-            b"after-reconnect",
-            Duration::from_secs(1),
-        )
-        .await?,
-        b"b:after-reconnect"
+        ask_peer(&node_a, &node_b.registry.peer_id, b"after-neutral-results").await?,
+        b"b:after-neutral-results"
     );
     assert!(
         asks_b.load(Ordering::Acquire) >= 2,
-        "actor should receive asks before failure and after reconnect"
+        "actor should receive asks before and after neutral registry results; \
+         the settling helper retries at the RPC layer, so delivery is at least once"
     );
 
     node_a.shutdown().await;

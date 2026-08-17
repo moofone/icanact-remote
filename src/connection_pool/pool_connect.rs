@@ -4760,13 +4760,10 @@ pub(crate) fn handle_incoming_message_with_instance(
                                 peer_info.last_failure_instant = None;
                             }
                             peer_info.last_success = crate::current_timestamp();
-                            // Inbound payload from peer — proves app-level liveness.
-                            // The response-asymmetry detector in
-                            // `apply_gossip_results` reads this field to decide
-                            // whether outbound writes that returned `Ok(None)`
-                            // were actually heard by the peer's application
-                            // layer. Mirror the inline-response path in
-                            // `GossipRegistry::handle_gossip_response`.
+                            // Preserve the inbound response high-water mark for
+                            // diagnostics and direct address-ownership evidence.
+                            // Registry gossip does not derive a failure verdict
+                            // from it; SWIM owns application-level liveness.
                             peer_info.last_response_received_ms = crate::current_timestamp_millis();
 
                             peer_info.last_sequence =
