@@ -1,7 +1,7 @@
 #[test]
 fn remote_invariants_are_present_and_complete() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("docs/architecture/REMOTE_INNVARIANTS.md");
+        .join("docs/architecture/REMOTE_INVARIANTS.md");
     let contents = std::fs::read_to_string(&path)
         .unwrap_or_else(|error| panic!("{} must exist: {error}", path.display()));
 
@@ -47,7 +47,7 @@ fn remote_invariants_are_present_and_complete() {
     }
 
     assert!(
-        include_str!("../README.md").contains("docs/architecture/REMOTE_INNVARIANTS.md"),
+        include_str!("../README.md").contains("docs/architecture/REMOTE_INVARIANTS.md"),
         "README must link the canonical remote architecture contract"
     );
 }

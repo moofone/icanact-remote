@@ -3,7 +3,7 @@
 `icanact_remote` is a Rust crate for remote actor discovery, peer connectivity, and tell/ask messaging over authenticated transports.
 
 The canonical remote-transport contract is
-[`docs/architecture/REMOTE_INNVARIANTS.md`](docs/architecture/REMOTE_INNVARIANTS.md).
+[`docs/architecture/REMOTE_INVARIANTS.md`](docs/architecture/REMOTE_INVARIANTS.md).
 
 ## What the crate provides
 
