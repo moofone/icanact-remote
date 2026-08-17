@@ -156,8 +156,16 @@ async fn publisher_recovers_from_every_round_of_connection_churn() -> icanact_re
         baseline.remote_enqueued >= 1,
         "baseline publish never reached the subscriber (stats={baseline:?})"
     );
+    assert!(
+        wait_until(Duration::from_secs(5), async || {
+            received.load(Ordering::SeqCst) >= 1
+        })
+        .await,
+        "baseline was enqueued but never delivered"
+    );
 
     for round in 0..ROUNDS {
+        let delivered_before = received.load(Ordering::SeqCst);
         // Alternate the two entry points the production logs recorded: the
         // address-keyed `socket disconnection detected` handler, and the
         // identity-keyed one behind `reason="disconnect_by_peer_id"`.
@@ -201,9 +209,10 @@ async fn publisher_recovers_from_every_round_of_connection_churn() -> icanact_re
         }
 
         let recovered = wait_until(ROUND_BUDGET, async || {
-            publish(b"probe")
+            let enqueued = publish(b"probe")
                 .map(|stats| stats.remote_enqueued >= 1)
-                .unwrap_or(false)
+                .unwrap_or(false);
+            enqueued && received.load(Ordering::SeqCst) > delivered_before
         })
         .await;
 
@@ -215,14 +224,11 @@ async fn publisher_recovers_from_every_round_of_connection_churn() -> icanact_re
              was {stats:?}",
             round % 4
         );
+        assert!(
+            received.load(Ordering::SeqCst) > delivered_before,
+            "round {round} enqueued a frame but did not deliver one to the subscriber"
+        );
     }
-
-    assert!(
-        received.load(Ordering::SeqCst) >= ROUNDS,
-        "publisher reported enqueued frames every round but the subscriber \
-         received only {} of them",
-        received.load(Ordering::SeqCst)
-    );
 
     subscriber.shutdown_and_wait().await;
     publisher.shutdown_and_wait().await;
@@ -316,7 +322,6 @@ async fn publisher_recovers_when_subscriber_process_restarts_unannounced()
         baseline.remote_enqueued >= 1,
         "baseline publish never reached the subscriber (stats={baseline:?})"
     );
-
     // The subscriber's process exits. The publisher is told nothing and still
     // holds a pooled connection to an address nobody is listening on.
     drop(sub);
@@ -438,6 +443,14 @@ async fn selected_peers_publisher_recovers_after_socket_close() -> icanact_remot
         baseline.remote_enqueued >= 1,
         "baseline publish never reached the subscriber (stats={baseline:?})"
     );
+    assert!(
+        wait_until(Duration::from_secs(5), async || {
+            received.load(Ordering::SeqCst) >= 1
+        })
+        .await,
+        "baseline SelectedPeers frame was enqueued but never delivered"
+    );
+    let delivered_before = received.load(Ordering::SeqCst);
 
     // The socket dies. The subscriber stays up and subscribed throughout.
     let _ = publisher
@@ -456,9 +469,10 @@ async fn selected_peers_publisher_recovers_after_socket_close() -> icanact_remot
     );
 
     let recovered = wait_until(RECOVERY_BUDGET, async || {
-        publish(b"after-disconnect")
+        let enqueued = publish(b"after-disconnect")
             .map(|stats| stats.remote_enqueued >= 1)
-            .unwrap_or(false)
+            .unwrap_or(false);
+        enqueued && received.load(Ordering::SeqCst) > delivered_before
     })
     .await;
 
@@ -468,6 +482,10 @@ async fn selected_peers_publisher_recovers_after_socket_close() -> icanact_remot
         "a SelectedPeers publisher never re-established a connection to a \
          configured peer that stayed up and interested throughout; last publish \
          was {stats:?}"
+    );
+    assert!(
+        received.load(Ordering::SeqCst) > delivered_before,
+        "SelectedPeers recovery enqueued frames but delivered none after reconnect"
     );
 
     subscriber.shutdown_and_wait().await;
