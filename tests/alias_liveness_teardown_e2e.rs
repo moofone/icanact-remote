@@ -17,9 +17,9 @@ use tokio::time::{Instant, sleep};
 
 type Node = GossipRegistryHandle<BuilderTlsBootstrap>;
 
-/// Liveness window kept comfortably above `gossip_interval * 2` so
-/// `GossipConfig::normalize` does not clamp it, and small enough that several
-/// windows elapse inside the test.
+/// Legacy liveness side-table retention horizon, kept small enough that several
+/// windows elapse inside the test. It is not a peer-health threshold and is not
+/// normalized against the gossip interval.
 const LIVENESS_WINDOW: Duration = Duration::from_millis(400);
 const GOSSIP_INTERVAL: Duration = Duration::from_millis(100);
 

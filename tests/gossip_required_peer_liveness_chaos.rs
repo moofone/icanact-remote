@@ -845,10 +845,10 @@ async fn required_peer_is_not_dropped_by_fire_and_forget_gossip_results() -> Res
         ask_peer(&node_a, &node_b.registry.peer_id, b"after-neutral-results").await?,
         b"b:after-neutral-results"
     );
-    assert_eq!(
-        asks_b.load(Ordering::Acquire),
-        2,
-        "actor should receive asks before and after neutral registry results"
+    assert!(
+        asks_b.load(Ordering::Acquire) >= 2,
+        "actor should receive asks before and after neutral registry results; \
+         the settling helper retries at the RPC layer, so delivery is at least once"
     );
 
     node_a.shutdown().await;

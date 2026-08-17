@@ -323,18 +323,14 @@ fn fire_and_forget_success_is_neutral_even_when_response_timestamp_is_stale() ->
 {
     run_gossip_test(async {
         let config = GossipConfig {
-            gossip_interval: Duration::from_millis(100),
-            // Default retry_interval is 5 s, which makes "three failed
-            // rounds" take ~10 s. Shrink so the test finishes quickly.
-            peer_retry_interval: Duration::from_millis(200),
+            // Keep background rounds and their real dead-port dial errors out
+            // of this deterministic apply_gossip_results boundary test.
+            gossip_interval: Duration::from_secs(3_600),
+            peer_retry_interval: Duration::from_secs(3_600),
+            peer_supervisor_interval: Duration::from_secs(3_600),
+            cleanup_interval: Duration::from_secs(3_600),
             // Short side-table retention horizon for the test fixture.
             peer_liveness_window: Duration::from_millis(500),
-            // Default dial timeout is 10 s; tighten so each failed
-            // redial to the accept-and-drop dummy listener completes
-            // within a gossip interval. Under multi-binary parallel test
-            // runs the 15-s assertion window otherwise catches only one
-            // or two rounds.
-            connection_timeout: Duration::from_millis(300),
             max_peer_failures: 3,
             ..Default::default()
         };
@@ -539,9 +535,13 @@ fn address_scoped_hard_error_does_not_disconnect_the_current_peer_session() -> R
 fn liveness_window_does_not_turn_fire_and_forget_success_into_a_probe() -> Result<(), DynError> {
     run_gossip_test(async {
         let config = GossipConfig {
-            gossip_interval: Duration::from_millis(100),
+            // Keep background rounds and their real dead-port dial errors out
+            // of this deterministic apply_gossip_results boundary test.
+            gossip_interval: Duration::from_secs(3_600),
             peer_gossip_interval: None,
-            peer_retry_interval: Duration::from_millis(200),
+            peer_retry_interval: Duration::from_secs(3_600),
+            peer_supervisor_interval: Duration::from_secs(3_600),
+            cleanup_interval: Duration::from_secs(3_600),
             peer_liveness_window: Duration::from_millis(500),
             max_peer_failures: 3,
             ..Default::default()
@@ -727,8 +727,13 @@ fn configured_peer_live_connection_is_not_failed_by_peer_gossip_cadence_gap() ->
 fn discovered_peer_fire_and_forget_success_is_not_liveness_evidence() -> Result<(), DynError> {
     run_gossip_test(async {
         let config = GossipConfig {
-            gossip_interval: Duration::from_millis(100),
+            // Keep background rounds and their real dead-port dial errors out
+            // of this deterministic apply_gossip_results boundary test.
+            gossip_interval: Duration::from_secs(3_600),
             peer_gossip_interval: None,
+            peer_retry_interval: Duration::from_secs(3_600),
+            peer_supervisor_interval: Duration::from_secs(3_600),
+            cleanup_interval: Duration::from_secs(3_600),
             peer_liveness_window: Duration::from_millis(500),
             max_peer_failures: 3,
             ..Default::default()
