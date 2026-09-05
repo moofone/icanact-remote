@@ -9606,32 +9606,29 @@ impl<T: 'static> GossipRegistry<T> {
             }
 
             // Distinct-address peer churn must not retain reverse routes after
-            // the last actor for a non-required, disconnected peer expires.
-            let mut expired_peers: HashMap<crate::PeerId, SocketAddr> = HashMap::new();
+            // an actor at that address expires. One peer can leave several
+            // historical addresses; reclaim each independently if no remaining
+            // actor still uses it and it is not the required configured addr.
+            let mut expired_routes: HashSet<(crate::PeerId, SocketAddr)> = HashSet::new();
             for (_, stale_location) in &to_remove {
                 if let Ok(addr) = stale_location.socket_addr() {
-                    expired_peers.insert(stale_location.peer_id.clone(), addr);
+                    expired_routes.insert((stale_location.peer_id.clone(), addr));
                 }
             }
-            for (peer_id, addr) in expired_peers {
-                if self.connection_pool.is_required_peer(&peer_id) {
-                    continue;
-                }
-                if self
-                    .connection_pool
-                    .peer_current_connection_snapshot(&peer_id)
-                    .is_some()
+            for (peer_id, addr) in expired_routes {
+                if self.connection_pool.is_required_peer(&peer_id)
+                    && self.connection_pool.get_required_peer_addr(&peer_id) == Some(addr)
                 {
                     continue;
                 }
-                let mut still_present = false;
+                let mut still_at_addr = false;
                 self.actor_state.known_actors.iter_sync(|_, location| {
-                    if location.peer_id == peer_id {
-                        still_present = true;
+                    if location.peer_id == peer_id && location.socket_addr().ok() == Some(addr) {
+                        still_at_addr = true;
                     }
-                    !still_present
+                    !still_at_addr
                 });
-                if still_present {
+                if still_at_addr {
                     continue;
                 }
                 self.connection_pool
@@ -13514,6 +13511,106 @@ mod tests {
         assert_eq!(
             retained_routes, 0,
             "expired unique-address peer routes survive cleanup"
+        );
+    }
+
+    fn install_learned_route(reg: &GossipRegistry<()>, peer: &crate::PeerId, addr: SocketAddr) {
+        let _ = reg
+            .connection_pool
+            .addr_to_peer_id
+            .upsert_sync(addr, peer.clone());
+        reg.connection_pool.set_discovered_peer_addr(peer, addr);
+    }
+
+    #[tokio::test]
+    async fn expired_learned_routes_reclaim_every_address_for_a_peer() {
+        let mut config = test_config_with_seed("qa-route-multi-addr");
+        config.actor_ttl = Duration::from_millis(50);
+        let reg = GossipRegistry::<()>::new(test_addr(7410), config);
+        let peer = KeyPair::new_for_testing("qa-route-multi").peer_id();
+        let addr_a: SocketAddr = "127.0.0.1:9410".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:9411".parse().unwrap();
+        let mut loc_a = RemoteActorLocation::new_with_peer(addr_a, peer.clone());
+        loc_a.wall_clock_time = current_timestamp() - 100;
+        let mut loc_b = RemoteActorLocation::new_with_peer(addr_b, peer.clone());
+        loc_b.wall_clock_time = current_timestamp() - 100;
+        let _ = reg
+            .actor_state
+            .known_actors
+            .upsert_sync("qa/route/a".to_string(), loc_a);
+        let _ = reg
+            .actor_state
+            .known_actors
+            .upsert_sync("qa/route/b".to_string(), loc_b);
+        install_learned_route(&reg, &peer, addr_a);
+        install_learned_route(&reg, &peer, addr_b);
+        reg.cleanup_stale_actors().await;
+        assert!(
+            reg.connection_pool
+                .addr_to_peer_id
+                .read_sync(&addr_a, |_, _| ())
+                .is_none(),
+            "expired actor address A must be reclaimed even if the same peer also used B"
+        );
+        assert!(
+            reg.connection_pool
+                .addr_to_peer_id
+                .read_sync(&addr_b, |_, _| ())
+                .is_none(),
+            "expired actor address B must be reclaimed"
+        );
+        assert!(
+            reg.connection_pool
+                .peer_id_to_addr
+                .read_sync(&peer, |_, _| ())
+                .is_none(),
+            "forward route must not survive after every address expired"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_learned_route_is_reclaimed_while_peer_still_has_another_address() {
+        let mut config = test_config_with_seed("qa-route-move");
+        config.actor_ttl = Duration::from_secs(30);
+        let reg = GossipRegistry::<()>::new(test_addr(7412), config);
+        let peer = KeyPair::new_for_testing("qa-route-move").peer_id();
+        let addr_a: SocketAddr = "127.0.0.1:9412".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:9413".parse().unwrap();
+        let mut stale = RemoteActorLocation::new_with_peer(addr_a, peer.clone());
+        stale.wall_clock_time = 0;
+        let fresh = RemoteActorLocation::new_with_peer(addr_b, peer.clone());
+        let _ = reg
+            .actor_state
+            .known_actors
+            .upsert_sync("qa/route/old".to_string(), stale);
+        let _ = reg
+            .actor_state
+            .known_actors
+            .upsert_sync("qa/route/new".to_string(), fresh);
+        install_learned_route(&reg, &peer, addr_a);
+        install_learned_route(&reg, &peer, addr_b);
+        reg.cleanup_stale_actors().await;
+        assert!(
+            reg.actor_state.known_actors.contains_sync("qa/route/new"),
+            "fresh actor at B must survive"
+        );
+        assert!(
+            !reg.actor_state.known_actors.contains_sync("qa/route/old"),
+            "stale actor at A must expire"
+        );
+        assert!(
+            reg.connection_pool
+                .addr_to_peer_id
+                .read_sync(&addr_a, |_, _| ())
+                .is_none(),
+            "old address must be reclaimed while the peer still owns B"
+        );
+        assert!(
+            reg.connection_pool
+                .addr_to_peer_id
+                .read_sync(&addr_b, |_, owner| owner.clone() == peer)
+                .unwrap_or(false),
+            "live address B must stay registered"
         );
     }
 
