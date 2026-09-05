@@ -9604,6 +9604,36 @@ impl<T: 'static> GossipRegistry<T> {
             if removed > 0 {
                 info!(removed_count = removed, "cleaned up stale actor entries");
             }
+
+            // Distinct-address peer churn must not retain reverse routes after
+            // an actor at that address expires. One peer can leave several
+            // historical addresses; reclaim each independently if no remaining
+            // actor still uses it and it is not the required configured addr.
+            let mut expired_routes: HashSet<(crate::PeerId, SocketAddr)> = HashSet::new();
+            for (_, stale_location) in &to_remove {
+                if let Ok(addr) = stale_location.socket_addr() {
+                    expired_routes.insert((stale_location.peer_id.clone(), addr));
+                }
+            }
+            for (peer_id, addr) in expired_routes {
+                if self.connection_pool.is_required_peer(&peer_id)
+                    && self.connection_pool.get_required_peer_addr(&peer_id) == Some(addr)
+                {
+                    continue;
+                }
+                let mut still_at_addr = false;
+                self.actor_state.known_actors.iter_sync(|_, location| {
+                    if location.peer_id == peer_id && location.socket_addr().ok() == Some(addr) {
+                        still_at_addr = true;
+                    }
+                    !still_at_addr
+                });
+                if still_at_addr {
+                    continue;
+                }
+                self.connection_pool
+                    .retract_learned_idle_route(&peer_id, addr);
+            }
         }
 
         // Bound peer-death/unregister tombstones. They only need to outlive
@@ -13446,6 +13476,141 @@ mod tests {
         assert!(
             reg.connection_pool.list_configured_peers().is_empty(),
             "full-sync actor locations are learned routes, not supervised required peers"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_learned_routes_are_reclaimed() {
+        let mut config = test_config_with_seed("qa-route-local");
+        config.actor_ttl = Duration::ZERO;
+        let reg = GossipRegistry::<()>::new(test_addr(7400), config);
+        for n in 0..32 {
+            let peer = KeyPair::new_for_testing(&format!("qa-route-{n}")).peer_id();
+            let addr = format!("127.0.0.1:{}", 9400 + n).parse().unwrap();
+            let mut actors = HashMap::new();
+            actors.insert(
+                format!("qa/route/{n}"),
+                RemoteActorLocation::new_with_peer(addr, peer.clone()),
+            );
+            reg.merge_full_sync(actors, HashMap::new(), peer, addr, 1, current_timestamp())
+                .await;
+        }
+        reg.cleanup_stale_actors().await;
+        reg.cleanup_dead_peers().await;
+        reg.connection_pool.cleanup_stale_connections();
+        let mut live_actors = 0;
+        for n in 0..32 {
+            live_actors += usize::from(reg.lookup_actor(&format!("qa/route/{n}")).await.is_some());
+        }
+        let mut retained_routes = 0usize;
+        reg.connection_pool.peer_id_to_addr.iter_sync(|_, _| {
+            retained_routes += 1;
+            true
+        });
+        assert_eq!(live_actors, 0);
+        assert_eq!(
+            retained_routes, 0,
+            "expired unique-address peer routes survive cleanup"
+        );
+    }
+
+    fn install_learned_route(reg: &GossipRegistry<()>, peer: &crate::PeerId, addr: SocketAddr) {
+        let _ = reg
+            .connection_pool
+            .addr_to_peer_id
+            .upsert_sync(addr, peer.clone());
+        reg.connection_pool.set_discovered_peer_addr(peer, addr);
+    }
+
+    #[tokio::test]
+    async fn expired_learned_routes_reclaim_every_address_for_a_peer() {
+        let mut config = test_config_with_seed("qa-route-multi-addr");
+        config.actor_ttl = Duration::from_millis(50);
+        let reg = GossipRegistry::<()>::new(test_addr(7410), config);
+        let peer = KeyPair::new_for_testing("qa-route-multi").peer_id();
+        let addr_a: SocketAddr = "127.0.0.1:9410".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:9411".parse().unwrap();
+        let mut loc_a = RemoteActorLocation::new_with_peer(addr_a, peer.clone());
+        loc_a.wall_clock_time = current_timestamp() - 100;
+        let mut loc_b = RemoteActorLocation::new_with_peer(addr_b, peer.clone());
+        loc_b.wall_clock_time = current_timestamp() - 100;
+        let _ = reg
+            .actor_state
+            .known_actors
+            .upsert_sync("qa/route/a".to_string(), loc_a);
+        let _ = reg
+            .actor_state
+            .known_actors
+            .upsert_sync("qa/route/b".to_string(), loc_b);
+        install_learned_route(&reg, &peer, addr_a);
+        install_learned_route(&reg, &peer, addr_b);
+        reg.cleanup_stale_actors().await;
+        assert!(
+            reg.connection_pool
+                .addr_to_peer_id
+                .read_sync(&addr_a, |_, _| ())
+                .is_none(),
+            "expired actor address A must be reclaimed even if the same peer also used B"
+        );
+        assert!(
+            reg.connection_pool
+                .addr_to_peer_id
+                .read_sync(&addr_b, |_, _| ())
+                .is_none(),
+            "expired actor address B must be reclaimed"
+        );
+        assert!(
+            reg.connection_pool
+                .peer_id_to_addr
+                .read_sync(&peer, |_, _| ())
+                .is_none(),
+            "forward route must not survive after every address expired"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_learned_route_is_reclaimed_while_peer_still_has_another_address() {
+        let mut config = test_config_with_seed("qa-route-move");
+        config.actor_ttl = Duration::from_secs(30);
+        let reg = GossipRegistry::<()>::new(test_addr(7412), config);
+        let peer = KeyPair::new_for_testing("qa-route-move").peer_id();
+        let addr_a: SocketAddr = "127.0.0.1:9412".parse().unwrap();
+        let addr_b: SocketAddr = "127.0.0.1:9413".parse().unwrap();
+        let mut stale = RemoteActorLocation::new_with_peer(addr_a, peer.clone());
+        stale.wall_clock_time = 0;
+        let fresh = RemoteActorLocation::new_with_peer(addr_b, peer.clone());
+        let _ = reg
+            .actor_state
+            .known_actors
+            .upsert_sync("qa/route/old".to_string(), stale);
+        let _ = reg
+            .actor_state
+            .known_actors
+            .upsert_sync("qa/route/new".to_string(), fresh);
+        install_learned_route(&reg, &peer, addr_a);
+        install_learned_route(&reg, &peer, addr_b);
+        reg.cleanup_stale_actors().await;
+        assert!(
+            reg.actor_state.known_actors.contains_sync("qa/route/new"),
+            "fresh actor at B must survive"
+        );
+        assert!(
+            !reg.actor_state.known_actors.contains_sync("qa/route/old"),
+            "stale actor at A must expire"
+        );
+        assert!(
+            reg.connection_pool
+                .addr_to_peer_id
+                .read_sync(&addr_a, |_, _| ())
+                .is_none(),
+            "old address must be reclaimed while the peer still owns B"
+        );
+        assert!(
+            reg.connection_pool
+                .addr_to_peer_id
+                .read_sync(&addr_b, |_, owner| owner.clone() == peer)
+                .unwrap_or(false),
+            "live address B must stay registered"
         );
     }
 

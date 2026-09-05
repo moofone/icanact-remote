@@ -506,6 +506,13 @@ impl<T> ConnectionPool<T> {
     /// Required/operator configuration is retained; verified ownership cannot
     /// be displaced by arbitration, while provisional learned state must not
     /// survive a verified takeover.
+    pub(crate) fn retract_learned_idle_route(&self, peer_id: &crate::PeerId, addr: SocketAddr) {
+        let _ = self
+            .addr_to_peer_id
+            .remove_if_sync(&addr, |current| current == peer_id);
+        self.clear_displaced_peer_addr(peer_id, addr);
+    }
+
     pub(crate) fn clear_displaced_peer_addr(&self, peer_id: &crate::PeerId, addr: SocketAddr) {
         if let Some(session) = self
             .peer_sessions
