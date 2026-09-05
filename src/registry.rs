@@ -9604,6 +9604,39 @@ impl<T: 'static> GossipRegistry<T> {
             if removed > 0 {
                 info!(removed_count = removed, "cleaned up stale actor entries");
             }
+
+            // Distinct-address peer churn must not retain reverse routes after
+            // the last actor for a non-required, disconnected peer expires.
+            let mut expired_peers: HashMap<crate::PeerId, SocketAddr> = HashMap::new();
+            for (_, stale_location) in &to_remove {
+                if let Ok(addr) = stale_location.socket_addr() {
+                    expired_peers.insert(stale_location.peer_id.clone(), addr);
+                }
+            }
+            for (peer_id, addr) in expired_peers {
+                if self.connection_pool.is_required_peer(&peer_id) {
+                    continue;
+                }
+                if self
+                    .connection_pool
+                    .peer_current_connection_snapshot(&peer_id)
+                    .is_some()
+                {
+                    continue;
+                }
+                let mut still_present = false;
+                self.actor_state.known_actors.iter_sync(|_, location| {
+                    if location.peer_id == peer_id {
+                        still_present = true;
+                    }
+                    !still_present
+                });
+                if still_present {
+                    continue;
+                }
+                self.connection_pool
+                    .retract_learned_idle_route(&peer_id, addr);
+            }
         }
 
         // Bound peer-death/unregister tombstones. They only need to outlive
@@ -13446,6 +13479,41 @@ mod tests {
         assert!(
             reg.connection_pool.list_configured_peers().is_empty(),
             "full-sync actor locations are learned routes, not supervised required peers"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_learned_routes_are_reclaimed() {
+        let mut config = test_config_with_seed("qa-route-local");
+        config.actor_ttl = Duration::ZERO;
+        let reg = GossipRegistry::<()>::new(test_addr(7400), config);
+        for n in 0..32 {
+            let peer = KeyPair::new_for_testing(&format!("qa-route-{n}")).peer_id();
+            let addr = format!("127.0.0.1:{}", 9400 + n).parse().unwrap();
+            let mut actors = HashMap::new();
+            actors.insert(
+                format!("qa/route/{n}"),
+                RemoteActorLocation::new_with_peer(addr, peer.clone()),
+            );
+            reg.merge_full_sync(actors, HashMap::new(), peer, addr, 1, current_timestamp())
+                .await;
+        }
+        reg.cleanup_stale_actors().await;
+        reg.cleanup_dead_peers().await;
+        reg.connection_pool.cleanup_stale_connections();
+        let mut live_actors = 0;
+        for n in 0..32 {
+            live_actors += usize::from(reg.lookup_actor(&format!("qa/route/{n}")).await.is_some());
+        }
+        let mut retained_routes = 0usize;
+        reg.connection_pool.peer_id_to_addr.iter_sync(|_, _| {
+            retained_routes += 1;
+            true
+        });
+        assert_eq!(live_actors, 0);
+        assert_eq!(
+            retained_routes, 0,
+            "expired unique-address peer routes survive cleanup"
         );
     }
 

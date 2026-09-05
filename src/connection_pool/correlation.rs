@@ -82,10 +82,7 @@ impl CorrelationTracker {
     }
 
     #[inline]
-    fn try_take_ready(
-        slot_ref: &PendingResponseSlot,
-        correlation_id: u32,
-    ) -> ReadyTake {
+    fn try_take_ready(slot_ref: &PendingResponseSlot, correlation_id: u32) -> ReadyTake {
         Self::try_take_ready_before_release(slot_ref, correlation_id, || {})
     }
 
@@ -146,7 +143,10 @@ impl CorrelationTracker {
         waker: &std::task::Waker,
         correlation_id: u32,
     ) -> bool {
-        let _gate = slot_ref.register_lock.lock().expect("register_lock poisoned");
+        let _gate = slot_ref
+            .register_lock
+            .lock()
+            .expect("register_lock poisoned");
         if slot_ref.id.load(Ordering::Acquire) != correlation_id {
             return false;
         }
@@ -225,8 +225,10 @@ impl CorrelationTracker {
                     // register_if_owner takes the same gate, so it cannot observe
                     // a half-installed id or overwrite a waker for the previous
                     // generation.
-                    let _gate =
-                        slot_ref.register_lock.lock().expect("register_lock poisoned");
+                    let _gate = slot_ref
+                        .register_lock
+                        .lock()
+                        .expect("register_lock poisoned");
                     slot_ref.waker.wake();
                     slot_ref.id.store(id, Ordering::Release);
                 }
@@ -417,7 +419,7 @@ impl CorrelationTracker {
                             .state
                             .compare_exchange(
                                 SLOT_READY,
-                                SLOT_EMPTY,
+                                SLOT_WRITING,
                                 Ordering::AcqRel,
                                 Ordering::Acquire,
                             )
@@ -426,6 +428,7 @@ impl CorrelationTracker {
                             unsafe {
                                 (*slot_ref.response.get()).assume_init_drop();
                             }
+                            slot_ref.state.store(SLOT_EMPTY, Ordering::Release);
                             slot_ref.waker.wake();
                             break;
                         }
@@ -915,7 +918,11 @@ mod correlation_tests {
             .store(id_x + PENDING_RESPONSES_SIZE as u32, Ordering::Release);
         let guard_y = tracker.allocate().expect("Y should re-claim slot S");
         let id_y = guard_y.id();
-        assert_eq!(CorrelationTracker::slot_index(id_y), slot, "Y must alias to S");
+        assert_eq!(
+            CorrelationTracker::slot_index(id_y),
+            slot,
+            "Y must alias to S"
+        );
         assert_ne!(id_x, id_y);
 
         let slot_ref = &tracker.pending[slot];
@@ -935,7 +942,11 @@ mod correlation_tests {
         let pool = Arc::new(crate::AlignedBytesPool::default());
         let mut response = Some(crate::AlignedBytes::from_pooled_slice(b"for-Y", pool));
         assert!(tracker.complete(id_y, &mut response));
-        assert_eq!(y_wakes.load(Ordering::SeqCst), 1, "complete(Y) must wake Y's waker");
+        assert_eq!(
+            y_wakes.load(Ordering::SeqCst),
+            1,
+            "complete(Y) must wake Y's waker"
+        );
         assert_eq!(
             x_wakes.load(Ordering::SeqCst),
             0,
@@ -973,9 +984,8 @@ mod correlation_tests {
 
         // Y waits with NO timeout.
         let tracker_for_wait = tracker.clone();
-        let y_wait = tokio::spawn(async move {
-            tracker_for_wait.wait_for_response_no_timeout(id_y).await
-        });
+        let y_wait =
+            tokio::spawn(async move { tracker_for_wait.wait_for_response_no_timeout(id_y).await });
         // Let Y register its waker.
         tokio::task::yield_now().await;
         tokio::task::yield_now().await;
@@ -1000,5 +1010,57 @@ mod correlation_tests {
             .expect("Y's task joined");
         assert_eq!(reply.unwrap().as_ref(), b"for-Y");
         guard_y.disarm();
+    }
+
+    #[test]
+    fn cancel_all_must_keep_slot_exclusive_until_payload_drop_finishes() {
+        use std::sync::Barrier;
+
+        #[repr(align(16))]
+        struct BlockOnDrop {
+            bytes: [u8; 16],
+            entered: Arc<Barrier>,
+            release: Arc<Barrier>,
+        }
+        impl AsRef<[u8]> for BlockOnDrop {
+            fn as_ref(&self) -> &[u8] {
+                &self.bytes
+            }
+        }
+        impl Drop for BlockOnDrop {
+            fn drop(&mut self) {
+                self.entered.wait();
+                self.release.wait();
+            }
+        }
+
+        let tracker = CorrelationTracker::new();
+        let id = tracker.allocate().unwrap().disarm();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let bytes = bytes::Bytes::from_owner(BlockOnDrop {
+            bytes: [0; 16],
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        let mut response = Some(crate::AlignedBytes::from_bytes(bytes).unwrap());
+        assert!(tracker.complete(id, &mut response));
+
+        let cancel_tracker = tracker.clone();
+        let cancel = std::thread::spawn(move || cancel_tracker.cancel_all());
+        entered.wait();
+        tracker
+            .next_id
+            .store(id + PENDING_RESPONSES_SIZE as u32, Ordering::Relaxed);
+        let new_guard = tracker.allocate().unwrap();
+        let reused =
+            CorrelationTracker::slot_index(new_guard.id()) == CorrelationTracker::slot_index(id);
+        release.wait();
+        cancel.join().unwrap();
+        drop(new_guard);
+        assert!(
+            !reused,
+            "cancel_all published EMPTY before dropping the old payload"
+        );
     }
 }

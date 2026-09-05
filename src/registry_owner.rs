@@ -671,6 +671,7 @@ impl<T: 'static> RoutingPublisher for crate::connection_pool::ConnectionPool<T> 
         let _ = self
             .addr_to_peer_id
             .remove_if_sync(&addr, |current| current == peer_id);
+        self.clear_displaced_peer_addr(peer_id, addr);
     }
 
     fn set_configured_peer_addr(
