@@ -109,6 +109,10 @@ async fn bidirectional_inline_burst_must_resume_delivery() {
         accepted_ab += usize::from(ab.try_tell_actor_frame(1, 1, payload.clone()).is_ok());
         accepted_ba += usize::from(ba.try_tell_actor_frame(1, 1, payload.clone()).is_ok());
     }
+    assert!(
+        accepted_ab > 0 && accepted_ba > 0,
+        "burst admitted no messages: accepted_ab={accepted_ab}, accepted_ba={accepted_ba}"
+    );
     let progress = tokio::time::timeout(Duration::from_secs(12), async {
         while a_count.load(Ordering::Relaxed) < accepted_ba + 1
             || b_count.load(Ordering::Relaxed) < accepted_ab + 1
