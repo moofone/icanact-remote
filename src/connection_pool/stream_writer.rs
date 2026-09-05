@@ -1794,11 +1794,11 @@ impl LockFreeStreamHandle {
             let mut wrote_ask_payload = false;
             let mut wrote_actor_responses = false;
             let mut wrote_fast_responses = false;
-            // A partial streaming frame owns the wire. Response batches
-            // accumulated while it is in flight must survive into the turn
-            // that completes that frame; clearing them here would silently
+            // A partial streaming *or ordinary* frame owns the wire. Response
+            // batches accumulated while it is in flight must survive into the
+            // turn that completes that frame; clearing them here would silently
             // drop responses that were intentionally deferred.
-            if pending_stream_cmd.is_none() {
+            if pending_stream_cmd.is_none() && pending_ordinary_write.is_none() {
                 response_batch.clear();
                 direct_response_batch.clear();
             }
@@ -1806,7 +1806,9 @@ impl LockFreeStreamHandle {
             // Complete one bounded piece of the current frame before handling
             // normal writes and inbound reads. A partial frame stays ahead of
             // every other streaming command, preserving wire framing.
-            let next_stream = if let Some(pending) = pending_stream_cmd.take() {
+            let next_stream = if pending_ordinary_write.is_some() {
+                None
+            } else if let Some(pending) = pending_stream_cmd.take() {
                 Some(pending)
             } else {
                 let source = choose_streaming_source(
@@ -1912,40 +1914,44 @@ impl LockFreeStreamHandle {
                     &mut pending_stream_cmd,
                 );
             }
-            local_streaming_queue.set_wire_blocked(pending_stream_cmd.is_some());
+            local_streaming_queue
+                .set_wire_blocked(pending_stream_cmd.is_some() || pending_ordinary_write.is_some());
 
             // A partial streaming frame owns the wire until complete. Reads may
             // still run below, but no normal/response write can interleave and
-            // corrupt the frame boundary.
+            // corrupt the frame boundary. A partial ordinary inline write has
+            // the same exclusive-wire requirement.
             if pending_stream_cmd.is_none() {
                 // Queued backpressure NACKs (see `LocalStreamingQueue::queue_ask_nack`)
                 // are only ever safe to write here, now that the wire is
                 // proven free of a partial frame.
-                match drain_pending_ask_nacks(
-                    &mut stream,
-                    &bytes_written_counter,
-                    &mut bytes_since_flush,
-                    &mut local_streaming_queue,
-                )
-                .await
-                {
-                    // Entries survived the bounded per-turn drain: treat this
-                    // turn as having done work so the loop revisits the top
-                    // (and this drain) again instead of falling into the
-                    // `!did_work` pre-park/idle-select path below with a NACK
-                    // still queued and no other event left to wake it.
-                    Ok(more_pending) => {
-                        if more_pending {
-                            did_work = true;
+                if pending_ordinary_write.is_none() {
+                    match drain_pending_ask_nacks(
+                        &mut stream,
+                        &bytes_written_counter,
+                        &mut bytes_since_flush,
+                        &mut local_streaming_queue,
+                    )
+                    .await
+                    {
+                        // Entries survived the bounded per-turn drain: treat this
+                        // turn as having done work so the loop revisits the top
+                        // (and this drain) again instead of falling into the
+                        // `!did_work` pre-park/idle-select path below with a NACK
+                        // still queued and no other event left to wake it.
+                        Ok(more_pending) => {
+                            if more_pending {
+                                did_work = true;
+                            }
                         }
-                    }
-                    Err(e) => {
-                        warn!(
-                            peer = ?read_context.as_ref().map(|c| c.peer_addr),
-                            error = %e,
-                            "Failed to drain queued ask backpressure NACKs"
-                        );
-                        return;
+                        Err(e) => {
+                            warn!(
+                                peer = ?read_context.as_ref().map(|c| c.peer_addr),
+                                error = %e,
+                                "Failed to drain queued ask backpressure NACKs"
+                            );
+                            return;
+                        }
                     }
                 }
                 // ACTOR_REM_2 R8: service the normal write queue when no partial
@@ -2897,6 +2903,7 @@ impl LockFreeStreamHandle {
                         // memory growth before `read_batch_limit` frames are
                         // seen. See `flush_response_batch_if_over_byte_cap`.
                         if pending_stream_cmd.is_none()
+                            && pending_ordinary_write.is_none()
                             && let Err(e) = flush_response_batch_if_over_byte_cap(
                                 &mut stream,
                                 &bytes_written_counter,
@@ -2913,6 +2920,7 @@ impl LockFreeStreamHandle {
                             return;
                         }
                         if pending_stream_cmd.is_none()
+                            && pending_ordinary_write.is_none()
                             && let Err(e) = flush_direct_response_batch_if_over_byte_cap(
                                 &mut stream,
                                 &bytes_written_counter,
@@ -3069,7 +3077,10 @@ impl LockFreeStreamHandle {
                             break;
                         }
                     }
-                    if pending_stream_cmd.is_none() && !response_batch.is_empty() {
+                    if pending_stream_cmd.is_none()
+                        && pending_ordinary_write.is_none()
+                        && !response_batch.is_empty()
+                    {
                         if let Err(e) = write_response_batch(
                             &mut stream,
                             &bytes_written_counter,
@@ -3087,7 +3098,10 @@ impl LockFreeStreamHandle {
                         }
                         wrote_actor_responses = true;
                     }
-                    if pending_stream_cmd.is_none() && !direct_response_batch.is_empty() {
+                    if pending_stream_cmd.is_none()
+                        && pending_ordinary_write.is_none()
+                        && !direct_response_batch.is_empty()
+                    {
                         if let Err(e) = write_direct_response_batch(
                             &mut stream,
                             &bytes_written_counter,
@@ -3292,6 +3306,7 @@ impl LockFreeStreamHandle {
                                 // drain loop above; see
                                 // `flush_response_batch_if_over_byte_cap`.
                                 if pending_stream_cmd.is_none()
+                                    && pending_ordinary_write.is_none()
                                     && let Err(e) = flush_response_batch_if_over_byte_cap(
                                     &mut stream,
                                     &bytes_written_counter,
@@ -3308,6 +3323,7 @@ impl LockFreeStreamHandle {
                                     return;
                                 }
                                 if pending_stream_cmd.is_none()
+                                    && pending_ordinary_write.is_none()
                                     && let Err(e) = flush_direct_response_batch_if_over_byte_cap(
                                     &mut stream,
                                     &bytes_written_counter,
@@ -3441,7 +3457,10 @@ impl LockFreeStreamHandle {
                                 }
                             }
 
-                            if pending_stream_cmd.is_none() && !response_batch.is_empty() {
+                            if pending_stream_cmd.is_none()
+                                && pending_ordinary_write.is_none()
+                                && !response_batch.is_empty()
+                            {
                                 if let Err(e) = write_response_batch(
                                     &mut stream,
                                     &bytes_written_counter,
@@ -3458,7 +3477,10 @@ impl LockFreeStreamHandle {
                                     return;
                                 }
                             }
-                            if pending_stream_cmd.is_none() && !direct_response_batch.is_empty() {
+                            if pending_stream_cmd.is_none()
+                                && pending_ordinary_write.is_none()
+                                && !direct_response_batch.is_empty()
+                            {
                                 if let Err(e) = write_direct_response_batch(
                                     &mut stream,
                                     &bytes_written_counter,
