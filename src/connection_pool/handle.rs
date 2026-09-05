@@ -692,8 +692,10 @@ impl<T> ConnectionHandle<T> {
         payload: bytes::Bytes,
         timeout: Duration,
     ) -> Result<crate::AlignedBytes> {
-        self.ask_actor_frame_aligned_with_optional_request_id(actor_id, type_hash, payload, timeout, None)
-            .await
+        self.ask_actor_frame_aligned_with_optional_request_id(
+            actor_id, type_hash, payload, timeout, None,
+        )
+        .await
     }
 
     /// Ask an actor using an uncompact ActorAsk frame with an out-of-band
@@ -709,11 +711,7 @@ impl<T> ConnectionHandle<T> {
     ) -> Result<bytes::Bytes> {
         let response = self
             .ask_actor_frame_aligned_with_request_id(
-                actor_id,
-                type_hash,
-                payload,
-                timeout,
-                request_id,
+                actor_id, type_hash, payload, timeout, request_id,
             )
             .await?;
         Ok(response.into_bytes())
@@ -782,9 +780,13 @@ impl<T> ConnectionHandle<T> {
             return Err(e);
         }
 
+        let remaining = timeout.saturating_sub(started_at.elapsed());
+        if remaining.is_zero() {
+            return Err(crate::GossipError::Timeout);
+        }
         let result = self
             .correlation
-            .wait_for_response(correlation_id, timeout)
+            .wait_for_response(correlation_id, remaining)
             .await;
         if let Err(error) = &result {
             match error {
@@ -1183,8 +1185,14 @@ impl<T> ConnectionHandle<T> {
         self.reject_oversize_inline(framing::DIRECT_ASK_HEADER_LEN, request.len())?;
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
-        self.ask_direct_on_slot(correlation_id, u64::from(correlation_id), request, timeout, slot)
-            .await
+        self.ask_direct_on_slot(
+            correlation_id,
+            u64::from(correlation_id),
+            request,
+            timeout,
+            slot,
+        )
+        .await
     }
 
     /// Like `ask_direct`, but the caller supplies a stable `request_id` that
@@ -1285,7 +1293,9 @@ impl<T> ConnectionHandle<T> {
             ))
         })?;
         if payload.is_empty() {
-            return self.ask_actor_frame(actor_id, type_hash, payload, timeout).await;
+            return self
+                .ask_actor_frame(actor_id, type_hash, payload, timeout)
+                .await;
         }
         let chunk_size = stream_handle.max_stream_chunk_size()?;
         // `SlotGuard` cancels this exact correlation slot on every `?` or
@@ -1304,10 +1314,11 @@ impl<T> ConnectionHandle<T> {
                 max: crate::MAX_STREAM_SIZE,
             });
         }
-        let total_size = u32::try_from(payload.len()).map_err(|_| GossipError::MessageTooLarge {
-            size: payload.len(),
-            max: crate::MAX_STREAM_SIZE,
-        })?;
+        let total_size =
+            u32::try_from(payload.len()).map_err(|_| GossipError::MessageTooLarge {
+                size: payload.len(),
+                max: crate::MAX_STREAM_SIZE,
+            })?;
         let first_len = payload.len().min(chunk_size);
         let first_header = crate::framing::try_write_stream_request_start_header(
             stream_id,
@@ -1317,10 +1328,9 @@ impl<T> ConnectionHandle<T> {
             type_hash,
             first_len,
         )?;
-        stream_handle.write_bytes_vectored(
-            first_header,
-            payload.slice(..first_len),
-        ).await?;
+        stream_handle
+            .write_bytes_vectored(first_header, payload.slice(..first_len))
+            .await?;
         // Armed only after StreamStart was accepted by the FIFO. From here on,
         // every cancellation path must release the peer-side reassembly.
         let mut abort_guard = StreamAbortGuard::new(stream_handle, stream_id);
@@ -1334,10 +1344,10 @@ impl<T> ConnectionHandle<T> {
                 index,
                 end - offset,
             )?;
-            if let Err(error) = stream_handle.write_bytes_vectored(
-                header,
-                payload.slice(offset..end),
-            ).await {
+            if let Err(error) = stream_handle
+                .write_bytes_vectored(header, payload.slice(offset..end))
+                .await
+            {
                 return Err(error);
             }
             offset = end;
@@ -1355,7 +1365,10 @@ impl<T> ConnectionHandle<T> {
         // while it waits for the response cannot leave a partial reassembly.
         abort_guard.disarm();
         drop(gate_guard);
-        let response = self.correlation.wait_for_response(correlation_id, timeout).await?;
+        let response = self
+            .correlation
+            .wait_for_response(correlation_id, timeout)
+            .await?;
         let _ = slot.disarm();
         Ok(response.into_bytes())
     }
@@ -1546,8 +1559,12 @@ mod ask_nack_send_tests {
         );
         let stream_handle = Arc::new(stream_handle);
         let correlation = CorrelationTracker::new();
-        let conn: ConnectionHandle =
-            ConnectionHandle::new_stream(test_addr(), ConnectionDirection::Outbound, stream_handle, correlation);
+        let conn: ConnectionHandle = ConnectionHandle::new_stream(
+            test_addr(),
+            ConnectionDirection::Outbound,
+            stream_handle,
+            correlation,
+        );
 
         conn.send_ask_nack(77, crate::framing::AskNackReason::HandlerError)
             .await
@@ -1607,7 +1624,12 @@ mod pubsub_lane_tests {
         );
         let stream_handle = Arc::new(stream_handle);
         let correlation = CorrelationTracker::new();
-        let conn = ConnectionHandle::new_stream(test_addr(), ConnectionDirection::Outbound, stream_handle.clone(), correlation);
+        let conn = ConnectionHandle::new_stream(
+            test_addr(),
+            ConnectionDirection::Outbound,
+            stream_handle.clone(),
+            correlation,
+        );
         (conn, stream_handle, task)
     }
 
@@ -1715,7 +1737,12 @@ mod oversized_inline_send_gate_tests {
         );
         let stream_handle = Arc::new(stream_handle);
         let correlation = CorrelationTracker::new();
-        let conn = ConnectionHandle::new_stream(test_addr(), ConnectionDirection::Outbound, stream_handle.clone(), correlation);
+        let conn = ConnectionHandle::new_stream(
+            test_addr(),
+            ConnectionDirection::Outbound,
+            stream_handle.clone(),
+            correlation,
+        );
         (conn, stream_handle, task, peer)
     }
 
@@ -1800,7 +1827,10 @@ mod oversized_inline_send_gate_tests {
     async fn bytes_ask_over_max_message_size_errors_and_connection_survives() {
         let (conn, _stream_handle, _task, mut peer) = make_handle();
         let err = conn
-            .ask_with_timeout_bytes(bytes::Bytes::from(vec![0u8; OVERSIZED]), Duration::from_secs(5))
+            .ask_with_timeout_bytes(
+                bytes::Bytes::from(vec![0u8; OVERSIZED]),
+                Duration::from_secs(5),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, GossipError::MessageTooLarge { .. }));
@@ -2158,7 +2188,12 @@ mod oversized_inline_send_gate_tests {
         );
         let stream_handle = Arc::new(stream_handle);
         let correlation = CorrelationTracker::new();
-        let conn = ConnectionHandle::new_stream(test_addr(), ConnectionDirection::Outbound, stream_handle.clone(), correlation);
+        let conn = ConnectionHandle::new_stream(
+            test_addr(),
+            ConnectionDirection::Outbound,
+            stream_handle.clone(),
+            correlation,
+        );
         (conn, stream_handle, task, peer)
     }
 
@@ -2281,12 +2316,7 @@ mod zero_timeout_gate_tests {
         let conn = make_handle();
         assert_immediate_timeout(
             &conn,
-            conn.ask_actor_frame(
-                7,
-                9,
-                bytes::Bytes::from_static(b"actor"),
-                Duration::ZERO,
-            ),
+            conn.ask_actor_frame(7, 9, bytes::Bytes::from_static(b"actor"), Duration::ZERO),
         )
         .await;
     }
@@ -2296,12 +2326,7 @@ mod zero_timeout_gate_tests {
         let conn = make_handle();
         assert_immediate_timeout(
             &conn,
-            conn.ask_streaming_bytes(
-                bytes::Bytes::from_static(b"stream"),
-                9,
-                7,
-                Duration::ZERO,
-            ),
+            conn.ask_streaming_bytes(bytes::Bytes::from_static(b"stream"), 9, 7, Duration::ZERO),
         )
         .await;
     }
