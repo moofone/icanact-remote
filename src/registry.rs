@@ -7944,23 +7944,38 @@ impl<T: 'static> GossipRegistry<T> {
                 extensions: None,
             };
             let payload = encode(&delta_msg)?;
-            if !fits(payload.len(), max_message_size) {
-                let last = batch.pop().expect("overflow actor");
-                if !batch.is_empty() {
-                    let flush = RegistryMessage::DeltaGossip {
-                        delta: RegistryDelta {
-                            since_sequence: sequence,
-                            current_sequence: sequence,
-                            changes: std::mem::take(&mut batch),
-                            sender_peer_id: sender_peer_id.clone(),
-                            wall_clock_time,
-                            precise_timing_nanos: crate::current_timestamp_nanos(),
-                        },
-                        extensions: None,
-                    };
-                    payloads.push(encode(&flush)?);
-                }
-                batch.push(last);
+            if fits(payload.len(), max_message_size) {
+                continue;
+            }
+            let last = batch.pop().expect("overflow actor");
+            if !batch.is_empty() {
+                let flush = RegistryMessage::DeltaGossip {
+                    delta: RegistryDelta {
+                        since_sequence: sequence,
+                        current_sequence: sequence,
+                        changes: std::mem::take(&mut batch),
+                        sender_peer_id: sender_peer_id.clone(),
+                        wall_clock_time,
+                        precise_timing_nanos: crate::current_timestamp_nanos(),
+                    },
+                    extensions: None,
+                };
+                payloads.push(encode(&flush)?);
+            }
+            let solo = RegistryMessage::DeltaGossip {
+                delta: RegistryDelta {
+                    since_sequence: sequence,
+                    current_sequence: sequence,
+                    changes: vec![last],
+                    sender_peer_id: sender_peer_id.clone(),
+                    wall_clock_time,
+                    precise_timing_nanos: crate::current_timestamp_nanos(),
+                },
+                extensions: None,
+            };
+            let solo_payload = encode(&solo)?;
+            if fits(solo_payload.len(), max_message_size) {
+                payloads.push(solo_payload);
             }
         }
         if !batch.is_empty() {

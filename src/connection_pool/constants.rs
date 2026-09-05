@@ -796,6 +796,16 @@ mod queue_notify_hook {
     }
 }
 
+#[derive(Debug)]
+enum WriteTryPushError {
+    #[allow(dead_code)]
+    Closed(WriteCommand),
+    /// Published into the queue, then observed close. The command is owned by
+    /// the queue and will be reclaimed; the caller must not retry it.
+    ClosedDropped,
+    Full(WriteCommand),
+}
+
 struct WriteQueue {
     queue: crossbeam_queue::ArrayQueue<WriteCommand>,
     data_notify: Notify,
@@ -810,6 +820,9 @@ struct WriteQueue {
     /// returns `ConnectionClosed` instead of re-parking forever. Hot path never
     /// reads this flag.
     closed: AtomicBool,
+    /// Coordinates non-blocking enqueues with teardown. High bit is closed;
+    /// lower bits count in-flight try_push callers. See `StreamingQueue`.
+    try_push_state: AtomicUsize,
     /// Peer address used to construct the `ConnectionClosed` error on teardown.
     addr: SocketAddr,
 }
@@ -822,15 +835,36 @@ impl WriteQueue {
             space_notify: Notify::new(),
             data_pending: AtomicBool::new(false),
             closed: AtomicBool::new(false),
+            try_push_state: AtomicUsize::new(0),
             addr,
         })
     }
 
-    fn try_push(&self, command: WriteCommand) -> std::result::Result<(), WriteCommand> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(command);
+    fn try_push(&self, command: WriteCommand) -> std::result::Result<(), WriteTryPushError> {
+        loop {
+            let state = self.try_push_state.load(Ordering::Acquire);
+            if state & STREAMING_QUEUE_CLOSED != 0 {
+                return Err(WriteTryPushError::Closed(command));
+            }
+            debug_assert!(state & STREAMING_QUEUE_PUSHERS != STREAMING_QUEUE_PUSHERS);
+            if self
+                .try_push_state
+                .compare_exchange_weak(state, state + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
         }
-        self.queue.push(command)
+
+        let result = match self.queue.push(command) {
+            Ok(()) => Ok(()),
+            Err(cmd) => Err(WriteTryPushError::Full(cmd)),
+        };
+        let state = self.try_push_state.fetch_sub(1, Ordering::AcqRel);
+        if state & STREAMING_QUEUE_CLOSED != 0 {
+            return Err(WriteTryPushError::ClosedDropped);
+        }
+        result
     }
 
     /// Publish a writer wakeup after a successful push, coalescing wakeups so
@@ -883,16 +917,26 @@ impl WriteQueue {
     /// observe the close and return an error instead of hanging forever.
     /// Teardown-only; never called on the message fast path.
     fn mark_closed_and_wake(&self) {
+        self.try_push_state
+            .fetch_or(STREAMING_QUEUE_CLOSED, Ordering::AcqRel);
         self.closed.store(true, Ordering::Release);
         self.space_notify.notify_waiters();
     }
 
-    /// Fence admission, then drop every undeliverable payload still sitting in
-    /// the queue. Retained connection handles keep these Arcs alive, so without
-    /// an explicit drain the bodies would outlive IO exit.
+    /// Fence admission (including in-flight `try_push` racers), then drop every
+    /// undeliverable payload. Retained connection handles keep these Arcs alive,
+    /// so without an explicit drain the bodies would outlive IO exit.
     fn close_and_reclaim(&self) {
         self.mark_closed_and_wake();
-        while self.queue.pop().is_some() {}
+        loop {
+            while self.queue.pop().is_some() {}
+            let state = self.try_push_state.load(Ordering::Acquire);
+            if state & STREAMING_QUEUE_PUSHERS == 0 {
+                while self.queue.pop().is_some() {}
+                break;
+            }
+            std::thread::yield_now();
+        }
     }
 
     async fn push(&self, mut command: WriteCommand) -> Result<()> {
@@ -904,6 +948,9 @@ impl WriteQueue {
             match self.queue.push(command) {
                 Ok(()) => {
                     self.notify_data();
+                    if self.closed.load(Ordering::Acquire) {
+                        return Err(GossipError::ConnectionClosed(self.addr));
+                    }
                     return Ok(());
                 }
                 Err(cmd) => {

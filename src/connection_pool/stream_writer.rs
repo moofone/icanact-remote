@@ -4368,7 +4368,10 @@ impl LockFreeStreamHandle {
                 self.write_queue.notify_data();
                 Ok(())
             }
-            Err(command) => self.write_queue.push(command).await,
+            Err(WriteTryPushError::Full(command)) => self.write_queue.push(command).await,
+            Err(WriteTryPushError::Closed(_) | WriteTryPushError::ClosedDropped) => {
+                Err(GossipError::ConnectionClosed(self.addr))
+            }
         }
     }
 
@@ -4387,7 +4390,10 @@ impl LockFreeStreamHandle {
                 self.write_queue.notify_data();
                 Ok(())
             }
-            Err(command) => self.write_queue.push(command).await,
+            Err(WriteTryPushError::Full(command)) => self.write_queue.push(command).await,
+            Err(WriteTryPushError::Closed(_) | WriteTryPushError::ClosedDropped) => {
+                Err(GossipError::ConnectionClosed(self.addr))
+            }
         }
     }
 
@@ -4405,7 +4411,10 @@ impl LockFreeStreamHandle {
                 self.write_queue.notify_data();
                 Ok(())
             }
-            Err(_) => Err(GossipError::WriteQueueFull),
+            Err(WriteTryPushError::Full(_)) => Err(GossipError::WriteQueueFull),
+            Err(WriteTryPushError::Closed(_) | WriteTryPushError::ClosedDropped) => {
+                Err(GossipError::ConnectionClosed(self.addr))
+            }
         }
     }
 
@@ -4426,7 +4435,10 @@ impl LockFreeStreamHandle {
                 self.immediate_write_queue.notify_data();
                 Ok(())
             }
-            Err(_) => Err(GossipError::WriteQueueFull),
+            Err(WriteTryPushError::Full(_)) => Err(GossipError::WriteQueueFull),
+            Err(WriteTryPushError::Closed(_) | WriteTryPushError::ClosedDropped) => {
+                Err(GossipError::ConnectionClosed(self.addr))
+            }
         }
     }
 
