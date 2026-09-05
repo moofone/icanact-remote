@@ -145,6 +145,7 @@ impl DirectResponseBatch {
     }
 }
 
+#[allow(dead_code)]
 async fn write_remaining_chunks<S: AsyncWrite + Unpin>(
     stream: &mut S,
     chunks: &[bytes::Bytes],
@@ -163,6 +164,7 @@ async fn write_remaining_chunks<S: AsyncWrite + Unpin>(
     Ok(wrote)
 }
 
+#[allow(dead_code)]
 async fn write_chunks_batched<S: AsyncWrite + Unpin>(
     stream: &mut S,
     chunks: &[bytes::Bytes],
@@ -825,6 +827,9 @@ impl WriteQueue {
     }
 
     fn try_push(&self, command: WriteCommand) -> std::result::Result<(), WriteCommand> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(command);
+        }
         self.queue.push(command)
     }
 
@@ -880,6 +885,14 @@ impl WriteQueue {
     fn mark_closed_and_wake(&self) {
         self.closed.store(true, Ordering::Release);
         self.space_notify.notify_waiters();
+    }
+
+    /// Fence admission, then drop every undeliverable payload still sitting in
+    /// the queue. Retained connection handles keep these Arcs alive, so without
+    /// an explicit drain the bodies would outlive IO exit.
+    fn close_and_reclaim(&self) {
+        self.mark_closed_and_wake();
+        while self.queue.pop().is_some() {}
     }
 
     async fn push(&self, mut command: WriteCommand) -> Result<()> {
@@ -1046,6 +1059,21 @@ impl StreamingQueue {
         self.space_notify.notify_waiters();
     }
 
+    /// Fence admission (including in-flight `try_push` racers), then drop every
+    /// undeliverable streaming payload. See `WriteQueue::close_and_reclaim`.
+    fn close_and_reclaim(&self) {
+        self.mark_closed_and_wake();
+        loop {
+            while self.queue.pop().is_some() {}
+            let state = self.try_push_state.load(Ordering::Acquire);
+            if state & STREAMING_QUEUE_PUSHERS == 0 {
+                while self.queue.pop().is_some() {}
+                break;
+            }
+            std::thread::yield_now();
+        }
+    }
+
     async fn push(&self, mut command: StreamingCommand) -> Result<()> {
         if self.closed.load(Ordering::Acquire) {
             return Err(GossipError::ConnectionClosed(self.addr));
@@ -1087,7 +1115,8 @@ impl StreamingQueue {
 
     fn notify_space(&self) {
         #[cfg(test)]
-        self.space_notification_count.fetch_add(1, Ordering::Relaxed);
+        self.space_notification_count
+            .fetch_add(1, Ordering::Relaxed);
         self.space_notify.notify_one();
     }
 
@@ -1297,7 +1326,10 @@ mod queue_notify_tests {
         for _ in 0..128 {
             normal.try_push(frame()).expect("normal queue has capacity");
         }
-        assert!(normal.try_push(frame()).is_err(), "normal queue is saturated");
+        assert!(
+            normal.try_push(frame()).is_err(),
+            "normal queue is saturated"
+        );
 
         immediate
             .try_push(immediate_frame())
@@ -1307,7 +1339,11 @@ mod queue_notify_tests {
             .pop()
             .expect("writer drains priority queue before normal backlog");
         assert!(matches!(first, WriteCommand::ImmediatePayload(_)));
-        assert_eq!(normal.queue.len(), 128, "normal backlog was not consumed first");
+        assert_eq!(
+            normal.queue.len(),
+            128,
+            "normal backlog was not consumed first"
+        );
     }
 
     /// The priority lane is bounded per writer turn. After a control burst,
@@ -1330,9 +1366,11 @@ mod queue_notify_tests {
         }
         turn.push(normal.pop().expect("regular frame receives a fair turn"));
 
-        assert!(turn[..IMMEDIATE_WRITE_BATCH]
-            .iter()
-            .all(|command| matches!(command, WriteCommand::ImmediatePayload(_))));
+        assert!(
+            turn[..IMMEDIATE_WRITE_BATCH]
+                .iter()
+                .all(|command| matches!(command, WriteCommand::ImmediatePayload(_)))
+        );
         assert!(matches!(
             turn[IMMEDIATE_WRITE_BATCH],
             WriteCommand::Payload(_)
@@ -1545,8 +1583,9 @@ mod queue_notify_tests {
     /// assertion fails cleanly rather than hanging.
     #[tokio::test]
     async fn qa_r7_direct_response_batch_ok0_errors_not_spins() {
-        let mut stream =
-            WriteZeroVectored { calls: std::sync::atomic::AtomicUsize::new(0) };
+        let mut stream = WriteZeroVectored {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut bytes_since_flush = 0usize;
         let mut batch = DirectResponseBatch::new(8);
@@ -1557,9 +1596,7 @@ mod queue_notify_tests {
             write_direct_response_batch(&mut stream, &counter, &mut bytes_since_flush, &mut batch)
                 .await;
         match result {
-            Err(crate::GossipError::Network(e))
-                if e.kind() == std::io::ErrorKind::WriteZero =>
-            {
+            Err(crate::GossipError::Network(e)) if e.kind() == std::io::ErrorKind::WriteZero => {
                 assert!(
                     stream.calls.load(std::sync::atomic::Ordering::SeqCst) <= 1,
                     "WriteZero must surface on the first Ok(0), not after a spin"
@@ -1585,8 +1622,8 @@ mod queue_notify_tests {
 #[cfg(test)]
 mod response_batch_byte_cap_tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
 
     /// Records every byte written via `write_vectored`/`write_all` in order,
     /// so tests can assert both total volume and exact frame ordering across
@@ -1694,8 +1731,7 @@ mod response_batch_byte_cap_tests {
     #[tokio::test]
     async fn response_batch_never_exceeds_byte_cap_regardless_of_frame_count() {
         const FRAMES: usize = 32;
-        let (write_vectored_calls, written, max_batch_bytes) =
-            drain_simulated_turn(FRAMES).await;
+        let (write_vectored_calls, written, max_batch_bytes) = drain_simulated_turn(FRAMES).await;
 
         assert!(
             max_batch_bytes <= RESPONSE_BATCH_BYTE_CAP,

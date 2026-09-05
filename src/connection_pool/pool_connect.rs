@@ -4124,25 +4124,28 @@ impl<T> ConnectionPool<T> {
         let mut identify_send_failed = false;
         match registry_weak.upgrade() {
             Some(registry_arc) => {
-                let initial_msg = {
+                let (local_actors, known_actors, sequence, sender_bind_addr, wall_clock_time) = {
                     let (local_actors, known_actors) = registry_arc.snapshot_actor_pairs();
                     let gossip_state = registry_arc.gossip_state.lock().await;
-
-                    RegistryMessage::FullSync {
+                    (
                         local_actors,
                         known_actors,
-                        sender_peer_id: registry_arc.peer_id.clone(),
-                        sender_bind_addr: Some(registry_arc.advertised_addr().to_string()), // reachable advertised address (NAT-aware), not the raw bind
-                        sequence: gossip_state.gossip_sequence,
-                        wall_clock_time: crate::current_timestamp(),
-                        extensions: None,
-                    }
+                        gossip_state.gossip_sequence,
+                        Some(registry_arc.advertised_addr().to_string()),
+                        crate::current_timestamp(),
+                    )
                 };
-
-                // Serialize and send the initial message without flattening header + payload.
-                match rkyv::to_bytes::<rkyv::rancor::Error>(&initial_msg) {
-                    Ok(data) => {
-                        // Create a connection handle to send the message
+                let max_message_size = registry_arc.config.max_message_size;
+                match registry_arc.split_full_sync_for_inline_limit(
+                    local_actors,
+                    known_actors,
+                    registry_arc.peer_id.clone(),
+                    sender_bind_addr,
+                    sequence,
+                    wall_clock_time,
+                    max_message_size,
+                ) {
+                    Ok(payloads) => {
                         let conn_handle: ConnectionHandle<T> = ConnectionHandle::new_stream(
                             addr,
                             connection_arc.direction,
@@ -4152,34 +4155,32 @@ impl<T> ConnectionPool<T> {
                                 .clone()
                                 .unwrap_or_else(CorrelationTracker::new),
                         );
-                        match conn_handle
-                            .send_gossip_payload(bytes::Bytes::from_owner(data))
-                            .await
-                        {
-                            Ok(()) => {
-                                // The enqueue can succeed even though the IO
-                                // task backing it had already exited (or exits
-                                // an instant later) -- the frame was accepted
-                                // into the queue, but nothing will ever flush
-                                // it to the peer. Revalidate liveness right
-                                // after the enqueue so that race is caught too,
-                                // not just an outright enqueue failure.
-                                if conn_handle.is_closed() {
-                                    warn!(
-                                        peer = %addr,
-                                        "identify FullSync enqueued but this connection's IO task \
-                                         had already exited; treating identify as failed"
-                                    );
-                                    identify_send_failed = true;
-                                } else {
-                                    stream_handle.mark_identified();
-                                    info!(peer = %addr, "Sent initial FullSync message to identify ourselves");
+                        let mut send_ok = true;
+                        for payload in payloads {
+                            match conn_handle.send_gossip_payload(payload).await {
+                                Ok(()) => {
+                                    if conn_handle.is_closed() {
+                                        warn!(
+                                            peer = %addr,
+                                            "identify FullSync enqueued but this connection's IO task \
+                                             had already exited; treating identify as failed"
+                                        );
+                                        send_ok = false;
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(peer = %addr, error = %e, "Failed to send initial FullSync message");
+                                    send_ok = false;
+                                    break;
                                 }
                             }
-                            Err(e) => {
-                                warn!(peer = %addr, error = %e, "Failed to send initial FullSync message");
-                                identify_send_failed = true;
-                            }
+                        }
+                        if send_ok {
+                            stream_handle.mark_identified();
+                            info!(peer = %addr, "Sent initial FullSync message to identify ourselves");
+                        } else {
+                            identify_send_failed = true;
                         }
                     }
                     Err(e) => {
