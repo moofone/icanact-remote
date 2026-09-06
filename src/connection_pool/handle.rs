@@ -291,8 +291,7 @@ impl<T> ConnectionHandle<T> {
     /// complete, well-formed V5 frames -- this method adds no framing of
     /// its own, and this crate's wire protocol has no raw-passthrough read
     /// mode for it to fall back to if `data` isn't. Every read path
-    /// (`read_message_step`/`read_message_step_poll`/
-    /// `read_message_step_nonblocking` in `read_pipeline.rs`)
+    /// (`read_message_step_poll`/`read_message_step_nonblocking` in `read_pipeline.rs`)
     /// unconditionally decodes a V5 control word from whatever arrives on
     /// the connection and fails it if the bytes don't decode; there is no
     /// way to send genuinely unframed bytes and have the peer treat them

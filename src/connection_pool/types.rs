@@ -280,8 +280,7 @@ pub enum WritePayload {
     /// answer "is this a frame" and the caller should declare it instead,
     /// which is true about content-sniffing but false about there being a
     /// legitimate opaque case to declare. Every read path this crate has
-    /// (`read_message_step`/`read_message_step_poll`/
-    /// `read_message_step_nonblocking` in `read_pipeline.rs`)
+    /// (`read_message_step_poll`/`read_message_step_nonblocking` in `read_pipeline.rs`)
     /// unconditionally decodes a control word from whatever the peer sends
     /// and fails the connection if it doesn't decode; there is no
     /// raw-passthrough mode a sender could target with genuinely unframed

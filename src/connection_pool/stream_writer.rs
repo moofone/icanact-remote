@@ -3895,8 +3895,7 @@ impl LockFreeStreamHandle {
     /// instead. That theory was right about content-sniffing, wrong about
     /// there being a legitimate opaque case to declare: **this crate's
     /// wire protocol has no concept of unframed bytes.** Every read path
-    /// (`read_message_step`/`read_message_step_poll`/
-    /// `read_message_step_nonblocking` in `read_pipeline.rs`)
+    /// (`read_message_step_poll`/`read_message_step_nonblocking` in `read_pipeline.rs`)
     /// unconditionally decodes a control word from whatever arrives on the
     /// stream and fails the connection (`"unknown V5 wire kind"`) if it
     /// doesn't decode -- there is no raw-passthrough read mode a sender
@@ -5617,38 +5616,6 @@ impl Debug for LockFreeStreamHandle {
             .field("sequence", &self.sequence_counter.load(Ordering::Relaxed))
             .finish()
     }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-#[cfg(any(test, feature = "test-helpers", debug_assertions))]
-#[allow(dead_code)]
-enum DirectPayloadError {
-    HeaderTooShort,
-    PayloadTruncated { expected: usize, available: usize },
-}
-
-#[cfg(any(test, feature = "test-helpers", debug_assertions))]
-#[allow(dead_code)]
-fn parse_direct_message_payload<'a>(
-    msg_data: &'a [u8],
-) -> std::result::Result<&'a [u8], DirectPayloadError> {
-    if msg_data.len() < crate::framing::DIRECT_ASK_HEADER_LEN {
-        return Err(DirectPayloadError::HeaderTooShort);
-    }
-
-    let payload_len =
-        u32::from_be_bytes([msg_data[3], msg_data[4], msg_data[5], msg_data[6]]) as usize;
-    let payload_start = crate::framing::DIRECT_ASK_HEADER_LEN;
-    let payload_end = payload_start + payload_len;
-
-    if msg_data.len() < payload_end {
-        return Err(DirectPayloadError::PayloadTruncated {
-            expected: payload_len,
-            available: msg_data.len().saturating_sub(payload_start),
-        });
-    }
-
-    Ok(&msg_data[payload_start..payload_end])
 }
 
 #[cfg(test)]

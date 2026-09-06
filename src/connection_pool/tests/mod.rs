@@ -4768,45 +4768,6 @@ fn test_writer_vectored_sequence_header_payload() {
 }
 
 #[test]
-fn parse_direct_message_payload_success() {
-    let mut frame = vec![crate::MessageType::DirectAsk as u8, 0x12, 0x34];
-    frame.extend_from_slice(&(4u32).to_be_bytes()); /* ALLOW_COPY */
-    frame.extend_from_slice(&[0u8; 5]); /* ALLOW_COPY */
-    frame.extend_from_slice(b"PING"); /* ALLOW_COPY */
-
-    let payload = super::parse_direct_message_payload(&frame).expect("parse ok");
-    assert_eq!(payload, b"PING");
-}
-
-#[test]
-fn parse_direct_message_payload_truncated() {
-    let mut frame = vec![crate::MessageType::DirectAsk as u8, 0x12, 0x34];
-    frame.extend_from_slice(&(4u32).to_be_bytes()); /* ALLOW_COPY */
-    frame.extend_from_slice(&[0u8; 5]); /* ALLOW_COPY */
-    frame.extend_from_slice(b"PI"); /* ALLOW_COPY */
-
-    match super::parse_direct_message_payload(&frame) {
-        Err(super::DirectPayloadError::PayloadTruncated {
-            expected,
-            available,
-        }) => {
-            assert_eq!(expected, 4);
-            assert_eq!(available, 2);
-        }
-        other => panic!("unexpected parse result: {:?}", other),
-    }
-}
-
-#[test]
-fn parse_direct_message_payload_header_too_short() {
-    let frame = vec![0u8; 3];
-    assert_eq!(
-        super::parse_direct_message_payload(&frame),
-        Err(super::DirectPayloadError::HeaderTooShort)
-    );
-}
-
-#[test]
 fn test_connection_handle_send_data_closed() {
     run_multi_thread_test(async {
         let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(

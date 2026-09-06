@@ -1243,7 +1243,7 @@ impl StreamingState {
 
     /// Number of tombstoned (rejected or reaped) stream ids currently
     /// quarantined. Exposed for tests (including `connection_pool`'s, which
-    /// drive `read_message_step` directly) that verify the table stays
+    /// drive the production read pipeline directly) that verify the table stays
     /// bounded or that a tombstone is cleaned up.
     #[cfg(test)]
     pub(crate) fn rejected_stream_count(&self) -> usize {
