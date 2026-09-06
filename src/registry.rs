@@ -8047,8 +8047,10 @@ impl<T: 'static> GossipRegistry<T> {
         mut since_sequence: u64,
         mut current_sequence: u64,
         wall_clock_time: u64,
+        precise_timing_nanos: u64,
         extensions: Option<GossipExtensionsV1>,
         max_message_size: usize,
+        as_response: bool,
     ) -> Result<Vec<bytes::Bytes>> {
         fn delta_message(
             changes: Vec<RegistryChange>,
@@ -8056,18 +8058,22 @@ impl<T: 'static> GossipRegistry<T> {
             since_sequence: u64,
             current_sequence: u64,
             wall_clock_time: u64,
+            precise_timing_nanos: u64,
             extensions: Option<GossipExtensionsV1>,
+            as_response: bool,
         ) -> RegistryMessage {
-            RegistryMessage::DeltaGossip {
-                delta: RegistryDelta {
-                    since_sequence,
-                    current_sequence,
-                    changes,
-                    sender_peer_id,
-                    wall_clock_time,
-                    precise_timing_nanos: crate::current_timestamp_nanos(),
-                },
-                extensions,
+            let delta = RegistryDelta {
+                since_sequence,
+                current_sequence,
+                changes,
+                sender_peer_id,
+                wall_clock_time,
+                precise_timing_nanos,
+            };
+            if as_response {
+                RegistryMessage::DeltaGossipResponse { delta, extensions }
+            } else {
+                RegistryMessage::DeltaGossip { delta, extensions }
             }
         }
 
@@ -8090,7 +8096,9 @@ impl<T: 'static> GossipRegistry<T> {
                 since_sequence,
                 current_sequence,
                 wall_clock_time,
+                precise_timing_nanos,
                 extensions.clone(),
+                as_response,
             ))
         };
 
@@ -8104,7 +8112,9 @@ impl<T: 'static> GossipRegistry<T> {
                 since_sequence,
                 current_sequence,
                 wall_clock_time,
+                precise_timing_nanos,
                 extensions.clone(),
+                as_response,
             ))?;
             if Self::gossip_payload_fits(candidate.len(), max_message_size) {
                 continue;
@@ -8119,7 +8129,9 @@ impl<T: 'static> GossipRegistry<T> {
                 since_sequence,
                 current_sequence,
                 wall_clock_time,
+                precise_timing_nanos,
                 extensions.clone(),
+                as_response,
             ))?;
             if !Self::gossip_payload_fits(solo.len(), max_message_size) {
                 return Err(crate::framing::reject_oversize_for_inline_send(
@@ -8229,8 +8241,10 @@ impl<T: 'static> GossipRegistry<T> {
                         *sequence,
                         *sequence,
                         *wall_clock_time,
+                        crate::current_timestamp_nanos(),
                         extensions.clone(),
                         max_message_size,
+                        false,
                     )?);
                 }
                 Ok(payloads)
@@ -8251,8 +8265,10 @@ impl<T: 'static> GossipRegistry<T> {
                     delta.since_sequence,
                     delta.current_sequence,
                     delta.wall_clock_time,
+                    delta.precise_timing_nanos,
                     extensions.clone(),
                     max_message_size,
+                    matches!(message, RegistryMessage::DeltaGossipResponse { .. }),
                 )
             }
             _ => Err(crate::framing::reject_oversize_for_inline_send(
@@ -13907,6 +13923,97 @@ mod tests {
             matches!(result, Err(GossipError::MessageTooLarge { .. })),
             "oversized empty delta must not encode as zero frames, got {result:?}"
         );
+    }
+
+    fn oversized_delta_changes(registry: &GossipRegistry<()>) -> Vec<RegistryChange> {
+        (0..8)
+            .map(|i| {
+                let mut location = test_location(test_addr(7777));
+                location.metadata = vec![7; 16 * 1024];
+                location.peer_id = registry.peer_id.clone();
+                location.node_id = registry.peer_id.to_node_id();
+                let priority = location.priority;
+                RegistryChange::ActorAdded {
+                    name: format!("large/{i}"),
+                    location,
+                    priority,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn split_delta_fragments_preserve_precise_timing() {
+        let mut config = test_config();
+        config.max_message_size = 64 * 1024;
+        let registry = GossipRegistry::<()>::new(test_addr(18_083), config);
+        let original_timing = 1_800_000_000_123_456_789;
+        let msg = RegistryMessage::DeltaGossip {
+            delta: RegistryDelta {
+                since_sequence: 4,
+                current_sequence: 4,
+                changes: oversized_delta_changes(&registry),
+                sender_peer_id: registry.peer_id.clone(),
+                wall_clock_time: 9,
+                precise_timing_nanos: original_timing,
+            },
+            extensions: None,
+        };
+        let payloads = registry
+            .encode_outbound_gossip_for_inline_limit(&msg)
+            .expect("oversized delta must split");
+        assert!(
+            payloads.len() > 1,
+            "fixture must split so timing preservation is observable"
+        );
+        for payload in &payloads {
+            let decoded =
+                rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(payload).unwrap(); // ALLOW_RKYV_FROM_BYTES
+            let RegistryMessage::DeltaGossip { delta, .. } = decoded else {
+                panic!("delta fragments must stay DeltaGossip, got {decoded:?}");
+            };
+            assert_eq!(
+                delta.precise_timing_nanos, original_timing,
+                "split fragments must keep the source delta timestamp, not fragmentation time"
+            );
+        }
+    }
+
+    #[test]
+    fn split_delta_response_fragments_keep_response_variant() {
+        let mut config = test_config();
+        config.max_message_size = 64 * 1024;
+        let registry = GossipRegistry::<()>::new(test_addr(18_084), config);
+        let original_timing = 1_800_000_000_987_654_321;
+        let msg = RegistryMessage::DeltaGossipResponse {
+            delta: RegistryDelta {
+                since_sequence: 5,
+                current_sequence: 5,
+                changes: oversized_delta_changes(&registry),
+                sender_peer_id: registry.peer_id.clone(),
+                wall_clock_time: 11,
+                precise_timing_nanos: original_timing,
+            },
+            extensions: None,
+        };
+        let payloads = registry
+            .encode_outbound_gossip_for_inline_limit(&msg)
+            .expect("oversized delta response must split");
+        assert!(
+            payloads.len() > 1,
+            "fixture must split so response variant preservation is observable"
+        );
+        for payload in &payloads {
+            let decoded =
+                rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(payload).unwrap(); // ALLOW_RKYV_FROM_BYTES
+            let RegistryMessage::DeltaGossipResponse { delta, .. } = decoded else {
+                panic!("response fragments must stay DeltaGossipResponse, got {decoded:?}");
+            };
+            assert_eq!(
+                delta.precise_timing_nanos, original_timing,
+                "response fragments must keep the source delta timestamp"
+            );
+        }
     }
 
     #[tokio::test]
