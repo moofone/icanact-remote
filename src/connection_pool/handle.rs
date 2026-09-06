@@ -29,6 +29,27 @@ fn require_positive_timeout(timeout: Duration) -> Result<()> {
     }
 }
 
+/// Deadline covering admission only. Remaining time is returned for a later
+/// wait: deferred asks start their budget at submission, not at the later
+/// `PendingAsk` await.
+async fn admit_ask_with_deadline(
+    timeout: Duration,
+    started_at: Instant,
+    write: impl Future<Output = Result<()>>,
+) -> Result<Duration> {
+    match tokio::time::timeout(timeout, write).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err(crate::GossipError::Timeout),
+    }
+    let remaining = timeout.saturating_sub(started_at.elapsed());
+    if remaining.is_zero() {
+        Err(crate::GossipError::Timeout)
+    } else {
+        Ok(remaining)
+    }
+}
+
 impl<T> std::fmt::Debug for ConnectionHandle<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnectionHandle")
@@ -122,6 +143,31 @@ impl<T> ConnectionHandle<T> {
         self.stream_handle
             .as_ref()
             .map(|handle| handle.instance_id())
+    }
+
+    /// One absolute deadline covering queue/gate admission and the response wait.
+    async fn finish_timed_ask(
+        &self,
+        timeout: Duration,
+        correlation_id: u32,
+        slot: SlotGuard<'_>,
+        write: impl Future<Output = Result<()>>,
+    ) -> Result<bytes::Bytes> {
+        let result = match tokio::time::timeout(timeout, async {
+            write.await?;
+            self.correlation
+                .wait_for_response_no_timeout(correlation_id)
+                .await
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(crate::GossipError::Timeout),
+        };
+        if result.is_ok() {
+            let _ = slot.disarm();
+        }
+        result.map(|response| response.into_bytes())
     }
 
     #[inline]
@@ -1102,39 +1148,24 @@ impl<T> ConnectionHandle<T> {
             correlation_id,
             payload_len,
         )?;
-        if let Some(stream_handle) = self.stream_handle.as_ref() {
-            let prefix_len = prefix.as_ref().map(|p| p.len()).unwrap_or(0) as u8;
-            if let Err(e) = stream_handle
-                .write_pooled_ask_inline(header, 16, prefix, prefix_len, payload)
-                .await
-            {
-                // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
-                return Err(e);
+        self.finish_timed_ask(timeout, correlation_id, slot, async {
+            if let Some(stream_handle) = self.stream_handle.as_ref() {
+                let prefix_len = prefix.as_ref().map(|p| p.len()).unwrap_or(0) as u8;
+                stream_handle
+                    .write_pooled_ask_inline(header, 16, prefix, prefix_len, payload)
+                    .await
+            } else {
+                let mut body = BytesMut::with_capacity(payload_len);
+                if let Some(prefix) = prefix {
+                    body.extend_from_slice(&prefix); // ALLOW_COPY
+                }
+                let payload_bytes = payload.copy_to_bytes(payload.remaining());
+                body.extend_from_slice(payload_bytes.as_ref()); // ALLOW_COPY
+                self.write_header_and_payload_ask_inline(header, 16, body.freeze())
+                    .await
             }
-        } else {
-            let mut body = BytesMut::with_capacity(payload_len);
-            if let Some(prefix) = prefix {
-                body.extend_from_slice(&prefix); // ALLOW_COPY
-            }
-            let payload_bytes = payload.copy_to_bytes(payload.remaining());
-            body.extend_from_slice(payload_bytes.as_ref()); // ALLOW_COPY
-            if let Err(e) = self
-                .write_header_and_payload_ask_inline(header, 16, body.freeze())
-                .await
-            {
-                // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
-                return Err(e);
-            }
-        }
-
-        let response = self
-            .correlation
-            .wait_for_response(correlation_id, timeout)
-            .await?;
-        // wait_for_response always cleans up slot state on terminal returns
-        // (Ok / Err); disarming skips the redundant Drop-time cancel CAS.
-        let _ = slot.disarm();
-        Ok(response.into_bytes())
+        })
+        .await
     }
 
     /// Ask using owned bytes and custom timeout. Returns response as Bytes.
@@ -1154,22 +1185,11 @@ impl<T> ConnectionHandle<T> {
             request.len(),
         )?;
 
-        if let Err(e) = self
-            .write_header_and_payload_ask_inline(header, 16, request)
-            .await
-        {
-            // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
-            return Err(e);
-        }
-
-        let response = self
-            .correlation
-            .wait_for_response(correlation_id, timeout)
-            .await?;
-        // wait_for_response always cleans up slot state on terminal returns
-        // (Ok / Err); disarming skips the redundant Drop-time cancel CAS.
-        let _ = slot.disarm();
-        Ok(response.into_bytes())
+        self.finish_timed_ask(timeout, correlation_id, slot, async {
+            self.write_header_and_payload_ask_inline(header, 16, request)
+                .await
+        })
+        .await
     }
 
     /// Fast-path direct ask that bypasses the actor message handler.
@@ -1243,20 +1263,10 @@ impl<T> ConnectionHandle<T> {
         let header =
             framing::try_write_direct_ask_header(correlation_id, request_id, request.len())?;
 
-        // Write header + payload inline (fast path)
-        if let Err(e) = self.write_direct_ask_inline(header, request).await {
-            // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
-            return Err(e);
-        }
-
-        let response = self
-            .correlation
-            .wait_for_response(correlation_id, timeout)
-            .await?;
-        // wait_for_response always cleans up slot state on terminal returns
-        // (Ok / Err); disarming skips the redundant Drop-time cancel CAS.
-        let _ = slot.disarm();
-        Ok(response.into_bytes())
+        self.finish_timed_ask(timeout, correlation_id, slot, async {
+            self.write_direct_ask_inline(header, request).await
+        })
+        .await
     }
 
     /// Fast-path direct ask without timeout allocation (benchmarking/hot path).
@@ -1308,14 +1318,6 @@ impl<T> ConnectionHandle<T> {
                 .ask_actor_frame(actor_id, type_hash, payload, timeout)
                 .await;
         }
-        let chunk_size = stream_handle.max_stream_chunk_size()?;
-        // `SlotGuard` cancels this exact correlation slot on every `?` or
-        // cancellation path below. Only a successful terminal response calls
-        // `disarm`, after `wait_for_response` has removed the waiter.
-        let slot = self.correlation.allocate()?;
-        let correlation_id = slot.id();
-        let gate_guard = stream_handle.acquire_streaming_mode().await?;
-        let stream_id = stream_handle.allocate_stream_id()?;
         // R-9: reject locally at MAX_STREAM_SIZE — every receiver hard-rejects a
         // larger stream as a FATAL error, so sending it would tear the
         // connection down with collateral loss. Cap before emitting any frame.
@@ -1330,58 +1332,71 @@ impl<T> ConnectionHandle<T> {
                 size: payload.len(),
                 max: crate::MAX_STREAM_SIZE,
             })?;
-        let first_len = payload.len().min(chunk_size);
-        let first_header = crate::framing::try_write_stream_request_start_header(
-            stream_id,
-            correlation_id,
-            total_size,
-            actor_id,
-            type_hash,
-            first_len,
-        )?;
-        stream_handle
-            .write_bytes_vectored(first_header, payload.slice(..first_len))
-            .await?;
-        // Armed only after StreamStart was accepted by the FIFO. From here on,
-        // every cancellation path must release the peer-side reassembly.
-        let mut abort_guard = StreamAbortGuard::new(stream_handle, stream_id);
-        let mut offset = first_len;
-        let mut index = 1u32;
-        while offset < payload.len() {
-            let end = (offset + chunk_size).min(payload.len());
-            let header = crate::framing::try_write_stream_data_header(
-                false,
+        let chunk_size = stream_handle.max_stream_chunk_size()?;
+        // `SlotGuard` cancels this exact correlation slot on every `?` or
+        // cancellation path below. Only a successful terminal response calls
+        // `disarm`, after `wait_for_response` has removed the waiter.
+        let slot = self.correlation.allocate()?;
+        let correlation_id = slot.id();
+        let result = match tokio::time::timeout(timeout, async {
+            let gate_guard = stream_handle.acquire_streaming_mode().await?;
+            let stream_id = stream_handle.allocate_stream_id()?;
+            let first_len = payload.len().min(chunk_size);
+            let first_header = crate::framing::try_write_stream_request_start_header(
                 stream_id,
-                index,
-                end - offset,
+                correlation_id,
+                total_size,
+                actor_id,
+                type_hash,
+                first_len,
             )?;
-            if let Err(error) = stream_handle
-                .write_bytes_vectored(header, payload.slice(offset..end))
-                .await
-            {
-                return Err(error);
+            stream_handle
+                .write_bytes_vectored(first_header, payload.slice(..first_len))
+                .await?;
+            // Armed only after StreamStart was accepted by the FIFO. From here on,
+            // every cancellation path must release the peer-side reassembly.
+            let mut abort_guard = StreamAbortGuard::new(stream_handle, stream_id);
+            let mut offset = first_len;
+            let mut index = 1u32;
+            while offset < payload.len() {
+                let end = (offset + chunk_size).min(payload.len());
+                let header = crate::framing::try_write_stream_data_header(
+                    false,
+                    stream_id,
+                    index,
+                    end - offset,
+                )?;
+                stream_handle
+                    .write_bytes_vectored(header, payload.slice(offset..end))
+                    .await?;
+                offset = end;
+                index = match index.checked_add(1) {
+                    Some(index) => index,
+                    None => {
+                        return Err(GossipError::Network(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "stream chunk index exhausted",
+                        )));
+                    }
+                };
             }
-            offset = end;
-            index = match index.checked_add(1) {
-                Some(index) => index,
-                None => {
-                    return Err(GossipError::Network(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "stream chunk index exhausted",
-                    )));
-                }
-            };
+            // All stream frames are now queued in FIFO order. A caller cancelling
+            // while it waits for the response cannot leave a partial reassembly.
+            abort_guard.disarm();
+            drop(gate_guard);
+            self.correlation
+                .wait_for_response_no_timeout(correlation_id)
+                .await
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(crate::GossipError::Timeout),
+        };
+        if result.is_ok() {
+            let _ = slot.disarm();
         }
-        // All stream frames are now queued in FIFO order. A caller cancelling
-        // while it waits for the response cannot leave a partial reassembly.
-        abort_guard.disarm();
-        drop(gate_guard);
-        let response = self
-            .correlation
-            .wait_for_response(correlation_id, timeout)
-            .await?;
-        let _ = slot.disarm();
-        Ok(response.into_bytes())
+        result.map(|response| response.into_bytes())
     }
 
     /// Send an ask and return a handle that can be awaited later.
@@ -1396,6 +1411,9 @@ impl<T> ConnectionHandle<T> {
     }
 
     /// Deferred ask using owned bytes and a custom timeout.
+    ///
+    /// The timeout starts at submission and covers write-queue admission.
+    /// Remaining time is stored on the returned handle for the later wait.
     pub(crate) async fn ask_deferred_with_timeout_bytes(
         &self,
         request: bytes::Bytes,
@@ -1403,6 +1421,7 @@ impl<T> ConnectionHandle<T> {
     ) -> Result<PendingAsk> {
         require_positive_timeout(timeout)?;
         self.reject_oversize_inline(framing::ASK_RESPONSE_HEADER_LEN, request.len())?;
+        let started_at = Instant::now();
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
 
@@ -1412,13 +1431,12 @@ impl<T> ConnectionHandle<T> {
             request.len(),
         )?;
 
-        if let Err(e) = self
-            .write_header_and_payload_ask_inline(header, 16, request)
-            .await
-        {
-            // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
-            return Err(e);
-        }
+        let remaining = admit_ask_with_deadline(
+            timeout,
+            started_at,
+            self.write_header_and_payload_ask_inline(header, 16, request),
+        )
+        .await?;
 
         Ok(PendingAsk {
             // Transfer slot ownership to PendingAsk: its own Drop becomes
@@ -1426,7 +1444,7 @@ impl<T> ConnectionHandle<T> {
             // dropped without being awaited.
             correlation_id: slot.disarm(),
             correlation: self.correlation.clone(),
-            timeout,
+            timeout: remaining,
             active: true,
         })
     }
@@ -1442,6 +1460,7 @@ impl<T> ConnectionHandle<T> {
             return Ok(Vec::new());
         }
         require_positive_timeout(timeout)?;
+        let started_at = Instant::now();
 
         // Validate every request's encoded size *before* touching the
         // allocator. `reject_oversize_inline` used to run inside the loop
@@ -1486,17 +1505,17 @@ impl<T> ConnectionHandle<T> {
         // use the trusted lane, not the generic one, which would otherwise
         // reject a legitimately large batch on the same bare length ceiling
         // that protects arbitrary caller bytes.
-        let send_result = if let Some(stream_handle) = self.stream_handle.as_ref() {
-            stream_handle
-                .write_trusted_bytes_ask(batch_message.freeze())
-                .await
-        } else {
-            self.write_trusted_bytes_control(batch_message.freeze())
-                .await
-        };
-        // Send-failure path: returning Err drops `slots`, which cancels every
-        // reservation. No explicit per-id cancel loop needed.
-        send_result?;
+        let remaining = admit_ask_with_deadline(timeout, started_at, async {
+            if let Some(stream_handle) = self.stream_handle.as_ref() {
+                stream_handle
+                    .write_trusted_bytes_ask(batch_message.freeze())
+                    .await
+            } else {
+                self.write_trusted_bytes_control(batch_message.freeze())
+                    .await
+            }
+        })
+        .await?;
 
         let handles = slots
             .into_iter()
@@ -1506,7 +1525,7 @@ impl<T> ConnectionHandle<T> {
                 // is abandoned without being awaited.
                 correlation_id: slot.disarm(),
                 correlation: self.correlation.clone(),
-                timeout,
+                timeout: remaining,
                 active: true,
             })
             .collect();
