@@ -192,3 +192,38 @@ async fn actor_ask_timeout_covers_full_write_queue() {
         "10ms ask budget must expire while the write queue is full, got {outcome:?}"
     );
 }
+
+#[tokio::test]
+async fn actor_ask_cancel_beyond_ring_capacity_still_admits() {
+    use std::future::Future;
+    use std::task::{Context, Poll};
+
+    let (stream, conn, writer, reader) = deadline_fixture();
+    stream.begin_identify_gate();
+    let waker = futures::task::noop_waker();
+    let mut cx = Context::from_waker(&waker);
+    for _ in 0..(8192 + 1) {
+        let ask = conn.ask_actor_frame(1, 1, bytes::Bytes::new(), Duration::from_millis(10));
+        tokio::pin!(ask);
+        let polled = ask.as_mut().poll(&mut cx);
+        assert!(
+            matches!(polled, Poll::Pending),
+            "cancelled asks must park on the identify gate, got {polled:?}"
+        );
+        drop(ask);
+    }
+    let outcome = tokio::time::timeout(
+        Duration::from_millis(150),
+        conn.ask_actor_frame(1, 1, bytes::Bytes::new(), Duration::from_millis(10)),
+    )
+    .await;
+    stream.shutdown();
+    writer.abort();
+    if let Some(reader) = reader {
+        reader.abort();
+    }
+    assert!(
+        matches!(outcome, Ok(Err(GossipError::Timeout))),
+        "after more than one correlation ring of cancelled asks, a new ask must still be admitted, got {outcome:?}"
+    );
+}
