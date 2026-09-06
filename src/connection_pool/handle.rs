@@ -37,7 +37,11 @@ async fn admit_ask_with_deadline(
     started_at: Instant,
     write: impl Future<Output = Result<()>>,
 ) -> Result<Duration> {
-    match tokio::time::timeout(timeout, write).await {
+    let remaining = timeout.saturating_sub(started_at.elapsed());
+    if remaining.is_zero() {
+        return Err(crate::GossipError::Timeout);
+    }
+    match tokio::time::timeout(remaining, write).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(e),
         Err(_) => return Err(crate::GossipError::Timeout),
@@ -47,6 +51,45 @@ async fn admit_ask_with_deadline(
         Err(crate::GossipError::Timeout)
     } else {
         Ok(remaining)
+    }
+}
+
+#[cfg(test)]
+mod admit_ask_deadline_tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn times_out_immediately_when_submission_budget_is_already_exhausted() {
+        let timeout = Duration::from_millis(50);
+        let started_at = Instant::now() - timeout;
+        let started = Instant::now();
+        let result = admit_ask_with_deadline(timeout, started_at, std::future::pending()).await;
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(result, Err(GossipError::Timeout)),
+            "exhausted admission budget must be Timeout, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(20),
+            "exhausted budget must fail without waiting the full timeout, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn caps_blocked_write_to_remaining_submission_budget() {
+        let timeout = Duration::from_millis(50);
+        let started_at = Instant::now() - Duration::from_millis(40);
+        let started = Instant::now();
+        let result = admit_ask_with_deadline(timeout, started_at, std::future::pending()).await;
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(result, Err(GossipError::Timeout)),
+            "blocked write past remaining budget must be Timeout, got {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(30),
+            "blocked write must wait only remaining budget (~10ms), not full timeout, took {elapsed:?}"
+        );
     }
 }
 
@@ -928,20 +971,12 @@ impl<T> ConnectionHandle<T> {
         let started_at = Instant::now();
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
-        match tokio::time::timeout(
+        let remaining = admit_ask_with_deadline(
             timeout,
+            started_at,
             self.write_routed_actor_ask(correlation_id, actor_id, type_hash, payload),
         )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(_) => return Err(crate::GossipError::Timeout),
-        }
-        let remaining = timeout.saturating_sub(started_at.elapsed());
-        if remaining.is_zero() {
-            return Err(crate::GossipError::Timeout);
-        }
+        .await?;
 
         Ok(PendingAsk {
             // Transfer slot ownership to PendingAsk: its own Drop becomes
