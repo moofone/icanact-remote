@@ -14428,3 +14428,5 @@ async fn full_sync_claim_displaced_during_merge_records_no_stale_projection() {
 async fn full_sync_response_claim_displaced_during_merge_records_no_stale_projection() {
     run_full_sync_displaced_during_merge_is_dropped(true).await;
 }
+
+include!("qa_queue_close.rs");

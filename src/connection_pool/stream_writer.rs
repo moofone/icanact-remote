@@ -485,6 +485,53 @@ enum PendingOrdinaryWrite {
     },
 }
 
+/// Park `batch` as a one-poll `PendingOrdinaryWrite::Chunks` so the IO loop
+/// can keep reading while the write makes partial progress. No-ops when the
+/// batch is empty or the wire is already owned.
+fn park_ask_response_batch(
+    pending_ordinary_write: &mut Option<PendingOrdinaryWrite>,
+    batch: &mut ResponseBatch,
+) -> Result<bool> {
+    if batch.is_empty() || pending_ordinary_write.is_some() {
+        return Ok(false);
+    }
+    let chunks = batch.take_wire_chunks()?;
+    *pending_ordinary_write = Some(PendingOrdinaryWrite::Chunks { chunks, offset: 0 });
+    Ok(true)
+}
+
+fn park_direct_response_batch(
+    pending_ordinary_write: &mut Option<PendingOrdinaryWrite>,
+    batch: &mut DirectResponseBatch,
+) -> Result<bool> {
+    if batch.is_empty() || pending_ordinary_write.is_some() {
+        return Ok(false);
+    }
+    let chunks = batch.take_wire_chunks()?;
+    *pending_ordinary_write = Some(PendingOrdinaryWrite::Chunks { chunks, offset: 0 });
+    Ok(true)
+}
+
+fn park_ask_response_batch_if_over_byte_cap(
+    pending_ordinary_write: &mut Option<PendingOrdinaryWrite>,
+    batch: &mut ResponseBatch,
+) -> Result<bool> {
+    if batch.total_bytes() < RESPONSE_BATCH_BYTE_CAP {
+        return Ok(false);
+    }
+    park_ask_response_batch(pending_ordinary_write, batch)
+}
+
+fn park_direct_response_batch_if_over_byte_cap(
+    pending_ordinary_write: &mut Option<PendingOrdinaryWrite>,
+    batch: &mut DirectResponseBatch,
+) -> Result<bool> {
+    if batch.total_bytes() < RESPONSE_BATCH_BYTE_CAP {
+        return Ok(false);
+    }
+    park_direct_response_batch(pending_ordinary_write, batch)
+}
+
 fn advance_header_payload_offset(
     header_len: usize,
     header_off: &mut usize,
@@ -3114,39 +3161,43 @@ impl LockFreeStreamHandle {
                         // max-size response frames cannot force unbounded
                         // memory growth before `read_batch_limit` frames are
                         // seen. See `flush_response_batch_if_over_byte_cap`.
-                        if pending_stream_cmd.is_none()
-                            && pending_ordinary_write.is_none()
-                            && let Err(e) = flush_response_batch_if_over_byte_cap(
-                                &mut stream,
-                                &bytes_written_counter,
-                                &mut bytes_since_flush,
+                        if pending_stream_cmd.is_none() {
+                            match park_ask_response_batch_if_over_byte_cap(
+                                &mut pending_ordinary_write,
                                 &mut response_batch,
-                            )
-                            .await
-                        {
-                            warn!(
-                                peer = %ctx.peer_addr,
-                                error = %e,
-                                "Failed to write response batch (byte cap)"
-                            );
-                            return;
-                        }
-                        if pending_stream_cmd.is_none()
-                            && pending_ordinary_write.is_none()
-                            && let Err(e) = flush_direct_response_batch_if_over_byte_cap(
-                                &mut stream,
-                                &bytes_written_counter,
-                                &mut bytes_since_flush,
+                            ) {
+                                Ok(true) => {
+                                    wrote_actor_responses = true;
+                                    break;
+                                }
+                                Ok(false) => {}
+                                Err(e) => {
+                                    warn!(
+                                        peer = %ctx.peer_addr,
+                                        error = %e,
+                                        "Failed to park response batch (byte cap)"
+                                    );
+                                    return;
+                                }
+                            }
+                            match park_direct_response_batch_if_over_byte_cap(
+                                &mut pending_ordinary_write,
                                 &mut direct_response_batch,
-                            )
-                            .await
-                        {
-                            warn!(
-                                peer = %ctx.peer_addr,
-                                error = %e,
-                                "Failed to write direct response batch (byte cap)"
-                            );
-                            return;
+                            ) {
+                                Ok(true) => {
+                                    wrote_fast_responses = true;
+                                    break;
+                                }
+                                Ok(false) => {}
+                                Err(e) => {
+                                    warn!(
+                                        peer = %ctx.peer_addr,
+                                        error = %e,
+                                        "Failed to park direct response batch (byte cap)"
+                                    );
+                                    return;
+                                }
+                            }
                         }
 
                         let read_start = perf.map(|_| Instant::now());
@@ -3289,47 +3340,37 @@ impl LockFreeStreamHandle {
                             break;
                         }
                     }
-                    if pending_stream_cmd.is_none()
-                        && pending_ordinary_write.is_none()
-                        && !response_batch.is_empty()
-                    {
-                        if let Err(e) = write_response_batch(
-                            &mut stream,
-                            &bytes_written_counter,
-                            &mut bytes_since_flush,
+                    if pending_stream_cmd.is_none() {
+                        match park_ask_response_batch(
+                            &mut pending_ordinary_write,
                             &mut response_batch,
-                        )
-                        .await
-                        {
-                            warn!(
-                                peer = %ctx.peer_addr,
-                                error = %e,
-                                "Failed to write response batch"
-                            );
-                            return;
+                        ) {
+                            Ok(true) => wrote_actor_responses = true,
+                            Ok(false) => {}
+                            Err(e) => {
+                                warn!(
+                                    peer = %ctx.peer_addr,
+                                    error = %e,
+                                    "Failed to park response batch"
+                                );
+                                return;
+                            }
                         }
-                        wrote_actor_responses = true;
-                    }
-                    if pending_stream_cmd.is_none()
-                        && pending_ordinary_write.is_none()
-                        && !direct_response_batch.is_empty()
-                    {
-                        if let Err(e) = write_direct_response_batch(
-                            &mut stream,
-                            &bytes_written_counter,
-                            &mut bytes_since_flush,
+                        match park_direct_response_batch(
+                            &mut pending_ordinary_write,
                             &mut direct_response_batch,
-                        )
-                        .await
-                        {
-                            warn!(
-                                peer = %ctx.peer_addr,
-                                error = %e,
-                                "Failed to write direct response batch"
-                            );
-                            return;
+                        ) {
+                            Ok(true) => wrote_fast_responses = true,
+                            Ok(false) => {}
+                            Err(e) => {
+                                warn!(
+                                    peer = %ctx.peer_addr,
+                                    error = %e,
+                                    "Failed to park direct response batch"
+                                );
+                                return;
+                            }
                         }
-                        wrote_fast_responses = true;
                     }
                 }
             }
@@ -3517,39 +3558,37 @@ impl LockFreeStreamHandle {
                                 // R-I: same per-turn byte cap as the primary
                                 // drain loop above; see
                                 // `flush_response_batch_if_over_byte_cap`.
-                                if pending_stream_cmd.is_none()
-                                    && pending_ordinary_write.is_none()
-                                    && let Err(e) = flush_response_batch_if_over_byte_cap(
-                                    &mut stream,
-                                    &bytes_written_counter,
-                                    &mut bytes_since_flush,
-                                    &mut response_batch,
-                                )
-                                .await
-                                {
-                                    warn!(
-                                        peer = %ctx.peer_addr,
-                                        error = %e,
-                                        "Failed to write response batch (byte cap)"
-                                    );
-                                    return;
-                                }
-                                if pending_stream_cmd.is_none()
-                                    && pending_ordinary_write.is_none()
-                                    && let Err(e) = flush_direct_response_batch_if_over_byte_cap(
-                                    &mut stream,
-                                    &bytes_written_counter,
-                                    &mut bytes_since_flush,
-                                    &mut direct_response_batch,
-                                )
-                                .await
-                                {
-                                    warn!(
-                                        peer = %ctx.peer_addr,
-                                        error = %e,
-                                        "Failed to write direct response batch (byte cap)"
-                                    );
-                                    return;
+                                if pending_stream_cmd.is_none() {
+                                    match park_ask_response_batch_if_over_byte_cap(
+                                        &mut pending_ordinary_write,
+                                        &mut response_batch,
+                                    ) {
+                                        Ok(true) => break,
+                                        Ok(false) => {}
+                                        Err(e) => {
+                                            warn!(
+                                                peer = %ctx.peer_addr,
+                                                error = %e,
+                                                "Failed to park response batch (byte cap)"
+                                            );
+                                            return;
+                                        }
+                                    }
+                                    match park_direct_response_batch_if_over_byte_cap(
+                                        &mut pending_ordinary_write,
+                                        &mut direct_response_batch,
+                                    ) {
+                                        Ok(true) => break,
+                                        Ok(false) => {}
+                                        Err(e) => {
+                                            warn!(
+                                                peer = %ctx.peer_addr,
+                                                error = %e,
+                                                "Failed to park direct response batch (byte cap)"
+                                            );
+                                            return;
+                                        }
+                                    }
                                 }
 
                                 let read_start = perf.map(|_| Instant::now());
@@ -3669,42 +3708,26 @@ impl LockFreeStreamHandle {
                                 }
                             }
 
-                            if pending_stream_cmd.is_none()
-                                && pending_ordinary_write.is_none()
-                                && !response_batch.is_empty()
-                            {
-                                if let Err(e) = write_response_batch(
-                                    &mut stream,
-                                    &bytes_written_counter,
-                                    &mut bytes_since_flush,
+                            if pending_stream_cmd.is_none() {
+                                if let Err(e) = park_ask_response_batch(
+                                    &mut pending_ordinary_write,
                                     &mut response_batch,
-                                )
-                                .await
-                                {
+                                ) {
                                     warn!(
                                         peer = %ctx.peer_addr,
                                         error = %e,
-                                        "Failed to write response batch"
+                                        "Failed to park response batch"
                                     );
                                     return;
                                 }
-                            }
-                            if pending_stream_cmd.is_none()
-                                && pending_ordinary_write.is_none()
-                                && !direct_response_batch.is_empty()
-                            {
-                                if let Err(e) = write_direct_response_batch(
-                                    &mut stream,
-                                    &bytes_written_counter,
-                                    &mut bytes_since_flush,
+                                if let Err(e) = park_direct_response_batch(
+                                    &mut pending_ordinary_write,
                                     &mut direct_response_batch,
-                                )
-                                .await
-                                {
+                                ) {
                                     warn!(
                                         peer = %ctx.peer_addr,
                                         error = %e,
-                                        "Failed to write direct response batch"
+                                        "Failed to park direct response batch"
                                     );
                                     return;
                                 }
