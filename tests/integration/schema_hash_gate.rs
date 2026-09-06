@@ -29,8 +29,8 @@ impl icanact_remote::registry::ActorMessageHandler for TestHandler {
 
 #[tokio::test]
 async fn schema_hash_allows_matching_headers() {
-    let addr_a: SocketAddr = "127.0.0.1:9111".parse().unwrap();
-    let addr_b: SocketAddr = "127.0.0.1:9112".parse().unwrap();
+    let addr_a: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let schema_hash = 0xAABBCCDDEEFF0011u64;
 
     let key_a = KeyPair::new_for_testing("schema_hash_a");
@@ -76,7 +76,7 @@ async fn schema_hash_allows_matching_headers() {
         .await;
 
     let peer_b = handle_a.add_peer(&peer_id_b).await;
-    peer_b.connect(&addr_b).await.unwrap();
+    peer_b.connect(&handle_b.registry.bind_addr).await.unwrap();
 
     sleep(Duration::from_millis(200)).await;
 
@@ -99,8 +99,8 @@ async fn schema_hash_allows_matching_headers() {
 
 #[tokio::test]
 async fn schema_hash_rejects_mismatched_hello_before_a_session_is_published() {
-    let addr_a: SocketAddr = "127.0.0.1:9113".parse().unwrap();
-    let addr_b: SocketAddr = "127.0.0.1:9114".parse().unwrap();
+    let addr_a: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let addr_b: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let schema_hash = 0x1122334455667788u64;
 
     let key_a = KeyPair::new_for_testing("schema_hash_miss_a");
@@ -147,7 +147,7 @@ async fn schema_hash_rejects_mismatched_hello_before_a_session_is_published() {
 
     let peer_b = handle_a.add_peer(&peer_id_b).await;
     let error = peer_b
-        .connect(&addr_b)
+        .connect(&handle_b.registry.bind_addr)
         .await
         .expect_err("schema mismatch must reject the authenticated Hello");
     assert!(error.to_string().contains("schema hash mismatch"));
