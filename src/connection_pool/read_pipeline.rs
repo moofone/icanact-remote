@@ -1607,20 +1607,14 @@ where
     }
 }
 
-/// Writes an actor-generated response directly to the socket, bypassing the
-/// background writer queue entirely -- the low-latency path for a response
-/// produced synchronously inside the read loop.
+/// Writes an actor-generated response directly to the socket.
 ///
-/// Every current caller (`write_ask_disposition_io`'s `Immediate`/
-/// `ImmediatePooled` branches) already computes `should_stream` from
-/// `max_message_size` before choosing this path over
-/// `queue_streaming_response_*`, so today this rejection is unreachable in
-/// practice. It still runs here, not only at the caller: this function --
-/// not any one caller -- is the single point every direct (non-streaming,
-/// non-queued) actor response funnels through, so gating here is what makes
-/// an unchecked oversize direct write impossible to express for a future
-/// caller, mirroring the `enqueue_write` choke-point fix on the queued write
-/// path in `stream_writer.rs`.
+/// Production inline replies are parked through `ResponseBatch` (bytes) or
+/// `park_pooled_inline_response` (pooled) so the read loop can keep making
+/// progress. This helper remains the size-gate for a raw direct write and is
+/// exercised by tests; it must still refuse an oversize frame rather than
+/// emit a header that disagrees with the body.
+#[cfg_attr(not(test), allow(dead_code))]
 async fn write_actor_response_direct<S>(
     stream: &mut S,
     bytes_written_counter: &Arc<AtomicUsize>,
@@ -1769,11 +1763,51 @@ fn ask_context_from_context(
         })
 }
 
+fn park_pooled_inline_response(
+    response_batch: &mut ResponseBatch,
+    correlation_id: u32,
+    payload: crate::typed::PooledPayload,
+    prefix: Option<[u8; 16]>,
+    payload_len: usize,
+    max_message_size: usize,
+) -> Result<()> {
+    let prefix_len = prefix.map(|p| p.len()).unwrap_or(0);
+    let actual_len = prefix_len + payload.remaining();
+    if actual_len != payload_len {
+        return Err(GossipError::Network(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "pooled response declared {payload_len} bytes (prefix + \
+                 payload) but the buffer actually has {actual_len} -- \
+                 refusing to send a frame whose header would disagree \
+                 with its own body"
+            ),
+        )));
+    }
+    crate::framing::reject_oversize_for_inline_send(
+        crate::framing::ASK_RESPONSE_HEADER_LEN,
+        actual_len,
+        max_message_size,
+    )?;
+    let bytes = match prefix {
+        Some(prefix) => {
+            let rest = payload.into_remaining_bytes();
+            let mut out = Vec::with_capacity(prefix.len() + rest.len());
+            out.extend_from_slice(&prefix);
+            out.extend_from_slice(&rest);
+            bytes::Bytes::from(out)
+        }
+        None => payload.into_remaining_bytes(),
+    };
+    response_batch.push_bytes(correlation_id, bytes);
+    Ok(())
+}
+
 async fn write_ask_disposition_io<S>(
     ctx: &ReadContext,
-    stream: &mut S,
-    bytes_written_counter: &Arc<AtomicUsize>,
-    bytes_since_flush: &mut usize,
+    _stream: &mut S,
+    _bytes_written_counter: &Arc<AtomicUsize>,
+    _bytes_since_flush: &mut usize,
     response_batch: &mut ResponseBatch,
     streaming_responses: &mut LocalStreamingQueue,
     wrote_response_bytes: &mut bool,
@@ -1876,40 +1910,23 @@ where
                     }
                     *wrote_response_bytes = true;
                 } else {
-                    if streaming_responses.wire_blocked() {
-                        let crate::registry::ActorResponse::Pooled {
-                            payload,
-                            prefix,
-                            payload_len,
-                        } = other
-                        else {
-                            unreachable!("only pooled responses reach the direct branch")
-                        };
-                        queue_streaming_response_pooled_or_nack(
-                            streaming_responses,
-                            correlation_id,
-                            payload,
-                            prefix,
-                            payload_len,
-                            ctx.max_message_size,
-                            schema_hash,
-                        )?;
-                    } else {
-                        write_actor_response_direct(
-                            stream,
-                            bytes_written_counter,
-                            bytes_since_flush,
-                            correlation_id,
-                            other,
-                            ctx.max_message_size,
-                        )
-                        .await?;
-                    }
+                    let crate::registry::ActorResponse::Pooled {
+                        payload,
+                        prefix,
+                        payload_len,
+                    } = other
+                    else {
+                        unreachable!("only pooled responses reach the parked inline branch")
+                    };
+                    park_pooled_inline_response(
+                        response_batch,
+                        correlation_id,
+                        payload,
+                        prefix,
+                        payload_len,
+                        ctx.max_message_size,
+                    )?;
                     *wrote_response_bytes = true;
-                    if !streaming_responses.wire_blocked() && flush_each_actor_response() {
-                        stream.flush().await.map_err(GossipError::Network)?;
-                        *bytes_since_flush = 0;
-                    }
                 }
             }
         },
@@ -1966,36 +1983,15 @@ where
                 )?;
                 *wrote_response_bytes = true;
             } else {
-                if streaming_responses.wire_blocked() {
-                    queue_streaming_response_pooled_or_nack(
-                        streaming_responses,
-                        correlation_id,
-                        payload,
-                        prefix,
-                        payload_len,
-                        ctx.max_message_size,
-                        schema_hash,
-                    )?;
-                } else {
-                    write_actor_response_direct(
-                        stream,
-                        bytes_written_counter,
-                        bytes_since_flush,
-                        correlation_id,
-                        crate::registry::ActorResponse::Pooled {
-                            payload,
-                            prefix,
-                            payload_len,
-                        },
-                        ctx.max_message_size,
-                    )
-                    .await?;
-                }
+                park_pooled_inline_response(
+                    response_batch,
+                    correlation_id,
+                    payload,
+                    prefix,
+                    payload_len,
+                    ctx.max_message_size,
+                )?;
                 *wrote_response_bytes = true;
-                if !streaming_responses.wire_blocked() && flush_each_actor_response() {
-                    stream.flush().await.map_err(GossipError::Network)?;
-                    *bytes_since_flush = 0;
-                }
             }
         }
     }
