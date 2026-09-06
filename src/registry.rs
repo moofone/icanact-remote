@@ -8028,6 +8028,19 @@ impl<T: 'static> GossipRegistry<T> {
         .is_ok()
     }
 
+    fn strip_actor_pair_metadata(
+        actors: &[(String, RemoteActorLocation)],
+    ) -> Vec<(String, RemoteActorLocation)> {
+        actors
+            .iter()
+            .map(|(name, location)| {
+                let mut location = location.clone();
+                location.metadata.clear();
+                (name.clone(), location)
+            })
+            .collect()
+    }
+
     fn pack_delta_change_batches(
         changes: Vec<RegistryChange>,
         sender_peer_id: crate::PeerId,
@@ -8061,25 +8074,19 @@ impl<T: 'static> GossipRegistry<T> {
         if current_sequence < since_sequence {
             current_sequence = since_sequence;
         }
-        let since_sequence = std::cell::Cell::new(since_sequence);
-        let current_sequence = std::cell::Cell::new(current_sequence);
 
+        // Reuse the sender's real sequence on every fragment. Fabricating a
+        // local chain poisons the receiver's last_sequence high-water mark
+        // and drops later real commits, including ActorRemoved.
         let emit_batch = |batch: Vec<RegistryChange>| -> Result<bytes::Bytes> {
-            let payload = Self::encode_registry_message(&delta_message(
+            Self::encode_registry_message(&delta_message(
                 batch,
                 sender_peer_id.clone(),
-                since_sequence.get(),
-                current_sequence.get(),
+                since_sequence,
+                current_sequence,
                 wall_clock_time,
                 extensions.clone(),
-            ))?;
-            since_sequence.set(current_sequence.get());
-            current_sequence.set(current_sequence.get().checked_add(1).ok_or_else(|| {
-                GossipError::InvalidConfig(
-                    "gossip sequence exhausted while splitting an oversized snapshot".into(),
-                )
-            })?);
-            Ok(payload)
+            ))
         };
 
         let mut payloads = Vec::new();
@@ -8089,8 +8096,8 @@ impl<T: 'static> GossipRegistry<T> {
             let candidate = Self::encode_registry_message(&delta_message(
                 batch.clone(),
                 sender_peer_id.clone(),
-                since_sequence.get(),
-                current_sequence.get(),
+                since_sequence,
+                current_sequence,
                 wall_clock_time,
                 extensions.clone(),
             ))?;
@@ -8104,8 +8111,8 @@ impl<T: 'static> GossipRegistry<T> {
             let solo = Self::encode_registry_message(&delta_message(
                 vec![last.clone()],
                 sender_peer_id.clone(),
-                since_sequence.get(),
-                current_sequence.get(),
+                since_sequence,
+                current_sequence,
                 wall_clock_time,
                 extensions.clone(),
             ))?;
@@ -8145,8 +8152,10 @@ impl<T: 'static> GossipRegistry<T> {
     /// A FullSync/FullSyncResponse that does not fit is not emitted as a
     /// truncated snapshot plus overflow deltas: `merge_full_sync` treats
     /// FullSync as complete and omission-prunes actors that only appear in
-    /// the overflow. Oversized snapshots become DeltaGossip ActorAdded
-    /// batches, which upsert without pruning.
+    /// the overflow. Oversized snapshots first emit a compact FullSync with
+    /// the complete name set (metadata stripped) so omission-prune still
+    /// runs, then DeltaGossip ActorAdded batches restore full metadata.
+    /// Every fragment reuses the sender's real sequence.
     pub(crate) fn encode_outbound_gossip_for_inline_limit(
         &self,
         message: &RegistryMessage,
@@ -8161,30 +8170,76 @@ impl<T: 'static> GossipRegistry<T> {
                 local_actors,
                 known_actors,
                 sender_peer_id,
+                sender_bind_addr,
                 sequence,
                 wall_clock_time,
                 extensions,
-                ..
             }
             | RegistryMessage::FullSyncResponse {
                 local_actors,
                 known_actors,
                 sender_peer_id,
+                sender_bind_addr,
                 sequence,
                 wall_clock_time,
                 extensions,
-                ..
-            } => Self::pack_delta_change_batches(
-                Self::actor_pairs_to_added_changes(local_actors, known_actors),
-                sender_peer_id.clone(),
-                *sequence,
-                *sequence,
-                *wall_clock_time,
-                extensions.clone(),
-                max_message_size,
-            ),
+            } => {
+                let compact_local = Self::strip_actor_pair_metadata(local_actors);
+                let compact_known = Self::strip_actor_pair_metadata(known_actors);
+                let compact = match message {
+                    RegistryMessage::FullSyncResponse { .. } => RegistryMessage::FullSyncResponse {
+                        local_actors: compact_local,
+                        known_actors: compact_known,
+                        sender_peer_id: sender_peer_id.clone(),
+                        sender_bind_addr: sender_bind_addr.clone(),
+                        sequence: *sequence,
+                        wall_clock_time: *wall_clock_time,
+                        extensions: extensions.clone(),
+                    },
+                    _ => RegistryMessage::FullSync {
+                        local_actors: compact_local,
+                        known_actors: compact_known,
+                        sender_peer_id: sender_peer_id.clone(),
+                        sender_bind_addr: sender_bind_addr.clone(),
+                        sequence: *sequence,
+                        wall_clock_time: *wall_clock_time,
+                        extensions: extensions.clone(),
+                    },
+                };
+                let compact_encoded = Self::encode_registry_message(&compact)?;
+                if !Self::gossip_payload_fits(compact_encoded.len(), max_message_size) {
+                    return Err(crate::framing::reject_oversize_for_inline_send(
+                        crate::framing::GOSSIP_HEADER_LEN,
+                        compact_encoded.len(),
+                        max_message_size,
+                    )
+                    .expect_err("compact FullSync was already checked not to fit"));
+                }
+                let mut payloads = vec![compact_encoded];
+                let adds = Self::actor_pairs_to_added_changes(local_actors, known_actors);
+                if !adds.is_empty() {
+                    payloads.extend(Self::pack_delta_change_batches(
+                        adds,
+                        sender_peer_id.clone(),
+                        *sequence,
+                        *sequence,
+                        *wall_clock_time,
+                        extensions.clone(),
+                        max_message_size,
+                    )?);
+                }
+                Ok(payloads)
+            }
             RegistryMessage::DeltaGossip { delta, extensions }
             | RegistryMessage::DeltaGossipResponse { delta, extensions } => {
+                if delta.changes.is_empty() {
+                    return Err(crate::framing::reject_oversize_for_inline_send(
+                        crate::framing::GOSSIP_HEADER_LEN,
+                        encoded.len(),
+                        max_message_size,
+                    )
+                    .expect_err("payload was already checked not to fit"));
+                }
                 Self::pack_delta_change_batches(
                     delta.changes.clone(),
                     delta.sender_peer_id.clone(),
@@ -13715,15 +13770,51 @@ mod tests {
             .expect("split payload must fit the inline limit");
             let decoded =
                 rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(payload).unwrap(); // ALLOW_RKYV_FROM_BYTES
-            assert!(
-                matches!(decoded, RegistryMessage::DeltaGossip { .. }),
-                "oversized snapshot must not omit-prune via truncated FullSync, got {decoded:?}"
-            );
+            match decoded {
+                RegistryMessage::FullSync {
+                    local_actors,
+                    known_actors,
+                    ..
+                } => {
+                    assert_eq!(
+                        local_actors.len() + known_actors.len(),
+                        8,
+                        "compact FullSync must keep the complete name set for omission prune"
+                    );
+                    assert!(
+                        local_actors
+                            .iter()
+                            .chain(known_actors.iter())
+                            .all(|(_, loc)| loc.metadata.is_empty()),
+                        "compact FullSync must strip bulky metadata so the complete snapshot fits"
+                    );
+                }
+                RegistryMessage::DeltaGossip { .. } => {}
+                other => panic!(
+                    "oversized snapshot must be compact FullSync plus add deltas, got {other:?}"
+                ),
+            }
         }
+        let kinds: Vec<_> = payloads
+            .iter()
+            .map(|payload| {
+                rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(payload).unwrap() // ALLOW_RKYV_FROM_BYTES
+            })
+            .collect();
+        assert!(
+            matches!(kinds.first(), Some(RegistryMessage::FullSync { .. })),
+            "first frame must be a complete compact FullSync so omitted actors prune"
+        );
+        assert!(
+            kinds
+                .iter()
+                .any(|msg| matches!(msg, RegistryMessage::DeltaGossip { .. })),
+            "full metadata must follow as DeltaGossip adds"
+        );
     }
 
     #[test]
-    fn split_delta_frames_chain_distinct_sequence_metadata() {
+    fn split_delta_frames_reuse_sender_sequence() {
         let mut config = test_config();
         config.max_message_size = 64 * 1024;
         let registry = GossipRegistry::<()>::new(test_addr(18_081), config);
@@ -13750,34 +13841,67 @@ mod tests {
             .expect("oversized snapshot must split");
         assert!(
             payloads.len() > 1,
-            "fixture must split so sequence chaining is observable"
+            "fixture must split so sequence reuse is observable"
         );
-        let mut sequences = Vec::new();
+        let mut saw_delta = false;
         for payload in &payloads {
             let decoded =
                 rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(payload).unwrap(); // ALLOW_RKYV_FROM_BYTES
-            let RegistryMessage::DeltaGossip { delta, .. } = decoded else {
-                panic!("split frames must be DeltaGossip, got {decoded:?}");
-            };
-            sequences.push((delta.since_sequence, delta.current_sequence));
+            match decoded {
+                RegistryMessage::FullSync { sequence, .. } => {
+                    assert_eq!(
+                        sequence, 7,
+                        "compact FullSync must keep the sender sequence"
+                    );
+                }
+                RegistryMessage::DeltaGossip { delta, .. } => {
+                    saw_delta = true;
+                    assert_eq!(
+                        (delta.since_sequence, delta.current_sequence),
+                        (7, 7),
+                        "split deltas must reuse the sender sequence, not mint a local chain"
+                    );
+                }
+                other => panic!("unexpected split frame {other:?}"),
+            }
         }
-        for window in sequences.windows(2) {
-            let (prev_since, prev_current) = window[0];
-            let (next_since, next_current) = window[1];
-            assert_ne!(
-                prev_current, next_current,
-                "split frames must not share current_sequence ({sequences:?})"
-            );
-            assert_eq!(
-                next_since, prev_current,
-                "frame N+1 since_sequence must continue from frame N current_sequence ({sequences:?})"
-            );
-            assert!(
-                next_current > prev_current,
-                "current_sequence must advance across split frames ({sequences:?})"
-            );
-            let _ = prev_since;
-        }
+        assert!(
+            saw_delta,
+            "oversized snapshot must emit metadata add deltas"
+        );
+    }
+
+    #[test]
+    fn oversized_empty_delta_returns_oversize_error() {
+        let mut config = test_config();
+        config.max_message_size = 64;
+        let registry = GossipRegistry::<()>::new(test_addr(18_082), config);
+        let msg = RegistryMessage::DeltaGossip {
+            delta: RegistryDelta {
+                since_sequence: 3,
+                current_sequence: 3,
+                changes: Vec::new(),
+                sender_peer_id: registry.peer_id.clone(),
+                wall_clock_time: 0,
+                precise_timing_nanos: 0,
+            },
+            extensions: None,
+        };
+        let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&msg).unwrap();
+        assert!(
+            crate::framing::reject_oversize_for_inline_send(
+                crate::framing::GOSSIP_HEADER_LEN,
+                encoded.len(),
+                registry.config.max_message_size,
+            )
+            .is_err(),
+            "empty delta fixture must exceed the tiny inline limit"
+        );
+        let result = registry.encode_outbound_gossip_for_inline_limit(&msg);
+        assert!(
+            matches!(result, Err(GossipError::MessageTooLarge { .. })),
+            "oversized empty delta must not encode as zero frames, got {result:?}"
+        );
     }
 
     #[test]
