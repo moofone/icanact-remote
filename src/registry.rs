@@ -8075,9 +8075,14 @@ impl<T: 'static> GossipRegistry<T> {
             current_sequence = since_sequence;
         }
 
-        // Reuse the sender's real sequence on every fragment. Fabricating a
-        // local chain poisons the receiver's last_sequence high-water mark
-        // and drops later real commits, including ActorRemoved.
+        // Reuse the sender's real sequence on every fragment. Inbound
+        // DeltaGossip is not sequence-rejected: apply_delta_from is
+        // idempotent, and the wire path still applies after
+        // last_sequence.max. Fabricating a local chain poisons the
+        // receiver's last_sequence high-water mark; later prepare_gossip_round
+        // deltas use that inflated since_sequence and drop real commits,
+        // including ActorRemoved. Bootstrap split_full_sync_for_inline_limit
+        // already keeps overflow deltas at the real sequence.
         let emit_batch = |batch: Vec<RegistryChange>| -> Result<bytes::Bytes> {
             Self::encode_registry_message(&delta_message(
                 batch,
@@ -13901,6 +13906,124 @@ mod tests {
         assert!(
             matches!(result, Err(GossipError::MessageTooLarge { .. })),
             "oversized empty delta must not encode as zero frames, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_sequence_split_fragments_apply_without_poisoning_last_sequence() {
+        let mut send_config = test_config_with_seed("split-frag-sender");
+        send_config.max_message_size = 64 * 1024;
+        let sender = GossipRegistry::<()>::new(test_addr(18_090), send_config);
+        let mut recv_config = test_config_with_seed("split-frag-receiver");
+        recv_config.max_message_size = 64 * 1024;
+        let receiver = GossipRegistry::<()>::new(test_addr(18_091), recv_config);
+        let sender_addr = test_addr(7777);
+        let stale_name = "stale/gone";
+        let mut stale = test_location(sender_addr);
+        stale.peer_id = sender.peer_id.clone();
+        stale.node_id = sender.peer_id.to_node_id();
+        let _ = receiver
+            .actor_state
+            .known_actors
+            .upsert_sync(stale_name.to_string(), stale);
+        {
+            let mut gossip_state = receiver.gossip_state.lock().await;
+            gossip_state.peers.insert(
+                sender_addr,
+                peer_info_with_node_id(sender_addr, sender.peer_id.to_node_id()),
+            );
+            let mut attributed = HashSet::new();
+            attributed.insert(stale_name.to_string());
+            gossip_state.peer_to_actors.insert(sender_addr, attributed);
+        }
+
+        let local_actors: Vec<_> = (0..8)
+            .map(|i| {
+                let mut location = test_location(sender_addr);
+                location.metadata = vec![7; 16 * 1024];
+                location.peer_id = sender.peer_id.clone();
+                location.node_id = sender.peer_id.to_node_id();
+                (format!("large/{i}"), location)
+            })
+            .collect();
+        let msg = RegistryMessage::FullSync {
+            local_actors,
+            known_actors: Vec::new(),
+            sender_peer_id: sender.peer_id.clone(),
+            sender_bind_addr: Some(sender.advertised_addr().to_string()),
+            sequence: 7,
+            wall_clock_time: 0,
+            extensions: None,
+        };
+        let payloads = sender
+            .encode_outbound_gossip_for_inline_limit(&msg)
+            .expect("oversized snapshot must split");
+        assert!(
+            payloads.len() > 2,
+            "fixture must emit compact FullSync plus multiple metadata fragments"
+        );
+
+        for payload in &payloads {
+            let decoded =
+                rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(payload).unwrap(); // ALLOW_RKYV_FROM_BYTES
+            match decoded {
+                RegistryMessage::FullSync {
+                    local_actors,
+                    known_actors,
+                    sender_peer_id,
+                    sequence,
+                    wall_clock_time,
+                    ..
+                } => {
+                    receiver
+                        .merge_full_sync(
+                            local_actors.into_iter().collect(),
+                            known_actors.into_iter().collect(),
+                            sender_peer_id,
+                            sender_addr,
+                            sequence,
+                            wall_clock_time,
+                        )
+                        .await;
+                }
+                RegistryMessage::DeltaGossip { delta, .. } => {
+                    {
+                        let mut gossip_state = receiver.gossip_state.lock().await;
+                        if let Some(peer_info) = gossip_state.peers.get_mut(&sender_addr) {
+                            peer_info.last_sequence =
+                                peer_info.last_sequence.max(delta.current_sequence);
+                        }
+                    }
+                    receiver.apply_delta(delta).await.unwrap();
+                }
+                other => panic!("unexpected split frame {other:?}"),
+            }
+        }
+
+        assert!(
+            read_known_actor(&receiver, stale_name).is_none(),
+            "compact FullSync must omission-prune actors the sender no longer advertises"
+        );
+        for i in 0..8 {
+            let loc = read_known_actor(&receiver, &format!("large/{i}"))
+                .unwrap_or_else(|| panic!("same-sequence fragment actor large/{i} must apply"));
+            assert_eq!(
+                loc.metadata.len(),
+                16 * 1024,
+                "later same-sequence fragments must restore metadata for large/{i}"
+            );
+        }
+        let last_sequence = {
+            let gossip_state = receiver.gossip_state.lock().await;
+            gossip_state
+                .peers
+                .get(&sender_addr)
+                .expect("sender peer")
+                .last_sequence
+        };
+        assert_eq!(
+            last_sequence, 7,
+            "split fragments must reuse the sender sequence; inflating last_sequence drops later real commits"
         );
     }
 
