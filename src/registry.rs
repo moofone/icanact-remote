@@ -8031,7 +8031,8 @@ impl<T: 'static> GossipRegistry<T> {
     fn pack_delta_change_batches(
         changes: Vec<RegistryChange>,
         sender_peer_id: crate::PeerId,
-        sequence: u64,
+        mut since_sequence: u64,
+        mut current_sequence: u64,
         wall_clock_time: u64,
         extensions: Option<GossipExtensionsV1>,
         max_message_size: usize,
@@ -8039,14 +8040,15 @@ impl<T: 'static> GossipRegistry<T> {
         fn delta_message(
             changes: Vec<RegistryChange>,
             sender_peer_id: crate::PeerId,
-            sequence: u64,
+            since_sequence: u64,
+            current_sequence: u64,
             wall_clock_time: u64,
             extensions: Option<GossipExtensionsV1>,
         ) -> RegistryMessage {
             RegistryMessage::DeltaGossip {
                 delta: RegistryDelta {
-                    since_sequence: sequence,
-                    current_sequence: sequence,
+                    since_sequence,
+                    current_sequence,
                     changes,
                     sender_peer_id,
                     wall_clock_time,
@@ -8056,56 +8058,69 @@ impl<T: 'static> GossipRegistry<T> {
             }
         }
 
+        if current_sequence < since_sequence {
+            current_sequence = since_sequence;
+        }
+        let since_sequence = std::cell::Cell::new(since_sequence);
+        let current_sequence = std::cell::Cell::new(current_sequence);
+
+        let emit_batch = |batch: Vec<RegistryChange>| -> Result<bytes::Bytes> {
+            let payload = Self::encode_registry_message(&delta_message(
+                batch,
+                sender_peer_id.clone(),
+                since_sequence.get(),
+                current_sequence.get(),
+                wall_clock_time,
+                extensions.clone(),
+            ))?;
+            since_sequence.set(current_sequence.get());
+            current_sequence.set(current_sequence.get().checked_add(1).ok_or_else(|| {
+                GossipError::InvalidConfig(
+                    "gossip sequence exhausted while splitting an oversized snapshot".into(),
+                )
+            })?);
+            Ok(payload)
+        };
+
         let mut payloads = Vec::new();
         let mut batch: Vec<RegistryChange> = Vec::new();
         for change in changes {
             batch.push(change);
-            let payload = Self::encode_registry_message(&delta_message(
+            let candidate = Self::encode_registry_message(&delta_message(
                 batch.clone(),
                 sender_peer_id.clone(),
-                sequence,
+                since_sequence.get(),
+                current_sequence.get(),
                 wall_clock_time,
                 extensions.clone(),
             ))?;
-            if Self::gossip_payload_fits(payload.len(), max_message_size) {
+            if Self::gossip_payload_fits(candidate.len(), max_message_size) {
                 continue;
             }
             let last = batch.pop().expect("overflow change");
             if !batch.is_empty() {
-                payloads.push(Self::encode_registry_message(&delta_message(
-                    std::mem::take(&mut batch),
-                    sender_peer_id.clone(),
-                    sequence,
-                    wall_clock_time,
-                    extensions.clone(),
-                ))?);
+                payloads.push(emit_batch(std::mem::take(&mut batch))?);
             }
-            let solo = delta_message(
-                vec![last],
+            let solo = Self::encode_registry_message(&delta_message(
+                vec![last.clone()],
                 sender_peer_id.clone(),
-                sequence,
+                since_sequence.get(),
+                current_sequence.get(),
                 wall_clock_time,
                 extensions.clone(),
-            );
-            let solo_payload = Self::encode_registry_message(&solo)?;
-            if !Self::gossip_payload_fits(solo_payload.len(), max_message_size) {
+            ))?;
+            if !Self::gossip_payload_fits(solo.len(), max_message_size) {
                 return Err(crate::framing::reject_oversize_for_inline_send(
                     crate::framing::GOSSIP_HEADER_LEN,
-                    solo_payload.len(),
+                    solo.len(),
                     max_message_size,
                 )
                 .expect_err("solo DeltaGossip was already checked not to fit"));
             }
-            payloads.push(solo_payload);
+            payloads.push(emit_batch(vec![last])?);
         }
         if !batch.is_empty() {
-            payloads.push(Self::encode_registry_message(&delta_message(
-                batch,
-                sender_peer_id,
-                sequence,
-                wall_clock_time,
-                extensions,
-            ))?);
+            payloads.push(emit_batch(batch)?);
         }
         Ok(payloads)
     }
@@ -8163,6 +8178,7 @@ impl<T: 'static> GossipRegistry<T> {
                 Self::actor_pairs_to_added_changes(local_actors, known_actors),
                 sender_peer_id.clone(),
                 *sequence,
+                *sequence,
                 *wall_clock_time,
                 extensions.clone(),
                 max_message_size,
@@ -8172,6 +8188,7 @@ impl<T: 'static> GossipRegistry<T> {
                 Self::pack_delta_change_batches(
                     delta.changes.clone(),
                     delta.sender_peer_id.clone(),
+                    delta.since_sequence,
                     delta.current_sequence,
                     delta.wall_clock_time,
                     extensions.clone(),
@@ -13702,6 +13719,64 @@ mod tests {
                 matches!(decoded, RegistryMessage::DeltaGossip { .. }),
                 "oversized snapshot must not omit-prune via truncated FullSync, got {decoded:?}"
             );
+        }
+    }
+
+    #[test]
+    fn split_delta_frames_chain_distinct_sequence_metadata() {
+        let mut config = test_config();
+        config.max_message_size = 64 * 1024;
+        let registry = GossipRegistry::<()>::new(test_addr(18_081), config);
+        let local_actors: Vec<_> = (0..8)
+            .map(|i| {
+                let mut location = test_location(test_addr(7777));
+                location.metadata = vec![7; 16 * 1024];
+                location.peer_id = registry.peer_id.clone();
+                location.node_id = registry.peer_id.to_node_id();
+                (format!("large/{i}"), location)
+            })
+            .collect();
+        let msg = RegistryMessage::FullSync {
+            local_actors,
+            known_actors: Vec::new(),
+            sender_peer_id: registry.peer_id.clone(),
+            sender_bind_addr: Some(registry.advertised_addr().to_string()),
+            sequence: 7,
+            wall_clock_time: 0,
+            extensions: None,
+        };
+        let payloads = registry
+            .encode_outbound_gossip_for_inline_limit(&msg)
+            .expect("oversized snapshot must split");
+        assert!(
+            payloads.len() > 1,
+            "fixture must split so sequence chaining is observable"
+        );
+        let mut sequences = Vec::new();
+        for payload in &payloads {
+            let decoded =
+                rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(payload).unwrap(); // ALLOW_RKYV_FROM_BYTES
+            let RegistryMessage::DeltaGossip { delta, .. } = decoded else {
+                panic!("split frames must be DeltaGossip, got {decoded:?}");
+            };
+            sequences.push((delta.since_sequence, delta.current_sequence));
+        }
+        for window in sequences.windows(2) {
+            let (prev_since, prev_current) = window[0];
+            let (next_since, next_current) = window[1];
+            assert_ne!(
+                prev_current, next_current,
+                "split frames must not share current_sequence ({sequences:?})"
+            );
+            assert_eq!(
+                next_since, prev_current,
+                "frame N+1 since_sequence must continue from frame N current_sequence ({sequences:?})"
+            );
+            assert!(
+                next_current > prev_current,
+                "current_sequence must advance across split frames ({sequences:?})"
+            );
+            let _ = prev_since;
         }
     }
 
