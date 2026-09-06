@@ -748,46 +748,50 @@ impl<T> ConnectionHandle<T> {
         let started_at = Instant::now();
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
-        let write_result = match request_id {
-            Some(request_id) => {
-                self.write_routed_actor_ask_with_request_id(
-                    correlation_id,
+        // One absolute deadline covers identification, route-bind admission,
+        // write-queue admission, and the response wait. Admission used to
+        // run unbounded before subtracting elapsed time, so a blocked gate
+        // or full queue could outlive the caller's timeout.
+        let timed = tokio::time::timeout(timeout, async {
+            let write_result = match request_id {
+                Some(request_id) => {
+                    self.write_routed_actor_ask_with_request_id(
+                        correlation_id,
+                        actor_id,
+                        type_hash,
+                        payload,
+                        request_id,
+                    )
+                    .await
+                }
+                None => {
+                    self.write_routed_actor_ask(correlation_id, actor_id, type_hash, payload)
+                        .await
+                }
+            };
+            if let Err(e) = write_result {
+                warn!(
+                    addr = %self.addr,
                     actor_id,
                     type_hash,
-                    payload,
-                    request_id,
-                )
+                    correlation_id,
+                    error = %e,
+                    stream_instance_id = ?self.stream_handle.as_ref().map(|handle| handle.instance_id()),
+                    stream_closed = self.is_closed(),
+                    bytes_written = self.bytes_written(),
+                    "transport_ask_write_failed"
+                );
+                return Err(e);
+            }
+            self.correlation
+                .wait_for_response_no_timeout(correlation_id)
                 .await
-            }
-            None => {
-                self.write_routed_actor_ask(correlation_id, actor_id, type_hash, payload)
-                    .await
-            }
+        })
+        .await;
+        let result = match timed {
+            Ok(result) => result,
+            Err(_) => Err(crate::GossipError::Timeout),
         };
-        if let Err(e) = write_result {
-            // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
-            warn!(
-                addr = %self.addr,
-                actor_id,
-                type_hash,
-                correlation_id,
-                error = %e,
-                stream_instance_id = ?self.stream_handle.as_ref().map(|handle| handle.instance_id()),
-                stream_closed = self.is_closed(),
-                bytes_written = self.bytes_written(),
-                "transport_ask_write_failed"
-            );
-            return Err(e);
-        }
-
-        let remaining = timeout.saturating_sub(started_at.elapsed());
-        if remaining.is_zero() {
-            return Err(crate::GossipError::Timeout);
-        }
-        let result = self
-            .correlation
-            .wait_for_response(correlation_id, remaining)
-            .await;
         if let Err(error) = &result {
             match error {
                 crate::GossipError::ConnectionDropped => {
@@ -876,14 +880,22 @@ impl<T> ConnectionHandle<T> {
         timeout: Duration,
     ) -> Result<PendingAsk> {
         require_positive_timeout(timeout)?;
+        let started_at = Instant::now();
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
-        if let Err(e) = self
-            .write_routed_actor_ask(correlation_id, actor_id, type_hash, payload)
-            .await
+        match tokio::time::timeout(
+            timeout,
+            self.write_routed_actor_ask(correlation_id, actor_id, type_hash, payload),
+        )
+        .await
         {
-            // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
-            return Err(e);
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err(crate::GossipError::Timeout),
+        }
+        let remaining = timeout.saturating_sub(started_at.elapsed());
+        if remaining.is_zero() {
+            return Err(crate::GossipError::Timeout);
         }
 
         Ok(PendingAsk {
@@ -892,7 +904,7 @@ impl<T> ConnectionHandle<T> {
             // dropped without being awaited.
             correlation_id: slot.disarm(),
             correlation: self.correlation.clone(),
-            timeout,
+            timeout: remaining,
             active: true,
         })
     }
