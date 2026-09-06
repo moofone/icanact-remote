@@ -46,6 +46,7 @@ struct IoPerfCounters {
     ask_write_ns: AtomicU64,
 }
 
+#[allow(dead_code)]
 fn flush_each_actor_response() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {

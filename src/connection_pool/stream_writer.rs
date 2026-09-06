@@ -215,9 +215,9 @@ mod qa_queue_retention_review {
 /// `write_direct_response_batch`, and `write_chunks_batched` (this
 /// connection's ordinary, non-streaming response/tell writers) still loop
 /// over multiple `poll_write`/`write_vectored` calls with no per-attempt
-/// timeout, and `read_pipeline.rs`'s two `flush_each_actor_response` call
-/// sites are plain unbounded flushes of the same shape this fix closes
-/// here. None of them are individually cancel-safe to wrap in a naive
+/// timeout. Inline pooled/bytes replies are now parked on `ResponseBatch`
+/// instead of flushing from the read loop. Remaining ordinary writers are
+/// not individually cancel-safe to wrap in a naive
 /// `tokio::time::timeout` the way this file's slice writers are --
 /// `write_all`-shaped internals mean a cancelled attempt can abandon a
 /// partially-written frame mid-flight and corrupt every later frame on the

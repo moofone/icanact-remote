@@ -497,6 +497,7 @@ impl LocalStreamingQueue {
         self.wire_blocked = blocked;
     }
 
+    #[allow(dead_code)]
     fn wire_blocked(&self) -> bool {
         self.wire_blocked
     }

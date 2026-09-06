@@ -129,6 +129,7 @@ pub(crate) fn prewarm_pooled_byte_buffers(count: usize, capacity: usize) {
 #[cfg(test)]
 mod qa_pool_review {
     use super::*;
+    use bytes::Buf;
 
     #[test]
     fn qa_prewarmed_pool_adapts_to_larger_steady_state_payloads() {
@@ -151,6 +152,17 @@ mod qa_pool_review {
             suitable > 0,
             "larger steady-state messages must become reusable instead of allocating forever (suitable={suitable}, undersized={undersized})"
         );
+    }
+
+    #[test]
+    fn into_remaining_bytes_preserves_payload_and_offset() {
+        let mut payload = PooledPayload::try_from_pooled_bytes(8, |buf| {
+            buf.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        })
+        .unwrap();
+        payload.advance(3);
+        let bytes = payload.into_remaining_bytes();
+        assert_eq!(&bytes[..], &[4, 5, 6, 7, 8]);
     }
 }
 
@@ -204,6 +216,31 @@ impl PooledPayload {
             len,
             pos: 0,
         })
+    }
+
+    /// Take remaining bytes out of the pool wrapper. The allocation is held
+    /// by the returned `Bytes` until write completion instead of being
+    /// returned to the pool immediately.
+    pub(crate) fn into_remaining_bytes(mut self) -> Bytes {
+        let pos = self.pos;
+        let len = self.len;
+        match self.inner.take() {
+            Some(PooledPayloadInner::Bytes(buffer)) => {
+                if pos == 0 && buffer.len() == len {
+                    Bytes::from(buffer)
+                } else {
+                    let bytes = Bytes::copy_from_slice(&buffer[pos..len]);
+                    release_byte_buffer(buffer);
+                    bytes
+                }
+            }
+            Some(PooledPayloadInner::Serializer(ctx)) => {
+                let bytes = Bytes::copy_from_slice(&ctx.writer[pos..len]);
+                release_ctx(ctx);
+                bytes
+            }
+            None => Bytes::new(),
+        }
     }
 }
 
