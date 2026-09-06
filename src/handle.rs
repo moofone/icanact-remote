@@ -6265,21 +6265,14 @@ async fn send_gossip_message_zero_copy(
         _ => {}
     }
 
-    // Serialize the message AFTER updating timing
-    let data = rkyv::to_bytes::<rkyv::rancor::Error>(&task.message)?;
-
-    // Create message with Gossip type prefix
-    let mut msg_with_type = Vec::with_capacity(crate::framing::GOSSIP_HEADER_LEN + data.len());
-    msg_with_type.push(crate::MessageType::Gossip as u8);
-    msg_with_type.resize(crate::framing::GOSSIP_HEADER_LEN, 0);
-    msg_with_type.extend_from_slice(&data);
-
-    // Use zero-copy tell() which uses try_send() internally for max performance
-    // This completely bypasses async overhead when the channel has capacity
-    let tcp_start = std::time::Instant::now();
-    conn.tell(bytes::Bytes::from(msg_with_type)).await?;
-    let _tcp_elapsed = tcp_start.elapsed();
-    // eprintln!("🔍 TCP_WRITE_TIME: {:?}", tcp_elapsed);
+    // Serialize AFTER updating timing. Oversized FullSync/delta payloads are
+    // split into fitting frames here so periodic gossip uses the same inline
+    // limit as identifying bootstrap, without a truncated FullSync prefix
+    // that would omission-prune overflow actors on a live connection.
+    let payloads = registry.encode_outbound_gossip_for_inline_limit(&task.message)?;
+    for payload in payloads {
+        conn.send_gossip_payload(payload).await?;
+    }
     Ok(())
 }
 #[cfg(test)]
