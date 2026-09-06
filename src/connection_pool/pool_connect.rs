@@ -4184,7 +4184,7 @@ impl<T> ConnectionPool<T> {
                         }
                     }
                     Err(e) => {
-                        warn!(peer = %addr, error = %e, "Failed to serialize initial FullSync message");
+                        warn!(peer = %addr, error = %e, "Failed to prepare identifying FullSync");
                         identify_send_failed = true;
                     }
                 }
