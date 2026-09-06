@@ -146,3 +146,49 @@ async fn actor_ask_timeout_releases_correlation_for_reuse() {
         "timed-out ask must release its correlation slot for a later attempt, got {second:?}"
     );
 }
+
+#[tokio::test]
+async fn actor_ask_timeout_covers_full_write_queue() {
+    let addr = "127.0.0.1:9992".parse().unwrap();
+    let (io, _peer) = tokio::io::duplex(64);
+    let buffer_config = BufferConfig::default().with_write_queue_capacity(128);
+    let cap = buffer_config.write_queue_capacity();
+    let (stream, writer, reader) = LockFreeStreamHandle::new(
+        io,
+        addr,
+        ChannelId::Global,
+        buffer_config,
+        None,
+        None,
+    );
+    let stream = Arc::new(stream);
+    let conn = ConnectionHandle::<()>::new_stream(
+        addr,
+        ConnectionDirection::Outbound,
+        stream.clone(),
+        CorrelationTracker::new(),
+    );
+    for _ in 0..cap {
+        match stream.write_queue.try_push(WriteCommand::Payload(
+            WritePayload::TrustedFrame(bytes::Bytes::from_static(&[0u8; 32])),
+        )) {
+            Ok(()) => {}
+            Err(WriteTryPushError::Full(_)) => break,
+            Err(other) => panic!("unexpected fill error: {other:?}"),
+        }
+    }
+    let outcome = tokio::time::timeout(
+        Duration::from_millis(150),
+        conn.ask_actor_frame(1, 1, bytes::Bytes::new(), Duration::from_millis(10)),
+    )
+    .await;
+    stream.shutdown();
+    writer.abort();
+    if let Some(reader) = reader {
+        reader.abort();
+    }
+    assert!(
+        matches!(outcome, Ok(Err(GossipError::Timeout))),
+        "10ms ask budget must expire while the write queue is full, got {outcome:?}"
+    );
+}
