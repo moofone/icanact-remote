@@ -13,7 +13,9 @@ use std::sync::atomic::{
 };
 use std::task::{Context, Poll};
 use std::{net::SocketAddr, pin::Pin, sync::Arc, time::Duration, time::Instant};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+#[cfg(test)]
+use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::Notify;
 use tokio::task::{AbortHandle, JoinHandle};

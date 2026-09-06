@@ -271,7 +271,10 @@ mod read_pipeline_tests {
         let first_result = super::read_message_step(&mut reader, &mut state, &ctx, &mut streams)
             .await
             .unwrap();
-        assert!(first_result.is_none(), "a 1-of-4 chunk stream is not complete");
+        assert!(
+            first_result.is_none(),
+            "a 1-of-4 chunk stream is not complete"
+        );
 
         let mut expected = Vec::new();
         expected.extend_from_slice(&[0xA0u8; STRIDE]);
@@ -284,7 +287,8 @@ mod read_pipeline_tests {
             // of reach of even this maximally aggressive idle bound. The
             // rate window is wide enough that this test's real-time span
             // never crosses it -- it exercises the idle bound only.
-            let _ = streams.cleanup_stale_with(idle_timeout, std::time::Duration::from_secs(3600), 1);
+            let _ =
+                streams.cleanup_stale_with(idle_timeout, std::time::Duration::from_secs(3600), 1);
             assert_eq!(
                 streams.active_stream_count(),
                 1,
@@ -293,7 +297,8 @@ mod read_pipeline_tests {
 
             let payload = [0xA0u8 + idx as u8; STRIDE];
             let data_header =
-                crate::framing::try_write_stream_data_header(false, stream_id, idx, STRIDE).unwrap();
+                crate::framing::try_write_stream_data_header(false, stream_id, idx, STRIDE)
+                    .unwrap();
             writer.write_all(&data_header).await.unwrap();
             writer.write_all(&payload).await.unwrap();
             expected.extend_from_slice(&payload);
@@ -317,7 +322,12 @@ mod read_pipeline_tests {
 
         let result = final_result.expect("the last chunk must complete the stream");
         match result {
-            crate::handle::MessageReadResult::Actor { payload, actor_id, type_hash, .. } => {
+            crate::handle::MessageReadResult::Actor {
+                payload,
+                actor_id,
+                type_hash,
+                ..
+            } => {
                 assert_eq!(payload.as_ref(), expected.as_slice());
                 assert_eq!(actor_id, 7);
                 assert_eq!(type_hash, 3);
@@ -338,7 +348,10 @@ mod read_pipeline_tests {
             .expect("a frame following a completed stream must still parse");
         assert!(matches!(
             abort_result,
-            crate::handle::MessageReadResult::StreamAbort { stream_id: 999, reason: 4 }
+            crate::handle::MessageReadResult::StreamAbort {
+                stream_id: 999,
+                reason: 4
+            }
         ));
     }
 
@@ -434,7 +447,10 @@ mod read_pipeline_tests {
             "a reap racing a live reservation must not be a fatal connection error: {result:?}"
         );
         assert!(result.unwrap().is_none());
-        assert!(matches!(state, super::ReadState::DiscardStreamPayload { .. }));
+        assert!(matches!(
+            state,
+            super::ReadState::DiscardStreamPayload { .. }
+        ));
 
         // The discard must consume exactly the remaining bytes, restoring
         // frame sync: a following, unrelated frame still reads cleanly.
@@ -445,7 +461,10 @@ mod read_pipeline_tests {
             .expect("connection must keep working after a discarded chunk");
         assert!(matches!(
             abort_result,
-            crate::handle::MessageReadResult::StreamAbort { stream_id: 777, reason: 2 }
+            crate::handle::MessageReadResult::StreamAbort {
+                stream_id: 777,
+                reason: 2
+            }
         ));
 
         // The discarded chunk was this stream's only one: draining its
@@ -710,7 +729,7 @@ impl ReadState {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 async fn read_message_step<S>(
     stream: &mut S,
     state: &mut ReadState,
@@ -720,182 +739,16 @@ async fn read_message_step<S>(
 where
     S: AsyncRead + Unpin,
 {
-    match state {
-        ReadState::ReadLen { buf, read } => {
-            let n = stream.read(&mut buf[*read..]).await?;
-            if n == 0 {
-                return Err(GossipError::Network(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "connection closed",
-                )));
-            }
-            *read += n;
-            if *read < crate::framing::LENGTH_PREFIX_LEN {
-                return Ok(None);
-            }
-
-            let control = crate::framing::decode_control(*buf).ok_or_else(|| {
-                crate::GossipError::Network(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "unknown V5 wire kind",
-                ))
-            })?;
-            let msg_len = control.body_len;
-            if msg_len == 0 {
-                return Err(reject_zero_length_frame());
-            }
-            if msg_len > ctx.max_message_size {
-                return Err(GossipError::MessageTooLarge {
-                    size: msg_len,
-                    max: ctx.max_message_size,
-                });
-            }
-
-            if let Some(meta_len) = stream_meta_len(control.kind) {
-                if msg_len < meta_len {
-                    return Err(GossipError::Network(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "truncated V5 stream metadata",
-                    )));
-                }
-                *state = ReadState::ReadStreamMeta {
-                    kind: control.kind,
-                    body_len: msg_len,
-                    meta: [0; crate::framing::STREAM_REQUEST_START_HEADER_LEN],
-                    meta_len,
-                    read: 0,
-                };
-                return Ok(None);
-            }
-
-            let total_len = msg_len + crate::framing::LENGTH_PREFIX_LEN;
-            let mut buffer =
-                crate::PooledAlignedBuffer::with_len(total_len, ctx.aligned_pool.clone());
-            buffer.as_mut_slice()[..crate::framing::LENGTH_PREFIX_LEN].copy_from_slice(buf);
-
-            *state = ReadState::ReadBody {
-                msg_len,
-                buffer,
-                read: 0,
-            };
-            Ok(None)
+    // Tests drive the production poll path; this wrapper only adapts the
+    // result type so existing regressions keep their assertions.
+    let poll = read_message_step_poll(stream, state, ctx, streaming_state, true).await?;
+    Ok(match poll.result {
+        None => None,
+        Some(ReadIoResult::Generic(result)) => Some(result),
+        Some(ReadIoResult::DirectAsk { .. } | ReadIoResult::ActorAsk { .. }) => {
+            unreachable!("try_handle_read_fast_from_pooled currently always returns Unhandled")
         }
-        ReadState::ReadBody {
-            msg_len,
-            buffer,
-            read,
-        } => {
-            let offset = crate::framing::LENGTH_PREFIX_LEN + *read;
-            let end = crate::framing::LENGTH_PREFIX_LEN + *msg_len;
-            let n = stream.read(&mut buffer.as_mut_slice()[offset..end]).await?;
-            if n == 0 {
-                return Err(GossipError::Network(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "connection closed",
-                )));
-            }
-            *read += n;
-            if *read < *msg_len {
-                return Ok(None);
-            }
-
-            let (msg_len, buffer) = match std::mem::replace(state, ReadState::new()) {
-                ReadState::ReadBody {
-                    msg_len, buffer, ..
-                } => (msg_len, buffer),
-                _ => unreachable!("read state must be ReadBody when complete"),
-            };
-
-            let result = crate::handle::parse_message_from_pooled_buffer_with_routes(
-                buffer,
-                msg_len,
-                Some(&ctx.inbound_routes),
-            )?;
-            Ok(Some(result))
-        }
-        ReadState::ReadStreamMeta {
-            kind,
-            body_len,
-            meta,
-            meta_len,
-            read,
-        } => {
-            let n = stream.read(&mut meta[*read..*meta_len]).await?;
-            if n == 0 {
-                return Err(GossipError::Network(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "connection closed during V5 stream metadata",
-                )));
-            }
-            *read += n;
-            if *read < *meta_len {
-                return Ok(None);
-            }
-            let reservation = reserve_v5_stream_payload(
-                *kind,
-                *body_len,
-                &meta[..*meta_len],
-                streaming_state,
-                ctx.aligned_pool.clone(),
-            )?;
-            *state = stream_payload_state(reservation, *body_len, *meta_len);
-            Ok(None)
-        }
-        ReadState::ReadStreamPayload { reservation, read } => {
-            let target = match streaming_state.v5_chunk_target(*reservation, *read) {
-                Ok(target) => target,
-                Err(e) if crate::protocol::is_stream_reaped_error(&e) => {
-                    *state = discard_remainder_of_reservation(*reservation, *read);
-                    return Ok(None);
-                }
-                Err(e) => return Err(e),
-            };
-            let n = stream.read(target).await?;
-            if n == 0 {
-                return Err(GossipError::Network(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "connection closed during V5 stream payload",
-                )));
-            }
-            *read += n;
-            streaming_state.record_v5_chunk_progress(*reservation, n);
-            if *read < reservation.len() {
-                return Ok(None);
-            }
-            let reservation = match std::mem::replace(state, ReadState::new()) {
-                ReadState::ReadStreamPayload { reservation, .. } => reservation,
-                _ => unreachable!("read state must be V5 stream payload"),
-            };
-            Ok(streaming_state
-                .commit_v5_chunk(reservation)?
-                .map(completed_v5_stream_result))
-        }
-        ReadState::DiscardStreamPayload {
-            remaining,
-            scratch,
-            on_complete_mark_received,
-        } => {
-            let read_len = (*remaining).min(scratch.len());
-            if read_len == 0 {
-                finish_discarding_reservation(streaming_state, *on_complete_mark_received);
-                *state = ReadState::new();
-                return Ok(None);
-            }
-            let n = stream.read(&mut scratch[..read_len]).await?;
-            if n == 0 {
-                return Err(GossipError::Network(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "connection closed while discarding rejected stream payload",
-                )));
-            }
-            *remaining -= n;
-            if *remaining == 0 {
-                finish_discarding_reservation(streaming_state, *on_complete_mark_received);
-                *state = ReadState::new();
-            }
-            Ok(None)
-        }
-    }
+    })
 }
 
 struct ReadPollResult {
@@ -1174,7 +1027,10 @@ where
                 Ok(target) => target,
                 Err(e) if crate::protocol::is_stream_reaped_error(&e) => {
                     *state = discard_remainder_of_reservation(*reservation, *read);
-                    return Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }));
+                    return Poll::Ready(Ok(ReadPollResult {
+                        result: None,
+                        progressed: true,
+                    }));
                 }
                 Err(e) => return Poll::Ready(Err(e)),
             };
@@ -1462,7 +1318,10 @@ where
                 Ok(target) => target,
                 Err(e) if crate::protocol::is_stream_reaped_error(&e) => {
                     *state = discard_remainder_of_reservation(*reservation, *read);
-                    return Poll::Ready(Ok(ReadPollResult { result: None, progressed: true }));
+                    return Poll::Ready(Ok(ReadPollResult {
+                        result: None,
+                        progressed: true,
+                    }));
                 }
                 Err(e) => return Poll::Ready(Err(e)),
             };
@@ -1751,16 +1610,14 @@ fn ask_context_from_context(
     correlation_id: u32,
     request_id: Option<u64>,
 ) -> Option<crate::AskContext<'_>> {
-    ctx.response_writer
-        .as_ref()
-        .map(|writer| {
-            crate::AskContext::from_writer_with_request_id(
-                correlation_id,
-                writer,
-                ctx.peer_id.as_ref(),
-                request_id,
-            )
-        })
+    ctx.response_writer.as_ref().map(|writer| {
+        crate::AskContext::from_writer_with_request_id(
+            correlation_id,
+            writer,
+            ctx.peer_id.as_ref(),
+            request_id,
+        )
+    })
 }
 
 fn park_pooled_inline_response(
@@ -1832,8 +1689,10 @@ where
             // write regardless would risk splicing the NACK's bytes into
             // that frame's payload. `io_task` drains the queue only once it
             // has proven the wire free of a partial frame.
-            streaming_responses
-                .queue_ask_nack(crate::framing::write_ask_nack_header(correlation_id, reason));
+            streaming_responses.queue_ask_nack(crate::framing::write_ask_nack_header(
+                correlation_id,
+                reason,
+            ));
             *wrote_response_bytes = true;
         }
         crate::registry::AskDisposition::Immediate(response) => match response {
