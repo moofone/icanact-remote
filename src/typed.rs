@@ -4,12 +4,15 @@ use crossbeam_queue::ArrayQueue;
 use std::cell::RefCell;
 use std::marker::PhantomData;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 const SERIALIZER_POOL_SIZE: usize = 64;
 const MAX_POOLED_BUFFER_CAPACITY: usize = 1024 * 1024; // 1MB
 const MAX_POOLED_ARENA_CAPACITY: usize = 1024 * 1024; // 1MB
 const BYTE_PAYLOAD_POOL_SIZE: usize = 4096;
 const MAX_POOLED_BYTE_CAPACITY: usize = 1024 * 1024; // 1MB
+/// Process-wide retained-byte budget for idle pooled payload buffers.
+const DEFAULT_RETAINED_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 
 fn validate_archive_alignment<A>(payload: &[u8], type_name: &str) -> Result<()> {
     let required = std::mem::align_of::<A>();
@@ -51,10 +54,129 @@ thread_local! {
     });
 }
 
-static BYTE_PAYLOAD_POOL: OnceLock<ArrayQueue<Vec<u8>>> = OnceLock::new();
+struct BytePayloadPool {
+    queue: ArrayQueue<Vec<u8>>,
+    retained_bytes: AtomicUsize,
+    budget: usize,
+}
 
-fn byte_payload_pool() -> &'static ArrayQueue<Vec<u8>> {
-    BYTE_PAYLOAD_POOL.get_or_init(|| ArrayQueue::new(BYTE_PAYLOAD_POOL_SIZE))
+impl BytePayloadPool {
+    fn new(slots: usize, budget: usize) -> Self {
+        Self {
+            queue: ArrayQueue::new(slots),
+            retained_bytes: AtomicUsize::new(0),
+            budget,
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.retained_bytes.load(Ordering::Acquire)
+    }
+
+    fn try_reserve(&self, bytes: usize) -> bool {
+        let mut current = self.retained_bytes.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = current.checked_add(bytes) else {
+                return false;
+            };
+            if next > self.budget {
+                return false;
+            }
+            match self.retained_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn release_reservation(&self, bytes: usize) {
+        let mut current = self.retained_bytes.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_sub(bytes);
+            match self.retained_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn acquire(&self, min_capacity: usize) -> Option<Vec<u8>> {
+        if min_capacity > MAX_POOLED_BYTE_CAPACITY {
+            return None;
+        }
+        match self.queue.pop() {
+            Some(buffer) if buffer.capacity() >= min_capacity => {
+                self.release_reservation(buffer.capacity());
+                Some(buffer)
+            }
+            Some(mut buffer) => {
+                self.release_reservation(buffer.capacity());
+                buffer.clear();
+                if buffer.capacity() < min_capacity {
+                    buffer.reserve(min_capacity);
+                }
+                Some(buffer)
+            }
+            None => Some(Vec::with_capacity(min_capacity)),
+        }
+    }
+
+    fn release(&self, mut buffer: Vec<u8>) {
+        buffer.clear();
+        let cap = buffer.capacity();
+        if cap > MAX_POOLED_BYTE_CAPACITY {
+            return;
+        }
+        if !self.try_reserve(cap) {
+            return;
+        }
+        if self.queue.push(buffer).is_err() {
+            self.release_reservation(cap);
+        }
+    }
+
+    fn prewarm(&self, count: usize, capacity: usize) {
+        if capacity > MAX_POOLED_BYTE_CAPACITY {
+            return;
+        }
+        for _ in 0..count {
+            if self.queue.is_full() {
+                return;
+            }
+            let buffer = Vec::with_capacity(capacity);
+            let cap = buffer.capacity();
+            if cap > MAX_POOLED_BYTE_CAPACITY || !self.try_reserve(cap) {
+                return;
+            }
+            if self.queue.push(buffer).is_err() {
+                self.release_reservation(cap);
+                return;
+            }
+        }
+    }
+}
+
+static BYTE_PAYLOAD_POOL: OnceLock<BytePayloadPool> = OnceLock::new();
+
+fn byte_payload_pool() -> &'static BytePayloadPool {
+    BYTE_PAYLOAD_POOL
+        .get_or_init(|| BytePayloadPool::new(BYTE_PAYLOAD_POOL_SIZE, DEFAULT_RETAINED_BYTE_BUDGET))
+}
+
+/// Idle pooled payload capacity currently retained by the process-wide pool.
+/// Checked-out buffers and thread-local serializer arenas are not included.
+pub fn retained_byte_pool_bytes() -> usize {
+    byte_payload_pool().retained_bytes()
 }
 
 fn acquire_ctx() -> Box<SerializerCtx> {
@@ -85,63 +207,35 @@ fn release_ctx(mut ctx: Box<SerializerCtx>) {
 }
 
 fn try_acquire_byte_buffer(min_capacity: usize) -> Option<Vec<u8>> {
-    if min_capacity > MAX_POOLED_BYTE_CAPACITY {
-        return None;
-    }
-    match byte_payload_pool().pop() {
-        Some(buffer) if buffer.capacity() >= min_capacity => Some(buffer),
-        Some(mut buffer) => {
-            // Grow the undersized buffer so later equal-sized payloads reuse it.
-            // Returning it unchanged left the pool full of small buffers and forced
-            // a fresh allocation on every larger message.
-            // `Vec::reserve` is relative to `len`, not `capacity`; clear first so
-            // `reserve(min_capacity)` actually raises capacity to the new size.
-            buffer.clear();
-            if buffer.capacity() < min_capacity {
-                buffer.reserve(min_capacity);
-            }
-            Some(buffer)
-        }
-        None => Some(Vec::with_capacity(min_capacity)),
-    }
+    byte_payload_pool().acquire(min_capacity)
 }
 
-fn release_byte_buffer(mut buffer: Vec<u8>) {
-    buffer.clear();
-    if buffer.capacity() > MAX_POOLED_BYTE_CAPACITY {
-        return;
-    }
-    let _ = byte_payload_pool().push(buffer);
+fn release_byte_buffer(buffer: Vec<u8>) {
+    byte_payload_pool().release(buffer);
 }
 
 pub(crate) fn prewarm_pooled_byte_buffers(count: usize, capacity: usize) {
-    let pool = byte_payload_pool();
-    for _ in 0..count {
-        if pool.is_full() {
-            return;
-        }
-        if pool.push(Vec::with_capacity(capacity)).is_err() {
-            return;
-        }
-    }
+    byte_payload_pool().prewarm(count, capacity);
 }
 
 #[cfg(test)]
 mod qa_pool_review {
     use super::*;
     use bytes::Buf;
+    use std::sync::Arc;
 
     #[test]
     fn qa_prewarmed_pool_adapts_to_larger_steady_state_payloads() {
-        while byte_payload_pool().pop().is_some() {}
-        prewarm_pooled_byte_buffers(BYTE_PAYLOAD_POOL_SIZE, 4096);
+        let pool = BytePayloadPool::new(64, DEFAULT_RETAINED_BYTE_BUDGET);
+        pool.prewarm(64, 4096);
         for _ in 0..100 {
-            let buffer = try_acquire_byte_buffer(8192).unwrap();
-            release_byte_buffer(buffer);
+            let buffer = pool.acquire(8192).unwrap();
+            pool.release(buffer);
         }
         let mut suitable = 0;
         let mut undersized = 0;
-        while let Some(buffer) = byte_payload_pool().pop() {
+        while let Some(buffer) = pool.queue.pop() {
+            pool.release_reservation(buffer.capacity());
             if buffer.capacity() >= 8192 {
                 suitable += 1;
             } else {
@@ -152,6 +246,7 @@ mod qa_pool_review {
             suitable > 0,
             "larger steady-state messages must become reusable instead of allocating forever (suitable={suitable}, undersized={undersized})"
         );
+        assert_eq!(pool.retained_bytes(), 0);
     }
 
     #[test]
@@ -163,6 +258,110 @@ mod qa_pool_review {
         payload.advance(3);
         let bytes = payload.into_remaining_bytes();
         assert_eq!(&bytes[..], &[4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn retained_bytes_use_capacity_not_length() {
+        let budget = 3 * 1024;
+        let pool = BytePayloadPool::new(8, budget);
+        let mut first = pool.acquire(2048).unwrap();
+        first.resize(16, 1);
+        let mut second = pool.acquire(2048).unwrap();
+        second.resize(16, 2);
+        assert_eq!(
+            pool.retained_bytes(),
+            0,
+            "checked-out buffers are not retained"
+        );
+        pool.release(first);
+        pool.release(second);
+        assert!(pool.retained_bytes() <= budget);
+        assert!(
+            pool.retained_bytes() >= 2048,
+            "idle pool must account for capacity bytes, not payload lengths (retained={})",
+            pool.retained_bytes()
+        );
+        // A count-only policy would keep both 2 KiB-class buffers. The byte
+        // budget must drop at least one so retained capacity stays in bound.
+        assert!(
+            pool.queue.len() < 2 || pool.retained_bytes() <= budget,
+            "byte budget must reject a second buffer that would exceed retained capacity"
+        );
+    }
+
+    #[test]
+    fn small_budget_drops_the_second_large_return() {
+        let budget = 1536;
+        let pool = BytePayloadPool::new(8, budget);
+        let a = Vec::with_capacity(1024);
+        let cap = a.capacity();
+        assert!(
+            cap <= budget,
+            "fixture capacity {cap} must fit the {budget} byte budget once"
+        );
+        let b = Vec::with_capacity(1024);
+        pool.release(a);
+        pool.release(b);
+        assert!(pool.retained_bytes() <= budget);
+        assert_eq!(pool.queue.len(), 1);
+        assert_eq!(pool.retained_bytes(), cap);
+    }
+
+    #[test]
+    fn oversize_buffer_is_dropped_without_retaining() {
+        let pool = BytePayloadPool::new(8, DEFAULT_RETAINED_BYTE_BUDGET);
+        let oversize = Vec::with_capacity(MAX_POOLED_BYTE_CAPACITY + 1);
+        pool.release(oversize);
+        assert_eq!(pool.retained_bytes(), 0);
+        assert_eq!(pool.queue.len(), 0);
+        assert!(pool.acquire(MAX_POOLED_BYTE_CAPACITY + 1).is_none());
+    }
+
+    #[test]
+    fn checkout_releases_reservation_exactly_once() {
+        let pool = BytePayloadPool::new(8, 4096);
+        let buffer = Vec::with_capacity(1024);
+        let cap = buffer.capacity();
+        pool.release(buffer);
+        assert_eq!(pool.retained_bytes(), cap);
+        let checked_out = pool.acquire(1024).unwrap();
+        assert_eq!(pool.retained_bytes(), 0);
+        let cap = checked_out.capacity();
+        pool.release(checked_out);
+        assert_eq!(pool.retained_bytes(), cap);
+    }
+
+    #[test]
+    fn concurrent_returns_never_exceed_budget_or_underflow() {
+        let budget = 8 * 1024;
+        let pool = Arc::new(BytePayloadPool::new(32, budget));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let pool = Arc::clone(&pool);
+                scope.spawn(move || {
+                    for _ in 0..64 {
+                        let buffer = pool.acquire(1024).unwrap();
+                        assert!(buffer.capacity() >= 1024);
+                        pool.release(buffer);
+                        assert!(pool.retained_bytes() <= budget);
+                    }
+                });
+            }
+        });
+        assert!(pool.retained_bytes() <= budget);
+    }
+
+    #[test]
+    fn large_then_small_payloads_reuse_without_exceeding_budget() {
+        let budget = 4 * 1024;
+        let pool = BytePayloadPool::new(8, budget);
+        let large = pool.acquire(2048).unwrap();
+        pool.release(large);
+        let small = pool.acquire(64).unwrap();
+        assert!(small.capacity() >= 64);
+        pool.release(small);
+        assert!(pool.retained_bytes() <= budget);
+        assert!(pool.retained_bytes() > 0);
     }
 }
 
