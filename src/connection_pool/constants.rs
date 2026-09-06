@@ -796,6 +796,14 @@ mod queue_notify_hook {
     }
 }
 
+struct WriteEnqueueGuard<'a>(&'a WriteQueue);
+
+impl Drop for WriteEnqueueGuard<'_> {
+    fn drop(&mut self) {
+        self.0.try_push_state.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 #[derive(Debug)]
 enum WriteTryPushError {
     #[allow(dead_code)]
@@ -840,11 +848,11 @@ impl WriteQueue {
         })
     }
 
-    fn try_push(&self, command: WriteCommand) -> std::result::Result<(), WriteTryPushError> {
+    fn enqueue_guard(&self) -> Option<WriteEnqueueGuard<'_>> {
         loop {
             let state = self.try_push_state.load(Ordering::Acquire);
             if state & STREAMING_QUEUE_CLOSED != 0 {
-                return Err(WriteTryPushError::Closed(command));
+                return None;
             }
             debug_assert!(state & STREAMING_QUEUE_PUSHERS != STREAMING_QUEUE_PUSHERS);
             if self
@@ -852,16 +860,20 @@ impl WriteQueue {
                 .compare_exchange_weak(state, state + 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                break;
+                return Some(WriteEnqueueGuard(self));
             }
         }
+    }
 
+    fn try_push(&self, command: WriteCommand) -> std::result::Result<(), WriteTryPushError> {
+        let Some(_guard) = self.enqueue_guard() else {
+            return Err(WriteTryPushError::Closed(command));
+        };
         let result = match self.queue.push(command) {
             Ok(()) => Ok(()),
             Err(cmd) => Err(WriteTryPushError::Full(cmd)),
         };
-        let state = self.try_push_state.fetch_sub(1, Ordering::AcqRel);
-        if state & STREAMING_QUEUE_CLOSED != 0 {
+        if self.try_push_state.load(Ordering::Acquire) & STREAMING_QUEUE_CLOSED != 0 {
             return Err(WriteTryPushError::ClosedDropped);
         }
         result
@@ -940,10 +952,9 @@ impl WriteQueue {
     }
 
     async fn push(&self, mut command: WriteCommand) -> Result<()> {
-        // Fast reject if the writer already tore down before we attempt to park.
-        if self.closed.load(Ordering::Acquire) {
+        let Some(_guard) = self.enqueue_guard() else {
             return Err(GossipError::ConnectionClosed(self.addr));
-        }
+        };
         loop {
             match self.queue.push(command) {
                 Ok(()) => {
@@ -986,6 +997,14 @@ impl WriteQueue {
 
     fn notify_space(&self) {
         self.space_notify.notify_one();
+    }
+}
+
+struct StreamEnqueueGuard<'a>(&'a StreamingQueue);
+
+impl Drop for StreamEnqueueGuard<'_> {
+    fn drop(&mut self) {
+        self.0.try_push_state.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -1038,14 +1057,11 @@ impl StreamingQueue {
         })
     }
 
-    fn try_push(
-        &self,
-        command: StreamingCommand,
-    ) -> std::result::Result<(), StreamingTryPushError> {
+    fn enqueue_guard(&self) -> Option<StreamEnqueueGuard<'_>> {
         loop {
             let state = self.try_push_state.load(Ordering::Acquire);
             if state & STREAMING_QUEUE_CLOSED != 0 {
-                return Err(StreamingTryPushError::Closed(self.addr));
+                return None;
             }
             debug_assert!(state & STREAMING_QUEUE_PUSHERS != STREAMING_QUEUE_PUSHERS);
             if self
@@ -1053,10 +1069,18 @@ impl StreamingQueue {
                 .compare_exchange_weak(state, state + 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                break;
+                return Some(StreamEnqueueGuard(self));
             }
         }
+    }
 
+    fn try_push(
+        &self,
+        command: StreamingCommand,
+    ) -> std::result::Result<(), StreamingTryPushError> {
+        let Some(_guard) = self.enqueue_guard() else {
+            return Err(StreamingTryPushError::Closed(self.addr));
+        };
         let result = match self.queue.push(command) {
             Ok(()) => {
                 self.notify_data();
@@ -1064,8 +1088,7 @@ impl StreamingQueue {
             }
             Err(cmd) => Err(StreamingTryPushError::Full(cmd)),
         };
-        let state = self.try_push_state.fetch_sub(1, Ordering::AcqRel);
-        if state & STREAMING_QUEUE_CLOSED != 0 {
+        if self.try_push_state.load(Ordering::Acquire) & STREAMING_QUEUE_CLOSED != 0 {
             return Err(StreamingTryPushError::Closed(self.addr));
         }
         result
@@ -1122,13 +1145,16 @@ impl StreamingQueue {
     }
 
     async fn push(&self, mut command: StreamingCommand) -> Result<()> {
-        if self.closed.load(Ordering::Acquire) {
+        let Some(_guard) = self.enqueue_guard() else {
             return Err(GossipError::ConnectionClosed(self.addr));
-        }
+        };
         loop {
             match self.queue.push(command) {
                 Ok(()) => {
                     self.notify_data();
+                    if self.closed.load(Ordering::Acquire) {
+                        return Err(GossipError::ConnectionClosed(self.addr));
+                    }
                     return Ok(());
                 }
                 Err(cmd) => {
