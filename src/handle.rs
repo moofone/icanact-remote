@@ -186,9 +186,10 @@ pub struct GossipClient<T = ()> {
 
 impl<T> Drop for GossipRegistryHandle<T> {
     fn drop(&mut self) {
-        // If the handle is dropped without an explicit shutdown, the runtime would otherwise
-        // keep the accept loop + timer alive and the process may require multiple SIGINTs
-        // to terminate. Aborting here makes example binaries exit cleanly on Ctrl+C.
+        // Owner drop must break handler -> client/router/pubsub -> registry cycles
+        // even when the caller never awaits `shutdown()`. Aborting the accept/
+        // timer/monitor tasks alone leaves those strong refs installed.
+        self.registry.begin_drop_retirement();
         if let Some(handle) = self._server_handle.take() {
             handle.abort();
         }

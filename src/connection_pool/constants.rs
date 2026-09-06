@@ -145,6 +145,7 @@ impl DirectResponseBatch {
     }
 }
 
+#[allow(dead_code)]
 async fn write_remaining_chunks<S: AsyncWrite + Unpin>(
     stream: &mut S,
     chunks: &[bytes::Bytes],
@@ -163,6 +164,7 @@ async fn write_remaining_chunks<S: AsyncWrite + Unpin>(
     Ok(wrote)
 }
 
+#[allow(dead_code)]
 async fn write_chunks_batched<S: AsyncWrite + Unpin>(
     stream: &mut S,
     chunks: &[bytes::Bytes],
@@ -794,6 +796,24 @@ mod queue_notify_hook {
     }
 }
 
+struct WriteEnqueueGuard<'a>(&'a WriteQueue);
+
+impl Drop for WriteEnqueueGuard<'_> {
+    fn drop(&mut self) {
+        self.0.try_push_state.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[derive(Debug)]
+enum WriteTryPushError {
+    #[allow(dead_code)]
+    Closed(WriteCommand),
+    /// Published into the queue, then observed close. The command is owned by
+    /// the queue and will be reclaimed; the caller must not retry it.
+    ClosedDropped,
+    Full(WriteCommand),
+}
+
 struct WriteQueue {
     queue: crossbeam_queue::ArrayQueue<WriteCommand>,
     data_notify: Notify,
@@ -808,6 +828,9 @@ struct WriteQueue {
     /// returns `ConnectionClosed` instead of re-parking forever. Hot path never
     /// reads this flag.
     closed: AtomicBool,
+    /// Coordinates non-blocking enqueues with teardown. High bit is closed;
+    /// lower bits count in-flight try_push callers. See `StreamingQueue`.
+    try_push_state: AtomicUsize,
     /// Peer address used to construct the `ConnectionClosed` error on teardown.
     addr: SocketAddr,
 }
@@ -820,12 +843,40 @@ impl WriteQueue {
             space_notify: Notify::new(),
             data_pending: AtomicBool::new(false),
             closed: AtomicBool::new(false),
+            try_push_state: AtomicUsize::new(0),
             addr,
         })
     }
 
-    fn try_push(&self, command: WriteCommand) -> std::result::Result<(), WriteCommand> {
-        self.queue.push(command)
+    fn enqueue_guard(&self) -> Option<WriteEnqueueGuard<'_>> {
+        loop {
+            let state = self.try_push_state.load(Ordering::Acquire);
+            if state & STREAMING_QUEUE_CLOSED != 0 {
+                return None;
+            }
+            debug_assert!(state & STREAMING_QUEUE_PUSHERS != STREAMING_QUEUE_PUSHERS);
+            if self
+                .try_push_state
+                .compare_exchange_weak(state, state + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(WriteEnqueueGuard(self));
+            }
+        }
+    }
+
+    fn try_push(&self, command: WriteCommand) -> std::result::Result<(), WriteTryPushError> {
+        let Some(_guard) = self.enqueue_guard() else {
+            return Err(WriteTryPushError::Closed(command));
+        };
+        let result = match self.queue.push(command) {
+            Ok(()) => Ok(()),
+            Err(cmd) => Err(WriteTryPushError::Full(cmd)),
+        };
+        if self.try_push_state.load(Ordering::Acquire) & STREAMING_QUEUE_CLOSED != 0 {
+            return Err(WriteTryPushError::ClosedDropped);
+        }
+        result
     }
 
     /// Publish a writer wakeup after a successful push, coalescing wakeups so
@@ -878,19 +929,39 @@ impl WriteQueue {
     /// observe the close and return an error instead of hanging forever.
     /// Teardown-only; never called on the message fast path.
     fn mark_closed_and_wake(&self) {
+        self.try_push_state
+            .fetch_or(STREAMING_QUEUE_CLOSED, Ordering::AcqRel);
         self.closed.store(true, Ordering::Release);
         self.space_notify.notify_waiters();
     }
 
-    async fn push(&self, mut command: WriteCommand) -> Result<()> {
-        // Fast reject if the writer already tore down before we attempt to park.
-        if self.closed.load(Ordering::Acquire) {
-            return Err(GossipError::ConnectionClosed(self.addr));
+    /// Fence admission (including in-flight `try_push` racers), then drop every
+    /// undeliverable payload. Retained connection handles keep these Arcs alive,
+    /// so without an explicit drain the bodies would outlive IO exit.
+    fn close_and_reclaim(&self) {
+        self.mark_closed_and_wake();
+        loop {
+            while self.queue.pop().is_some() {}
+            let state = self.try_push_state.load(Ordering::Acquire);
+            if state & STREAMING_QUEUE_PUSHERS == 0 {
+                while self.queue.pop().is_some() {}
+                break;
+            }
+            std::thread::yield_now();
         }
+    }
+
+    async fn push(&self, mut command: WriteCommand) -> Result<()> {
+        let Some(_guard) = self.enqueue_guard() else {
+            return Err(GossipError::ConnectionClosed(self.addr));
+        };
         loop {
             match self.queue.push(command) {
                 Ok(()) => {
                     self.notify_data();
+                    if self.closed.load(Ordering::Acquire) {
+                        return Err(GossipError::ConnectionClosed(self.addr));
+                    }
                     return Ok(());
                 }
                 Err(cmd) => {
@@ -926,6 +997,14 @@ impl WriteQueue {
 
     fn notify_space(&self) {
         self.space_notify.notify_one();
+    }
+}
+
+struct StreamEnqueueGuard<'a>(&'a StreamingQueue);
+
+impl Drop for StreamEnqueueGuard<'_> {
+    fn drop(&mut self) {
+        self.0.try_push_state.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -978,14 +1057,11 @@ impl StreamingQueue {
         })
     }
 
-    fn try_push(
-        &self,
-        command: StreamingCommand,
-    ) -> std::result::Result<(), StreamingTryPushError> {
+    fn enqueue_guard(&self) -> Option<StreamEnqueueGuard<'_>> {
         loop {
             let state = self.try_push_state.load(Ordering::Acquire);
             if state & STREAMING_QUEUE_CLOSED != 0 {
-                return Err(StreamingTryPushError::Closed(self.addr));
+                return None;
             }
             debug_assert!(state & STREAMING_QUEUE_PUSHERS != STREAMING_QUEUE_PUSHERS);
             if self
@@ -993,10 +1069,18 @@ impl StreamingQueue {
                 .compare_exchange_weak(state, state + 1, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                break;
+                return Some(StreamEnqueueGuard(self));
             }
         }
+    }
 
+    fn try_push(
+        &self,
+        command: StreamingCommand,
+    ) -> std::result::Result<(), StreamingTryPushError> {
+        let Some(_guard) = self.enqueue_guard() else {
+            return Err(StreamingTryPushError::Closed(self.addr));
+        };
         let result = match self.queue.push(command) {
             Ok(()) => {
                 self.notify_data();
@@ -1004,8 +1088,7 @@ impl StreamingQueue {
             }
             Err(cmd) => Err(StreamingTryPushError::Full(cmd)),
         };
-        let state = self.try_push_state.fetch_sub(1, Ordering::AcqRel);
-        if state & STREAMING_QUEUE_CLOSED != 0 {
+        if self.try_push_state.load(Ordering::Acquire) & STREAMING_QUEUE_CLOSED != 0 {
             return Err(StreamingTryPushError::Closed(self.addr));
         }
         result
@@ -1046,14 +1129,32 @@ impl StreamingQueue {
         self.space_notify.notify_waiters();
     }
 
-    async fn push(&self, mut command: StreamingCommand) -> Result<()> {
-        if self.closed.load(Ordering::Acquire) {
-            return Err(GossipError::ConnectionClosed(self.addr));
+    /// Fence admission (including in-flight `try_push` racers), then drop every
+    /// undeliverable streaming payload. See `WriteQueue::close_and_reclaim`.
+    fn close_and_reclaim(&self) {
+        self.mark_closed_and_wake();
+        loop {
+            while self.queue.pop().is_some() {}
+            let state = self.try_push_state.load(Ordering::Acquire);
+            if state & STREAMING_QUEUE_PUSHERS == 0 {
+                while self.queue.pop().is_some() {}
+                break;
+            }
+            std::thread::yield_now();
         }
+    }
+
+    async fn push(&self, mut command: StreamingCommand) -> Result<()> {
+        let Some(_guard) = self.enqueue_guard() else {
+            return Err(GossipError::ConnectionClosed(self.addr));
+        };
         loop {
             match self.queue.push(command) {
                 Ok(()) => {
                     self.notify_data();
+                    if self.closed.load(Ordering::Acquire) {
+                        return Err(GossipError::ConnectionClosed(self.addr));
+                    }
                     return Ok(());
                 }
                 Err(cmd) => {
@@ -1087,7 +1188,8 @@ impl StreamingQueue {
 
     fn notify_space(&self) {
         #[cfg(test)]
-        self.space_notification_count.fetch_add(1, Ordering::Relaxed);
+        self.space_notification_count
+            .fetch_add(1, Ordering::Relaxed);
         self.space_notify.notify_one();
     }
 
@@ -1297,7 +1399,10 @@ mod queue_notify_tests {
         for _ in 0..128 {
             normal.try_push(frame()).expect("normal queue has capacity");
         }
-        assert!(normal.try_push(frame()).is_err(), "normal queue is saturated");
+        assert!(
+            normal.try_push(frame()).is_err(),
+            "normal queue is saturated"
+        );
 
         immediate
             .try_push(immediate_frame())
@@ -1307,7 +1412,11 @@ mod queue_notify_tests {
             .pop()
             .expect("writer drains priority queue before normal backlog");
         assert!(matches!(first, WriteCommand::ImmediatePayload(_)));
-        assert_eq!(normal.queue.len(), 128, "normal backlog was not consumed first");
+        assert_eq!(
+            normal.queue.len(),
+            128,
+            "normal backlog was not consumed first"
+        );
     }
 
     /// The priority lane is bounded per writer turn. After a control burst,
@@ -1330,9 +1439,11 @@ mod queue_notify_tests {
         }
         turn.push(normal.pop().expect("regular frame receives a fair turn"));
 
-        assert!(turn[..IMMEDIATE_WRITE_BATCH]
-            .iter()
-            .all(|command| matches!(command, WriteCommand::ImmediatePayload(_))));
+        assert!(
+            turn[..IMMEDIATE_WRITE_BATCH]
+                .iter()
+                .all(|command| matches!(command, WriteCommand::ImmediatePayload(_)))
+        );
         assert!(matches!(
             turn[IMMEDIATE_WRITE_BATCH],
             WriteCommand::Payload(_)
@@ -1545,8 +1656,9 @@ mod queue_notify_tests {
     /// assertion fails cleanly rather than hanging.
     #[tokio::test]
     async fn qa_r7_direct_response_batch_ok0_errors_not_spins() {
-        let mut stream =
-            WriteZeroVectored { calls: std::sync::atomic::AtomicUsize::new(0) };
+        let mut stream = WriteZeroVectored {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut bytes_since_flush = 0usize;
         let mut batch = DirectResponseBatch::new(8);
@@ -1557,9 +1669,7 @@ mod queue_notify_tests {
             write_direct_response_batch(&mut stream, &counter, &mut bytes_since_flush, &mut batch)
                 .await;
         match result {
-            Err(crate::GossipError::Network(e))
-                if e.kind() == std::io::ErrorKind::WriteZero =>
-            {
+            Err(crate::GossipError::Network(e)) if e.kind() == std::io::ErrorKind::WriteZero => {
                 assert!(
                     stream.calls.load(std::sync::atomic::Ordering::SeqCst) <= 1,
                     "WriteZero must surface on the first Ok(0), not after a spin"
@@ -1585,8 +1695,8 @@ mod queue_notify_tests {
 #[cfg(test)]
 mod response_batch_byte_cap_tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
 
     /// Records every byte written via `write_vectored`/`write_all` in order,
     /// so tests can assert both total volume and exact frame ordering across
@@ -1694,8 +1804,7 @@ mod response_batch_byte_cap_tests {
     #[tokio::test]
     async fn response_batch_never_exceeds_byte_cap_regardless_of_frame_count() {
         const FRAMES: usize = 32;
-        let (write_vectored_calls, written, max_batch_bytes) =
-            drain_simulated_turn(FRAMES).await;
+        let (write_vectored_calls, written, max_batch_bytes) = drain_simulated_turn(FRAMES).await;
 
         assert!(
             max_batch_bytes <= RESPONSE_BATCH_BYTE_CAP,

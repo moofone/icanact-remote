@@ -2,6 +2,120 @@
 /// read side. Ordinary tell/ask commands never use this slice machinery.
 const STREAM_WRITE_SLICE_BYTES: usize = 64 * 1024;
 
+#[cfg(test)]
+mod qa_queue_retention_review {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn qa_mixed_ordinary_batch_observes_shutdown_when_peer_stops_reading() {
+        use tokio::io::AsyncReadExt;
+        let (client, mut peer) = tokio::io::duplex(64);
+        let (writer, mut task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9989".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let payload = bytes::Bytes::from(vec![0; 8192]);
+        let header = crate::framing::try_write_ask_response_header(
+            crate::MessageType::Response,
+            1,
+            payload.len(),
+        )
+        .unwrap();
+        let mut frame = Vec::from(&header[..16]);
+        frame.extend_from_slice(&payload);
+        writer
+            .enqueue_write_nonblocking(WritePayload::Single(frame.into()))
+            .unwrap();
+        writer
+            .enqueue_write_nonblocking(WritePayload::HeaderInline {
+                header,
+                header_len: 16,
+                payload,
+            })
+            .unwrap();
+        let mut prefix = [0; 1];
+        tokio::time::timeout(Duration::from_secs(2), peer.read_exact(&mut prefix))
+            .await
+            .unwrap()
+            .unwrap();
+        writer.shutdown();
+        let exited = tokio::time::timeout(Duration::from_secs(2), &mut task)
+            .await
+            .is_ok();
+        if !exited {
+            task.abort();
+            let _ = task.await;
+        }
+        assert!(
+            exited,
+            "mixed ordinary write is stuck inside an unbounded write and cannot observe shutdown"
+        );
+    }
+
+    struct PayloadOwner {
+        bytes: Vec<u8>,
+        dropped: Arc<AtomicUsize>,
+    }
+    impl AsRef<[u8]> for PayloadOwner {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+    impl Drop for PayloadOwner {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn qa_closed_retained_handle_releases_unsent_payloads() {
+        let (client, _peer) = tokio::io::duplex(64);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:9988".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let dropped = Arc::new(AtomicUsize::new(0));
+        for _ in 0..32 {
+            let bytes = bytes::Bytes::from_owner(PayloadOwner {
+                bytes: vec![0; 1024],
+                dropped: dropped.clone(),
+            });
+            let header = crate::framing::try_write_ask_response_header(
+                crate::MessageType::Response,
+                1,
+                bytes.len(),
+            )
+            .unwrap();
+            writer
+                .enqueue_write_nonblocking(WritePayload::HeaderInline {
+                    header,
+                    header_len: 16,
+                    payload: bytes,
+                })
+                .unwrap();
+        }
+        writer.shutdown();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let released_at_exit = dropped.load(Ordering::SeqCst);
+        drop(writer);
+        assert_eq!(
+            released_at_exit, 32,
+            "closed cached handles must not retain undeliverable payloads"
+        );
+    }
+}
+
 /// Invariant: a connection must never end up with both directions unable to
 /// read because both are unable to write.
 ///
@@ -524,6 +638,52 @@ where
             SliceAttemptOutcome::TearDown { .. } => OrdinaryWriteProgress::Failed,
             SliceAttemptOutcome::Continue => OrdinaryWriteProgress::Partial(0),
         },
+    }
+}
+
+fn append_fixed_header_payloads<const N: usize>(
+    chunks: &mut Vec<bytes::Bytes>,
+    headers: &mut Vec<[u8; N]>,
+    payloads: &mut Vec<bytes::Bytes>,
+) {
+    let count = headers.len().min(payloads.len());
+    for idx in 0..count {
+        chunks.push(bytes::Bytes::copy_from_slice(&headers[idx]));
+        chunks.push(std::mem::take(&mut payloads[idx]));
+    }
+    headers.clear();
+    payloads.clear();
+}
+
+fn take_ordinary_kind_switch_chunks(
+    write_chunks: &mut Vec<bytes::Bytes>,
+    inline32_headers: &mut Vec<[u8; 32]>,
+    inline32_payloads: &mut Vec<bytes::Bytes>,
+    direct_ask_headers: &mut Vec<[u8; 16]>,
+    direct_ask_payloads: &mut Vec<bytes::Bytes>,
+) -> Vec<bytes::Bytes> {
+    let mut flush = Vec::with_capacity(
+        write_chunks.len()
+            + inline32_headers.len().saturating_mul(2)
+            + direct_ask_headers.len().saturating_mul(2),
+    );
+    append_fixed_header_payloads(&mut flush, direct_ask_headers, direct_ask_payloads);
+    append_fixed_header_payloads(&mut flush, inline32_headers, inline32_payloads);
+    flush.append(write_chunks);
+    flush
+}
+
+fn requeue_write_command(
+    is_immediate_payload: bool,
+    is_ask_payload: bool,
+    payload: WritePayload,
+) -> WriteCommand {
+    if is_immediate_payload {
+        WriteCommand::ImmediatePayload(payload)
+    } else if is_ask_payload {
+        WriteCommand::AskPayload(payload)
+    } else {
+        WriteCommand::Payload(payload)
     }
 }
 
@@ -1489,9 +1649,9 @@ impl LockFreeStreamHandle {
                 self.notify.notify_waiters();
                 // Wake parked `push()` callers so they observe `closed` and
                 // return `ConnectionClosed` rather than hanging on a full queue.
-                self.write_queue.mark_closed_and_wake();
-                self.immediate_write_queue.mark_closed_and_wake();
-                self.streaming_queue.mark_closed_and_wake();
+                self.write_queue.close_and_reclaim();
+                self.immediate_write_queue.close_and_reclaim();
+                self.streaming_queue.close_and_reclaim();
                 // Authoritative signal from a caller that is deliberately
                 // retiring this exact instance while its correlation tracker
                 // is still shared with a live sibling (e.g.
@@ -2152,48 +2312,52 @@ impl LockFreeStreamHandle {
                                     header_len,
                                     payload,
                                 } => {
-                                    if !direct_ask_headers.is_empty() {
-                                        let bytes_written = match flush_direct_ask_batch(
+                                    let flush = take_ordinary_kind_switch_chunks(
+                                        &mut write_chunks,
+                                        &mut inline32_headers,
+                                        &mut inline32_payloads,
+                                        &mut direct_ask_headers,
+                                        &mut direct_ask_payloads,
+                                    );
+                                    if !flush.is_empty() {
+                                        let mut offset = 0usize;
+                                        match write_chunks_once(
                                             &mut stream,
-                                            &mut direct_ask_headers,
-                                            &mut direct_ask_payloads,
+                                            &flush,
+                                            &mut offset,
+                                            &mut stream_write_wedged_since,
+                                            &mut stream_flush_wedged_since,
                                         )
                                         .await
                                         {
-                                            Ok(n) => n,
-                                            Err(_) => return,
-                                        };
-                                        bytes_written_counter
-                                            .fetch_add(bytes_written, Ordering::Relaxed);
-                                        total_bytes_written += bytes_written;
-                                    }
-                                    if !inline32_headers.is_empty() {
-                                        let bytes_written = match flush_inline32_batch(
-                                            &mut stream,
-                                            &mut inline32_headers,
-                                            &mut inline32_payloads,
-                                        )
-                                        .await
-                                        {
-                                            Ok(n) => n,
-                                            Err(_) => return,
-                                        };
-                                        bytes_written_counter
-                                            .fetch_add(bytes_written, Ordering::Relaxed);
-                                        total_bytes_written += bytes_written;
-                                    }
-                                    if !write_chunks.is_empty() {
-                                        let bytes_written =
-                                            match write_chunks_batched(&mut stream, &write_chunks)
-                                                .await
-                                            {
-                                                Ok(n) => n,
-                                                Err(_) => return,
-                                            };
-                                        bytes_written_counter
-                                            .fetch_add(bytes_written, Ordering::Relaxed);
-                                        total_bytes_written += bytes_written;
-                                        write_chunks.clear();
+                                            OrdinaryWriteProgress::Complete(n) => {
+                                                bytes_written_counter
+                                                    .fetch_add(n, Ordering::Relaxed);
+                                                total_bytes_written += n;
+                                            }
+                                            OrdinaryWriteProgress::Partial(n) => {
+                                                bytes_written_counter
+                                                    .fetch_add(n, Ordering::Relaxed);
+                                                total_bytes_written += n;
+                                                pending_ordinary_write =
+                                                    Some(PendingOrdinaryWrite::Chunks {
+                                                        chunks: flush,
+                                                        offset,
+                                                    });
+                                                leftover_commands.push(requeue_write_command(
+                                                    is_immediate_payload,
+                                                    is_ask_payload,
+                                                    WritePayload::HeaderInline {
+                                                        header,
+                                                        header_len,
+                                                        payload,
+                                                    },
+                                                ));
+                                                leftover_commands.extend(command_iter);
+                                                break;
+                                            }
+                                            OrdinaryWriteProgress::Failed => return,
+                                        }
                                     }
 
                                     let header_len = header_len as usize;
@@ -2236,48 +2400,52 @@ impl LockFreeStreamHandle {
                                     header_len,
                                     payload,
                                 } => {
-                                    if !direct_ask_headers.is_empty() {
-                                        let bytes_written = match flush_direct_ask_batch(
+                                    let flush = take_ordinary_kind_switch_chunks(
+                                        &mut write_chunks,
+                                        &mut inline32_headers,
+                                        &mut inline32_payloads,
+                                        &mut direct_ask_headers,
+                                        &mut direct_ask_payloads,
+                                    );
+                                    if !flush.is_empty() {
+                                        let mut offset = 0usize;
+                                        match write_chunks_once(
                                             &mut stream,
-                                            &mut direct_ask_headers,
-                                            &mut direct_ask_payloads,
+                                            &flush,
+                                            &mut offset,
+                                            &mut stream_write_wedged_since,
+                                            &mut stream_flush_wedged_since,
                                         )
                                         .await
                                         {
-                                            Ok(n) => n,
-                                            Err(_) => return,
-                                        };
-                                        bytes_written_counter
-                                            .fetch_add(bytes_written, Ordering::Relaxed);
-                                        total_bytes_written += bytes_written;
-                                    }
-                                    if !inline32_headers.is_empty() {
-                                        let bytes_written = match flush_inline32_batch(
-                                            &mut stream,
-                                            &mut inline32_headers,
-                                            &mut inline32_payloads,
-                                        )
-                                        .await
-                                        {
-                                            Ok(n) => n,
-                                            Err(_) => return,
-                                        };
-                                        bytes_written_counter
-                                            .fetch_add(bytes_written, Ordering::Relaxed);
-                                        total_bytes_written += bytes_written;
-                                    }
-                                    if !write_chunks.is_empty() {
-                                        let bytes_written =
-                                            match write_chunks_batched(&mut stream, &write_chunks)
-                                                .await
-                                            {
-                                                Ok(n) => n,
-                                                Err(_) => return,
-                                            };
-                                        bytes_written_counter
-                                            .fetch_add(bytes_written, Ordering::Relaxed);
-                                        total_bytes_written += bytes_written;
-                                        write_chunks.clear();
+                                            OrdinaryWriteProgress::Complete(n) => {
+                                                bytes_written_counter
+                                                    .fetch_add(n, Ordering::Relaxed);
+                                                total_bytes_written += n;
+                                            }
+                                            OrdinaryWriteProgress::Partial(n) => {
+                                                bytes_written_counter
+                                                    .fetch_add(n, Ordering::Relaxed);
+                                                total_bytes_written += n;
+                                                pending_ordinary_write =
+                                                    Some(PendingOrdinaryWrite::Chunks {
+                                                        chunks: flush,
+                                                        offset,
+                                                    });
+                                                leftover_commands.push(requeue_write_command(
+                                                    is_immediate_payload,
+                                                    is_ask_payload,
+                                                    WritePayload::HeaderInlineAligned {
+                                                        header,
+                                                        header_len,
+                                                        payload,
+                                                    },
+                                                ));
+                                                leftover_commands.extend(command_iter);
+                                                break;
+                                            }
+                                            OrdinaryWriteProgress::Failed => return,
+                                        }
                                     }
 
                                     let header_len = header_len as usize;
@@ -2316,33 +2484,50 @@ impl LockFreeStreamHandle {
                                     }
                                 }
                                 WritePayload::HeaderInline32 { header, payload } => {
-                                    if !direct_ask_headers.is_empty() {
-                                        let bytes_written = match flush_direct_ask_batch(
+                                    append_fixed_header_payloads(
+                                        &mut write_chunks,
+                                        &mut direct_ask_headers,
+                                        &mut direct_ask_payloads,
+                                    );
+                                    if !write_chunks.is_empty() {
+                                        let mut offset = 0usize;
+                                        match write_chunks_once(
                                             &mut stream,
-                                            &mut direct_ask_headers,
-                                            &mut direct_ask_payloads,
+                                            &write_chunks,
+                                            &mut offset,
+                                            &mut stream_write_wedged_since,
+                                            &mut stream_flush_wedged_since,
                                         )
                                         .await
                                         {
-                                            Ok(n) => n,
-                                            Err(_) => return,
-                                        };
-                                        bytes_written_counter
-                                            .fetch_add(bytes_written, Ordering::Relaxed);
-                                        total_bytes_written += bytes_written;
-                                    }
-                                    if !write_chunks.is_empty() {
-                                        let bytes_written =
-                                            match write_chunks_batched(&mut stream, &write_chunks)
-                                                .await
-                                            {
-                                                Ok(n) => n,
-                                                Err(_) => return,
-                                            };
-                                        bytes_written_counter
-                                            .fetch_add(bytes_written, Ordering::Relaxed);
-                                        total_bytes_written += bytes_written;
-                                        write_chunks.clear();
+                                            OrdinaryWriteProgress::Complete(n) => {
+                                                bytes_written_counter
+                                                    .fetch_add(n, Ordering::Relaxed);
+                                                total_bytes_written += n;
+                                                write_chunks.clear();
+                                            }
+                                            OrdinaryWriteProgress::Partial(n) => {
+                                                bytes_written_counter
+                                                    .fetch_add(n, Ordering::Relaxed);
+                                                total_bytes_written += n;
+                                                pending_ordinary_write =
+                                                    Some(PendingOrdinaryWrite::Chunks {
+                                                        chunks: std::mem::take(&mut write_chunks),
+                                                        offset,
+                                                    });
+                                                leftover_commands.push(requeue_write_command(
+                                                    is_immediate_payload,
+                                                    is_ask_payload,
+                                                    WritePayload::HeaderInline32 {
+                                                        header,
+                                                        payload,
+                                                    },
+                                                ));
+                                                leftover_commands.extend(command_iter);
+                                                break;
+                                            }
+                                            OrdinaryWriteProgress::Failed => return,
+                                        }
                                     }
                                     inline32_headers.push(header);
                                     inline32_payloads.push(payload);
@@ -2674,17 +2859,44 @@ impl LockFreeStreamHandle {
                                 }
                                 WritePayload::DirectAskInline { header, payload } => {
                                     if !write_chunks.is_empty() {
-                                        let bytes_written =
-                                            match write_chunks_batched(&mut stream, &write_chunks)
-                                                .await
-                                            {
-                                                Ok(n) => n,
-                                                Err(_) => return,
-                                            };
-                                        bytes_written_counter
-                                            .fetch_add(bytes_written, Ordering::Relaxed);
-                                        total_bytes_written += bytes_written;
-                                        write_chunks.clear();
+                                        let mut offset = 0usize;
+                                        match write_chunks_once(
+                                            &mut stream,
+                                            &write_chunks,
+                                            &mut offset,
+                                            &mut stream_write_wedged_since,
+                                            &mut stream_flush_wedged_since,
+                                        )
+                                        .await
+                                        {
+                                            OrdinaryWriteProgress::Complete(n) => {
+                                                bytes_written_counter
+                                                    .fetch_add(n, Ordering::Relaxed);
+                                                total_bytes_written += n;
+                                                write_chunks.clear();
+                                            }
+                                            OrdinaryWriteProgress::Partial(n) => {
+                                                bytes_written_counter
+                                                    .fetch_add(n, Ordering::Relaxed);
+                                                total_bytes_written += n;
+                                                pending_ordinary_write =
+                                                    Some(PendingOrdinaryWrite::Chunks {
+                                                        chunks: std::mem::take(&mut write_chunks),
+                                                        offset,
+                                                    });
+                                                leftover_commands.push(requeue_write_command(
+                                                    is_immediate_payload,
+                                                    is_ask_payload,
+                                                    WritePayload::DirectAskInline {
+                                                        header,
+                                                        payload,
+                                                    },
+                                                ));
+                                                leftover_commands.extend(command_iter);
+                                                break;
+                                            }
+                                            OrdinaryWriteProgress::Failed => return,
+                                        }
                                     }
                                     if !inline32_headers.is_empty() {
                                         let bytes_written = match flush_inline32_batch(
@@ -4156,7 +4368,10 @@ impl LockFreeStreamHandle {
                 self.write_queue.notify_data();
                 Ok(())
             }
-            Err(command) => self.write_queue.push(command).await,
+            Err(WriteTryPushError::Full(command)) => self.write_queue.push(command).await,
+            Err(WriteTryPushError::Closed(_) | WriteTryPushError::ClosedDropped) => {
+                Err(GossipError::ConnectionClosed(self.addr))
+            }
         }
     }
 
@@ -4175,7 +4390,10 @@ impl LockFreeStreamHandle {
                 self.write_queue.notify_data();
                 Ok(())
             }
-            Err(command) => self.write_queue.push(command).await,
+            Err(WriteTryPushError::Full(command)) => self.write_queue.push(command).await,
+            Err(WriteTryPushError::Closed(_) | WriteTryPushError::ClosedDropped) => {
+                Err(GossipError::ConnectionClosed(self.addr))
+            }
         }
     }
 
@@ -4193,7 +4411,10 @@ impl LockFreeStreamHandle {
                 self.write_queue.notify_data();
                 Ok(())
             }
-            Err(_) => Err(GossipError::WriteQueueFull),
+            Err(WriteTryPushError::Full(_)) => Err(GossipError::WriteQueueFull),
+            Err(WriteTryPushError::Closed(_) | WriteTryPushError::ClosedDropped) => {
+                Err(GossipError::ConnectionClosed(self.addr))
+            }
         }
     }
 
@@ -4214,7 +4435,10 @@ impl LockFreeStreamHandle {
                 self.immediate_write_queue.notify_data();
                 Ok(())
             }
-            Err(_) => Err(GossipError::WriteQueueFull),
+            Err(WriteTryPushError::Full(_)) => Err(GossipError::WriteQueueFull),
+            Err(WriteTryPushError::Closed(_) | WriteTryPushError::ClosedDropped) => {
+                Err(GossipError::ConnectionClosed(self.addr))
+            }
         }
     }
 

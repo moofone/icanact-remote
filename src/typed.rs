@@ -90,9 +90,17 @@ fn try_acquire_byte_buffer(min_capacity: usize) -> Option<Vec<u8>> {
     }
     match byte_payload_pool().pop() {
         Some(buffer) if buffer.capacity() >= min_capacity => Some(buffer),
-        Some(buffer) => {
-            release_byte_buffer(buffer);
-            Some(Vec::with_capacity(min_capacity))
+        Some(mut buffer) => {
+            // Grow the undersized buffer so later equal-sized payloads reuse it.
+            // Returning it unchanged left the pool full of small buffers and forced
+            // a fresh allocation on every larger message.
+            // `Vec::reserve` is relative to `len`, not `capacity`; clear first so
+            // `reserve(min_capacity)` actually raises capacity to the new size.
+            buffer.clear();
+            if buffer.capacity() < min_capacity {
+                buffer.reserve(min_capacity);
+            }
+            Some(buffer)
         }
         None => Some(Vec::with_capacity(min_capacity)),
     }
@@ -115,6 +123,34 @@ pub(crate) fn prewarm_pooled_byte_buffers(count: usize, capacity: usize) {
         if pool.push(Vec::with_capacity(capacity)).is_err() {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod qa_pool_review {
+    use super::*;
+
+    #[test]
+    fn qa_prewarmed_pool_adapts_to_larger_steady_state_payloads() {
+        while byte_payload_pool().pop().is_some() {}
+        prewarm_pooled_byte_buffers(BYTE_PAYLOAD_POOL_SIZE, 4096);
+        for _ in 0..100 {
+            let buffer = try_acquire_byte_buffer(8192).unwrap();
+            release_byte_buffer(buffer);
+        }
+        let mut suitable = 0;
+        let mut undersized = 0;
+        while let Some(buffer) = byte_payload_pool().pop() {
+            if buffer.capacity() >= 8192 {
+                suitable += 1;
+            } else {
+                undersized += 1;
+            }
+        }
+        assert!(
+            suitable > 0,
+            "larger steady-state messages must become reusable instead of allocating forever (suitable={suitable}, undersized={undersized})"
+        );
     }
 }
 
