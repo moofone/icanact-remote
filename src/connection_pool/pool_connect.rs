@@ -5126,15 +5126,17 @@ pub(crate) fn handle_incoming_message_with_instance(
                             .await,
                     };
 
-                    // Send the response back through existing connection
-                    // We'll use send_lock_free which doesn't create new connections
-                    let response_data = match rkyv::to_bytes::<rkyv::rancor::Error>(&response) {
-                        Ok(data) => data,
-                        Err(e) => {
-                            warn!(error = %e, "Failed to serialize FullSync response");
-                            return Ok(());
-                        }
-                    };
+                    // Send the response back through existing connection.
+                    // Split oversized snapshots the same way periodic gossip
+                    // does; a truncated FullSyncResponse would omission-prune.
+                    let payloads =
+                        match registry.encode_outbound_gossip_for_inline_limit(&response) {
+                            Ok(payloads) => payloads,
+                            Err(e) => {
+                                warn!(error = %e, "Failed to encode FullSync response");
+                                return Ok(());
+                            }
+                        };
 
                     // Try to send immediately on existing connection
                     {
@@ -5159,27 +5161,6 @@ pub(crate) fn handle_incoming_message_with_instance(
                             );
                             true
                         });
-
-                        let payload = bytes::Bytes::from_owner(response_data);
-                        // Locally generated, not gated by any caller: reject
-                        // here rather than let `framing` panic (>= 2^27
-                        // bytes) or hand the peer a frame it will
-                        // hard-reject as MessageTooLarge, tearing the whole
-                        // connection down. Goes through the same helper every
-                        // other inline-send gate uses so the admission check
-                        // and `write_gossip_frame_prefix`'s own
-                        // `GOSSIP_HEADER_LEN` overhead can't drift apart.
-                        if let Err(e) = framing::reject_oversize_for_inline_send(
-                            framing::GOSSIP_HEADER_LEN,
-                            payload.len(),
-                            registry.config.max_message_size,
-                        ) {
-                            warn!(error = %e, "FullSync response too large to frame");
-                            return Ok(());
-                        }
-                        let header = bytes::Bytes::copy_from_slice(
-                            &framing::try_write_gossip_frame_prefix(payload.len())?,
-                        );
 
                         // Debug: Log what connections we have
                         let mut available_addrs: Vec<SocketAddr> = Vec::new();
@@ -5208,20 +5189,30 @@ pub(crate) fn handle_incoming_message_with_instance(
                             sender_socket_addr
                         );
 
-                        // Try to send using peer ID
-                        let send_result = match pool.send_to_peer_id_parts(
-                            &sender_peer_id,
-                            header.clone(),
-                            payload.clone(),
-                        ) {
-                            Ok(()) => Ok(()),
-                            Err(e) => {
-                                warn!("Failed to send via peer ID {}: {}", sender_peer_id, e);
-                                // Fall back to socket address, reusing the
-                                // already-validated header (same payload).
-                                pool.send_lock_free_parts(sender_socket_addr, header, payload)
+                        let mut send_result = Ok(());
+                        for payload in payloads {
+                            let header = bytes::Bytes::copy_from_slice(
+                                &framing::try_write_gossip_frame_prefix(payload.len())?,
+                            );
+                            send_result = match pool.send_to_peer_id_parts(
+                                &sender_peer_id,
+                                header.clone(),
+                                payload.clone(),
+                            ) {
+                                Ok(()) => Ok(()),
+                                Err(e) => {
+                                    warn!("Failed to send via peer ID {}: {}", sender_peer_id, e);
+                                    pool.send_lock_free_parts(
+                                        sender_socket_addr,
+                                        header,
+                                        payload,
+                                    )
+                                }
+                            };
+                            if send_result.is_err() {
+                                break;
                             }
-                        };
+                        }
 
                         if send_result.is_err() {
                             warn!(
