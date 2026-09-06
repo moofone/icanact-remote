@@ -8171,7 +8171,8 @@ impl<T: 'static> GossipRegistry<T> {
     /// FullSync as complete and omission-prunes actors that only appear in
     /// the overflow. Oversized snapshots first emit a compact FullSync with
     /// the complete name set (metadata stripped) so omission-prune still
-    /// runs, then DeltaGossip ActorAdded batches restore full metadata.
+    /// runs, then ActorAdded batches restore full metadata using the matching
+    /// delta variant (`DeltaGossip` vs `DeltaGossipResponse`).
     /// Every fragment reuses the sender's real sequence.
     pub(crate) fn encode_outbound_gossip_for_inline_limit(
         &self,
@@ -8244,7 +8245,7 @@ impl<T: 'static> GossipRegistry<T> {
                         crate::current_timestamp_nanos(),
                         extensions.clone(),
                         max_message_size,
-                        false,
+                        matches!(message, RegistryMessage::FullSyncResponse { .. }),
                     )?);
                 }
                 Ok(payloads)
@@ -13831,6 +13832,69 @@ mod tests {
                 .iter()
                 .any(|msg| matches!(msg, RegistryMessage::DeltaGossip { .. })),
             "full metadata must follow as DeltaGossip adds"
+        );
+    }
+
+    #[test]
+    fn oversized_full_sync_response_overflow_stays_delta_response() {
+        let mut config = test_config();
+        config.max_message_size = 64 * 1024;
+        let registry = GossipRegistry::<()>::new(test_addr(18_085), config);
+        let local_actors: Vec<_> = (0..8)
+            .map(|i| {
+                let mut location = test_location(test_addr(7777));
+                location.metadata = vec![7; 16 * 1024];
+                location.peer_id = registry.peer_id.clone();
+                location.node_id = registry.peer_id.to_node_id();
+                (format!("large/{i}"), location)
+            })
+            .collect();
+        let msg = RegistryMessage::FullSyncResponse {
+            local_actors,
+            known_actors: Vec::new(),
+            sender_peer_id: registry.peer_id.clone(),
+            sender_bind_addr: Some(registry.advertised_addr().to_string()),
+            sequence: 2,
+            wall_clock_time: 0,
+            extensions: None,
+        };
+        let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&msg).unwrap();
+        assert!(
+            crate::framing::reject_oversize_for_inline_send(
+                crate::framing::GOSSIP_HEADER_LEN,
+                encoded.len(),
+                registry.config.max_message_size,
+            )
+            .is_err(),
+            "fixture FullSyncResponse must exceed the inline limit"
+        );
+        let payloads = registry
+            .encode_outbound_gossip_for_inline_limit(&msg)
+            .expect("oversized FullSyncResponse must split");
+        assert!(
+            payloads.len() > 1,
+            "fixture must emit compact FullSyncResponse plus overflow fragments"
+        );
+        let mut saw_compact = false;
+        let mut saw_overflow = false;
+        for payload in &payloads {
+            let decoded =
+                rkyv::from_bytes::<RegistryMessage, rkyv::rancor::Error>(payload).unwrap(); // ALLOW_RKYV_FROM_BYTES
+            match decoded {
+                RegistryMessage::FullSyncResponse { .. } => saw_compact = true,
+                RegistryMessage::DeltaGossipResponse { .. } => saw_overflow = true,
+                other => {
+                    panic!("FullSyncResponse overflow must stay a response variant, got {other:?}")
+                }
+            }
+        }
+        assert!(
+            saw_compact,
+            "first fragment must be compact FullSyncResponse"
+        );
+        assert!(
+            saw_overflow,
+            "metadata overflow must be DeltaGossipResponse, not inbound DeltaGossip"
         );
     }
 
