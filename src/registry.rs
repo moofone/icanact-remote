@@ -2620,8 +2620,12 @@ impl GossipState {
         let charge = Self::compact_record_charge(name, location);
         if let Some(old) = self.compact_charge_by_name.get(name).copied() {
             // Account the replacement even if occupancy exceeds the frame cap.
-            // Rejecting drops compact-FullSync metadata restores; pinning a
-            // fake cap desyncs compact_admission_bytes from per-name charges.
+            // Compact FullSync is name-bearing with metadata stripped; the
+            // original records are restored by later DeltaGossip fragments
+            // (`same_sequence_split_fragments_apply_without_poisoning_last_sequence`).
+            // Rejecting those replacements omits metadata. Pinning a fake cap
+            // desyncs compact_admission_bytes from per-name charges. New names
+            // are still rejected once occupancy is at or above the cap.
             if old != charge {
                 self.compact_admission_bytes = self
                     .compact_admission_bytes
