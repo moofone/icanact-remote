@@ -3313,6 +3313,52 @@ fn drain_pending_ask_nacks_requeues_on_zero_byte_write_miss() {
     });
 }
 
+/// Overflow of `deferred_asks` must not grow `pending_ask_nacks` past
+/// `PENDING_ASK_NACK_CAP`. `queue_ask_nack` is unconditional; this helper is
+/// one of the callers that must check `has_room_for_ask_nack` first.
+#[test]
+fn park_deferred_ask_does_not_grow_nack_queue_past_cap() {
+    let pool = Arc::new(crate::AlignedBytesPool::default());
+    let ask = |id: u32| ReadIoResult::ActorAsk {
+        correlation_id: id,
+        actor_id: 1,
+        type_hash: 1,
+        payload: crate::AlignedBytes::from_pooled_slice(&[], pool.clone()),
+    };
+
+    let mut deferred = std::collections::VecDeque::new();
+    let mut queue = LocalStreamingQueue::new();
+    for i in 0..DEFERRED_ASK_CAP as u32 {
+        park_deferred_ask(&mut deferred, ask(i), &mut queue);
+    }
+    assert_eq!(deferred.len(), DEFERRED_ASK_CAP);
+    assert_eq!(queue.pending_ask_nack_count(), 0);
+
+    park_deferred_ask(&mut deferred, ask(1_000), &mut queue);
+    assert_eq!(deferred.len(), DEFERRED_ASK_CAP);
+    assert_eq!(queue.pending_ask_nack_count(), 1);
+
+    while queue.has_room_for_ask_nack() {
+        queue.queue_ask_nack(crate::framing::write_ask_nack_header(
+            2_000 + queue.pending_ask_nack_count() as u32,
+            crate::framing::AskNackReason::Backpressure,
+        ));
+    }
+    let nacks_at_cap = queue.pending_ask_nack_count();
+    assert!(!queue.has_room_for_ask_nack());
+    park_deferred_ask(&mut deferred, ask(3_000), &mut queue);
+    assert_eq!(
+        queue.pending_ask_nack_count(),
+        nacks_at_cap,
+        "deferred overflow must not grow pending_ask_nacks past PENDING_ASK_NACK_CAP"
+    );
+    assert_eq!(
+        deferred.len(),
+        DEFERRED_ASK_CAP + 1,
+        "the already-read ask is retained until NACK room exists"
+    );
+}
+
 /// P1: reproduces the reported deadlock shape end-to-end through the real
 /// `io_task`, not just the drain primitive above. Nine raw `ActorAsk` frames
 /// land in a single `write_all` so all nine are read and dispatched (each

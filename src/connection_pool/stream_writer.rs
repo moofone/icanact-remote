@@ -1131,6 +1131,60 @@ where
     Ok(local_streaming_queue.has_pending_ask_nacks())
 }
 
+/// Cap on already-read asks waiting for inline budget or NACK-queue room.
+/// Overflow NACKs only when `LocalStreamingQueue` still has room; otherwise
+/// the ask is retained rather than growing `pending_ask_nacks` past
+/// `PENDING_ASK_NACK_CAP`.
+const DEFERRED_ASK_CAP: usize = 64;
+
+fn actor_ask_correlation_id(result: &ReadIoResult) -> Option<u32> {
+    match result {
+        ReadIoResult::ActorAsk { correlation_id, .. } => Some(*correlation_id),
+        ReadIoResult::Generic(crate::handle::MessageReadResult::Actor {
+            msg_type,
+            correlation_id,
+            ..
+        }) if *msg_type == crate::MessageType::ActorAsk as u8 => Some(*correlation_id),
+        _ => None,
+    }
+}
+
+fn queue_ask_backpressure_nack(
+    local_streaming_queue: &mut LocalStreamingQueue,
+    result: &ReadIoResult,
+) -> bool {
+    let Some(correlation_id) = actor_ask_correlation_id(result) else {
+        return false;
+    };
+    local_streaming_queue.queue_ask_nack(crate::framing::write_ask_nack_header(
+        correlation_id,
+        crate::framing::AskNackReason::Backpressure,
+    ));
+    true
+}
+
+/// Park an already-read ask until budget or NACK-queue room exists.
+/// Overwriting a single slot would silently drop the previous ask; a bounded
+/// deque keeps those frames out of the duplex. Overflow becomes a NACK only
+/// when `has_room_for_ask_nack` is true so this path cannot bypass the read
+/// loop's `PENDING_ASK_NACK_CAP` gate. If both caps are full the ask is
+/// retained until a drain turn frees NACK room.
+fn park_deferred_ask(
+    slot: &mut std::collections::VecDeque<ReadIoResult>,
+    result: ReadIoResult,
+    local_streaming_queue: &mut LocalStreamingQueue,
+) {
+    if slot.len() < DEFERRED_ASK_CAP {
+        slot.push_back(result);
+        return;
+    }
+    if local_streaming_queue.has_room_for_ask_nack() {
+        queue_ask_backpressure_nack(local_streaming_queue, &result);
+        return;
+    }
+    slot.push_back(result);
+}
+
 /// Write one bounded slice of a lazily framed `Bytes` response. Returning a
 /// frame-boundary yield lets the scheduler interleave another streaming source
 /// without materializing the remaining response into per-frame commands.
@@ -1908,49 +1962,14 @@ impl LockFreeStreamHandle {
             }
         }
 
-        /// `Some(correlation_id)` for an `ActorAsk`-shaped read result:
-        /// dispatching it calls an ask handler whose response, depending on
-        /// its size, may need `local_streaming_queue` admission
-        /// (`write_ask_disposition_io` ->
-        /// `queue_streaming_response_bytes`/`_pooled`). `DirectAsk` is
-        /// excluded: it answers through `direct_response_batch`, never
-        /// through the streaming queue, so it has nothing to gate here. The
-        /// correlation id is returned (not just a bool) so a caller that
-        /// decides not to dispatch can still answer the peer with a NACK
-        /// instead of silently dropping the already-read ask.
-        fn actor_ask_correlation_id(result: &ReadIoResult) -> Option<u32> {
-            match result {
-                ReadIoResult::ActorAsk { correlation_id, .. } => Some(*correlation_id),
-                ReadIoResult::Generic(crate::handle::MessageReadResult::Actor {
-                    msg_type,
-                    correlation_id,
-                    ..
-                }) if *msg_type == crate::MessageType::ActorAsk as u8 => Some(*correlation_id),
-                _ => None,
-            }
-        }
-
-        fn queue_ask_backpressure_nack(
-            local_streaming_queue: &mut LocalStreamingQueue,
-            result: &ReadIoResult,
-        ) -> bool {
-            let Some(correlation_id) = actor_ask_correlation_id(result) else {
-                return false;
-            };
-            local_streaming_queue.queue_ask_nack(crate::framing::write_ask_nack_header(
-                correlation_id,
-                crate::framing::AskNackReason::Backpressure,
-            ));
-            true
-        }
-
         /// Inline-budget / streaming-queue admission for an already-read ask.
         ///
         /// Streaming-queue full always NACKs: that work cannot be written until
         /// a different queue drains. Inline-budget exhaustion defers the ask so
         /// a parked write can free budget — a healthy finite burst must complete
         /// rather than be NACKed in the same turn that parked its responses.
-        /// Overflow of the deferred-ask deque still NACKs.
+        /// Overflow of the deferred-ask deque still NACKs when the NACK queue
+        /// has room; otherwise the ask is retained.
         enum AskBudgetAction {
             Dispatch,
             Nack,
@@ -1981,20 +2000,6 @@ impl LockFreeStreamHandle {
         /// Park an already-read ask until budget or NACK-queue room exists.
         /// A bounded deque keeps the last unread socket frames from sitting
         /// in the duplex forever when `PENDING_ASK_NACK_CAP` is full.
-        const DEFERRED_ASK_CAP: usize = 64;
-
-        fn park_deferred_ask(
-            slot: &mut std::collections::VecDeque<ReadIoResult>,
-            result: ReadIoResult,
-            local_streaming_queue: &mut LocalStreamingQueue,
-        ) {
-            if slot.len() >= DEFERRED_ASK_CAP {
-                queue_ask_backpressure_nack(local_streaming_queue, &result);
-                return;
-            }
-            slot.push_back(result);
-        }
-
         fn take_deferred_if_budget_allows(
             slot: &mut std::collections::VecDeque<ReadIoResult>,
             pending_ordinary_write: &Option<PendingOrdinaryWrite>,
@@ -4048,15 +4053,12 @@ impl LockFreeStreamHandle {
                             // for the same reason.
                             while drained < drain_batch_limit
                                 // See the identical check in the primary
-                                // drain loop above.
+                                // drain loop above, minus the budget-not-
+                                // exhausted clause: this inner drain only
+                                // reads new socket frames, it does not pop
+                                // `deferred_asks`.
                                 && (deferred_asks.len() < DEFERRED_ASK_CAP
-                                    || local_streaming_queue.has_room_for_ask_nack()
-                                    || (!deferred_asks.is_empty()
-                                        && !inline_response_budget_exhausted(
-                                            &pending_ordinary_write,
-                                            &response_batch,
-                                            &direct_response_batch,
-                                        )))
+                                    || local_streaming_queue.has_room_for_ask_nack())
                                 && (pending_stream_cmd.is_none()
                                     || (response_batch.total_bytes() < RESPONSE_BATCH_BYTE_CAP
                                         && direct_response_batch.total_bytes()
