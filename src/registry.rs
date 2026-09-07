@@ -2616,10 +2616,20 @@ impl GossipState {
         location: &RemoteActorLocation,
         max_message_size: usize,
     ) -> Result<bool> {
-        if self.compact_charge_by_name.contains_key(name) {
+        let charge = Self::compact_record_charge(name, location);
+        if let Some(old) = self.compact_charge_by_name.get(name).copied() {
+            // Already-admitted names must be allowed to grow (compact FullSync
+            // plus metadata deltas). Recompute the stored charge so later NEW
+            // names see the real occupancy; do not reject the update itself.
+            if old != charge {
+                self.compact_admission_bytes = self
+                    .compact_admission_bytes
+                    .saturating_sub(old)
+                    .saturating_add(charge);
+                self.compact_charge_by_name.insert(name.to_string(), charge);
+            }
             return Ok(false);
         }
-        let charge = Self::compact_record_charge(name, location);
         let new_total = self.compact_admission_bytes.saturating_add(charge);
         if crate::framing::reject_oversize_for_inline_send(
             crate::framing::GOSSIP_HEADER_LEN,
@@ -9934,14 +9944,6 @@ impl<T: 'static> GossipRegistry<T> {
                     rejected_by_global_cap += 1;
                     continue;
                 }
-                let newly_charged = match gossip_state.try_charge_compact_snapshot(
-                    name.as_str(),
-                    location,
-                    self.config.max_message_size,
-                ) {
-                    Ok(charged) => charged,
-                    Err(_) => continue,
-                };
                 let upsert_plan = self.current_actor_upsert_plan(
                     name.as_str(),
                     location,
@@ -9949,12 +9951,22 @@ impl<T: 'static> GossipRegistry<T> {
                     owner_restart_authenticated,
                 );
                 if upsert_plan.is_none() {
-                    if newly_charged {
-                        gossip_state.release_compact_snapshot(name.as_str());
-                    }
                     // An exact duplicate is still an admitted advertisement
                     // when the actor already exists. Other rejected candidates
                     // must not create phantom peer_to_actors entries.
+                    if known_exists {
+                        peer_actors.insert(name.clone());
+                    }
+                    continue;
+                }
+                if gossip_state
+                    .try_charge_compact_snapshot(
+                        name.as_str(),
+                        location,
+                        self.config.max_message_size,
+                    )
+                    .is_err()
+                {
                     if known_exists {
                         peer_actors.insert(name.clone());
                     }
@@ -34307,6 +34319,105 @@ mod tests {
                 .encode_outbound_gossip_for_inline_limit(&msg)
                 .is_ok(),
             "accepted metadata-bearing state must remain replicable"
+        );
+    }
+
+    #[tokio::test]
+    async fn qa_location_update_recalculates_compact_charge() {
+        let addr = test_addr(18_206);
+        let mut config = test_config();
+        config.max_message_size = 32 * 1024;
+        let registry = GossipRegistry::<()>::new(addr, config);
+        let sender = test_peer_id("qa-grow-meta");
+        let mut seed = RemoteActorLocation::new_with_peer(test_addr(9100), sender.clone());
+        seed.vector_clock.increment(sender.to_node_id());
+        seed.metadata = vec![1; 64];
+        registry
+            .apply_delta(RegistryDelta {
+                since_sequence: 0,
+                current_sequence: 1,
+                changes: vec![RegistryChange::ActorAdded {
+                    name: "grower".to_string(),
+                    location: seed.clone(),
+                    priority: RegistrationPriority::Normal,
+                }],
+                sender_peer_id: sender.clone(),
+                wall_clock_time: current_timestamp(),
+                precise_timing_nanos: crate::current_timestamp_nanos(),
+            })
+            .await
+            .unwrap();
+        let mut grown = seed.clone();
+        grown.vector_clock.increment(sender.to_node_id());
+        grown.metadata = vec![9; 24 * 1024];
+        registry
+            .apply_delta(RegistryDelta {
+                since_sequence: 0,
+                current_sequence: 40,
+                changes: vec![RegistryChange::ActorAdded {
+                    name: "grower".to_string(),
+                    location: grown,
+                    priority: RegistrationPriority::Normal,
+                }],
+                sender_peer_id: sender.clone(),
+                wall_clock_time: current_timestamp(),
+                precise_timing_nanos: crate::current_timestamp_nanos(),
+            })
+            .await
+            .unwrap();
+        let stored = registry
+            .actor_state
+            .known_actors
+            .read_sync("grower", |_, loc| loc.metadata.len())
+            .expect("grower must remain admitted");
+        assert_eq!(
+            stored,
+            24 * 1024,
+            "compact FullSync metadata deltas must still apply to an admitted name"
+        );
+        let mut extra_accepted = 0usize;
+        for i in 20..40 {
+            let mut fill = RemoteActorLocation::new_with_peer(test_addr(9200 + i), sender.clone());
+            fill.vector_clock.increment(sender.to_node_id());
+            fill.metadata = vec![7; 4 * 1024];
+            let before = registry.actor_state.known_actors.len();
+            let _ = registry
+                .apply_delta(RegistryDelta {
+                    since_sequence: 0,
+                    current_sequence: 50 + i as u64,
+                    changes: vec![RegistryChange::ActorAdded {
+                        name: format!("late-{i}"),
+                        location: fill,
+                        priority: RegistrationPriority::Normal,
+                    }],
+                    sender_peer_id: sender.clone(),
+                    wall_clock_time: current_timestamp(),
+                    precise_timing_nanos: crate::current_timestamp_nanos(),
+                })
+                .await;
+            if registry.actor_state.known_actors.len() > before {
+                extra_accepted += 1;
+            }
+        }
+        assert!(
+            extra_accepted <= 1,
+            "growing an admitted actor's metadata must consume compact budget for later names, extra={extra_accepted}"
+        );
+        let (local, known) = registry.snapshot_actor_pairs();
+        let msg = RegistryMessage::FullSync {
+            local_actors: local,
+            known_actors: known,
+            sender_peer_id: registry.peer_id.clone(),
+            sender_bind_addr: Some(addr.to_string()),
+            sequence: 1,
+            wall_clock_time: 0,
+            extensions: None,
+        };
+        assert!(
+            registry
+                .encode_outbound_gossip_for_inline_limit(&msg)
+                .is_ok(),
+            "state after a metadata grow must remain replicable"
         );
     }
 
