@@ -125,6 +125,104 @@ mod qa_queue_retention_review {
         );
     }
 
+    #[test]
+    fn take_ordinary_kind_switch_chunks_keeps_ordinary_frames_first() {
+        let mut write_chunks = vec![bytes::Bytes::from_static(b"ordinary-first")];
+        let mut inline32_headers = vec![[7u8; 32]];
+        let mut inline32_payloads = vec![bytes::Bytes::from_static(b"inline32-second")];
+        let mut direct_ask_headers = vec![[9u8; 16]];
+        let mut direct_ask_payloads = vec![bytes::Bytes::from_static(b"direct-third")];
+        let flush = super::take_ordinary_kind_switch_chunks(
+            &mut write_chunks,
+            &mut inline32_headers,
+            &mut inline32_payloads,
+            &mut direct_ask_headers,
+            &mut direct_ask_payloads,
+        );
+        assert_eq!(
+            flush.iter().map(|chunk| chunk.as_ref()).collect::<Vec<_>>(),
+            vec![
+                b"ordinary-first".as_ref(),
+                [7u8; 32].as_ref(),
+                b"inline32-second".as_ref(),
+                [9u8; 16].as_ref(),
+                b"direct-third".as_ref(),
+            ],
+            "ordinary write_chunks were enqueued before the fixed-header batches"
+        );
+        assert!(write_chunks.is_empty());
+        assert!(inline32_headers.is_empty());
+        assert!(direct_ask_headers.is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn qa_ordinary_single_then_inline32_keeps_enqueue_order() {
+        use tokio::io::AsyncReadExt;
+        let (client, mut peer) = tokio::io::duplex(4096);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:39924".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let gossip_payload = bytes::Bytes::from_static(b"ordinary-single");
+        let gossip_header =
+            crate::framing::try_write_gossip_frame_prefix(gossip_payload.len()).unwrap();
+        let mut gossip_frame = Vec::from(gossip_header.as_slice());
+        gossip_frame.extend_from_slice(&gossip_payload);
+        let actor_payload = bytes::Bytes::from_static(b"later-inline32");
+        let actor_header = crate::framing::try_write_actor_ask_header_with_request_id(
+            1,
+            7,
+            9,
+            actor_payload.len(),
+            None,
+        )
+        .unwrap();
+        writer
+            .enqueue_write_nonblocking(WritePayload::Single(gossip_frame.into()))
+            .unwrap();
+        writer
+            .enqueue_write_nonblocking(WritePayload::HeaderInline32 {
+                header: actor_header,
+                payload: actor_payload.clone(),
+            })
+            .unwrap();
+        let mut buf = Vec::new();
+        let expected =
+            gossip_header.len() + gossip_payload.len() + actor_header.len() + actor_payload.len();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while buf.len() < expected {
+                let mut tmp = [0u8; 256];
+                let n = peer.read(&mut tmp).await.unwrap();
+                assert!(n > 0, "peer closed before both frames arrived");
+                buf.extend_from_slice(&tmp[..n]);
+            }
+        })
+        .await
+        .expect("both frames must be written");
+        writer.shutdown();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let first = crate::framing::decode_control(buf[..4].try_into().unwrap()).unwrap();
+        let second_off = 4 + first.body_len;
+        let second =
+            crate::framing::decode_control(buf[second_off..second_off + 4].try_into().unwrap())
+                .unwrap();
+        assert_eq!(
+            (first.kind, second.kind),
+            (
+                crate::framing::WireKind::Gossip,
+                crate::framing::WireKind::ActorAsk
+            ),
+            "ordinary Single must leave the wire before a later HeaderInline32"
+        );
+    }
+
     struct PayloadOwner {
         bytes: Vec<u8>,
         dropped: Arc<AtomicUsize>,
@@ -1015,12 +1113,12 @@ fn take_ordinary_kind_switch_chunks(
             + inline32_headers.len().saturating_mul(2)
             + direct_ask_headers.len().saturating_mul(2),
     );
-    // Same order as the pre-fix leftover flush: HeaderInline32, then
-    // DirectAskInline, then generic write_chunks. Emitting DirectAsk first
-    // lets a later DirectAsk overtake a pending 32-byte frame.
+    // Ordinary write_chunks were accumulated from earlier Single/HeaderPayload
+    // frames. Emitting the later inline32/DirectAsk batches first lets a newer
+    // fixed-header frame overtake that pending ordinary frame on the byte stream.
+    flush.append(write_chunks);
     append_fixed_header_payloads(&mut flush, inline32_headers, inline32_payloads);
     append_fixed_header_payloads(&mut flush, direct_ask_headers, direct_ask_payloads);
-    flush.append(write_chunks);
     flush
 }
 
