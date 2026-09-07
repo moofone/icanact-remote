@@ -6856,6 +6856,12 @@ impl<T: 'static> GossipRegistry<T> {
             return Err(GossipError::ActorAlreadyExists(name));
         }
 
+        // Reject a record that cannot be replicated: a single change must fit
+        // one gossip frame, and the compact name-bearing FullSync of accepted
+        // state must remain encodable. This is an API restriction so periodic
+        // anti-entropy cannot observe MessageTooLarge for already-accepted names.
+        self.ensure_registration_is_replicable(&name, &location)?;
+
         // Increment vector clock before insertion for atomicity of "this write".
         let previous_tombstone = self
             .actor_state
@@ -7866,157 +7872,233 @@ impl<T: 'static> GossipRegistry<T> {
         max_message_size: usize,
     ) -> Result<Vec<bytes::Bytes>> {
         let max_message_size = max_message_size.min(self.config.max_message_size);
-        fn encode(msg: &RegistryMessage) -> Result<bytes::Bytes> {
-            rkyv::to_bytes::<rkyv::rancor::Error>(msg)
-                .map(bytes::Bytes::from_owner)
-                .map_err(|e| {
-                    GossipError::InvalidConfig(format!(
-                        "failed to serialize registry snapshot: {e}"
-                    ))
-                })
+        let mut overflow: Vec<(String, RemoteActorLocation)> = Vec::new();
+        let mut estimate = Self::estimated_full_sync_bytes(&local_actors, &known_actors);
+        while !Self::gossip_payload_fits(estimate, max_message_size)
+            && (!local_actors.is_empty() || !known_actors.is_empty())
+        {
+            let item = if let Some(item) = known_actors.pop() {
+                item
+            } else {
+                local_actors.pop().expect("snapshot was checked non-empty")
+            };
+            estimate = estimate.saturating_sub(Self::estimated_actor_pair_bytes(&item.0, &item.1));
+            overflow.push(item);
         }
-        fn fits(payload_len: usize, max_message_size: usize) -> bool {
-            crate::framing::reject_oversize_for_inline_send(
-                crate::framing::GOSSIP_HEADER_LEN,
-                payload_len,
-                max_message_size,
-            )
-            .is_ok()
-        }
-        fn full_sync(
-            local_actors: Vec<(String, RemoteActorLocation)>,
-            known_actors: Vec<(String, RemoteActorLocation)>,
-            sender_peer_id: crate::PeerId,
-            sender_bind_addr: Option<String>,
-            sequence: u64,
-            wall_clock_time: u64,
-        ) -> RegistryMessage {
-            RegistryMessage::FullSync {
-                local_actors,
-                known_actors,
-                sender_peer_id,
-                sender_bind_addr,
+
+        loop {
+            let payload = Self::encode_registry_message(&RegistryMessage::FullSync {
+                local_actors: local_actors.clone(),
+                known_actors: known_actors.clone(),
+                sender_peer_id: sender_peer_id.clone(),
+                sender_bind_addr: sender_bind_addr.clone(),
                 sequence,
                 wall_clock_time,
                 extensions: None,
-            }
-        }
-
-        let mut overflow: Vec<(String, RemoteActorLocation)> = Vec::new();
-        let mut payloads = Vec::new();
-        loop {
-            let msg = full_sync(
-                local_actors.clone(),
-                known_actors.clone(),
-                sender_peer_id.clone(),
-                sender_bind_addr.clone(),
-                sequence,
-                wall_clock_time,
-            );
-            let payload = encode(&msg)?;
-            if fits(payload.len(), max_message_size) {
-                payloads.push(payload);
-                break;
+            })?;
+            if Self::gossip_payload_fits(payload.len(), max_message_size) {
+                let mut payloads = vec![payload];
+                overflow.reverse();
+                if !overflow.is_empty() {
+                    let changes = overflow
+                        .into_iter()
+                        .map(|(name, location)| {
+                            let priority = location.priority;
+                            RegistryChange::ActorAdded {
+                                name,
+                                location,
+                                priority,
+                            }
+                        })
+                        .collect();
+                    payloads.extend(Self::pack_delta_change_batches(
+                        changes,
+                        sender_peer_id,
+                        sequence,
+                        sequence,
+                        wall_clock_time,
+                        crate::current_timestamp_nanos(),
+                        None,
+                        max_message_size,
+                        false,
+                    )?);
+                }
+                return Ok(payloads);
             }
             if let Some(item) = known_actors.pop() {
                 overflow.push(item);
             } else if let Some(item) = local_actors.pop() {
                 overflow.push(item);
             } else {
-                return Err(crate::framing::reject_oversize_for_inline_send(
-                    crate::framing::GOSSIP_HEADER_LEN,
+                return Err(Self::oversized_gossip_error(
                     payload.len(),
                     max_message_size,
-                )
-                .expect_err("empty FullSync was already checked not to fit"));
+                ));
             }
         }
-
-        overflow.reverse();
-        let mut batch: Vec<RegistryChange> = Vec::new();
-        for (name, location) in overflow {
-            let priority = location.priority;
-            let candidate = RegistryChange::ActorAdded {
-                name,
-                location,
-                priority,
-            };
-            batch.push(candidate);
-            let delta_msg = RegistryMessage::DeltaGossip {
-                delta: RegistryDelta {
-                    since_sequence: sequence,
-                    current_sequence: sequence,
-                    changes: batch.clone(),
-                    sender_peer_id: sender_peer_id.clone(),
-                    wall_clock_time,
-                    precise_timing_nanos: crate::current_timestamp_nanos(),
-                },
-                extensions: None,
-            };
-            let payload = encode(&delta_msg)?;
-            if fits(payload.len(), max_message_size) {
-                continue;
-            }
-            let last = batch.pop().expect("overflow actor");
-            if !batch.is_empty() {
-                let flush = RegistryMessage::DeltaGossip {
-                    delta: RegistryDelta {
-                        since_sequence: sequence,
-                        current_sequence: sequence,
-                        changes: std::mem::take(&mut batch),
-                        sender_peer_id: sender_peer_id.clone(),
-                        wall_clock_time,
-                        precise_timing_nanos: crate::current_timestamp_nanos(),
-                    },
-                    extensions: None,
-                };
-                payloads.push(encode(&flush)?);
-            }
-            let solo = RegistryMessage::DeltaGossip {
-                delta: RegistryDelta {
-                    since_sequence: sequence,
-                    current_sequence: sequence,
-                    changes: vec![last],
-                    sender_peer_id: sender_peer_id.clone(),
-                    wall_clock_time,
-                    precise_timing_nanos: crate::current_timestamp_nanos(),
-                },
-                extensions: None,
-            };
-            let solo_payload = encode(&solo)?;
-            if !fits(solo_payload.len(), max_message_size) {
-                return Err(crate::framing::reject_oversize_for_inline_send(
-                    crate::framing::GOSSIP_HEADER_LEN,
-                    solo_payload.len(),
-                    max_message_size,
-                )
-                .expect_err("solo DeltaGossip was already checked not to fit"));
-            }
-            payloads.push(solo_payload);
-        }
-        if !batch.is_empty() {
-            let flush = RegistryMessage::DeltaGossip {
-                delta: RegistryDelta {
-                    since_sequence: sequence,
-                    current_sequence: sequence,
-                    changes: batch,
-                    sender_peer_id,
-                    wall_clock_time,
-                    precise_timing_nanos: crate::current_timestamp_nanos(),
-                },
-                extensions: None,
-            };
-            payloads.push(encode(&flush)?);
-        }
-        Ok(payloads)
     }
 
     fn encode_registry_message(msg: &RegistryMessage) -> Result<bytes::Bytes> {
+        #[cfg(test)]
+        snapshot_pack_metrics::record(Self::registry_message_actor_bytes(msg));
         rkyv::to_bytes::<rkyv::rancor::Error>(msg)
             .map(bytes::Bytes::from_owner)
             .map_err(|e| {
                 GossipError::InvalidConfig(format!("failed to serialize registry snapshot: {e}"))
             })
+    }
+
+    fn registry_message_actor_bytes(msg: &RegistryMessage) -> u64 {
+        fn pair_bytes(actors: &[(String, RemoteActorLocation)]) -> u64 {
+            actors
+                .iter()
+                .map(|(name, location)| {
+                    name.len()
+                        .saturating_add(location.metadata.len())
+                        .saturating_add(location.address.len()) as u64
+                })
+                .sum()
+        }
+        fn change_bytes(changes: &[RegistryChange]) -> u64 {
+            changes
+                .iter()
+                .map(|change| match change {
+                    RegistryChange::ActorAdded { name, location, .. } => {
+                        name.len()
+                            .saturating_add(location.metadata.len())
+                            .saturating_add(location.address.len()) as u64
+                    }
+                    RegistryChange::ActorRemoved { name, .. } => name.len() as u64,
+                })
+                .sum()
+        }
+        match msg {
+            RegistryMessage::FullSync {
+                local_actors,
+                known_actors,
+                ..
+            }
+            | RegistryMessage::FullSyncResponse {
+                local_actors,
+                known_actors,
+                ..
+            } => pair_bytes(local_actors).saturating_add(pair_bytes(known_actors)),
+            RegistryMessage::DeltaGossip { delta, .. }
+            | RegistryMessage::DeltaGossipResponse { delta, .. } => change_bytes(&delta.changes),
+            _ => 0,
+        }
+    }
+
+    const GOSSIP_RECORD_SIZE_SLACK: usize = 512;
+    const GOSSIP_MESSAGE_SIZE_SLACK: usize = 1024;
+
+    fn estimated_actor_pair_bytes(name: &str, location: &RemoteActorLocation) -> usize {
+        name.len()
+            .saturating_add(location.metadata.len())
+            .saturating_add(location.address.len())
+            .saturating_add(Self::GOSSIP_RECORD_SIZE_SLACK)
+    }
+
+    fn estimated_change_bytes(change: &RegistryChange) -> usize {
+        match change {
+            RegistryChange::ActorAdded { name, location, .. } => {
+                Self::estimated_actor_pair_bytes(name, location)
+            }
+            RegistryChange::ActorRemoved { name, .. } => {
+                name.len().saturating_add(Self::GOSSIP_RECORD_SIZE_SLACK)
+            }
+        }
+    }
+
+    fn estimated_full_sync_bytes(
+        local_actors: &[(String, RemoteActorLocation)],
+        known_actors: &[(String, RemoteActorLocation)],
+    ) -> usize {
+        local_actors.iter().chain(known_actors.iter()).fold(
+            Self::GOSSIP_MESSAGE_SIZE_SLACK,
+            |acc, (name, location)| {
+                acc.saturating_add(Self::estimated_actor_pair_bytes(name, location))
+            },
+        )
+    }
+
+    fn oversized_gossip_error(payload_len: usize, max_message_size: usize) -> GossipError {
+        crate::framing::reject_oversize_for_inline_send(
+            crate::framing::GOSSIP_HEADER_LEN,
+            payload_len,
+            max_message_size,
+        )
+        .expect_err("payload was already checked not to fit")
+    }
+
+    fn ensure_solo_change_fits(&self, name: &str, location: &RemoteActorLocation) -> Result<()> {
+        let encoded = Self::encode_registry_message(&RegistryMessage::DeltaGossip {
+            delta: RegistryDelta {
+                since_sequence: 0,
+                current_sequence: 0,
+                changes: vec![RegistryChange::ActorAdded {
+                    name: name.to_string(),
+                    location: location.clone(),
+                    priority: location.priority,
+                }],
+                sender_peer_id: self.peer_id.clone(),
+                wall_clock_time: 0,
+                precise_timing_nanos: 0,
+            },
+            extensions: None,
+        })?;
+        if Self::gossip_payload_fits(encoded.len(), self.config.max_message_size) {
+            Ok(())
+        } else {
+            Err(Self::oversized_gossip_error(
+                encoded.len(),
+                self.config.max_message_size,
+            ))
+        }
+    }
+
+    fn ensure_compact_snapshot_fits_with(
+        &self,
+        name: &str,
+        location: &RemoteActorLocation,
+    ) -> Result<()> {
+        let (mut local, mut known) = self.snapshot_actor_pairs();
+        for (_, loc) in local.iter_mut().chain(known.iter_mut()) {
+            loc.metadata.clear();
+        }
+        if !local.iter().any(|(existing, _)| existing == name)
+            && !known.iter().any(|(existing, _)| existing == name)
+        {
+            let mut extra = location.clone();
+            extra.metadata.clear();
+            local.push((name.to_string(), extra));
+        }
+        let encoded = Self::encode_registry_message(&RegistryMessage::FullSync {
+            local_actors: local,
+            known_actors: known,
+            sender_peer_id: self.peer_id.clone(),
+            sender_bind_addr: Some(self.advertised_addr().to_string()),
+            sequence: 0,
+            wall_clock_time: 0,
+            extensions: None,
+        })?;
+        if Self::gossip_payload_fits(encoded.len(), self.config.max_message_size) {
+            Ok(())
+        } else {
+            Err(Self::oversized_gossip_error(
+                encoded.len(),
+                self.config.max_message_size,
+            ))
+        }
+    }
+
+    fn ensure_registration_is_replicable(
+        &self,
+        name: &str,
+        location: &RemoteActorLocation,
+    ) -> Result<()> {
+        self.ensure_solo_change_fits(name, location)?;
+        self.ensure_compact_snapshot_fits_with(name, location)
     }
 
     fn gossip_payload_fits(payload_len: usize, max_message_size: usize) -> bool {
@@ -8044,7 +8126,7 @@ impl<T: 'static> GossipRegistry<T> {
     fn pack_delta_change_batches(
         changes: Vec<RegistryChange>,
         sender_peer_id: crate::PeerId,
-        mut since_sequence: u64,
+        since_sequence: u64,
         mut current_sequence: u64,
         wall_clock_time: u64,
         precise_timing_nanos: u64,
@@ -8104,48 +8186,67 @@ impl<T: 'static> GossipRegistry<T> {
 
         let mut payloads = Vec::new();
         let mut batch: Vec<RegistryChange> = Vec::new();
+        let mut batch_est = 0usize;
         for change in changes {
-            batch.push(change);
-            let candidate = Self::encode_registry_message(&delta_message(
-                batch.clone(),
-                sender_peer_id.clone(),
-                since_sequence,
-                current_sequence,
-                wall_clock_time,
-                precise_timing_nanos,
-                extensions.clone(),
-                as_response,
-            ))?;
-            if Self::gossip_payload_fits(candidate.len(), max_message_size) {
-                continue;
-            }
-            let last = batch.pop().expect("overflow change");
-            if !batch.is_empty() {
-                payloads.push(emit_batch(std::mem::take(&mut batch))?);
-            }
-            let solo = Self::encode_registry_message(&delta_message(
-                vec![last.clone()],
-                sender_peer_id.clone(),
-                since_sequence,
-                current_sequence,
-                wall_clock_time,
-                precise_timing_nanos,
-                extensions.clone(),
-                as_response,
-            ))?;
-            if !Self::gossip_payload_fits(solo.len(), max_message_size) {
-                return Err(crate::framing::reject_oversize_for_inline_send(
-                    crate::framing::GOSSIP_HEADER_LEN,
-                    solo.len(),
+            let change_est = Self::estimated_change_bytes(&change);
+            if !batch.is_empty()
+                && !Self::gossip_payload_fits(
+                    batch_est
+                        .saturating_add(change_est)
+                        .saturating_add(Self::GOSSIP_MESSAGE_SIZE_SLACK),
                     max_message_size,
                 )
-                .expect_err("solo DeltaGossip was already checked not to fit"));
+            {
+                payloads.extend(Self::encode_delta_batch_fitting(
+                    std::mem::take(&mut batch),
+                    &emit_batch,
+                    max_message_size,
+                )?);
+                batch_est = 0;
             }
-            payloads.push(emit_batch(vec![last])?);
+            batch.push(change);
+            batch_est = batch_est.saturating_add(change_est);
         }
         if !batch.is_empty() {
-            payloads.push(emit_batch(batch)?);
+            payloads.extend(Self::encode_delta_batch_fitting(
+                batch,
+                &emit_batch,
+                max_message_size,
+            )?);
         }
+        Ok(payloads)
+    }
+
+    fn encode_delta_batch_fitting(
+        batch: Vec<RegistryChange>,
+        emit_batch: &dyn Fn(Vec<RegistryChange>) -> Result<bytes::Bytes>,
+        max_message_size: usize,
+    ) -> Result<Vec<bytes::Bytes>> {
+        if batch.is_empty() {
+            return Ok(Vec::new());
+        }
+        let encoded = emit_batch(batch.clone())?;
+        if Self::gossip_payload_fits(encoded.len(), max_message_size) {
+            return Ok(vec![encoded]);
+        }
+        if batch.len() == 1 {
+            return Err(Self::oversized_gossip_error(
+                encoded.len(),
+                max_message_size,
+            ));
+        }
+        let mid = batch.len() / 2;
+        let mut right = batch;
+        let left = right.split_off(mid);
+        // `split_off` keeps the prefix in `right` and returns the suffix;
+        // swap so left is the prefix we intended to encode first.
+        let (left, right) = (right, left);
+        let mut payloads = Self::encode_delta_batch_fitting(left, emit_batch, max_message_size)?;
+        payloads.extend(Self::encode_delta_batch_fitting(
+            right,
+            emit_batch,
+            max_message_size,
+        )?);
         Ok(payloads)
     }
 
@@ -13704,6 +13805,34 @@ fn _configure_peer_is_callable_for_any_static_t<T: 'static>(
     addr: SocketAddr,
 ) -> impl std::future::Future<Output = ()> + '_ {
     registry.configure_peer(peer_id, addr)
+}
+
+#[cfg(test)]
+pub(crate) mod snapshot_pack_metrics {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ENCODE_ATTEMPTS: Cell<u64> = const { Cell::new(0) };
+        static ACTOR_BYTES_VISITED: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub fn reset() {
+        ENCODE_ATTEMPTS.with(|cell| cell.set(0));
+        ACTOR_BYTES_VISITED.with(|cell| cell.set(0));
+    }
+
+    pub fn encode_attempts() -> u64 {
+        ENCODE_ATTEMPTS.with(|cell| cell.get())
+    }
+
+    pub fn actor_bytes_visited() -> u64 {
+        ACTOR_BYTES_VISITED.with(|cell| cell.get())
+    }
+
+    pub fn record(actor_bytes: u64) {
+        ENCODE_ATTEMPTS.with(|cell| cell.set(cell.get().saturating_add(1)));
+        ACTOR_BYTES_VISITED.with(|cell| cell.set(cell.get().saturating_add(actor_bytes)));
+    }
 }
 
 #[cfg(test)]
@@ -33976,5 +34105,136 @@ mod tests {
             None,
             "an eviction must release the ownership it did invalidate"
         );
+    }
+
+    /// R2: accepted registry state must remain encodable. Registration that
+    /// would make the compact name-bearing FullSync exceed the frame limit is
+    /// rejected (documented aggregate cap), so periodic sync cannot observe
+    /// MessageTooLarge for already-accepted names.
+    #[tokio::test]
+    async fn qa_accepted_registry_state_remains_encodable_for_periodic_sync() {
+        let addr = test_addr(18_201);
+        let registry = GossipRegistry::<()>::new(
+            addr,
+            GossipConfig {
+                key_pair: Some(KeyPair::new_for_testing("qa-snapshot-limits")),
+                ..Default::default()
+            },
+        );
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
+        for i in 0..81 {
+            let name = format!("{i:03}/{}", "x".repeat(128 * 1024));
+            let loc = RemoteActorLocation::new_with_peer(addr, registry.peer_id.clone());
+            match registry.register_actor(name, loc).await {
+                Ok(()) => accepted += 1,
+                Err(GossipError::MessageTooLarge { .. }) => rejected += 1,
+                Err(err) => panic!("unexpected registration error: {err:?}"),
+            }
+        }
+        assert!(accepted > 0, "some long names must still register");
+        assert!(
+            rejected > 0,
+            "aggregate compact FullSync cap must reject before accepted state overflows"
+        );
+        assert_eq!(accepted + rejected, 81);
+        let (local, known) = registry.snapshot_actor_pairs();
+        assert_eq!(local.len() + known.len(), accepted);
+        let msg = RegistryMessage::FullSync {
+            local_actors: local,
+            known_actors: known,
+            sender_peer_id: registry.peer_id.clone(),
+            sender_bind_addr: Some(addr.to_string()),
+            sequence: 1,
+            wall_clock_time: 0,
+            extensions: None,
+        };
+        let outcome = registry.encode_outbound_gossip_for_inline_limit(&msg);
+        assert!(
+            outcome.is_ok(),
+            "accepted registry state must remain replicable: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn qa_single_unencodable_registration_is_rejected() {
+        let addr = test_addr(18_202);
+        let mut config = test_config();
+        config.max_message_size = 64 * 1024;
+        let registry = GossipRegistry::<()>::new(addr, config);
+        let name = "oversized".to_string();
+        let mut loc = RemoteActorLocation::new_with_peer(addr, registry.peer_id.clone());
+        loc.metadata = vec![7; 128 * 1024];
+        let err = registry
+            .register_actor(name.clone(), loc)
+            .await
+            .expect_err("a single record larger than the frame must fail admission");
+        assert!(
+            matches!(err, GossipError::MessageTooLarge { .. }),
+            "expected MessageTooLarge, got {err:?}"
+        );
+        assert_eq!(registry.get_actor_count().await, 0);
+    }
+
+    /// R3: packing must not reserialize the whole remaining snapshot per actor.
+    #[test]
+    fn qa_snapshot_split_work_is_linear_in_input_bytes() {
+        let addr = test_addr(18_203);
+        let registry = GossipRegistry::<()>::new(
+            addr,
+            GossipConfig {
+                key_pair: Some(KeyPair::new_for_testing("qa-snapshot-linear")),
+                max_message_size: 64 * 1024,
+                ..Default::default()
+            },
+        );
+        for n in [64usize, 128, 256, 512] {
+            let actors: Vec<_> = (0..n)
+                .map(|i| {
+                    let mut loc =
+                        RemoteActorLocation::new_with_peer(addr, registry.peer_id.clone());
+                    loc.metadata = vec![7; 4096];
+                    (format!("actor-{i}"), loc)
+                })
+                .collect();
+            let input_bytes: u64 = actors
+                .iter()
+                .map(|(name, loc)| name.len().saturating_add(loc.metadata.len()) as u64)
+                .sum();
+            super::snapshot_pack_metrics::reset();
+            let payloads = registry
+                .split_full_sync_for_inline_limit(
+                    actors,
+                    Vec::new(),
+                    registry.peer_id.clone(),
+                    Some(addr.to_string()),
+                    1,
+                    0,
+                    64 * 1024,
+                )
+                .expect("split must succeed");
+            assert!(!payloads.is_empty());
+            for payload in &payloads {
+                crate::framing::reject_oversize_for_inline_send(
+                    crate::framing::GOSSIP_HEADER_LEN,
+                    payload.len(),
+                    64 * 1024,
+                )
+                .expect("each split frame must fit");
+            }
+            let attempts = super::snapshot_pack_metrics::encode_attempts();
+            let visited = super::snapshot_pack_metrics::actor_bytes_visited();
+            let frame_bound = (payloads.len() as u64).saturating_mul(3).saturating_add(8);
+            assert!(
+                attempts <= frame_bound,
+                "split actors={n} encoded {attempts} times for {} frames (bound {frame_bound})",
+                payloads.len()
+            );
+            let visit_bound = input_bytes.saturating_mul(8).saturating_add(64 * 1024);
+            assert!(
+                visited <= visit_bound,
+                "split actors={n} visited {visited} bytes of {input_bytes} input (bound {visit_bound})"
+            );
+        }
     }
 }

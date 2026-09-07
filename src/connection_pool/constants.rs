@@ -19,9 +19,11 @@ pub const STREAMING_THRESHOLD: usize = MASTER_BUFFER_SIZE.saturating_sub(1024); 
 // memory-blowup DoS vector and it also inflates RTT, since nothing flushes
 // while still accumulating.
 //
-// `RESPONSE_BATCH_BYTE_CAP` bounds accumulated bytes per batch independent of
-// frame count: once a batch's running total reaches this cap, the drain loop
-// flushes it immediately and continues draining into a fresh batch. Sized at
+// `RESPONSE_BATCH_BYTE_CAP` is the connection's retained-inline-response
+// budget: pending ordinary write bytes plus both in-progress response batches.
+// Parking a batch into `PendingOrdinaryWrite` must not drop the charge, and
+// ask dispatch is NACKed (`AskNackReason::Backpressure`) once the sum reaches
+// this cap — including while an ordinary frame already owns the wire. Sized at
 // 8x `STREAMING_THRESHOLD` (~8 MiB): generous enough to keep the common case
 // (small ask/response payloads) batching exactly as before, while capping the
 // worst case (all-maximum-size payloads) at a small, fixed multiple of a

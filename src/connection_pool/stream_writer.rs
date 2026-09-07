@@ -181,19 +181,15 @@ mod qa_queue_retention_review {
 /// message keep dispatching unconditionally -- that is what actually lets
 /// the queue drain.
 ///
-/// What is NOT covered by either fix: a partial frame pending together with
-/// `response_batch`/`direct_response_batch` at their own (much smaller, ~8MB)
-/// byte cap still stops reads outright, on purpose -- those batches cannot be
-/// flushed mid-frame without corrupting the wire framing, and unlike
-/// streaming admission they are not individually fallible, so the only other
-/// way to bound them is to stop accepting more work. If both peers reach
-/// *that* specific state simultaneously, this task's periodic write retries
-/// keep attempting (and read gating from `is_full` is no longer a factor),
-/// but if the peer is truly not draining, no attempt makes progress and reads
-/// stay stopped until `STREAM_WRITE_STUCK_TEARDOWN` fires and tears the
-/// connection down. That is a bounded resolution (<= 30s), not a graceful
-/// one -- it is the teardown escape the invariant above allows, not the
-/// backpressure escape the `is_full` fix gives the more common case.
+/// Inline response batches have their own ~8MB budget (`RESPONSE_BATCH_BYTE_CAP`).
+/// Parking a batch into `PendingOrdinaryWrite` keeps that charge; ask dispatch
+/// is NACKed (`AskNackReason::Backpressure`) once parked bytes plus both batches
+/// reach the cap, including while an ordinary frame owns the wire. Tells and
+/// control frames keep being read. A partial *streaming* frame together with
+/// batches already at cap still stops the read loop, because those batches
+/// cannot be flushed mid-frame without corrupting wire framing. If the peer is
+/// truly not draining, write retries continue until `STREAM_WRITE_STUCK_TEARDOWN`
+/// tears the connection down. That is a bounded resolution (<= 30s).
 ///
 /// **Every `.await` that can block on this transport needs one of the two
 /// bounds above (or an equivalent), not just the streaming-slice write this
@@ -530,6 +526,62 @@ fn park_direct_response_batch_if_over_byte_cap(
         return Ok(false);
     }
     park_direct_response_batch(pending_ordinary_write, batch)
+}
+
+fn pending_ordinary_write_retained_bytes(pending: &Option<PendingOrdinaryWrite>) -> usize {
+    match pending {
+        None => 0,
+        Some(PendingOrdinaryWrite::HeaderInline {
+            header_len,
+            payload,
+            header_off,
+            payload_off,
+            ..
+        }) => header_len
+            .saturating_sub(*header_off)
+            .saturating_add(payload.len().saturating_sub(*payload_off)),
+        Some(PendingOrdinaryWrite::HeaderInlineAligned {
+            header_len,
+            payload,
+            header_off,
+            payload_off,
+            ..
+        }) => header_len
+            .saturating_sub(*header_off)
+            .saturating_add(payload.len().saturating_sub(*payload_off)),
+        Some(PendingOrdinaryWrite::Chunks { chunks, offset }) => chunks
+            .iter()
+            .map(|chunk| chunk.len())
+            .sum::<usize>()
+            .saturating_sub(*offset),
+    }
+}
+
+fn inline_response_retained_bytes(
+    pending_ordinary_write: &Option<PendingOrdinaryWrite>,
+    response_batch: &ResponseBatch,
+    direct_response_batch: &DirectResponseBatch,
+) -> usize {
+    pending_ordinary_write_retained_bytes(pending_ordinary_write)
+        .saturating_add(response_batch.total_bytes())
+        .saturating_add(direct_response_batch.total_bytes())
+}
+
+/// True when parked ordinary frames plus both response batches already occupy
+/// the inline response budget. Ask dispatch must NACK rather than run another
+/// handler: parking a batch into `PendingOrdinaryWrite` zeros the batch
+/// counters, and without this sum a non-reading peer can keep filling a fresh
+/// batch while the previous one still owns the wire.
+fn inline_response_budget_exhausted(
+    pending_ordinary_write: &Option<PendingOrdinaryWrite>,
+    response_batch: &ResponseBatch,
+    direct_response_batch: &DirectResponseBatch,
+) -> bool {
+    inline_response_retained_bytes(
+        pending_ordinary_write,
+        response_batch,
+        direct_response_batch,
+    ) >= RESPONSE_BATCH_BYTE_CAP
 }
 
 fn advance_header_payload_offset(
@@ -3258,7 +3310,12 @@ impl LockFreeStreamHandle {
                             // whose response would have been small enough to
                             // never need streaming admission at all, since
                             // that is not knowable before the handler runs.
-                            if local_streaming_queue.is_full()
+                            if (local_streaming_queue.is_full()
+                                || inline_response_budget_exhausted(
+                                    &pending_ordinary_write,
+                                    &response_batch,
+                                    &direct_response_batch,
+                                ))
                                 && let Some(correlation_id) = actor_ask_correlation_id(&result)
                             {
                                 local_streaming_queue.queue_ask_nack(
@@ -3451,7 +3508,12 @@ impl LockFreeStreamHandle {
                                 // even one more protocol-sized response --
                                 // answer with an `AskNackReason::Backpressure`
                                 // NACK instead.
-                                if local_streaming_queue.is_full()
+                                if (local_streaming_queue.is_full()
+                                    || inline_response_budget_exhausted(
+                                        &pending_ordinary_write,
+                                        &response_batch,
+                                        &direct_response_batch,
+                                    ))
                                     && let Some(correlation_id) = actor_ask_correlation_id(&result)
                                 {
                                     local_streaming_queue.queue_ask_nack(
@@ -3624,7 +3686,12 @@ impl LockFreeStreamHandle {
                                     // response -- answer with an
                                     // `AskNackReason::Backpressure` NACK
                                     // instead.
-                                    if local_streaming_queue.is_full()
+                                    if (local_streaming_queue.is_full()
+                                        || inline_response_budget_exhausted(
+                                            &pending_ordinary_write,
+                                            &response_batch,
+                                            &direct_response_batch,
+                                        ))
                                         && let Some(correlation_id) =
                                             actor_ask_correlation_id(&result)
                                     {
