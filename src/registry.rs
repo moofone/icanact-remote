@@ -2618,20 +2618,16 @@ impl GossipState {
         max_message_size: usize,
     ) -> Result<bool> {
         let charge = Self::compact_record_charge(name, location);
-        if let Some(old) = self.compact_charge_by_name.get(name).copied() {
-            // Already-admitted names must be allowed to grow (compact FullSync
-            // plus metadata deltas). Recompute the stored charge so later NEW
-            // names see the real occupancy; do not reject the update itself.
-            if old != charge {
-                self.compact_admission_bytes = self
-                    .compact_admission_bytes
-                    .saturating_sub(old)
-                    .saturating_add(charge);
-                self.compact_charge_by_name.insert(name.to_string(), charge);
+        let new_total = if let Some(old) = self.compact_charge_by_name.get(name).copied() {
+            if old == charge {
+                return Ok(false);
             }
-            return Ok(false);
-        }
-        let new_total = self.compact_admission_bytes.saturating_add(charge);
+            self.compact_admission_bytes
+                .saturating_sub(old)
+                .saturating_add(charge)
+        } else {
+            self.compact_admission_bytes.saturating_add(charge)
+        };
         if crate::framing::reject_oversize_for_inline_send(
             crate::framing::GOSSIP_HEADER_LEN,
             new_total,
@@ -2652,6 +2648,13 @@ impl GossipState {
     fn release_compact_snapshot(&mut self, name: &str) {
         if let Some(charge) = self.compact_charge_by_name.remove(name) {
             self.compact_admission_bytes = self.compact_admission_bytes.saturating_sub(charge);
+        }
+    }
+
+    fn pin_compact_admission_to_frame_cap(&mut self, max_message_size: usize) {
+        let cap = max_message_size.saturating_sub(crate::framing::GOSSIP_HEADER_LEN);
+        if self.compact_admission_bytes < cap {
+            self.compact_admission_bytes = cap;
         }
     }
 }
@@ -6922,12 +6925,9 @@ impl<T: 'static> GossipRegistry<T> {
             return Err(GossipError::ActorAlreadyExists(name));
         }
 
-        // A single record must fit one gossip frame. The aggregate compact
-        // FullSync budget is charged below under `gossip_state` so concurrent
-        // registers cannot each observe a fitting snapshot and both commit.
-        self.ensure_solo_change_fits(&name, &location)?;
-
         // Increment vector clock before insertion for atomicity of "this write".
+        // Fit/charge checks run after this so a merged tombstone clock is part
+        // of the encoded record and the compact admission occupancy.
         let previous_tombstone = self
             .actor_state
             .removed_actors
@@ -6936,6 +6936,11 @@ impl<T: 'static> GossipRegistry<T> {
             location.vector_clock.merge(&tombstone.vector_clock);
         }
         location.vector_clock.increment(location.node_id);
+
+        // A single record must fit one gossip frame. The aggregate compact
+        // FullSync budget is charged below under `gossip_state` so concurrent
+        // registers cannot each observe a fitting snapshot and both commit.
+        self.ensure_solo_change_fits(&name, &location)?;
 
         // Charge compact admission, insert, and enqueue the gossip change in
         // one critical section. The previous check-then-insert window let two
@@ -7486,7 +7491,11 @@ impl<T: 'static> GossipRegistry<T> {
                             )
                             .is_err()
                         {
-                            continue;
+                            if !is_update {
+                                continue;
+                            }
+                            gossip_state
+                                .pin_compact_admission_to_frame_cap(self.config.max_message_size);
                         }
                         if clear_tombstone {
                             let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
@@ -9966,24 +9975,33 @@ impl<T: 'static> GossipRegistry<T> {
                     }
                     continue;
                 }
+                let (clear_tombstone, is_update) = upsert_plan.expect("upsert plan checked above");
                 if self
                     .ensure_solo_change_fits(name.as_str(), location)
                     .is_err()
-                    || gossip_state
-                        .try_charge_compact_snapshot(
-                            name.as_str(),
-                            location,
-                            self.config.max_message_size,
-                        )
-                        .is_err()
                 {
                     if known_exists {
                         peer_actors.insert(name.clone());
                     }
                     continue;
                 }
+                if gossip_state
+                    .try_charge_compact_snapshot(
+                        name.as_str(),
+                        location,
+                        self.config.max_message_size,
+                    )
+                    .is_err()
+                {
+                    if !is_update {
+                        if known_exists {
+                            peer_actors.insert(name.clone());
+                        }
+                        continue;
+                    }
+                    gossip_state.pin_compact_admission_to_frame_cap(self.config.max_message_size);
+                }
                 peer_actors.insert(name.clone());
-                let (clear_tombstone, is_update) = upsert_plan.expect("upsert plan checked above");
                 if clear_tombstone {
                     let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
                 }
