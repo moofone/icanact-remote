@@ -2618,16 +2618,20 @@ impl GossipState {
         max_message_size: usize,
     ) -> Result<bool> {
         let charge = Self::compact_record_charge(name, location);
-        let new_total = if let Some(old) = self.compact_charge_by_name.get(name).copied() {
-            if old == charge {
-                return Ok(false);
+        if let Some(old) = self.compact_charge_by_name.get(name).copied() {
+            // Account the replacement even if occupancy exceeds the frame cap.
+            // Rejecting drops compact-FullSync metadata restores; pinning a
+            // fake cap desyncs compact_admission_bytes from per-name charges.
+            if old != charge {
+                self.compact_admission_bytes = self
+                    .compact_admission_bytes
+                    .saturating_sub(old)
+                    .saturating_add(charge);
+                self.compact_charge_by_name.insert(name.to_string(), charge);
             }
-            self.compact_admission_bytes
-                .saturating_sub(old)
-                .saturating_add(charge)
-        } else {
-            self.compact_admission_bytes.saturating_add(charge)
-        };
+            return Ok(false);
+        }
+        let new_total = self.compact_admission_bytes.saturating_add(charge);
         if crate::framing::reject_oversize_for_inline_send(
             crate::framing::GOSSIP_HEADER_LEN,
             new_total,
@@ -2648,13 +2652,6 @@ impl GossipState {
     fn release_compact_snapshot(&mut self, name: &str) {
         if let Some(charge) = self.compact_charge_by_name.remove(name) {
             self.compact_admission_bytes = self.compact_admission_bytes.saturating_sub(charge);
-        }
-    }
-
-    fn pin_compact_admission_to_frame_cap(&mut self, max_message_size: usize) {
-        let cap = max_message_size.saturating_sub(crate::framing::GOSSIP_HEADER_LEN);
-        if self.compact_admission_bytes < cap {
-            self.compact_admission_bytes = cap;
         }
     }
 }
@@ -7491,11 +7488,7 @@ impl<T: 'static> GossipRegistry<T> {
                             )
                             .is_err()
                         {
-                            if !is_update {
-                                continue;
-                            }
-                            gossip_state
-                                .pin_compact_admission_to_frame_cap(self.config.max_message_size);
+                            continue;
                         }
                         if clear_tombstone {
                             let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
@@ -8215,9 +8208,9 @@ impl<T: 'static> GossipRegistry<T> {
         // deltas use that inflated since_sequence and drop real commits,
         // including ActorRemoved. Bootstrap split_full_sync_for_inline_limit
         // already keeps overflow deltas at the real sequence.
-        let emit_batch = |batch: Vec<RegistryChange>| -> Result<bytes::Bytes> {
+        let emit_batch = |batch: &[RegistryChange]| -> Result<bytes::Bytes> {
             Self::encode_registry_message(&delta_message(
-                batch,
+                batch.to_vec(),
                 sender_peer_id.clone(),
                 since_sequence,
                 current_sequence,
@@ -8263,13 +8256,13 @@ impl<T: 'static> GossipRegistry<T> {
 
     fn encode_delta_batch_fitting(
         batch: Vec<RegistryChange>,
-        emit_batch: &dyn Fn(Vec<RegistryChange>) -> Result<bytes::Bytes>,
+        emit_batch: &dyn Fn(&[RegistryChange]) -> Result<bytes::Bytes>,
         max_message_size: usize,
     ) -> Result<Vec<bytes::Bytes>> {
         if batch.is_empty() {
             return Ok(Vec::new());
         }
-        let encoded = emit_batch(batch.clone())?;
+        let encoded = emit_batch(&batch)?;
         if Self::gossip_payload_fits(encoded.len(), max_message_size) {
             return Ok(vec![encoded]);
         }
@@ -8282,8 +8275,6 @@ impl<T: 'static> GossipRegistry<T> {
         let mid = batch.len() / 2;
         let mut right = batch;
         let left = right.split_off(mid);
-        // `split_off` keeps the prefix in `right` and returns the suffix;
-        // swap so left is the prefix we intended to encode first.
         let (left, right) = (right, left);
         let mut payloads = Self::encode_delta_batch_fitting(left, emit_batch, max_message_size)?;
         payloads.extend(Self::encode_delta_batch_fitting(
@@ -9993,13 +9984,10 @@ impl<T: 'static> GossipRegistry<T> {
                     )
                     .is_err()
                 {
-                    if !is_update {
-                        if known_exists {
-                            peer_actors.insert(name.clone());
-                        }
-                        continue;
+                    if known_exists {
+                        peer_actors.insert(name.clone());
                     }
-                    gossip_state.pin_compact_admission_to_frame_cap(self.config.max_message_size);
+                    continue;
                 }
                 peer_actors.insert(name.clone());
                 if clear_tombstone {
