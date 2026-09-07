@@ -1,4 +1,4 @@
-use icanact_remote::{BuilderTlsBootstrap, GossipRegistryHandle, SecretKey};
+use icanact_remote::{BuilderTlsBootstrap, GossipError, GossipRegistryHandle, SecretKey};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,12 +31,35 @@ async fn qa_accepted_registry_can_bootstrap_after_snapshot_exceeds_frame_limit()
     )
     .await
     .unwrap();
-    let names: Vec<String> = (0..81).map(|i| format!("qa/snapshot/{i}")).collect();
-    for name in &names {
-        a.register_with_metadata(name.clone(), a.registry.bind_addr, vec![7; 128 * 1024])
+    let mut accepted = Vec::new();
+    let mut rejected = None;
+    for i in 0..81 {
+        let name = format!("qa/snapshot/{i}");
+        match a
+            .register_with_metadata(name.clone(), a.registry.bind_addr, vec![7; 128 * 1024])
             .await
-            .unwrap();
+        {
+            Ok(()) => accepted.push(name),
+            Err(err) => {
+                rejected = Some((name, err));
+                break;
+            }
+        }
     }
+    let (rejected_name, rejected_err) =
+        rejected.expect("compact snapshot admission must reject once the frame budget is full");
+    assert!(
+        matches!(rejected_err, GossipError::MessageTooLarge { .. }),
+        "overflow must be MessageTooLarge, got {rejected_err:?}"
+    );
+    assert!(
+        a.lookup(&rejected_name).await.is_none(),
+        "rejected name must not mutate the local registry"
+    );
+    assert!(
+        !accepted.is_empty(),
+        "admission must accept records that still fit the compact snapshot budget"
+    );
     let result = tokio::time::timeout(Duration::from_secs(8), async {
         a.add_peer(&b.registry.peer_id)
             .await
@@ -48,7 +71,7 @@ async fn qa_accepted_registry_can_bootstrap_after_snapshot_exceeds_frame_limit()
         matches!(result, Ok(Ok(_))),
         "accepted registry state must remain bootstrap-able, got {result:?}"
     );
-    for name in &names {
+    for name in &accepted {
         tokio::time::timeout(Duration::from_secs(8), async {
             loop {
                 if b.lookup(name).await.is_some() {
@@ -60,6 +83,10 @@ async fn qa_accepted_registry_can_bootstrap_after_snapshot_exceeds_frame_limit()
         .await
         .unwrap_or_else(|_| panic!("peer B must observe accepted actor {name}"));
     }
+    assert!(
+        b.lookup(&rejected_name).await.is_none(),
+        "rejected name must not appear on the bootstrapped peer"
+    );
     a.shutdown().await;
     b.shutdown().await;
 }

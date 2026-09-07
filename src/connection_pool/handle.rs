@@ -29,9 +29,29 @@ fn require_positive_timeout(timeout: Duration) -> Result<()> {
     }
 }
 
-/// Deadline covering admission only. Remaining time is returned for a later
-/// wait: deferred asks start their budget at submission, not at the later
-/// `PendingAsk` await.
+/// Absolute deferred-ask deadline from submission. `Instant + Duration` panics
+/// when the sum is unrepresentable, so a caller-supplied `Duration::MAX` must
+/// not take the process down. Cap at the latest Instant reachable from
+/// `started_at`.
+fn saturating_deadline(started_at: Instant, timeout: Duration) -> Instant {
+    if let Some(deadline) = started_at.checked_add(timeout) {
+        return deadline;
+    }
+    let mut nanos = timeout.as_nanos();
+    while nanos > 0 {
+        let chunk = u64::try_from(nanos).unwrap_or(u64::MAX);
+        if let Some(deadline) = started_at.checked_add(Duration::from_nanos(chunk)) {
+            return deadline;
+        }
+        nanos /= 2;
+    }
+    started_at
+}
+
+/// Deadline covering write-queue admission only. A successful write must not
+/// become `Timeout` just because the remaining budget hit zero: the frame is
+/// already on the wire with live correlation IDs, so callers keep those slots
+/// armed and let `PendingAsk::wait` expire instead of cancelling them.
 async fn admit_ask_with_deadline(
     timeout: Duration,
     started_at: Instant,
@@ -42,15 +62,9 @@ async fn admit_ask_with_deadline(
         return Err(crate::GossipError::Timeout);
     }
     match tokio::time::timeout(remaining, write).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(e),
-        Err(_) => return Err(crate::GossipError::Timeout),
-    }
-    let remaining = timeout.saturating_sub(started_at.elapsed());
-    if remaining.is_zero() {
-        Err(crate::GossipError::Timeout)
-    } else {
-        Ok(remaining)
+        Ok(Ok(())) => Ok(timeout.saturating_sub(started_at.elapsed())),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(crate::GossipError::Timeout),
     }
 }
 
@@ -72,6 +86,33 @@ mod admit_ask_deadline_tests {
         assert!(
             elapsed < Duration::from_millis(20),
             "exhausted budget must fail without waiting the full timeout, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn saturating_deadline_does_not_panic_on_unrepresentable_timeout() {
+        let started_at = Instant::now();
+        let deadline = saturating_deadline(started_at, Duration::MAX);
+        assert!(deadline >= started_at);
+        let representable = Duration::from_millis(250);
+        assert_eq!(
+            saturating_deadline(started_at, representable),
+            started_at.checked_add(representable).unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn successful_write_does_not_timeout_after_admission_budget_expires() {
+        let timeout = Duration::from_millis(8);
+        let started_at = Instant::now() - Duration::from_millis(4);
+        let result = admit_ask_with_deadline(timeout, started_at, async {
+            std::thread::sleep(Duration::from_millis(8));
+            Ok(())
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "successful write must keep slots armed even if remaining budget is zero, got {result:?}"
         );
     }
 
@@ -113,7 +154,7 @@ impl<T> std::fmt::Debug for ConnectionHandle<T> {
 pub(crate) struct PendingAsk {
     correlation_id: u32,
     correlation: Arc<CorrelationTracker>,
-    timeout: Duration,
+    deadline: Instant,
     active: bool,
 }
 
@@ -124,9 +165,16 @@ impl PendingAsk {
 
     pub(crate) async fn wait(mut self) -> Result<bytes::Bytes> {
         let correlation_id = self.correlation_id;
-        let timeout = self.timeout;
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            self.correlation.cancel(self.correlation_id);
+            self.active = false;
+            return Err(crate::GossipError::Timeout);
+        }
         let correlation = Arc::clone(&self.correlation);
-        let result = correlation.wait_for_response(correlation_id, timeout).await;
+        let result = correlation
+            .wait_for_response(correlation_id, remaining)
+            .await;
         self.active = false;
         result.map(crate::AlignedBytes::into_bytes)
     }
@@ -144,7 +192,7 @@ impl std::fmt::Debug for PendingAsk {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingAsk")
             .field("correlation_id", &self.correlation_id)
-            .field("timeout", &self.timeout)
+            .field("deadline", &self.deadline)
             .finish()
     }
 }
@@ -971,7 +1019,7 @@ impl<T> ConnectionHandle<T> {
         let started_at = Instant::now();
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
-        let remaining = admit_ask_with_deadline(
+        let _remaining = admit_ask_with_deadline(
             timeout,
             started_at,
             self.write_routed_actor_ask(correlation_id, actor_id, type_hash, payload),
@@ -984,7 +1032,7 @@ impl<T> ConnectionHandle<T> {
             // dropped without being awaited.
             correlation_id: slot.disarm(),
             correlation: self.correlation.clone(),
-            timeout: remaining,
+            deadline: saturating_deadline(started_at, timeout),
             active: true,
         })
     }
@@ -1448,7 +1496,8 @@ impl<T> ConnectionHandle<T> {
     /// Deferred ask using owned bytes and a custom timeout.
     ///
     /// The timeout starts at submission and covers write-queue admission.
-    /// Remaining time is stored on the returned handle for the later wait.
+    /// The returned handle stores an absolute deadline so a later `wait()`
+    /// cannot restart the budget.
     pub(crate) async fn ask_deferred_with_timeout_bytes(
         &self,
         request: bytes::Bytes,
@@ -1466,7 +1515,7 @@ impl<T> ConnectionHandle<T> {
             request.len(),
         )?;
 
-        let remaining = admit_ask_with_deadline(
+        let _remaining = admit_ask_with_deadline(
             timeout,
             started_at,
             self.write_header_and_payload_ask_inline(header, 16, request),
@@ -1479,7 +1528,7 @@ impl<T> ConnectionHandle<T> {
             // dropped without being awaited.
             correlation_id: slot.disarm(),
             correlation: self.correlation.clone(),
-            timeout: remaining,
+            deadline: saturating_deadline(started_at, timeout),
             active: true,
         })
     }
@@ -1540,7 +1589,7 @@ impl<T> ConnectionHandle<T> {
         // use the trusted lane, not the generic one, which would otherwise
         // reject a legitimately large batch on the same bare length ceiling
         // that protects arbitrary caller bytes.
-        let remaining = admit_ask_with_deadline(timeout, started_at, async {
+        let _remaining = admit_ask_with_deadline(timeout, started_at, async {
             if let Some(stream_handle) = self.stream_handle.as_ref() {
                 stream_handle
                     .write_trusted_bytes_ask(batch_message.freeze())
@@ -1560,7 +1609,7 @@ impl<T> ConnectionHandle<T> {
                 // is abandoned without being awaited.
                 correlation_id: slot.disarm(),
                 correlation: self.correlation.clone(),
-                timeout: remaining,
+                deadline: saturating_deadline(started_at, timeout),
                 active: true,
             })
             .collect();

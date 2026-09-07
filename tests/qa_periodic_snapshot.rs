@@ -1,9 +1,10 @@
-use icanact_remote::{BuilderTlsBootstrap, GossipRegistryHandle, SecretKey};
+use icanact_remote::{BuilderTlsBootstrap, GossipError, GossipRegistryHandle, SecretKey};
 use std::time::Duration;
 
-/// Seed RED from the 2026-09-06 QA report F1: an already-connected peer
-/// must still observe registrations after the serialized FullSync exceeds
-/// the default 10 MiB frame limit. Bootstrap split is not this path.
+/// Seed RED from the 2026-09-06 QA report F1 / 2026-09-07 Q6: compact
+/// snapshot admission rejects new names once the frame budget is full.
+/// Every *accepted* registration must still converge over the existing
+/// connection; rejected names must not mutate either registry.
 #[tokio::test]
 async fn accepted_registrations_converge_over_existing_connection() {
     rustls::crypto::ring::default_provider()
@@ -48,25 +49,46 @@ async fn accepted_registrations_converge_over_existing_connection() {
     })
     .await
     .expect("small registry must converge first");
+
+    let mut accepted = Vec::new();
+    let mut rejected = None;
     for i in 0..81 {
-        a.register_with_metadata(
-            format!("large/{i}"),
-            a.registry.bind_addr,
-            vec![7; 128 * 1024],
-        )
-        .await
-        .unwrap();
+        let name = format!("large/{i}");
+        match a
+            .register_with_metadata(name.clone(), a.registry.bind_addr, vec![7; 128 * 1024])
+            .await
+        {
+            Ok(()) => accepted.push(name),
+            Err(err) => {
+                rejected = Some((name, err));
+                break;
+            }
+        }
     }
-    let names: Vec<String> = (0..81).map(|i| format!("large/{i}")).collect();
+    let (rejected_name, rejected_err) =
+        rejected.expect("compact snapshot admission must reject once the frame budget is full");
+    assert!(
+        matches!(rejected_err, GossipError::MessageTooLarge { .. }),
+        "overflow must be MessageTooLarge, got {rejected_err:?}"
+    );
+    assert!(
+        a.lookup(&rejected_name).await.is_none(),
+        "rejected name must not mutate the local registry"
+    );
+    assert!(
+        !accepted.is_empty(),
+        "admission must accept records that still fit the compact snapshot budget"
+    );
+
     let observed = tokio::time::timeout(Duration::from_secs(8), async {
         loop {
             let mut seen = 0;
-            for name in &names {
+            for name in &accepted {
                 if b.lookup(name).await.is_some() {
                     seen += 1;
                 }
             }
-            if seen == 81 {
+            if seen == accepted.len() {
                 break seen;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -74,6 +96,10 @@ async fn accepted_registrations_converge_over_existing_connection() {
     })
     .await
     .unwrap_or(0);
+    assert!(
+        b.lookup(&rejected_name).await.is_none(),
+        "rejected name must not appear on the peer"
+    );
     let tasks = a.registry.prepare_gossip_round().await.unwrap();
     let sizes: Vec<_> = tasks
         .iter()
@@ -84,13 +110,15 @@ async fn accepted_registrations_converge_over_existing_connection() {
         })
         .collect();
     eprintln!(
-        "accepted=81 observed={observed} prepared_payload_sizes={sizes:?} limit={}",
+        "accepted={} observed={observed} rejected={rejected_name} prepared_payload_sizes={sizes:?} limit={}",
+        accepted.len(),
         a.registry.config.max_message_size
     );
     a.shutdown().await;
     b.shutdown().await;
     assert_eq!(
-        observed, 81,
-        "accepted registrations must propagate without reconnecting"
+        observed,
+        accepted.len(),
+        "every accepted registration must propagate without reconnecting"
     );
 }

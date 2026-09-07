@@ -6775,7 +6775,7 @@ fn cancelled_pending_ask_wait_releases_slot() {
             let pending = PendingAsk {
                 correlation_id: slot.disarm(),
                 correlation: Arc::clone(&tracker),
-                timeout: std::time::Duration::from_secs(60),
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
                 active: true,
             };
 
@@ -14511,6 +14511,7 @@ async fn full_sync_response_claim_displaced_during_merge_records_no_stale_projec
 include!("qa_queue_close.rs");
 include!("qa_deadline.rs");
 include!("qa_response_budget.rs");
+include!("qa_scan_20260907.rs");
 mod qa_remaining_deadlines {
     include!("qa_remaining_deadlines.rs");
 }
