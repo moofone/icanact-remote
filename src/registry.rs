@@ -7471,6 +7471,12 @@ impl<T: 'static> GossipRegistry<T> {
                             rejected_by_global_cap += 1;
                             continue;
                         }
+                        if self
+                            .ensure_solo_change_fits(name.as_str(), &location)
+                            .is_err()
+                        {
+                            continue;
+                        }
                         if gossip_state
                             .try_charge_compact_snapshot(
                                 name.as_str(),
@@ -9959,13 +9965,16 @@ impl<T: 'static> GossipRegistry<T> {
                     }
                     continue;
                 }
-                if gossip_state
-                    .try_charge_compact_snapshot(
-                        name.as_str(),
-                        location,
-                        self.config.max_message_size,
-                    )
+                if self
+                    .ensure_solo_change_fits(name.as_str(), location)
                     .is_err()
+                    || gossip_state
+                        .try_charge_compact_snapshot(
+                            name.as_str(),
+                            location,
+                            self.config.max_message_size,
+                        )
+                        .is_err()
                 {
                     if known_exists {
                         peer_actors.insert(name.clone());
@@ -34277,6 +34286,40 @@ mod tests {
             "expected MessageTooLarge, got {err:?}"
         );
         assert_eq!(registry.get_actor_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn qa_remote_oversized_record_is_rejected_on_admission() {
+        let addr = test_addr(18_207);
+        let mut config = test_config();
+        config.max_message_size = 64 * 1024;
+        let registry = GossipRegistry::<()>::new(addr, config);
+        let sender = test_peer_id("qa-remote-oversize");
+        let mut loc = RemoteActorLocation::new_with_peer(test_addr(9300), sender.clone());
+        loc.vector_clock.increment(sender.to_node_id());
+        loc.metadata = vec![7; 128 * 1024];
+        registry
+            .apply_delta(RegistryDelta {
+                since_sequence: 0,
+                current_sequence: 1,
+                changes: vec![RegistryChange::ActorAdded {
+                    name: "remote-oversize".to_string(),
+                    location: loc,
+                    priority: RegistrationPriority::Normal,
+                }],
+                sender_peer_id: sender,
+                wall_clock_time: current_timestamp(),
+                precise_timing_nanos: crate::current_timestamp_nanos(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            !registry
+                .actor_state
+                .known_actors
+                .contains_sync("remote-oversize"),
+            "a remote ActorAdded that cannot fit a DeltaGossip frame must not be admitted"
+        );
     }
 
     #[tokio::test]
