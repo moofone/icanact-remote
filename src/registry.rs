@@ -2295,6 +2295,12 @@ pub struct GossipState {
     pub actor_admissions_by_peer: HashMap<crate::PeerId, HashSet<String>>,
     /// Reverse index used to release per-peer admission capacity on removal.
     pub actor_admission_peer_by_name: HashMap<String, crate::PeerId>,
+    /// Running compact-FullSync admission charge (names + addresses + fixed
+    /// per-record slack). Charged under this mutex so concurrent local
+    /// registers and remote applies cannot each observe a fitting snapshot
+    /// and then both commit. Incremental: no whole-registry clone/encode.
+    compact_admission_bytes: usize,
+    compact_charge_by_name: HashMap<String, usize>,
     // =================== Peer Discovery State ===================
     /// Last time we sent peer list gossip (for rate limiting)
     pub last_peer_gossip_time: u64,
@@ -2588,6 +2594,50 @@ impl GossipState {
             });
         if remove_peer {
             self.actor_admissions_by_peer.remove(&peer_id);
+        }
+        self.release_compact_snapshot(name);
+    }
+
+    /// Bytes charged for one compact (metadata-stripped) name-bearing record.
+    /// Name + address dominate the long-name overflow case; the fixed slack
+    /// covers peer_id/node_id/clock/rkyv without cloning the whole snapshot.
+    fn compact_record_charge(name: &str, location: &RemoteActorLocation) -> usize {
+        name.len()
+            .saturating_add(location.address.len())
+            .saturating_add(64)
+    }
+
+    fn try_charge_compact_snapshot(
+        &mut self,
+        name: &str,
+        location: &RemoteActorLocation,
+        max_message_size: usize,
+    ) -> Result<bool> {
+        if self.compact_charge_by_name.contains_key(name) {
+            return Ok(false);
+        }
+        let charge = Self::compact_record_charge(name, location);
+        let new_total = self.compact_admission_bytes.saturating_add(charge);
+        if crate::framing::reject_oversize_for_inline_send(
+            crate::framing::GOSSIP_HEADER_LEN,
+            new_total,
+            max_message_size,
+        )
+        .is_err()
+        {
+            return Err(GossipError::MessageTooLarge {
+                size: new_total,
+                max: max_message_size,
+            });
+        }
+        self.compact_admission_bytes = new_total;
+        self.compact_charge_by_name.insert(name.to_string(), charge);
+        Ok(true)
+    }
+
+    fn release_compact_snapshot(&mut self, name: &str) {
+        if let Some(charge) = self.compact_charge_by_name.remove(name) {
+            self.compact_admission_bytes = self.compact_admission_bytes.saturating_sub(charge);
         }
     }
 }
@@ -3087,6 +3137,8 @@ impl<T: 'static> GossipRegistry<T> {
                 peer_to_actors: HashMap::new(),
                 actor_admissions_by_peer: HashMap::new(),
                 actor_admission_peer_by_name: HashMap::new(),
+                compact_admission_bytes: GossipRegistry::<()>::GOSSIP_MESSAGE_SIZE_SLACK,
+                compact_charge_by_name: HashMap::new(),
                 // Peer discovery state
                 last_peer_gossip_time: 0,
                 peer_discovery: if config.enable_peer_discovery {
@@ -6856,11 +6908,10 @@ impl<T: 'static> GossipRegistry<T> {
             return Err(GossipError::ActorAlreadyExists(name));
         }
 
-        // Reject a record that cannot be replicated: a single change must fit
-        // one gossip frame, and the compact name-bearing FullSync of accepted
-        // state must remain encodable. This is an API restriction so periodic
-        // anti-entropy cannot observe MessageTooLarge for already-accepted names.
-        self.ensure_registration_is_replicable(&name, &location)?;
+        // A single record must fit one gossip frame. The aggregate compact
+        // FullSync budget is charged below under `gossip_state` so concurrent
+        // registers cannot each observe a fitting snapshot and both commit.
+        self.ensure_solo_change_fits(&name, &location)?;
 
         // Increment vector clock before insertion for atomicity of "this write".
         let previous_tombstone = self
@@ -6872,42 +6923,43 @@ impl<T: 'static> GossipRegistry<T> {
         }
         location.vector_clock.increment(location.node_id);
 
-        if self
-            .actor_state
-            .local_actors
-            .insert_sync(name.clone(), location.clone())
-            .is_err()
-        {
-            return Err(GossipError::ActorAlreadyExists(name));
-        }
-
-        // Publish only after the lock-free actor insertion is visible so a
-        // route refresh awakened by this revision can observe the actor.
-        self.actor_state.mark_routing_changed_for_actor(&name);
-
-        // If a remote actor raced in concurrently, roll back and preserve original semantics.
-        if self.actor_state.known_actors.contains_sync(name.as_str()) {
-            if self
-                .actor_state
-                .local_actors
-                .remove_sync(name.as_str())
-                .is_some()
-            {
-                self.actor_state.mark_routing_changed_for_actor(&name);
-            }
-            return Err(GossipError::ActorAlreadyExists(name));
-        }
-        let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
-
-        // Update gossip state with pending change - choose queue based on priority
+        // Charge compact admission, insert, and enqueue the gossip change in
+        // one critical section. The previous check-then-insert window let two
+        // registers pass a cloned snapshot encode and then both commit.
         let should_trigger_immediate = {
             let mut gossip_state = self.gossip_state.lock().await;
 
-            // Re-check shutdown under the lock — the atomic is the
-            // canonical source of truth (see `shutdown()`); the
-            // legacy mutex bool is a redundant cache that lags the
-            // atomic, so trust the atomic.
             if self.shutdown.load(Ordering::Acquire) {
+                return Err(GossipError::Shutdown);
+            }
+            if self.actor_state.local_actors.contains_sync(name.as_str())
+                || self.actor_state.known_actors.contains_sync(name.as_str())
+            {
+                return Err(GossipError::ActorAlreadyExists(name));
+            }
+            if let Err(err) = gossip_state.try_charge_compact_snapshot(
+                &name,
+                &location,
+                self.config.max_message_size,
+            ) {
+                return Err(err);
+            }
+
+            if self
+                .actor_state
+                .local_actors
+                .insert_sync(name.clone(), location.clone())
+                .is_err()
+            {
+                gossip_state.release_compact_snapshot(&name);
+                return Err(GossipError::ActorAlreadyExists(name));
+            }
+
+            // Publish only after the lock-free actor insertion is visible so a
+            // route refresh awakened by this revision can observe the actor.
+            self.actor_state.mark_routing_changed_for_actor(&name);
+
+            if self.actor_state.known_actors.contains_sync(name.as_str()) {
                 if self
                     .actor_state
                     .local_actors
@@ -6916,14 +6968,10 @@ impl<T: 'static> GossipRegistry<T> {
                 {
                     self.actor_state.mark_routing_changed_for_actor(&name);
                 }
-                if let Some(tombstone) = previous_tombstone.clone() {
-                    let _ = self
-                        .actor_state
-                        .removed_actors
-                        .upsert_sync(name.clone(), tombstone);
-                }
-                return Err(GossipError::Shutdown);
+                gossip_state.release_compact_snapshot(&name);
+                return Err(GossipError::ActorAlreadyExists(name));
             }
+            let _ = self.actor_state.removed_actors.remove_sync(name.as_str());
 
             let change = RegistryChange::ActorAdded {
                 name: name.clone(),
@@ -7024,6 +7072,7 @@ impl<T: 'static> GossipRegistry<T> {
                     self.actor_state.mark_routing_changed_for_actor(name);
                     return Err(GossipError::Shutdown);
                 }
+                gossip_state.release_compact_snapshot(name);
 
                 // Create a new vector clock for the removal with proper causality
                 let removal_clock = location.vector_clock.clone();
@@ -7407,6 +7456,16 @@ impl<T: 'static> GossipRegistry<T> {
                                 >= self.config.max_known_actors
                         {
                             rejected_by_global_cap += 1;
+                            continue;
+                        }
+                        if gossip_state
+                            .try_charge_compact_snapshot(
+                                name.as_str(),
+                                &location,
+                                self.config.max_message_size,
+                            )
+                            .is_err()
+                        {
                             continue;
                         }
                         if clear_tombstone {
@@ -8055,50 +8114,6 @@ impl<T: 'static> GossipRegistry<T> {
                 self.config.max_message_size,
             ))
         }
-    }
-
-    fn ensure_compact_snapshot_fits_with(
-        &self,
-        name: &str,
-        location: &RemoteActorLocation,
-    ) -> Result<()> {
-        let (mut local, mut known) = self.snapshot_actor_pairs();
-        for (_, loc) in local.iter_mut().chain(known.iter_mut()) {
-            loc.metadata.clear();
-        }
-        if !local.iter().any(|(existing, _)| existing == name)
-            && !known.iter().any(|(existing, _)| existing == name)
-        {
-            let mut extra = location.clone();
-            extra.metadata.clear();
-            local.push((name.to_string(), extra));
-        }
-        let encoded = Self::encode_registry_message(&RegistryMessage::FullSync {
-            local_actors: local,
-            known_actors: known,
-            sender_peer_id: self.peer_id.clone(),
-            sender_bind_addr: Some(self.advertised_addr().to_string()),
-            sequence: 0,
-            wall_clock_time: 0,
-            extensions: None,
-        })?;
-        if Self::gossip_payload_fits(encoded.len(), self.config.max_message_size) {
-            Ok(())
-        } else {
-            Err(Self::oversized_gossip_error(
-                encoded.len(),
-                self.config.max_message_size,
-            ))
-        }
-    }
-
-    fn ensure_registration_is_replicable(
-        &self,
-        name: &str,
-        location: &RemoteActorLocation,
-    ) -> Result<()> {
-        self.ensure_solo_change_fits(name, location)?;
-        self.ensure_compact_snapshot_fits_with(name, location)
     }
 
     fn gossip_payload_fits(payload_len: usize, max_message_size: usize) -> bool {
@@ -9916,6 +9931,14 @@ impl<T: 'static> GossipRegistry<T> {
                     rejected_by_global_cap += 1;
                     continue;
                 }
+                let newly_charged = match gossip_state.try_charge_compact_snapshot(
+                    name.as_str(),
+                    location,
+                    self.config.max_message_size,
+                ) {
+                    Ok(charged) => charged,
+                    Err(_) => continue,
+                };
                 let upsert_plan = self.current_actor_upsert_plan(
                     name.as_str(),
                     location,
@@ -9923,6 +9946,9 @@ impl<T: 'static> GossipRegistry<T> {
                     owner_restart_authenticated,
                 );
                 if upsert_plan.is_none() {
+                    if newly_charged {
+                        gossip_state.release_compact_snapshot(name.as_str());
+                    }
                     // An exact duplicate is still an admitted advertisement
                     // when the actor already exists. Other rejected candidates
                     // must not create phantom peer_to_actors entries.
@@ -34153,6 +34179,68 @@ mod tests {
         assert!(
             outcome.is_ok(),
             "accepted registry state must remain replicable: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn qa_concurrent_registrations_cannot_exceed_compact_budget() {
+        let addr = test_addr(18_204);
+        let registry = Arc::new(GossipRegistry::<()>::new(
+            addr,
+            GossipConfig {
+                key_pair: Some(KeyPair::new_for_testing("qa-snapshot-concurrent")),
+                ..Default::default()
+            },
+        ));
+        let left = Arc::clone(&registry);
+        let right = Arc::clone(&registry);
+        let left_peer = left.peer_id.clone();
+        let right_peer = right.peer_id.clone();
+        let (left_result, right_result) = tokio::join!(
+            async move {
+                let mut accepted = 0usize;
+                for i in 0..50 {
+                    let name = format!("L{i:02}/{}", "x".repeat(128 * 1024));
+                    let loc = RemoteActorLocation::new_with_peer(addr, left_peer.clone());
+                    if left.register_actor(name, loc).await.is_ok() {
+                        accepted += 1;
+                    }
+                }
+                accepted
+            },
+            async move {
+                let mut accepted = 0usize;
+                for i in 0..50 {
+                    let name = format!("R{i:02}/{}", "x".repeat(128 * 1024));
+                    let loc = RemoteActorLocation::new_with_peer(addr, right_peer.clone());
+                    if right.register_actor(name, loc).await.is_ok() {
+                        accepted += 1;
+                    }
+                }
+                accepted
+            }
+        );
+        let accepted = left_result + right_result;
+        assert!(accepted > 0);
+        assert!(
+            accepted < 100,
+            "concurrent registers must still share the compact FullSync budget, accepted={accepted}"
+        );
+        let (local, known) = registry.snapshot_actor_pairs();
+        let msg = RegistryMessage::FullSync {
+            local_actors: local,
+            known_actors: known,
+            sender_peer_id: registry.peer_id.clone(),
+            sender_bind_addr: Some(addr.to_string()),
+            sequence: 1,
+            wall_clock_time: 0,
+            extensions: None,
+        };
+        assert!(
+            registry
+                .encode_outbound_gossip_for_inline_limit(&msg)
+                .is_ok(),
+            "the names that won the compact budget must remain encodable"
         );
     }
 
