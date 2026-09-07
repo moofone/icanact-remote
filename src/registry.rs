@@ -2599,14 +2599,15 @@ impl GossipState {
         self.release_compact_snapshot(name);
     }
 
-    /// Bytes charged for one compact name-bearing record. Includes metadata
-    /// because FullSync/delta encodings retain it (compact stripping happens
-    /// only as a later encode-time split). Name, address, and metadata are the
-    /// variable serialized fields; the fixed slack covers peer_id/node_id/clock.
+    /// Bytes charged for one compact name-bearing record. Counts the variable
+    /// serialized fields (name, address, metadata, vector-clock entries) plus
+    /// fixed slack for peer_id/node_id/rkyv. Compact stripping of metadata is
+    /// encode-time only; admission must still bound the retained record.
     fn compact_record_charge(name: &str, location: &RemoteActorLocation) -> usize {
         name.len()
             .saturating_add(location.address.len())
             .saturating_add(location.metadata.len())
+            .saturating_add(location.vector_clock.len().saturating_mul(48))
             .saturating_add(64)
     }
 
@@ -34319,6 +34320,49 @@ mod tests {
                 .known_actors
                 .contains_sync("remote-oversize"),
             "a remote ActorAdded that cannot fit a DeltaGossip frame must not be admitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn qa_vector_clock_size_is_charged_on_admission() {
+        let addr = test_addr(18_208);
+        let mut config = test_config();
+        config.max_message_size = 16 * 1024;
+        let registry = GossipRegistry::<()>::new(addr, config);
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
+        for i in 0..16 {
+            let loc = RemoteActorLocation::new_with_peer(addr, registry.peer_id.clone());
+            for n in 0..80 {
+                loc.vector_clock
+                    .increment(test_peer_id(&format!("vc-{i}-{n}")).to_node_id());
+            }
+            match registry.register_actor(format!("clock-{i}"), loc).await {
+                Ok(()) => accepted += 1,
+                Err(GossipError::MessageTooLarge { .. }) => rejected += 1,
+                Err(err) => panic!("unexpected registration error: {err:?}"),
+            }
+        }
+        assert!(accepted > 0, "some clock-heavy names must still register");
+        assert!(
+            rejected > 0,
+            "vector-clock size must count against compact admission, accepted={accepted}"
+        );
+        let (local, known) = registry.snapshot_actor_pairs();
+        let msg = RegistryMessage::FullSync {
+            local_actors: local,
+            known_actors: known,
+            sender_peer_id: registry.peer_id.clone(),
+            sender_bind_addr: Some(addr.to_string()),
+            sequence: 1,
+            wall_clock_time: 0,
+            extensions: None,
+        };
+        assert!(
+            registry
+                .encode_outbound_gossip_for_inline_limit(&msg)
+                .is_ok(),
+            "accepted clock-heavy state must remain replicable"
         );
     }
 
