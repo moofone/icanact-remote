@@ -56,6 +56,77 @@ mod qa_queue_retention_review {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn qa_header_inline32_then_direct_ask_keeps_enqueue_order() {
+        use tokio::io::AsyncReadExt;
+        let (client, mut peer) = tokio::io::duplex(4096);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            client,
+            "127.0.0.1:39923".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let actor_payload = bytes::Bytes::from_static(b"first-inline32");
+        let actor_header = crate::framing::try_write_actor_ask_header_with_request_id(
+            1,
+            7,
+            9,
+            actor_payload.len(),
+            None,
+        )
+        .unwrap();
+        let direct_payload = bytes::Bytes::from_static(b"second-direct");
+        let direct_header =
+            crate::framing::try_write_direct_ask_header(2, 11, direct_payload.len()).unwrap();
+        writer
+            .enqueue_write_nonblocking(WritePayload::HeaderInline32 {
+                header: actor_header,
+                payload: actor_payload.clone(),
+            })
+            .unwrap();
+        writer
+            .enqueue_write_nonblocking(WritePayload::DirectAskInline {
+                header: direct_header,
+                payload: direct_payload.clone(),
+            })
+            .unwrap();
+        let mut buf = Vec::new();
+        let expected = actor_header.len()
+            + actor_payload.len()
+            + direct_header.len()
+            + direct_payload.len();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while buf.len() < expected {
+                let mut tmp = [0u8; 256];
+                let n = peer.read(&mut tmp).await.unwrap();
+                assert!(n > 0, "peer closed before both frames arrived");
+                buf.extend_from_slice(&tmp[..n]);
+            }
+        })
+        .await
+        .expect("both frames must be written");
+        writer.shutdown();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let first = crate::framing::decode_control(buf[..4].try_into().unwrap()).unwrap();
+        let second_off = 4 + first.body_len;
+        let second =
+            crate::framing::decode_control(buf[second_off..second_off + 4].try_into().unwrap())
+                .unwrap();
+        assert_eq!(
+            (first.kind, second.kind),
+            (
+                crate::framing::WireKind::ActorAsk,
+                crate::framing::WireKind::DirectAsk
+            ),
+            "HeaderInline32 must leave the wire before a later DirectAskInline"
+        );
+    }
+
     struct PayloadOwner {
         bytes: Vec<u8>,
         dropped: Arc<AtomicUsize>,
@@ -932,8 +1003,11 @@ fn take_ordinary_kind_switch_chunks(
             + inline32_headers.len().saturating_mul(2)
             + direct_ask_headers.len().saturating_mul(2),
     );
-    append_fixed_header_payloads(&mut flush, direct_ask_headers, direct_ask_payloads);
+    // Same order as the pre-fix leftover flush: HeaderInline32, then
+    // DirectAskInline, then generic write_chunks. Emitting DirectAsk first
+    // lets a later DirectAsk overtake a pending 32-byte frame.
     append_fixed_header_payloads(&mut flush, inline32_headers, inline32_payloads);
+    append_fixed_header_payloads(&mut flush, direct_ask_headers, direct_ask_payloads);
     flush.append(write_chunks);
     flush
 }
@@ -2618,13 +2692,13 @@ impl LockFreeStreamHandle {
                                 let mut flush = Vec::new();
                                 append_fixed_header_payloads(
                                     &mut flush,
-                                    &mut direct_ask_headers,
-                                    &mut direct_ask_payloads,
+                                    &mut inline32_headers,
+                                    &mut inline32_payloads,
                                 );
                                 append_fixed_header_payloads(
                                     &mut flush,
-                                    &mut inline32_headers,
-                                    &mut inline32_payloads,
+                                    &mut direct_ask_headers,
+                                    &mut direct_ask_payloads,
                                 );
                                 let mut offset = 0usize;
                                 match write_chunks_once(
