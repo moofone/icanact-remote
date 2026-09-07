@@ -93,10 +93,8 @@ mod qa_queue_retention_review {
             })
             .unwrap();
         let mut buf = Vec::new();
-        let expected = actor_header.len()
-            + actor_payload.len()
-            + direct_header.len()
-            + direct_payload.len();
+        let expected =
+            actor_header.len() + actor_payload.len() + direct_header.len() + direct_payload.len();
         tokio::time::timeout(Duration::from_secs(2), async {
             while buf.len() < expected {
                 let mut tmp = [0u8; 256];
@@ -509,6 +507,9 @@ enum PendingOrdinaryWrite {
         chunks: Vec<bytes::Bytes>,
         offset: usize,
     },
+    Buf {
+        buf: Box<dyn bytes::Buf + Send>,
+    },
 }
 
 /// Park `batch` as a one-poll `PendingOrdinaryWrite::Chunks` so the IO loop
@@ -584,6 +585,7 @@ fn pending_ordinary_write_retained_bytes(pending: &Option<PendingOrdinaryWrite>)
             .map(|chunk| chunk.len())
             .sum::<usize>()
             .saturating_sub(*offset),
+        Some(PendingOrdinaryWrite::Buf { buf }) => buf.remaining(),
     }
 }
 
@@ -761,6 +763,15 @@ where
             )
             .await
         }
+        PendingOrdinaryWrite::Buf { buf } => {
+            write_generic_buf_once(
+                stream,
+                buf,
+                stream_write_wedged_since,
+                stream_flush_wedged_since,
+            )
+            .await
+        }
     }
 }
 
@@ -927,6 +938,7 @@ where
                 OrdinaryWriteProgress::Failed => OrdinaryWriteProgress::Failed,
             }
         }
+        PendingOrdinaryWrite::Buf { buf } => poll_generic_buf_nowait(stream, buf).await,
     }
 }
 
@@ -1056,18 +1068,80 @@ fn chunks_for_header_inline_pooled(
     chunks
 }
 
-fn chunks_for_generic_buf(mut buf: Box<dyn bytes::Buf + Send>) -> Vec<bytes::Bytes> {
-    let mut data = Vec::with_capacity(buf.remaining());
-    while buf.has_remaining() {
-        let chunk = buf.chunk();
-        data.extend_from_slice(chunk);
-        let n = chunk.len();
-        buf.advance(n);
+async fn write_generic_buf_once<S>(
+    stream: &mut S,
+    buf: &mut Box<dyn bytes::Buf + Send>,
+    stream_write_wedged_since: &mut Option<Instant>,
+    stream_flush_wedged_since: &mut Option<Instant>,
+) -> OrdinaryWriteProgress
+where
+    S: AsyncWrite + Unpin,
+{
+    if !buf.has_remaining() {
+        return OrdinaryWriteProgress::Complete(0);
     }
-    if data.is_empty() {
-        Vec::new()
+    let n = {
+        let chunk = buf.chunk();
+        match tokio::time::timeout(
+            STREAM_WRITE_SLICE_TIMEOUT,
+            write_vectored_once(stream, &[std::io::IoSlice::new(chunk)]),
+        )
+        .await
+        {
+            Ok(Ok(n)) => n,
+            Ok(Err(_)) => return OrdinaryWriteProgress::Failed,
+            Err(_elapsed) => {
+                return match record_slice_attempt(
+                    false,
+                    false,
+                    Instant::now(),
+                    stream_write_wedged_since,
+                    stream_flush_wedged_since,
+                ) {
+                    SliceAttemptOutcome::TearDown { .. } => OrdinaryWriteProgress::Failed,
+                    SliceAttemptOutcome::Continue => OrdinaryWriteProgress::Partial(0),
+                };
+            }
+        }
+    };
+    record_slice_attempt(
+        false,
+        true,
+        Instant::now(),
+        stream_write_wedged_since,
+        stream_flush_wedged_since,
+    );
+    buf.advance(n);
+    if buf.has_remaining() {
+        OrdinaryWriteProgress::Partial(n)
     } else {
-        vec![bytes::Bytes::from(data)]
+        OrdinaryWriteProgress::Complete(n)
+    }
+}
+
+async fn poll_generic_buf_nowait<S>(
+    stream: &mut S,
+    buf: &mut Box<dyn bytes::Buf + Send>,
+) -> OrdinaryWriteProgress
+where
+    S: AsyncWrite + Unpin,
+{
+    if !buf.has_remaining() {
+        return OrdinaryWriteProgress::Complete(0);
+    }
+    let n = {
+        let chunk = buf.chunk();
+        match poll_vectored_nowait(stream, &[std::io::IoSlice::new(chunk)]).await {
+            OrdinaryWriteProgress::Partial(0) => return OrdinaryWriteProgress::Partial(0),
+            OrdinaryWriteProgress::Partial(n) | OrdinaryWriteProgress::Complete(n) => n,
+            OrdinaryWriteProgress::Failed => return OrdinaryWriteProgress::Failed,
+        }
+    };
+    buf.advance(n);
+    if buf.has_remaining() {
+        OrdinaryWriteProgress::Partial(n)
+    } else {
+        OrdinaryWriteProgress::Complete(n)
     }
 }
 
@@ -3074,7 +3148,10 @@ impl LockFreeStreamHandle {
                                             bytes_written_counter.fetch_add(n, Ordering::Relaxed);
                                             total_bytes_written += n;
                                             pending_ordinary_write =
-                                                Some(PendingOrdinaryWrite::Chunks { chunks, offset });
+                                                Some(PendingOrdinaryWrite::Chunks {
+                                                    chunks,
+                                                    offset,
+                                                });
                                             leftover_commands.extend(command_iter);
                                             break;
                                         }
@@ -3140,11 +3217,7 @@ impl LockFreeStreamHandle {
                                     let header_len = header_len as usize;
                                     let prefix_len = prefix_len as usize;
                                     let chunks = chunks_for_header_inline_pooled(
-                                        header,
-                                        header_len,
-                                        prefix,
-                                        prefix_len,
-                                        payload,
+                                        header, header_len, prefix, prefix_len, payload,
                                     );
                                     let mut offset = 0usize;
                                     match write_chunks_once(
@@ -3164,7 +3237,10 @@ impl LockFreeStreamHandle {
                                             bytes_written_counter.fetch_add(n, Ordering::Relaxed);
                                             total_bytes_written += n;
                                             pending_ordinary_write =
-                                                Some(PendingOrdinaryWrite::Chunks { chunks, offset });
+                                                Some(PendingOrdinaryWrite::Chunks {
+                                                    chunks,
+                                                    offset,
+                                                });
                                             leftover_commands.extend(command_iter);
                                             break;
                                         }
@@ -3215,12 +3291,10 @@ impl LockFreeStreamHandle {
                                             OrdinaryWriteProgress::Failed => return,
                                         }
                                     }
-                                    let chunks = chunks_for_generic_buf(buf);
-                                    let mut offset = 0usize;
-                                    match write_chunks_once(
+                                    let mut buf = buf;
+                                    match write_generic_buf_once(
                                         &mut stream,
-                                        &chunks,
-                                        &mut offset,
+                                        &mut buf,
                                         &mut stream_write_wedged_since,
                                         &mut stream_flush_wedged_since,
                                     )
@@ -3234,7 +3308,7 @@ impl LockFreeStreamHandle {
                                             bytes_written_counter.fetch_add(n, Ordering::Relaxed);
                                             total_bytes_written += n;
                                             pending_ordinary_write =
-                                                Some(PendingOrdinaryWrite::Chunks { chunks, offset });
+                                                Some(PendingOrdinaryWrite::Buf { buf });
                                             leftover_commands.extend(command_iter);
                                             break;
                                         }
@@ -3789,9 +3863,7 @@ impl LockFreeStreamHandle {
                         }
                     }
                 }
-                if ordinary_write_blocked
-                    && let Some(pending) = pending_ordinary_write.as_mut()
-                {
+                if ordinary_write_blocked && let Some(pending) = pending_ordinary_write.as_mut() {
                     match write_pending_ordinary_bounded(
                         &mut stream,
                         pending,

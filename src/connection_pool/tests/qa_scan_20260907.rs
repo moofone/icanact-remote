@@ -38,6 +38,45 @@ async fn qa_scan_pooled_writer_observes_shutdown() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn qa_scan_generic_buf_writer_observes_shutdown() {
+    let (stream, mut peer) = tokio::io::duplex(64);
+    let (writer, mut task, _) = LockFreeStreamHandle::new(
+        stream,
+        "127.0.0.1:39923".parse().unwrap(),
+        ChannelId::TellAsk,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    writer
+        .write_buf_control({
+            let mut data = crate::framing::write_gossip_frame_prefix(8192).to_vec();
+            data.extend(vec![7u8; 8192]);
+            bytes::Bytes::from(data)
+        })
+        .await
+        .unwrap();
+    let mut first = [0; 1];
+    tokio::time::timeout(Duration::from_secs(2), peer.read_exact(&mut first))
+        .await
+        .unwrap()
+        .unwrap();
+    writer.shutdown();
+    let exited = tokio::time::timeout(Duration::from_secs(2), &mut task)
+        .await
+        .is_ok();
+    eprintln!("generic buf writer: shutdown_completed_within_2s={exited}");
+    if !exited {
+        task.abort();
+        let _ = task.await;
+    }
+    assert!(
+        exited,
+        "queued generic Buf writes must observe shutdown when peer stops reading"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn qa_scan_deferred_deadline_does_not_restart_at_wait() {
     let (io, peer) = tokio::io::duplex(4096);
     let (stream, task, _) = LockFreeStreamHandle::new(
