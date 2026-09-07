@@ -48,9 +48,10 @@ fn saturating_deadline(started_at: Instant, timeout: Duration) -> Instant {
     started_at
 }
 
-/// Deadline covering admission only. Remaining time is returned for a later
-/// wait: deferred asks start their budget at submission, not at the later
-/// `PendingAsk` await.
+/// Deadline covering write-queue admission only. A successful write must not
+/// become `Timeout` just because the remaining budget hit zero: the frame is
+/// already on the wire with live correlation IDs, so callers keep those slots
+/// armed and let `PendingAsk::wait` expire instead of cancelling them.
 async fn admit_ask_with_deadline(
     timeout: Duration,
     started_at: Instant,
@@ -61,15 +62,9 @@ async fn admit_ask_with_deadline(
         return Err(crate::GossipError::Timeout);
     }
     match tokio::time::timeout(remaining, write).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(e),
-        Err(_) => return Err(crate::GossipError::Timeout),
-    }
-    let remaining = timeout.saturating_sub(started_at.elapsed());
-    if remaining.is_zero() {
-        Err(crate::GossipError::Timeout)
-    } else {
-        Ok(remaining)
+        Ok(Ok(())) => Ok(timeout.saturating_sub(started_at.elapsed())),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(crate::GossipError::Timeout),
     }
 }
 
@@ -103,6 +98,21 @@ mod admit_ask_deadline_tests {
         assert_eq!(
             saturating_deadline(started_at, representable),
             started_at.checked_add(representable).unwrap()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn successful_write_does_not_timeout_after_admission_budget_expires() {
+        let timeout = Duration::from_millis(8);
+        let started_at = Instant::now() - Duration::from_millis(4);
+        let result = admit_ask_with_deadline(timeout, started_at, async {
+            std::thread::sleep(Duration::from_millis(8));
+            Ok(())
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "successful write must keep slots armed even if remaining budget is zero, got {result:?}"
         );
     }
 
@@ -162,7 +172,9 @@ impl PendingAsk {
             return Err(crate::GossipError::Timeout);
         }
         let correlation = Arc::clone(&self.correlation);
-        let result = correlation.wait_for_response(correlation_id, remaining).await;
+        let result = correlation
+            .wait_for_response(correlation_id, remaining)
+            .await;
         self.active = false;
         result.map(crate::AlignedBytes::into_bytes)
     }
