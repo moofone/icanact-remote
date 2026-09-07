@@ -29,6 +29,25 @@ fn require_positive_timeout(timeout: Duration) -> Result<()> {
     }
 }
 
+/// Absolute deferred-ask deadline from submission. `Instant + Duration` panics
+/// when the sum is unrepresentable, so a caller-supplied `Duration::MAX` must
+/// not take the process down. Cap at the latest Instant reachable from
+/// `started_at`.
+fn saturating_deadline(started_at: Instant, timeout: Duration) -> Instant {
+    if let Some(deadline) = started_at.checked_add(timeout) {
+        return deadline;
+    }
+    let mut nanos = timeout.as_nanos();
+    while nanos > 0 {
+        let chunk = u64::try_from(nanos).unwrap_or(u64::MAX);
+        if let Some(deadline) = started_at.checked_add(Duration::from_nanos(chunk)) {
+            return deadline;
+        }
+        nanos /= 2;
+    }
+    started_at
+}
+
 /// Deadline covering admission only. Remaining time is returned for a later
 /// wait: deferred asks start their budget at submission, not at the later
 /// `PendingAsk` await.
@@ -72,6 +91,18 @@ mod admit_ask_deadline_tests {
         assert!(
             elapsed < Duration::from_millis(20),
             "exhausted budget must fail without waiting the full timeout, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn saturating_deadline_does_not_panic_on_unrepresentable_timeout() {
+        let started_at = Instant::now();
+        let deadline = saturating_deadline(started_at, Duration::MAX);
+        assert!(deadline >= started_at);
+        let representable = Duration::from_millis(250);
+        assert_eq!(
+            saturating_deadline(started_at, representable),
+            started_at.checked_add(representable).unwrap()
         );
     }
 
@@ -989,7 +1020,7 @@ impl<T> ConnectionHandle<T> {
             // dropped without being awaited.
             correlation_id: slot.disarm(),
             correlation: self.correlation.clone(),
-            deadline: started_at + timeout,
+            deadline: saturating_deadline(started_at, timeout),
             active: true,
         })
     }
@@ -1485,7 +1516,7 @@ impl<T> ConnectionHandle<T> {
             // dropped without being awaited.
             correlation_id: slot.disarm(),
             correlation: self.correlation.clone(),
-            deadline: started_at + timeout,
+            deadline: saturating_deadline(started_at, timeout),
             active: true,
         })
     }
@@ -1566,7 +1597,7 @@ impl<T> ConnectionHandle<T> {
                 // is abandoned without being awaited.
                 correlation_id: slot.disarm(),
                 correlation: self.correlation.clone(),
-                deadline: started_at + timeout,
+                deadline: saturating_deadline(started_at, timeout),
                 active: true,
             })
             .collect();
