@@ -108,6 +108,10 @@ async fn run_burst(default_maintenance: bool) {
     });
     let replies = futures::future::join_all(futures).await;
     let success = replies.iter().filter(|r| r.is_ok()).count();
+    let errors: Vec<String> = replies
+        .iter()
+        .filter_map(|r| r.as_ref().err().map(ToString::to_string))
+        .collect();
     let later = ab
         .ask_actor_frame(
             1,
@@ -119,8 +123,10 @@ async fn run_burst(default_maintenance: bool) {
     a.shutdown().await;
     b.shutdown().await;
     assert_eq!(
-        success, 128,
-        "healthy peers must drain finite simultaneous response bursts"
+        success,
+        128,
+        "healthy peers must drain finite simultaneous response bursts; errors={}/{success} failed: {errors:?}",
+        errors.len()
     );
     assert!(later.is_ok(), "connection must resume after burst");
 }
@@ -132,5 +138,10 @@ async fn finite_inline_reply_burst_and_followup_complete() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn finite_inline_reply_burst_with_default_maintenance() {
+    run_burst(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn finite_inline_reply_burst_multi_thread() {
     run_burst(true).await;
 }

@@ -456,6 +456,17 @@ impl LocalStreamingQueue {
         self.pending_ask_nacks.pop_front()
     }
 
+    /// Put a NACK back at the head after a clean zero-byte write miss.
+    /// `drain_pending_ask_nacks` pops before attempting the write; if the
+    /// socket had no room, the header must return here so that ask still
+    /// has a terminal outcome.
+    fn requeue_ask_nack_front(
+        &mut self,
+        header: [u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN],
+    ) {
+        self.pending_ask_nacks.push_front(header);
+    }
+
     /// Whether any backpressure NACK is still queued and unwritten.
     /// `drain_pending_ask_nacks` consults this after every attempt so its
     /// caller (`io_task`) can tell outstanding NACK work from a genuinely

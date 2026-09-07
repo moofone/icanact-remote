@@ -160,3 +160,115 @@ async fn concurrent_enqueue_unblocks_on_close() {
             .expect("concurrent producer task panicked");
     }
 }
+
+struct QueuedPayloadOwner {
+    data: Vec<u8>,
+    drops: Arc<AtomicUsize>,
+}
+
+impl AsRef<[u8]> for QueuedPayloadOwner {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+impl Drop for QueuedPayloadOwner {
+    fn drop(&mut self) {
+        self.drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn stopped_writer_releases_queued_payloads_with_handle_retained() {
+    let (stream, peer) = tokio::io::duplex(1);
+    let (writer, task, _) = LockFreeStreamHandle::new(
+        stream,
+        "127.0.0.1:29880".parse().unwrap(),
+        ChannelId::TellAsk,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let drops = Arc::new(AtomicUsize::new(0));
+    let header =
+        crate::framing::try_write_ask_response_header(crate::MessageType::Response, 1, 1024)
+            .unwrap();
+    let mut accepted = 0usize;
+    for _ in 0..1024 {
+        writer
+            .write_header_and_payload_control_inline_nonblocking(
+                header,
+                16,
+                bytes::Bytes::from_owner(QueuedPayloadOwner {
+                    data: vec![0; 1024],
+                    drops: drops.clone(),
+                }),
+            )
+            .unwrap();
+        accepted += 1;
+    }
+    assert_eq!(accepted, 1024);
+    tokio::task::yield_now().await;
+    drop(peer);
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("writer IO task must exit after peer drop")
+        .expect("writer IO task must not panic");
+    let after_exit = drops.load(Ordering::SeqCst);
+    drop(writer);
+    let after_handle_drop = drops.load(Ordering::SeqCst);
+    assert_eq!(
+        after_exit, 1024,
+        "dead IO task must reclaim unsendable bodies even when callers retain its handle"
+    );
+    assert_eq!(after_handle_drop, 1024);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn thousand_dead_writers_reclaim_payloads_before_handle_drop() {
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut retained = Vec::new();
+    let header =
+        crate::framing::try_write_ask_response_header(crate::MessageType::Response, 1, 256).unwrap();
+    for cycle in 1..=1000 {
+        let (stream, peer) = tokio::io::duplex(1);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            stream,
+            "127.0.0.1:29882".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default().with_write_queue_capacity(128),
+            None,
+            None,
+        );
+        for _ in 0..128 {
+            writer
+                .write_header_and_payload_control_inline_nonblocking(
+                    header,
+                    16,
+                    bytes::Bytes::from_owner(QueuedPayloadOwner {
+                        data: vec![0; 256],
+                        drops: drops.clone(),
+                    }),
+                )
+                .unwrap();
+        }
+        tokio::task::yield_now().await;
+        drop(peer);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap_or_else(|_| panic!("writer {cycle} IO task must exit"))
+            .unwrap_or_else(|_| panic!("writer {cycle} IO task must not panic"));
+        retained.push(writer);
+    }
+    let before = drops.load(Ordering::SeqCst);
+    drop(retained);
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        128_000,
+        "all owners must eventually be released"
+    );
+    assert_eq!(
+        before, 128_000,
+        "closed sessions must release all payloads independent of retained handles"
+    );
+}

@@ -3241,6 +3241,124 @@ fn drain_pending_ask_nacks_reports_outstanding_work_past_the_per_turn_cap() {
     });
 }
 
+/// A full duplex must not drop a NACK that timed out before any byte went
+/// out. The header is requeued and written once the peer reads.
+#[test]
+fn drain_pending_ask_nacks_requeues_on_zero_byte_write_miss() {
+    run_multi_thread_test(async {
+        let mut queue = LocalStreamingQueue::new();
+        queue.queue_ask_nack(crate::framing::write_ask_nack_header(
+            0x51_E11D,
+            crate::framing::AskNackReason::Backpressure,
+        ));
+        assert_eq!(queue.pending_ask_nack_count(), 1);
+
+        let (mut server_half, mut client_half) = tokio::io::duplex(32);
+        tokio::io::AsyncWriteExt::write_all(&mut server_half, &[0xAAu8; 32])
+            .await
+            .expect("fill the duplex so the NACK write cannot start");
+
+        let bytes_written_counter = Arc::new(AtomicUsize::new(0));
+        let mut bytes_since_flush = 0usize;
+        let more_pending = drain_pending_ask_nacks(
+            &mut server_half,
+            &bytes_written_counter,
+            &mut bytes_since_flush,
+            &mut queue,
+        )
+        .await
+        .expect("a zero-byte miss is not a write error");
+        assert!(
+            more_pending,
+            "the unwritten NACK must remain outstanding work"
+        );
+        assert_eq!(
+            queue.pending_ask_nack_count(),
+            1,
+            "a zero-byte miss must requeue the header, not drop the ask's terminal outcome"
+        );
+        assert_eq!(bytes_written_counter.load(Ordering::Acquire), 0);
+
+        let mut filler = [0u8; 32];
+        tokio::io::AsyncReadExt::read_exact(&mut client_half, &mut filler)
+            .await
+            .expect("peer must drain the filler to make room");
+
+        let more_pending = drain_pending_ask_nacks(
+            &mut server_half,
+            &bytes_written_counter,
+            &mut bytes_since_flush,
+            &mut queue,
+        )
+        .await
+        .expect("draining after the peer made room must not error");
+        assert!(!more_pending);
+        assert_eq!(queue.pending_ask_nack_count(), 0);
+
+        let mut header = [0u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN];
+        tokio::io::AsyncReadExt::read_exact(&mut client_half, &mut header)
+            .await
+            .expect("the requeued NACK must reach the wire once the peer reads");
+        assert_eq!(
+            u32::from_be_bytes(header[4..8].try_into().unwrap()),
+            0x51_E11D
+        );
+        assert_eq!(
+            crate::framing::ask_nack_reason(&header[4..]),
+            Some(crate::framing::AskNackReason::Backpressure)
+        );
+
+        drop(server_half);
+        drop(client_half);
+    });
+}
+
+/// Overflow of `deferred_asks` must not grow `pending_ask_nacks` past
+/// `PENDING_ASK_NACK_CAP`. `queue_ask_nack` is unconditional; this helper is
+/// one of the callers that must check `has_room_for_ask_nack` first.
+#[test]
+fn park_deferred_ask_does_not_grow_nack_queue_past_cap() {
+    let pool = Arc::new(crate::AlignedBytesPool::default());
+    let ask = |id: u32| ReadIoResult::ActorAsk {
+        correlation_id: id,
+        actor_id: 1,
+        type_hash: 1,
+        payload: crate::AlignedBytes::from_pooled_slice(&[], pool.clone()),
+    };
+
+    let mut deferred = std::collections::VecDeque::new();
+    let mut queue = LocalStreamingQueue::new();
+    for i in 0..DEFERRED_ASK_CAP as u32 {
+        park_deferred_ask(&mut deferred, ask(i), &mut queue);
+    }
+    assert_eq!(deferred.len(), DEFERRED_ASK_CAP);
+    assert_eq!(queue.pending_ask_nack_count(), 0);
+
+    park_deferred_ask(&mut deferred, ask(1_000), &mut queue);
+    assert_eq!(deferred.len(), DEFERRED_ASK_CAP);
+    assert_eq!(queue.pending_ask_nack_count(), 1);
+
+    while queue.has_room_for_ask_nack() {
+        queue.queue_ask_nack(crate::framing::write_ask_nack_header(
+            2_000 + queue.pending_ask_nack_count() as u32,
+            crate::framing::AskNackReason::Backpressure,
+        ));
+    }
+    let nacks_at_cap = queue.pending_ask_nack_count();
+    assert!(!queue.has_room_for_ask_nack());
+    park_deferred_ask(&mut deferred, ask(3_000), &mut queue);
+    assert_eq!(
+        queue.pending_ask_nack_count(),
+        nacks_at_cap,
+        "deferred overflow must not grow pending_ask_nacks past PENDING_ASK_NACK_CAP"
+    );
+    assert_eq!(
+        deferred.len(),
+        DEFERRED_ASK_CAP + 1,
+        "the already-read ask is retained until NACK room exists"
+    );
+}
+
 /// P1: reproduces the reported deadlock shape end-to-end through the real
 /// `io_task`, not just the drain primitive above. Nine raw `ActorAsk` frames
 /// land in a single `write_all` so all nine are read and dispatched (each
