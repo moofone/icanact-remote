@@ -2295,8 +2295,9 @@ pub struct GossipState {
     pub actor_admissions_by_peer: HashMap<crate::PeerId, HashSet<String>>,
     /// Reverse index used to release per-peer admission capacity on removal.
     pub actor_admission_peer_by_name: HashMap<String, crate::PeerId>,
-    /// Running compact-FullSync admission charge (names + addresses + fixed
-    /// per-record slack). Charged under this mutex so concurrent local
+    /// Running compact-FullSync admission charge. Counts the same variable
+    /// fields that rkyv serializes (name, address, metadata) plus fixed slack
+    /// for peer_id/node_id/clock. Charged under this mutex so concurrent local
     /// registers and remote applies cannot each observe a fitting snapshot
     /// and then both commit. Incremental: no whole-registry clone/encode.
     compact_admission_bytes: usize,
@@ -2598,12 +2599,14 @@ impl GossipState {
         self.release_compact_snapshot(name);
     }
 
-    /// Bytes charged for one compact (metadata-stripped) name-bearing record.
-    /// Name + address dominate the long-name overflow case; the fixed slack
-    /// covers peer_id/node_id/clock/rkyv without cloning the whole snapshot.
+    /// Bytes charged for one compact name-bearing record. Includes metadata
+    /// because FullSync/delta encodings retain it (compact stripping happens
+    /// only as a later encode-time split). Name, address, and metadata are the
+    /// variable serialized fields; the fixed slack covers peer_id/node_id/clock.
     fn compact_record_charge(name: &str, location: &RemoteActorLocation) -> usize {
         name.len()
             .saturating_add(location.address.len())
+            .saturating_add(location.metadata.len())
             .saturating_add(64)
     }
 
@@ -34262,6 +34265,49 @@ mod tests {
             "expected MessageTooLarge, got {err:?}"
         );
         assert_eq!(registry.get_actor_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn qa_aggregate_metadata_is_charged_on_admission() {
+        let addr = test_addr(18_205);
+        let mut config = test_config();
+        config.max_message_size = 64 * 1024;
+        let registry = GossipRegistry::<()>::new(addr, config);
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
+        for i in 0..16 {
+            let mut loc = RemoteActorLocation::new_with_peer(addr, registry.peer_id.clone());
+            loc.metadata = vec![7; 8 * 1024];
+            match registry.register_actor(format!("meta-{i}"), loc).await {
+                Ok(()) => accepted += 1,
+                Err(GossipError::MessageTooLarge { .. }) => rejected += 1,
+                Err(err) => panic!("unexpected registration error: {err:?}"),
+            }
+        }
+        assert!(
+            accepted > 0,
+            "some metadata-bearing names must still register"
+        );
+        assert!(
+            rejected > 0,
+            "aggregate metadata must count against compact admission, accepted={accepted}"
+        );
+        let (local, known) = registry.snapshot_actor_pairs();
+        let msg = RegistryMessage::FullSync {
+            local_actors: local,
+            known_actors: known,
+            sender_peer_id: registry.peer_id.clone(),
+            sender_bind_addr: Some(addr.to_string()),
+            sequence: 1,
+            wall_clock_time: 0,
+            extensions: None,
+        };
+        assert!(
+            registry
+                .encode_outbound_gossip_for_inline_limit(&msg)
+                .is_ok(),
+            "accepted metadata-bearing state must remain replicable"
+        );
     }
 
     /// R3: packing must not reserialize the whole remaining snapshot per actor.
