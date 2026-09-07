@@ -1,6 +1,7 @@
 use crossbeam_queue::ArrayQueue;
 use std::ops::Deref;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use rkyv::util::AlignedVec;
@@ -11,6 +12,9 @@ pub const PAYLOAD_ALIGNMENT: usize = 16;
 pub const DEFAULT_ALIGNED_POOL_SIZE: usize = 64;
 pub const MAX_POOLED_ALIGNED_CAPACITY: usize = 8 * 1024 * 1024; // 8MB
 pub const DEFAULT_ALIGNED_BUFFER_CAPACITY: usize = 256;
+/// Idle retained-capacity budget for the aligned receive pool, shared by every
+/// connection on a registry. Caps high-water reuse after large-frame bursts.
+pub const DEFAULT_ALIGNED_POOL_BYTE_BUDGET: usize = 64 * 1024 * 1024;
 
 pub type AlignedBuffer = AlignedVec<PAYLOAD_ALIGNMENT>;
 
@@ -233,23 +237,81 @@ impl From<AlignedBytes> for Bytes {
 #[derive(Debug)]
 pub struct AlignedBytesPool {
     queue: ArrayQueue<AlignedBuffer>,
+    retained_bytes: AtomicUsize,
+    budget: usize,
 }
 
 impl AlignedBytesPool {
     pub fn new(pool_size: usize) -> Self {
-        let queue = ArrayQueue::new(pool_size);
-        for _ in 0..pool_size {
-            let _ = queue.push(AlignedBuffer::with_capacity(
-                DEFAULT_ALIGNED_BUFFER_CAPACITY,
-            ));
-        }
+        Self::new_with_budget(pool_size, DEFAULT_ALIGNED_POOL_BYTE_BUDGET)
+    }
 
-        Self { queue }
+    pub fn new_with_budget(pool_size: usize, budget: usize) -> Self {
+        let queue = ArrayQueue::new(pool_size.max(1));
+        let pool = Self {
+            queue,
+            retained_bytes: AtomicUsize::new(0),
+            budget,
+        };
+        for _ in 0..pool_size {
+            let buffer = AlignedBuffer::with_capacity(DEFAULT_ALIGNED_BUFFER_CAPACITY);
+            let cap = buffer.capacity();
+            if !pool.try_reserve(cap) {
+                break;
+            }
+            if pool.queue.push(buffer).is_err() {
+                pool.release_reservation(cap);
+                break;
+            }
+        }
+        pool
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        self.retained_bytes.load(Ordering::Acquire)
+    }
+
+    fn try_reserve(&self, bytes: usize) -> bool {
+        let mut current = self.retained_bytes.load(Ordering::Relaxed);
+        loop {
+            let Some(next) = current.checked_add(bytes) else {
+                return false;
+            };
+            if next > self.budget {
+                return false;
+            }
+            match self.retained_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn release_reservation(&self, bytes: usize) {
+        let mut current = self.retained_bytes.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_sub(bytes);
+            match self.retained_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// CRITICAL_PATH: acquire aligned buffer without extra allocations.
     pub fn get_buffer(&self, min_capacity: usize) -> AlignedBuffer {
         if let Some(mut buffer) = self.queue.pop() {
+            self.release_reservation(buffer.capacity());
             if buffer.capacity() < min_capacity {
                 buffer.reserve(min_capacity - buffer.len());
             }
@@ -265,11 +327,16 @@ impl AlignedBytesPool {
     /// CRITICAL_PATH: return aligned buffer to pool.
     pub fn return_buffer(&self, mut buffer: AlignedBuffer) {
         buffer.clear();
-
-        if buffer.capacity() > MAX_POOLED_ALIGNED_CAPACITY {
+        let cap = buffer.capacity();
+        if cap > MAX_POOLED_ALIGNED_CAPACITY {
             return;
         }
-        let _ = self.queue.push(buffer);
+        if !self.try_reserve(cap) {
+            return;
+        }
+        if self.queue.push(buffer).is_err() {
+            self.release_reservation(cap);
+        }
     }
 
     pub fn available_count(&self) -> usize {
@@ -395,5 +462,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn aligned_pool_idle_retention_respects_byte_budget() {
+        let budget = 4 * 1024 * 1024;
+        let pool = AlignedBytesPool::new_with_budget(1024, budget);
+        let mut held = Vec::new();
+        for _ in 0..32 {
+            let mut buf = pool.get_buffer(512 * 1024);
+            buf.resize(512 * 1024, 7);
+            held.push(buf);
+        }
+        drop(held);
+        assert!(
+            pool.retained_bytes() <= budget,
+            "idle aligned pool retained {} over budget {}",
+            pool.retained_bytes(),
+            budget
+        );
     }
 }

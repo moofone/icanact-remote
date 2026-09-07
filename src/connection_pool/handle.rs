@@ -113,7 +113,7 @@ impl<T> std::fmt::Debug for ConnectionHandle<T> {
 pub(crate) struct PendingAsk {
     correlation_id: u32,
     correlation: Arc<CorrelationTracker>,
-    timeout: Duration,
+    deadline: Instant,
     active: bool,
 }
 
@@ -124,9 +124,14 @@ impl PendingAsk {
 
     pub(crate) async fn wait(mut self) -> Result<bytes::Bytes> {
         let correlation_id = self.correlation_id;
-        let timeout = self.timeout;
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            self.correlation.cancel(self.correlation_id);
+            self.active = false;
+            return Err(crate::GossipError::Timeout);
+        }
         let correlation = Arc::clone(&self.correlation);
-        let result = correlation.wait_for_response(correlation_id, timeout).await;
+        let result = correlation.wait_for_response(correlation_id, remaining).await;
         self.active = false;
         result.map(crate::AlignedBytes::into_bytes)
     }
@@ -144,7 +149,7 @@ impl std::fmt::Debug for PendingAsk {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingAsk")
             .field("correlation_id", &self.correlation_id)
-            .field("timeout", &self.timeout)
+            .field("deadline", &self.deadline)
             .finish()
     }
 }
@@ -971,7 +976,7 @@ impl<T> ConnectionHandle<T> {
         let started_at = Instant::now();
         let slot = self.correlation.allocate()?;
         let correlation_id = slot.id();
-        let remaining = admit_ask_with_deadline(
+        let _remaining = admit_ask_with_deadline(
             timeout,
             started_at,
             self.write_routed_actor_ask(correlation_id, actor_id, type_hash, payload),
@@ -984,7 +989,7 @@ impl<T> ConnectionHandle<T> {
             // dropped without being awaited.
             correlation_id: slot.disarm(),
             correlation: self.correlation.clone(),
-            timeout: remaining,
+            deadline: started_at + timeout,
             active: true,
         })
     }
@@ -1448,7 +1453,8 @@ impl<T> ConnectionHandle<T> {
     /// Deferred ask using owned bytes and a custom timeout.
     ///
     /// The timeout starts at submission and covers write-queue admission.
-    /// Remaining time is stored on the returned handle for the later wait.
+    /// The returned handle stores an absolute deadline so a later `wait()`
+    /// cannot restart the budget.
     pub(crate) async fn ask_deferred_with_timeout_bytes(
         &self,
         request: bytes::Bytes,
@@ -1466,7 +1472,7 @@ impl<T> ConnectionHandle<T> {
             request.len(),
         )?;
 
-        let remaining = admit_ask_with_deadline(
+        let _remaining = admit_ask_with_deadline(
             timeout,
             started_at,
             self.write_header_and_payload_ask_inline(header, 16, request),
@@ -1479,7 +1485,7 @@ impl<T> ConnectionHandle<T> {
             // dropped without being awaited.
             correlation_id: slot.disarm(),
             correlation: self.correlation.clone(),
-            timeout: remaining,
+            deadline: started_at + timeout,
             active: true,
         })
     }
@@ -1540,7 +1546,7 @@ impl<T> ConnectionHandle<T> {
         // use the trusted lane, not the generic one, which would otherwise
         // reject a legitimately large batch on the same bare length ceiling
         // that protects arbitrary caller bytes.
-        let remaining = admit_ask_with_deadline(timeout, started_at, async {
+        let _remaining = admit_ask_with_deadline(timeout, started_at, async {
             if let Some(stream_handle) = self.stream_handle.as_ref() {
                 stream_handle
                     .write_trusted_bytes_ask(batch_message.freeze())
@@ -1560,7 +1566,7 @@ impl<T> ConnectionHandle<T> {
                 // is abandoned without being awaited.
                 correlation_id: slot.disarm(),
                 correlation: self.correlation.clone(),
-                timeout: remaining,
+                deadline: started_at + timeout,
                 active: true,
             })
             .collect();
