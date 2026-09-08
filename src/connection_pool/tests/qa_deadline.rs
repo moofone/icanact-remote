@@ -1,5 +1,3 @@
-use super::*;
-
 fn deadline_fixture() -> (
     Arc<LockFreeStreamHandle>,
     ConnectionHandle<()>,
@@ -203,8 +201,12 @@ async fn actor_ask_cancel_beyond_ring_capacity_still_admits() {
     let waker = futures::task::noop_waker();
     let mut cx = Context::from_waker(&waker);
     for _ in 0..(8192 + 1) {
-        let ask = conn.ask_actor_frame(1, 1, bytes::Bytes::new(), Duration::from_millis(10));
-        tokio::pin!(ask);
+        let mut ask = Box::pin(conn.ask_actor_frame(
+            1,
+            1,
+            bytes::Bytes::new(),
+            Duration::from_millis(10),
+        ));
         let polled = ask.as_mut().poll(&mut cx);
         assert!(
             matches!(polled, Poll::Pending),

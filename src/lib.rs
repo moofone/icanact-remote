@@ -9,7 +9,6 @@
     clippy::field_reassign_with_default,
     clippy::manual_is_multiple_of,
     clippy::needless_borrow,
-    clippy::needless_lifetimes,
     clippy::option_as_ref_deref,
     clippy::question_mark,
     clippy::too_many_arguments,

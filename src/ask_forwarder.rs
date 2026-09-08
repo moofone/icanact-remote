@@ -1,14 +1,18 @@
+use std::collections::VecDeque;
 use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
 use tokio::sync::mpsc;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::task::{AbortHandle, JoinHandle};
 
+use crate::ask_responder::TryReplyError;
 use crate::{AskResponder, GossipError, RemoteConnection, Result};
 
 struct ForwardTask {
@@ -17,19 +21,40 @@ struct ForwardTask {
     type_hash: u32,
     payload: Bytes,
     responder: AskResponder,
-    timeout: Option<Duration>,
-    use_combined_timeout: bool,
+    deadline: Option<Instant>,
     timeout_reply: Option<Bytes>,
     error_reply: Option<Bytes>,
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+struct WorkerControl {
+    closed: AtomicBool,
+    remaining: AtomicUsize,
+    done: Notify,
 }
 
 struct AskForwarderInner {
     workers: Vec<mpsc::Sender<ForwardTask>>,
     next_worker: AtomicUsize,
+    control: Arc<WorkerControl>,
+    abort_handles: Vec<AbortHandle>,
+    joins: Mutex<Vec<JoinHandle<()>>>,
+    permits: Arc<Semaphore>,
 }
 
 const MAX_INFLIGHT_PER_WORKER: usize = 16;
 
+/// Bounded local forwarding of actor asks onto a shared destination connection.
+///
+/// Timed methods establish one absolute deadline at admission. That budget
+/// covers worker-queue wait, destination admission/response, and a single
+/// nonblocking terminal-reply attempt after expiry. Enqueue success is not
+/// remote receipt. No-timeout forwards stay deadline-free but are cancelled
+/// when the last owner is dropped or [`AskForwarder::shutdown`] expires.
+///
+/// Final-owner drop aborts outstanding work without waiting; reclamation is
+/// executor-driven. Call [`AskForwarder::shutdown`] when the caller needs
+/// completion evidence. Dropping one clone leaves other live owners usable.
 #[derive(Clone)]
 pub struct AskForwarder {
     inner: Arc<AskForwarderInner>,
@@ -53,56 +78,72 @@ impl AskForwarder {
         let workers = workers.max(1);
         let capacity = capacity.max(128);
         let max_inflight = capacity.clamp(1, MAX_INFLIGHT_PER_WORKER);
+        let permit_limit = capacity.saturating_add(MAX_INFLIGHT_PER_WORKER);
+        let permits = Arc::new(Semaphore::new(permit_limit));
+        let control = Arc::new(WorkerControl {
+            closed: AtomicBool::new(false),
+            remaining: AtomicUsize::new(workers),
+            done: Notify::new(),
+        });
 
         let mut worker_senders = Vec::with_capacity(workers);
+        let mut abort_handles = Vec::with_capacity(workers);
+        let mut joins = Vec::with_capacity(workers);
         for _ in 0..workers {
-            let (tx, mut rx) = mpsc::channel::<ForwardTask>(capacity);
+            let (tx, rx) = mpsc::channel::<ForwardTask>(capacity);
             let worker_observer = completion_observer.clone();
-            let handle = tokio::spawn(async move {
-                let mut inflight = FuturesUnordered::new();
-                let mut rx_closed = false;
-
-                loop {
-                    while inflight.len() < max_inflight {
-                        match rx.try_recv() {
-                            Ok(task) => inflight.push(Box::pin(run_forward_task_isolated(task))),
-                            Err(mpsc::error::TryRecvError::Empty) => break,
-                            Err(mpsc::error::TryRecvError::Disconnected) => {
-                                rx_closed = true;
-                                break;
-                            }
-                        }
-                    }
-
-                    if rx_closed && inflight.is_empty() {
-                        break;
-                    }
-
-                    tokio::select! {
-                        maybe_task = rx.recv(), if can_receive_more(rx_closed, inflight.len(), max_inflight) => {
-                            match maybe_task {
-                                Some(task) => inflight.push(Box::pin(run_forward_task_isolated(task))),
-                                None => rx_closed = true,
-                            }
-                        }
-                        Some(completed) = inflight.next(), if !inflight.is_empty() => {
-                            if let Some(completed) = completed {
-                                handle_completed_forward(completed, worker_observer.as_deref());
-                            }
-                        }
-                    }
-                }
-            });
+            let worker_control = control.clone();
+            let handle = tokio::spawn(run_forward_worker(
+                rx,
+                worker_observer,
+                worker_control,
+                max_inflight,
+            ));
+            abort_handles.push(handle.abort_handle());
+            joins.push(handle);
             worker_senders.push(tx);
-            std::mem::drop(handle);
         }
 
         let inner = Arc::new(AskForwarderInner {
             workers: worker_senders,
             next_worker: AtomicUsize::new(0),
+            control,
+            abort_handles,
+            joins: Mutex::new(joins),
+            permits,
         });
 
         Self { inner }
+    }
+
+    /// Close admission, drain until `grace`, then abort remaining work and
+    /// wait for workers to finish. Repeated calls observe the same terminal
+    /// state. A timeout is returned as [`GossipError::Timeout`] rather than
+    /// success.
+    pub async fn shutdown(&self, grace: Duration) -> Result<()> {
+        self.inner.control.closed.store(true, Ordering::Release);
+        if wait_for_workers(&self.inner.control, grace).await {
+            return Ok(());
+        }
+        for handle in &self.inner.abort_handles {
+            handle.abort();
+        }
+        let joins = {
+            let mut guard = self
+                .inner
+                .joins
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            std::mem::take(&mut *guard)
+        };
+        for join in joins {
+            let _ = join.await;
+        }
+        if wait_for_workers(&self.inner.control, Duration::from_secs(2)).await {
+            Ok(())
+        } else {
+            Err(GossipError::Timeout)
+        }
     }
 
     pub fn try_forward_actor_ask_no_timeout(
@@ -119,13 +160,16 @@ impl AskForwarder {
             type_hash,
             payload,
             responder,
-            timeout: None,
-            use_combined_timeout: false,
+            deadline: None,
             timeout_reply: None,
             error_reply: None,
+            _permit: None,
         })
     }
 
+    /// Forward with a destination timeout. The duration is converted to an
+    /// absolute deadline at this call; queue wait, destination wait, and
+    /// reply handoff share that budget.
     pub fn try_forward_actor_ask_with_timeout(
         &self,
         destination: RemoteConnection,
@@ -137,19 +181,22 @@ impl AskForwarder {
         timeout_reply: Bytes,
         error_reply: Bytes,
     ) -> Result<()> {
+        let deadline = admission_deadline(timeout);
         self.try_send_task(ForwardTask {
             destination,
             actor_id,
             type_hash,
             payload,
             responder,
-            timeout: Some(timeout),
-            use_combined_timeout: false,
+            deadline: Some(deadline),
             timeout_reply: Some(timeout_reply),
             error_reply: Some(error_reply),
+            _permit: None,
         })
     }
 
+    /// Forward with a combined destination+response timeout. Same admission
+    /// deadline contract as [`Self::try_forward_actor_ask_with_timeout`].
     pub fn try_forward_actor_ask_combined_timeout(
         &self,
         destination: RemoteConnection,
@@ -161,20 +208,31 @@ impl AskForwarder {
         timeout_reply: Bytes,
         error_reply: Bytes,
     ) -> Result<()> {
+        let deadline = admission_deadline(timeout);
         self.try_send_task(ForwardTask {
             destination,
             actor_id,
             type_hash,
             payload,
             responder,
-            timeout: Some(timeout),
-            use_combined_timeout: true,
+            deadline: Some(deadline),
             timeout_reply: Some(timeout_reply),
             error_reply: Some(error_reply),
+            _permit: None,
         })
     }
 
-    fn try_send_task(&self, task: ForwardTask) -> Result<()> {
+    fn try_send_task(&self, mut task: ForwardTask) -> Result<()> {
+        if self.inner.control.closed.load(Ordering::Acquire) {
+            return Err(GossipError::Shutdown);
+        }
+        let permit = self
+            .inner
+            .permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| GossipError::WriteQueueFull)?;
+        task._permit = Some(permit);
         let worker_count = self.inner.workers.len();
         let worker_idx = self.inner.next_worker.fetch_add(1, Ordering::Relaxed) % worker_count;
         self.inner.workers[worker_idx]
@@ -187,14 +245,196 @@ impl AskForwarder {
     }
 }
 
+impl Drop for AskForwarderInner {
+    fn drop(&mut self) {
+        self.control.closed.store(true, Ordering::Release);
+        for handle in &self.abort_handles {
+            handle.abort();
+        }
+    }
+}
+
 enum ForwardOutcome {
     Success,
     Timeout,
     Error,
+    ReplyUndeliverable,
 }
 
-fn can_receive_more(rx_closed: bool, inflight_len: usize, max_inflight: usize) -> bool {
-    !rx_closed && inflight_len < max_inflight
+fn admission_deadline(timeout: Duration) -> Instant {
+    // A zero duration is already expired: enqueue it so the worker delivers
+    // `timeout_reply` without sending a destination ask, matching the prior
+    // queued-timeout contract.
+    if timeout.is_zero() {
+        Instant::now()
+    } else {
+        saturating_deadline(Instant::now(), timeout)
+    }
+}
+
+fn saturating_deadline(started_at: Instant, timeout: Duration) -> Instant {
+    if let Some(deadline) = started_at.checked_add(timeout) {
+        return deadline;
+    }
+    let mut nanos = timeout.as_nanos();
+    while nanos > 0 {
+        let chunk = u64::try_from(nanos).unwrap_or(u64::MAX);
+        if let Some(deadline) = started_at.checked_add(Duration::from_nanos(chunk)) {
+            return deadline;
+        }
+        nanos /= 2;
+    }
+    started_at
+}
+
+fn remaining_until(deadline: Instant) -> Duration {
+    deadline.saturating_duration_since(Instant::now())
+}
+
+async fn wait_for_workers(control: &WorkerControl, grace: Duration) -> bool {
+    let sleep = tokio::time::sleep(grace);
+    tokio::pin!(sleep);
+    loop {
+        if control.remaining.load(Ordering::Acquire) == 0 {
+            return true;
+        }
+        let notified = control.done.notified();
+        tokio::select! {
+            _ = notified => {}
+            _ = &mut sleep => {
+                return control.remaining.load(Ordering::Acquire) == 0;
+            }
+        }
+    }
+}
+
+struct WorkerExit {
+    control: Arc<WorkerControl>,
+}
+
+impl Drop for WorkerExit {
+    fn drop(&mut self) {
+        if self.control.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.control.done.notify_waiters();
+        }
+    }
+}
+
+async fn run_forward_worker(
+    mut rx: mpsc::Receiver<ForwardTask>,
+    worker_observer: Option<Arc<dyn AskForwardObserver>>,
+    control: Arc<WorkerControl>,
+    max_inflight: usize,
+) {
+    let _exit = WorkerExit {
+        control: control.clone(),
+    };
+    let mut inflight = FuturesUnordered::new();
+    let mut waiting: VecDeque<ForwardTask> = VecDeque::new();
+    let mut rx_closed = false;
+
+    loop {
+        if control.closed.load(Ordering::Acquire) && waiting.is_empty() && inflight.is_empty() {
+            rx.close();
+            rx_closed = true;
+        }
+        expire_waiting(&mut waiting, worker_observer.as_deref());
+        dispatch_waiting(
+            &mut waiting,
+            &mut inflight,
+            max_inflight,
+            worker_observer.as_deref(),
+        );
+
+        if rx_closed && waiting.is_empty() && inflight.is_empty() {
+            break;
+        }
+
+        let earliest = earliest_deadline(&waiting);
+        tokio::select! {
+            maybe_task = rx.recv() => {
+                match maybe_task {
+                    Some(task) => waiting.push_back(task),
+                    None => rx_closed = true,
+                }
+            }
+            Some(completed) = inflight.next(), if !inflight.is_empty() => {
+                if let Some(completed) = completed {
+                    handle_completed_forward(completed, worker_observer.as_deref());
+                }
+            }
+            _ = sleep_until_deadline(earliest), if earliest.is_some() => {}
+        }
+    }
+}
+
+fn earliest_deadline(waiting: &VecDeque<ForwardTask>) -> Option<Instant> {
+    waiting.iter().filter_map(|task| task.deadline).min()
+}
+
+async fn sleep_until_deadline(deadline: Option<Instant>) {
+    let Some(deadline) = deadline else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    let wait = remaining_until(deadline);
+    if wait.is_zero() {
+        return;
+    }
+    tokio::time::sleep(wait).await;
+}
+
+fn expire_waiting(waiting: &mut VecDeque<ForwardTask>, observer: Option<&dyn AskForwardObserver>) {
+    let now = Instant::now();
+    let mut index = 0usize;
+    while index < waiting.len() {
+        if waiting[index]
+            .deadline
+            .is_some_and(|deadline| deadline <= now)
+        {
+            let task = waiting.remove(index).expect("index in range");
+            complete_expired_queued(task, observer);
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn dispatch_waiting(
+    waiting: &mut VecDeque<ForwardTask>,
+    inflight: &mut FuturesUnordered<
+        std::pin::Pin<Box<dyn std::future::Future<Output = Option<ForwardOutcome>> + Send>>,
+    >,
+    max_inflight: usize,
+    observer: Option<&dyn AskForwardObserver>,
+) {
+    while inflight.len() < max_inflight {
+        let Some(task) = waiting.pop_front() else {
+            break;
+        };
+        if task
+            .deadline
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
+            complete_expired_queued(task, observer);
+            continue;
+        }
+        inflight.push(Box::pin(run_forward_task_isolated(task)));
+    }
+}
+
+fn complete_expired_queued(task: ForwardTask, observer: Option<&dyn AskForwardObserver>) {
+    let outcome = if let Some(reply) = task.timeout_reply.clone() {
+        if try_deliver_terminal_reply(task.responder, reply) {
+            ForwardOutcome::Timeout
+        } else {
+            ForwardOutcome::ReplyUndeliverable
+        }
+    } else {
+        drop(task.responder);
+        ForwardOutcome::Timeout
+    };
+    handle_completed_forward(outcome, observer);
 }
 
 /// ACTOR_REM_2 R16k: isolate a panicking forwarded-ask future so it kills only
@@ -212,53 +452,113 @@ async fn run_forward_task_isolated(task: ForwardTask) -> Option<ForwardOutcome> 
 }
 
 /// Runs the forward and delivers its reply before resolving. Delivery is
-/// awaited here, inside the same future the worker's `inflight` set tracks,
-/// rather than handed to a detached task — a claimed reply guard is only
-/// ever released once delivery has actually completed (sent inline or
-/// retried to completion), never left pending on an untracked task that
-/// could go unpolled if the forward's own future were dropped.
+/// awaited here, inside the same future the worker's `inflight` set tracks.
+/// Timed work uses the admission deadline; expiry never restarts the original
+/// duration and reply handoff after the deadline is a single nonblocking try.
 async fn run_forward_task(task: ForwardTask) -> ForwardOutcome {
-    let response = match task.timeout {
-        Some(timeout) if task.use_combined_timeout => {
-            task.destination
-                .ask_actor_frame(task.actor_id, task.type_hash, task.payload, timeout)
+    if let Some(deadline) = task.deadline
+        && remaining_until(deadline).is_zero()
+    {
+        return terminal_timeout(task);
+    }
+
+    let remaining = task.deadline.map(remaining_until);
+    let destination = task.destination.clone();
+    let actor_id = task.actor_id;
+    let type_hash = task.type_hash;
+    let payload = task.payload.clone();
+    // Timed forwards always use `ask_actor_frame` so one SlotGuard covers
+    // identify-gate wait, write-queue admission, and the response wait.
+    // Timeout/cancel drops that guard and unregisters the correlation before
+    // returning `GossipError::Timeout`.
+    let response = match remaining {
+        Some(timeout) => {
+            destination
+                .ask_actor_frame(actor_id, type_hash, payload, timeout)
                 .await
         }
-        Some(timeout) => tokio::time::timeout(
-            timeout,
-            task.destination.ask_actor_frame_no_timeout(
-                task.actor_id,
-                task.type_hash,
-                task.payload,
-            ),
-        )
-        .await
-        .map_err(|_| GossipError::Timeout)
-        .and_then(|reply| reply),
         None => {
-            task.destination
-                .ask_actor_frame_no_timeout(task.actor_id, task.type_hash, task.payload)
+            destination
+                .ask_actor_frame_no_timeout(actor_id, type_hash, payload)
                 .await
         }
     };
 
     match response {
-        Ok(reply) => {
-            deliver_forwarded_reply(task.responder, reply).await;
-            ForwardOutcome::Success
-        }
-        Err(GossipError::Timeout) => {
-            if let Some(reply) = task.timeout_reply {
-                deliver_forwarded_reply(task.responder, reply).await;
-            }
-            ForwardOutcome::Timeout
-        }
+        Ok(reply) => deliver_result_reply(task, reply, ForwardOutcome::Success).await,
+        Err(GossipError::Timeout) => terminal_timeout(task),
         Err(_) => {
-            if let Some(reply) = task.error_reply {
-                deliver_forwarded_reply(task.responder, reply).await;
+            if let Some(reply) = task.error_reply.clone() {
+                deliver_result_reply(task, reply, ForwardOutcome::Error).await
+            } else {
+                ForwardOutcome::Error
             }
-            ForwardOutcome::Error
         }
+    }
+}
+
+fn terminal_timeout(task: ForwardTask) -> ForwardOutcome {
+    if let Some(reply) = task.timeout_reply {
+        if try_deliver_terminal_reply(task.responder, reply) {
+            ForwardOutcome::Timeout
+        } else {
+            ForwardOutcome::ReplyUndeliverable
+        }
+    } else {
+        ForwardOutcome::Timeout
+    }
+}
+
+async fn deliver_result_reply(
+    task: ForwardTask,
+    reply: Bytes,
+    success: ForwardOutcome,
+) -> ForwardOutcome {
+    match task.deadline {
+        None => {
+            deliver_forwarded_reply(task.responder, reply).await;
+            success
+        }
+        Some(deadline) => {
+            let remaining = remaining_until(deadline);
+            if remaining.is_zero() {
+                if try_deliver_terminal_reply(task.responder, reply) {
+                    success
+                } else {
+                    ForwardOutcome::ReplyUndeliverable
+                }
+            } else {
+                match tokio::time::timeout(
+                    remaining,
+                    deliver_forwarded_reply_outcome(task.responder, reply),
+                )
+                .await
+                {
+                    Ok(true) => success,
+                    Ok(false) => ForwardOutcome::ReplyUndeliverable,
+                    Err(_) => ForwardOutcome::ReplyUndeliverable,
+                }
+            }
+        }
+    }
+}
+
+async fn deliver_forwarded_reply_outcome(responder: AskResponder, reply: Bytes) -> bool {
+    match responder.reply_bytes_guaranteed(reply).await {
+        Ok(()) => true,
+        Err(err) if is_duplicate_reply_claim(&err) => true,
+        Err(err) => {
+            tracing::warn!(error = %err, "forwarded ask reply delivery failed");
+            false
+        }
+    }
+}
+
+fn try_deliver_terminal_reply(responder: AskResponder, reply: Bytes) -> bool {
+    match responder.try_reply_bytes_with_fallback(reply) {
+        Ok(()) => true,
+        Err(TryReplyError::ClaimUnavailable(_)) => false,
+        Err(TryReplyError::Enqueue(_)) => false,
     }
 }
 
@@ -271,7 +571,9 @@ fn handle_completed_forward(
     };
     match outcome {
         ForwardOutcome::Success => observer.record_success(),
-        ForwardOutcome::Timeout | ForwardOutcome::Error => observer.record_error(),
+        ForwardOutcome::Timeout | ForwardOutcome::Error | ForwardOutcome::ReplyUndeliverable => {
+            observer.record_error()
+        }
     }
 }
 
@@ -281,14 +583,7 @@ fn handle_completed_forward(
 /// handed to a completed, guaranteed retry. See
 /// [`AskResponder::reply_bytes_guaranteed`] for the delivery/claim contract.
 async fn deliver_forwarded_reply(responder: AskResponder, reply: Bytes) {
-    if let Err(err) = responder.reply_bytes_guaranteed(reply).await {
-        if !is_duplicate_reply_claim(&err) {
-            tracing::warn!(
-                error = %err,
-                "forwarded ask reply delivery failed"
-            );
-        }
-    }
+    let _ = deliver_forwarded_reply_outcome(responder, reply).await;
 }
 
 /// True when `err` is the single-use guard's duplicate-claim rejection
@@ -301,30 +596,6 @@ fn is_duplicate_reply_claim(err: &GossipError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn receive_guard_disables_reads_at_inflight_limit() {
-        assert!(can_receive_more(
-            false,
-            MAX_INFLIGHT_PER_WORKER - 1,
-            MAX_INFLIGHT_PER_WORKER
-        ));
-        assert!(!can_receive_more(
-            false,
-            MAX_INFLIGHT_PER_WORKER,
-            MAX_INFLIGHT_PER_WORKER
-        ));
-        assert!(!can_receive_more(
-            false,
-            MAX_INFLIGHT_PER_WORKER + 1,
-            MAX_INFLIGHT_PER_WORKER
-        ));
-    }
-
-    #[test]
-    fn receive_guard_disables_reads_after_channel_closes() {
-        assert!(!can_receive_more(true, 0, MAX_INFLIGHT_PER_WORKER));
-    }
 
     use crate::connection_pool::{BufferConfig, ChannelId, LockFreeStreamHandle};
     use std::sync::atomic::AtomicBool;
@@ -558,5 +829,11 @@ mod tests {
         );
 
         let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+
+    #[test]
+    fn zero_duration_is_an_already_expired_deadline() {
+        let deadline = admission_deadline(Duration::ZERO);
+        assert!(deadline <= Instant::now());
     }
 }

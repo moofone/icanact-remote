@@ -8033,6 +8033,7 @@ impl<T: 'static> GossipRegistry<T> {
             })
     }
 
+    #[cfg(test)]
     fn registry_message_actor_bytes(msg: &RegistryMessage) -> u64 {
         fn pair_bytes(actors: &[(String, RemoteActorLocation)]) -> u64 {
             actors
@@ -8220,7 +8221,7 @@ impl<T: 'static> GossipRegistry<T> {
                 current_sequence,
                 wall_clock_time,
                 precise_timing_nanos,
-                extensions.clone(),
+                extensions,
                 as_response,
             ))
         };
@@ -8352,7 +8353,7 @@ impl<T: 'static> GossipRegistry<T> {
                         sender_bind_addr: sender_bind_addr.clone(),
                         sequence: *sequence,
                         wall_clock_time: *wall_clock_time,
-                        extensions: extensions.clone(),
+                        extensions: *extensions,
                     },
                     _ => RegistryMessage::FullSync {
                         local_actors: compact_local,
@@ -8361,7 +8362,7 @@ impl<T: 'static> GossipRegistry<T> {
                         sender_bind_addr: sender_bind_addr.clone(),
                         sequence: *sequence,
                         wall_clock_time: *wall_clock_time,
-                        extensions: extensions.clone(),
+                        extensions: *extensions,
                     },
                 };
                 let compact_encoded = Self::encode_registry_message(&compact)?;
@@ -8383,7 +8384,7 @@ impl<T: 'static> GossipRegistry<T> {
                         *sequence,
                         *wall_clock_time,
                         crate::current_timestamp_nanos(),
-                        extensions.clone(),
+                        *extensions,
                         max_message_size,
                         matches!(message, RegistryMessage::FullSyncResponse { .. }),
                     )?);
@@ -8407,7 +8408,7 @@ impl<T: 'static> GossipRegistry<T> {
                     delta.current_sequence,
                     delta.wall_clock_time,
                     delta.precise_timing_nanos,
-                    extensions.clone(),
+                    *extensions,
                     max_message_size,
                     matches!(message, RegistryMessage::DeltaGossipResponse { .. }),
                 )
@@ -14569,7 +14570,7 @@ mod tests {
         config.actor_ttl = Duration::ZERO;
         let reg = GossipRegistry::<()>::new(test_addr(7400), config);
         for n in 0..32 {
-            let peer = KeyPair::new_for_testing(&format!("qa-route-{n}")).peer_id();
+            let peer = KeyPair::new_for_testing(format!("qa-route-{n}")).peer_id();
             let addr = format!("127.0.0.1:{}", 9400 + n).parse().unwrap();
             let mut actors = HashMap::new();
             actors.insert(

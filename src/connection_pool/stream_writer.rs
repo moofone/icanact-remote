@@ -608,6 +608,16 @@ enum PendingOrdinaryWrite {
     Buf {
         buf: Box<dyn bytes::Buf + Send>,
     },
+    /// A 16-byte ask NACK popped from `pending_ask_nacks`. Offset is retained
+    /// across owner turns so a partial header is never restarted or interleaved.
+    AskNack {
+        header: [u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN],
+        offset: usize,
+    },
+}
+
+fn pending_ask_nack_occupancy(pending: &Option<PendingOrdinaryWrite>) -> usize {
+    usize::from(matches!(pending, Some(PendingOrdinaryWrite::AskNack { .. })))
 }
 
 /// Park `batch` as a one-poll `PendingOrdinaryWrite::Chunks` so the IO loop
@@ -684,6 +694,9 @@ fn pending_ordinary_write_retained_bytes(pending: &Option<PendingOrdinaryWrite>)
             .sum::<usize>()
             .saturating_sub(*offset),
         Some(PendingOrdinaryWrite::Buf { buf }) => buf.remaining(),
+        Some(PendingOrdinaryWrite::AskNack { header, offset }) => {
+            header.len().saturating_sub(*offset)
+        }
     }
 }
 
@@ -870,6 +883,22 @@ where
             )
             .await
         }
+        PendingOrdinaryWrite::AskNack { header, offset } => {
+            let mut header_off = *offset;
+            let mut payload_off = 0usize;
+            let progress = write_header_payload_once(
+                stream,
+                header,
+                &mut header_off,
+                &[],
+                &mut payload_off,
+                stream_write_wedged_since,
+                stream_flush_wedged_since,
+            )
+            .await;
+            *offset = header_off;
+            progress
+        }
     }
 }
 
@@ -940,6 +969,32 @@ where
     }
 }
 
+/// One `poll_write`/`poll_write_vectored`. `Pending` keeps the task waker
+/// registered so the owner can park instead of spinning.
+fn poll_vectored<S>(
+    stream: &mut S,
+    slices: &[std::io::IoSlice<'_>],
+    cx: &mut Context<'_>,
+) -> Poll<OrdinaryWriteProgress>
+where
+    S: AsyncWrite + Unpin,
+{
+    let Some(first) = slices.iter().find(|slice| !slice.is_empty()) else {
+        return Poll::Ready(OrdinaryWriteProgress::Complete(0));
+    };
+    let poll = if stream.is_write_vectored() {
+        Pin::new(&mut *stream).poll_write_vectored(cx, slices)
+    } else {
+        Pin::new(&mut *stream).poll_write(cx, first.as_ref())
+    };
+    match poll {
+        Poll::Ready(Ok(0)) => Poll::Ready(OrdinaryWriteProgress::Failed),
+        Poll::Ready(Ok(n)) => Poll::Ready(OrdinaryWriteProgress::Partial(n)),
+        Poll::Ready(Err(_)) => Poll::Ready(OrdinaryWriteProgress::Failed),
+        Poll::Pending => Poll::Pending,
+    }
+}
+
 /// One `poll_write`/`poll_write_vectored` with no wait. `Pending` becomes
 /// `Partial(0)` so the IO loop can NACK readable asks instead of sitting in
 /// `STREAM_WRITE_SLICE_TIMEOUT` while a non-reading peer's duplex is full.
@@ -950,21 +1005,9 @@ async fn poll_vectored_nowait<S>(
 where
     S: AsyncWrite + Unpin,
 {
-    let Some(first) = slices.iter().find(|slice| !slice.is_empty()) else {
-        return OrdinaryWriteProgress::Complete(0);
-    };
-    std::future::poll_fn(|cx| {
-        let poll = if stream.is_write_vectored() {
-            Pin::new(&mut *stream).poll_write_vectored(cx, slices)
-        } else {
-            Pin::new(&mut *stream).poll_write(cx, first.as_ref())
-        };
-        Poll::Ready(match poll {
-            Poll::Ready(Ok(0)) => OrdinaryWriteProgress::Failed,
-            Poll::Ready(Ok(n)) => OrdinaryWriteProgress::Partial(n),
-            Poll::Ready(Err(_)) => OrdinaryWriteProgress::Failed,
-            Poll::Pending => OrdinaryWriteProgress::Partial(0),
-        })
+    std::future::poll_fn(|cx| match poll_vectored(stream, slices, cx) {
+        Poll::Pending => Poll::Ready(OrdinaryWriteProgress::Partial(0)),
+        ready => ready,
     })
     .await
 }
@@ -1037,7 +1080,210 @@ where
             }
         }
         PendingOrdinaryWrite::Buf { buf } => poll_generic_buf_nowait(stream, buf).await,
+        PendingOrdinaryWrite::AskNack { header, offset } => {
+            if *offset >= header.len() {
+                return OrdinaryWriteProgress::Complete(0);
+            }
+            match poll_vectored_nowait(
+                stream,
+                &[std::io::IoSlice::new(&header[*offset..])],
+            )
+            .await
+            {
+                OrdinaryWriteProgress::Partial(0) => OrdinaryWriteProgress::Partial(0),
+                OrdinaryWriteProgress::Partial(n) | OrdinaryWriteProgress::Complete(n) => {
+                    *offset += n;
+                    if *offset >= header.len() {
+                        OrdinaryWriteProgress::Complete(n)
+                    } else {
+                        OrdinaryWriteProgress::Partial(n)
+                    }
+                }
+                OrdinaryWriteProgress::Failed => OrdinaryWriteProgress::Failed,
+            }
+        }
     }
+}
+
+fn poll_header_payload<S>(
+    stream: &mut S,
+    header: &[u8],
+    header_off: &mut usize,
+    payload: &[u8],
+    payload_off: &mut usize,
+    cx: &mut Context<'_>,
+) -> Poll<OrdinaryWriteProgress>
+where
+    S: AsyncWrite + Unpin,
+{
+    let header_len = header.len();
+    if *header_off >= header_len && *payload_off >= payload.len() {
+        return Poll::Ready(OrdinaryWriteProgress::Complete(0));
+    }
+    let h = if *header_off < header_len {
+        &header[*header_off..]
+    } else {
+        &[]
+    };
+    let p = if *payload_off < payload.len() {
+        &payload[*payload_off..]
+    } else {
+        &[]
+    };
+    let mut slices = [std::io::IoSlice::new(h), std::io::IoSlice::new(p)];
+    let slice_count = if h.is_empty() {
+        slices[0] = std::io::IoSlice::new(p);
+        1
+    } else if p.is_empty() {
+        1
+    } else {
+        2
+    };
+    match poll_vectored(stream, &slices[..slice_count], cx) {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(OrdinaryWriteProgress::Partial(0)) => {
+            Poll::Ready(OrdinaryWriteProgress::Partial(0))
+        }
+        Poll::Ready(OrdinaryWriteProgress::Partial(n) | OrdinaryWriteProgress::Complete(n)) => {
+            advance_header_payload_offset(header_len, header_off, payload_off, n);
+            if *header_off >= header_len && *payload_off >= payload.len() {
+                Poll::Ready(OrdinaryWriteProgress::Complete(n))
+            } else {
+                Poll::Ready(OrdinaryWriteProgress::Partial(n))
+            }
+        }
+        Poll::Ready(OrdinaryWriteProgress::Failed) => Poll::Ready(OrdinaryWriteProgress::Failed),
+    }
+}
+
+fn poll_pending_ordinary<S>(
+    stream: &mut S,
+    pending: &mut PendingOrdinaryWrite,
+    cx: &mut Context<'_>,
+) -> Poll<OrdinaryWriteProgress>
+where
+    S: AsyncWrite + Unpin,
+{
+    match pending {
+        PendingOrdinaryWrite::HeaderInline {
+            header,
+            header_len,
+            payload,
+            header_off,
+            payload_off,
+        } => poll_header_payload(
+            stream,
+            &header[..*header_len],
+            header_off,
+            payload.as_ref(),
+            payload_off,
+            cx,
+        ),
+        PendingOrdinaryWrite::HeaderInlineAligned {
+            header,
+            header_len,
+            payload,
+            header_off,
+            payload_off,
+        } => poll_header_payload(
+            stream,
+            &header[..*header_len],
+            header_off,
+            payload.as_ref(),
+            payload_off,
+            cx,
+        ),
+        PendingOrdinaryWrite::Chunks { chunks, offset } => {
+            let total: usize = chunks.iter().map(|chunk| chunk.len()).sum();
+            if *offset >= total {
+                return Poll::Ready(OrdinaryWriteProgress::Complete(0));
+            }
+            let (index, chunk_off) = skip_written_chunks(chunks, *offset);
+            if index >= chunks.len() {
+                return Poll::Ready(OrdinaryWriteProgress::Complete(0));
+            }
+            let first = &chunks[index][chunk_off..];
+            let rest = &chunks[index + 1..];
+            let mut storage: Vec<std::io::IoSlice<'_>> = Vec::with_capacity(1 + rest.len());
+            storage.push(std::io::IoSlice::new(first));
+            storage.extend(rest.iter().map(|chunk| std::io::IoSlice::new(chunk)));
+            match poll_vectored(stream, &storage, cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(OrdinaryWriteProgress::Partial(0)) => {
+                    Poll::Ready(OrdinaryWriteProgress::Partial(0))
+                }
+                Poll::Ready(OrdinaryWriteProgress::Partial(n) | OrdinaryWriteProgress::Complete(n)) => {
+                    *offset += n;
+                    if *offset >= total {
+                        Poll::Ready(OrdinaryWriteProgress::Complete(n))
+                    } else {
+                        Poll::Ready(OrdinaryWriteProgress::Partial(n))
+                    }
+                }
+                Poll::Ready(OrdinaryWriteProgress::Failed) => {
+                    Poll::Ready(OrdinaryWriteProgress::Failed)
+                }
+            }
+        }
+        PendingOrdinaryWrite::Buf { buf } => {
+            if !buf.has_remaining() {
+                return Poll::Ready(OrdinaryWriteProgress::Complete(0));
+            }
+            let n = {
+                let chunk = buf.chunk();
+                match poll_vectored(stream, &[std::io::IoSlice::new(chunk)], cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(OrdinaryWriteProgress::Partial(0)) => {
+                        return Poll::Ready(OrdinaryWriteProgress::Partial(0))
+                    }
+                    Poll::Ready(OrdinaryWriteProgress::Partial(n) | OrdinaryWriteProgress::Complete(n)) => {
+                        n
+                    }
+                    Poll::Ready(OrdinaryWriteProgress::Failed) => {
+                        return Poll::Ready(OrdinaryWriteProgress::Failed)
+                    }
+                }
+            };
+            buf.advance(n);
+            if buf.has_remaining() {
+                Poll::Ready(OrdinaryWriteProgress::Partial(n))
+            } else {
+                Poll::Ready(OrdinaryWriteProgress::Complete(n))
+            }
+        }
+        PendingOrdinaryWrite::AskNack { header, offset } => {
+            if *offset >= header.len() {
+                return Poll::Ready(OrdinaryWriteProgress::Complete(0));
+            }
+            match poll_vectored(stream, &[std::io::IoSlice::new(&header[*offset..])], cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(OrdinaryWriteProgress::Partial(0)) => {
+                    Poll::Ready(OrdinaryWriteProgress::Partial(0))
+                }
+                Poll::Ready(OrdinaryWriteProgress::Partial(n) | OrdinaryWriteProgress::Complete(n)) => {
+                    *offset += n;
+                    if *offset >= header.len() {
+                        Poll::Ready(OrdinaryWriteProgress::Complete(n))
+                    } else {
+                        Poll::Ready(OrdinaryWriteProgress::Partial(n))
+                    }
+                }
+                Poll::Ready(OrdinaryWriteProgress::Failed) => {
+                    Poll::Ready(OrdinaryWriteProgress::Failed)
+                }
+            }
+        }
+    }
+}
+
+async fn wait_pending_ordinary<S>(
+    stream: &mut S,
+    pending: &mut PendingOrdinaryWrite,
+) -> OrdinaryWriteProgress
+where
+    S: AsyncWrite + Unpin,
+{
+    std::future::poll_fn(|cx| poll_pending_ordinary(stream, pending, cx)).await
 }
 
 async fn poll_header_payload_nowait<S>(
@@ -1285,11 +1531,12 @@ fn requeue_write_command(
 /// into an in-progress frame's payload and desynchronize every frame after
 /// it -- the same class of bug #183 fixed for `WritePayload::Buf`.
 ///
-/// Returns `Ok(true)` if the NACK was written, `Ok(false)` if it was
-/// abandoned cleanly before committing any bytes (the caller must requeue
-/// the header -- a zero-byte miss is not a terminal outcome), or `Err` on a
-/// real write error or a stuck mid-frame write (the caller should tear the
-/// connection down, same as any other write failure in this file).
+/// Returns `Ok(true)` if the NACK was written in this single attempt,
+/// `Ok(false)` if the transport returned `Pending` before any byte was
+/// committed, or `Err` on `WriteZero` / fatal write errors. The IO owner
+/// must not call this in a retry loop: partial NACKs live in
+/// `PendingOrdinaryWrite::AskNack` so shutdown/read can run between polls.
+#[cfg(test)]
 async fn write_ask_nack_header_bounded<S>(
     stream: &mut S,
     bytes_written_counter: &Arc<AtomicUsize>,
@@ -1299,100 +1546,82 @@ async fn write_ask_nack_header_bounded<S>(
 where
     S: AsyncWrite + Unpin,
 {
-    let mut offset = 0usize;
-    let mut stuck_since: Option<Instant> = None;
-    loop {
-        match tokio::time::timeout(
-            STREAM_WRITE_SLICE_TIMEOUT,
-            write_vectored_once(stream, &[std::io::IoSlice::new(&header[offset..])]),
-        )
-        .await
-        {
-            // `write_vectored_once` already folds a real zero-byte write
-            // into `Err(WriteZero)` before returning, so this arm is
-            // unreachable through that call path today. Checked locally
-            // anyway rather than relying on that callee detail: `offset`
-            // is nonempty-until-completion here, so `n == 0` taking this
-            // branch would add nothing, never reach `offset >=
-            // header.len()`, and reset `stuck_since` -- clearing the one
-            // signal that would otherwise let the stuck-mid-frame teardown
-            // timer above ever fire, letting a conforming `AsyncWrite`
-            // that starts returning `Ok(0)` pin this loop in a CPU-burning
-            // spin with no `Pending` and no timeout in between. Same class
-            // of bug R4 fixed for `OwnedChunks`' raw unwrapped-write tail.
-            Ok(Ok(0)) => {
-                return Err(std::io::Error::new(
+    match write_vectored_once(stream, &[std::io::IoSlice::new(&header)]).await {
+        Ok(0) => Err(std::io::Error::new(
+            std::io::ErrorKind::WriteZero,
+            "ask NACK write made no progress",
+        )),
+        Ok(n) => {
+            bytes_written_counter.fetch_add(n, Ordering::Relaxed);
+            *bytes_since_flush += n;
+            if n >= header.len() {
+                Ok(true)
+            } else {
+                Err(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
-                    "ask NACK write made no progress",
-                ));
-            }
-            Ok(Ok(n)) => {
-                bytes_written_counter.fetch_add(n, Ordering::Relaxed);
-                *bytes_since_flush += n;
-                offset += n;
-                if offset >= header.len() {
-                    return Ok(true);
-                }
-                stuck_since = None;
-            }
-            Ok(Err(e)) => return Err(e),
-            Err(_elapsed) => {
-                if offset == 0 {
-                    return Ok(false);
-                }
-                let wedged_since = *stuck_since.get_or_insert_with(Instant::now);
-                if wedged_since.elapsed() >= STREAM_WRITE_STUCK_TEARDOWN {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "ask backpressure NACK write stuck mid-frame",
-                    ));
-                }
+                    "ask NACK write committed a partial header without pending state",
+                ))
             }
         }
+        Err(e) => Err(e),
     }
 }
 
-/// Drain `LocalStreamingQueue`'s queued backpressure NACKs onto the wire.
-/// **Callers must only invoke this while `pending_stream_cmd.is_none()`** --
-/// see `write_ask_nack_header_bounded` and `LocalStreamingQueue::queue_ask_nack`
-/// for why writing during a partial frame would corrupt it. Bounded to a
-/// small burst per call (`MAX_PER_TURN`) so a backlog of queued NACKs cannot
-/// starve the read loop's return to reading; the rest wait for a later call.
-/// Stops (without error) at the first attempt that makes zero progress --
-/// likely the socket itself has no room right now, so further attempts this
-/// turn would just burn through more `STREAM_WRITE_SLICE_TIMEOUT` waits for
-/// the same result. That header is pushed back onto the queue so the ask
-/// still has a terminal outcome; the rest stay queued for the next turn.
+/// Drain queued ask NACKs onto the wire as I/O-owned pending state.
+/// **Callers must only invoke this while `pending_stream_cmd.is_none()`**.
+/// Each NACK is popped once into `PendingOrdinaryWrite::AskNack` and never
+/// requeued from offset zero. A turn performs at most `MAX_PER_TURN`
+/// completed headers, or stops at the first partial/`Pending` write so the
+/// owner can return to read/shutdown selection.
 ///
-/// Returns `Ok(true)` if any NACK remains queued once this call returns --
-/// either the `MAX_PER_TURN` cap was hit with the queue still non-empty, or
-/// the zero-progress stop left entries behind it. The caller must treat that
-/// as outstanding work (e.g. `did_work = true`) rather than letting the turn
-/// look idle: `pending_ask_nacks` is not visible to `has_pending` or the
-/// pre-park checks, so nothing else would prevent the I/O task from parking
-/// with a NACK still owed to a peer.
+/// Returns `Ok(true)` when an active or queued NACK still remains.
 async fn drain_pending_ask_nacks<S>(
     stream: &mut S,
     bytes_written_counter: &Arc<AtomicUsize>,
     bytes_since_flush: &mut usize,
     local_streaming_queue: &mut LocalStreamingQueue,
+    pending_ordinary_write: &mut Option<PendingOrdinaryWrite>,
 ) -> std::io::Result<bool>
 where
     S: AsyncWrite + Unpin,
 {
     const MAX_PER_TURN: usize = 8;
     for _ in 0..MAX_PER_TURN {
-        let Some(header) = local_streaming_queue.pop_ask_nack() else {
+        if !matches!(
+            pending_ordinary_write,
+            Some(PendingOrdinaryWrite::AskNack { .. }) | None
+        ) {
+            return Ok(local_streaming_queue.has_pending_ask_nacks());
+        }
+        if pending_ordinary_write.is_none() {
+            let Some(header) = local_streaming_queue.pop_ask_nack() else {
+                return Ok(false);
+            };
+            *pending_ordinary_write = Some(PendingOrdinaryWrite::AskNack { header, offset: 0 });
+        }
+        let Some(pending) = pending_ordinary_write.as_mut() else {
             return Ok(false);
         };
-        if !write_ask_nack_header_bounded(stream, bytes_written_counter, bytes_since_flush, header)
-            .await?
-        {
-            local_streaming_queue.requeue_ask_nack_front(header);
-            return Ok(true);
+        match poll_pending_ordinary_nowait(stream, pending).await {
+            OrdinaryWriteProgress::Complete(n) => {
+                bytes_written_counter.fetch_add(n, Ordering::Relaxed);
+                *bytes_since_flush += n;
+                *pending_ordinary_write = None;
+            }
+            OrdinaryWriteProgress::Partial(n) => {
+                bytes_written_counter.fetch_add(n, Ordering::Relaxed);
+                *bytes_since_flush += n;
+                return Ok(true);
+            }
+            OrdinaryWriteProgress::Failed => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "ask NACK write failed",
+                ));
+            }
         }
     }
-    Ok(local_streaming_queue.has_pending_ask_nacks())
+    Ok(pending_ordinary_write.is_some() || local_streaming_queue.has_pending_ask_nacks())
 }
 
 /// Cap on already-read asks waiting for inline budget or NACK-queue room.
@@ -1400,6 +1629,9 @@ where
 /// the ask is retained rather than growing `pending_ask_nacks` past
 /// `PENDING_ASK_NACK_CAP`.
 const DEFERRED_ASK_CAP: usize = 64;
+/// One extra already-read ask may sit behind a full NACK queue until a drain
+/// turn frees a slot. The read loop must stop admitting before this grows.
+const DEFERRED_ASK_HOLD_CAP: usize = DEFERRED_ASK_CAP + 1;
 
 fn actor_ask_correlation_id(result: &ReadIoResult) -> Option<u32> {
     match result {
@@ -1431,22 +1663,26 @@ fn queue_ask_backpressure_nack(
 /// Overwriting a single slot would silently drop the previous ask; a bounded
 /// deque keeps those frames out of the duplex. Overflow becomes a NACK only
 /// when `has_room_for_ask_nack` is true so this path cannot bypass the read
-/// loop's `PENDING_ASK_NACK_CAP` gate. If both caps are full the ask is
-/// retained until a drain turn frees NACK room.
+/// loop's `PENDING_ASK_NACK_CAP` gate. If both caps are full, at most one
+/// extra already-read ask is held (`DEFERRED_ASK_HOLD_CAP`); the read loop
+/// must stop admitting until a drain turn frees NACK or deferred room.
 fn park_deferred_ask(
     slot: &mut std::collections::VecDeque<ReadIoResult>,
     result: ReadIoResult,
     local_streaming_queue: &mut LocalStreamingQueue,
+    nack_extra: usize,
 ) {
     if slot.len() < DEFERRED_ASK_CAP {
         slot.push_back(result);
         return;
     }
-    if local_streaming_queue.has_room_for_ask_nack() {
+    if local_streaming_queue.has_room_for_ask_nack_occupying(nack_extra) {
         queue_ask_backpressure_nack(local_streaming_queue, &result);
         return;
     }
-    slot.push_back(result);
+    if slot.len() < DEFERRED_ASK_HOLD_CAP {
+        slot.push_back(result);
+    }
 }
 
 /// Write one bounded slice of a lazily framed `Bytes` response. Returning a
@@ -2550,6 +2786,30 @@ impl LockFreeStreamHandle {
             // turn that completes that frame; clearing them here would silently
             // drop responses that were intentionally deferred.
             if pending_stream_cmd.is_none() && pending_ordinary_write.is_none() {
+                if let Err(e) = park_ask_response_batch(
+                    &mut pending_ordinary_write,
+                    &mut response_batch,
+                ) {
+                    warn!(
+                        peer = ?read_context.as_ref().map(|c| c.peer_addr),
+                        error = %e,
+                        "Failed to park response batch"
+                    );
+                    return;
+                }
+                if let Err(e) = park_direct_response_batch(
+                    &mut pending_ordinary_write,
+                    &mut direct_response_batch,
+                ) {
+                    warn!(
+                        peer = ?read_context.as_ref().map(|c| c.peer_addr),
+                        error = %e,
+                        "Failed to park direct response batch"
+                    );
+                    return;
+                }
+            }
+            if pending_stream_cmd.is_none() && pending_ordinary_write.is_none() {
                 response_batch.clear();
                 direct_response_batch.clear();
             }
@@ -2677,21 +2937,18 @@ impl LockFreeStreamHandle {
                 // are only ever safe to write here, now that the wire is
                 // proven free of a partial frame.
                 if pending_ordinary_write.is_none() {
-                    let had_nacks = local_streaming_queue.has_pending_ask_nacks();
+                    let nack_bytes_before = bytes_since_flush;
                     match drain_pending_ask_nacks(
                         &mut stream,
                         &bytes_written_counter,
                         &mut bytes_since_flush,
                         &mut local_streaming_queue,
+                        &mut pending_ordinary_write,
                     )
                     .await
                     {
-                        // A drain turn that started with queued NACKs is work
-                        // even if the queue is empty afterwards: those headers
-                        // must not look like an idle turn, or the read loop
-                        // never resumes for asks still sitting in the socket.
-                        Ok(more_pending) => {
-                            if had_nacks || more_pending {
+                        Ok(_) => {
+                            if bytes_since_flush > nack_bytes_before {
                                 did_work = true;
                             }
                         }
@@ -2726,17 +2983,18 @@ impl LockFreeStreamHandle {
                                     &mut stream_write_wedged_since,
                                     &mut stream_flush_wedged_since,
                                 );
-                                let had_nacks = local_streaming_queue.has_pending_ask_nacks();
+                                let nack_bytes_before = bytes_since_flush;
                                 match drain_pending_ask_nacks(
                                     &mut stream,
                                     &bytes_written_counter,
                                     &mut bytes_since_flush,
                                     &mut local_streaming_queue,
+                                    &mut pending_ordinary_write,
                                 )
                                 .await
                                 {
-                                    Ok(more_pending) => {
-                                        if had_nacks || more_pending {
+                                    Ok(_) => {
+                                        if bytes_since_flush > nack_bytes_before {
                                             did_work = true;
                                         }
                                     }
@@ -3693,7 +3951,7 @@ impl LockFreeStreamHandle {
                         // (Deliberately not also gating on `is_full()` here
                         // -- see the doc comment above this loop.)
                         && (deferred_asks.len() < DEFERRED_ASK_CAP
-                            || local_streaming_queue.has_room_for_ask_nack()
+                            || local_streaming_queue.has_room_for_ask_nack_occupying(0)
                             || (!deferred_asks.is_empty()
                                 && !inline_response_budget_exhausted(
                                     &pending_ordinary_write,
@@ -3834,7 +4092,7 @@ impl LockFreeStreamHandle {
                             ) {
                                 AskBudgetAction::Dispatch => {}
                                 AskBudgetAction::Nack => {
-                                    if local_streaming_queue.has_room_for_ask_nack() {
+                                    if local_streaming_queue.has_room_for_ask_nack_occupying(pending_ask_nack_occupancy(&pending_ordinary_write)) {
                                         queue_ask_backpressure_nack(
                                             &mut local_streaming_queue,
                                             &result,
@@ -3842,18 +4100,20 @@ impl LockFreeStreamHandle {
                                         continue;
                                     }
                                     park_deferred_ask(
-                                        &mut deferred_asks,
-                                        result,
-                                        &mut local_streaming_queue,
-                                    );
+                                                &mut deferred_asks,
+                                                result,
+                                                &mut local_streaming_queue,
+                                                pending_ask_nack_occupancy(&pending_ordinary_write),
+                                            );
                                     break;
                                 }
                                 AskBudgetAction::Defer => {
                                     park_deferred_ask(
-                                        &mut deferred_asks,
-                                        result,
-                                        &mut local_streaming_queue,
-                                    );
+                                                &mut deferred_asks,
+                                                result,
+                                                &mut local_streaming_queue,
+                                                pending_ask_nack_occupancy(&pending_ordinary_write),
+                                            );
                                     continue;
                                 }
                             }
@@ -4013,14 +4273,141 @@ impl LockFreeStreamHandle {
                 }
             }
 
-            // A turn that only did non-blocking polls can starve a
-            // current_thread peer. Yield whenever we still hold a parked
-            // write, a deferred ask, or a queued NACK so the peer can drain.
-            if pending_ordinary_write.is_some()
-                || !deferred_asks.is_empty()
-                || local_streaming_queue.has_pending_ask_nacks()
+            // A retained partial frame is not itself a readiness event.
+            // Park on the stream waker when the socket made no progress.
+            // After actual byte progress, yield once so a current_thread peer
+            // can drain; do not yield_now-spin on Pending writes.
+            if (pending_ordinary_write.is_some() && did_work)
+                || (pending_ordinary_write.is_none()
+                    && (!deferred_asks.is_empty()
+                        || local_streaming_queue.has_pending_ask_nacks()))
             {
                 tokio::task::yield_now().await;
+            }
+            if pending_ordinary_write.is_some()
+                && (ordinary_write_blocked || ordinary_write_stalled || !did_work)
+            {
+                let mut completed_pending = false;
+                let maintenance = stream_write_wedged_since
+                    .map(|started| {
+                        STREAM_WRITE_STUCK_TEARDOWN.saturating_sub(started.elapsed())
+                    })
+                    .unwrap_or(STREAM_WRITE_SLICE_TIMEOUT);
+                {
+                let pending = pending_ordinary_write
+                    .as_mut()
+                    .expect("pending ordinary write checked above");
+                tokio::select! {
+                    biased;
+                    progress = wait_pending_ordinary(&mut stream, pending) => {
+                        match progress {
+                            OrdinaryWriteProgress::Complete(n) => {
+                                bytes_written_counter.fetch_add(n, Ordering::Relaxed);
+                                bytes_since_flush += n;
+                                completed_pending = true;
+                                ordinary_write_stalled = false;
+                                record_slice_attempt(
+                                    false,
+                                    n > 0,
+                                    Instant::now(),
+                                    &mut stream_write_wedged_since,
+                                    &mut stream_flush_wedged_since,
+                                );
+                            }
+                            OrdinaryWriteProgress::Partial(n) => {
+                                bytes_written_counter.fetch_add(n, Ordering::Relaxed);
+                                bytes_since_flush += n;
+                                if n > 0 {
+                                    ordinary_write_stalled = false;
+                                } else if let SliceAttemptOutcome::TearDown { stuck_for } =
+                                    record_slice_attempt(
+                                        false,
+                                        false,
+                                        Instant::now(),
+                                        &mut stream_write_wedged_since,
+                                        &mut stream_flush_wedged_since,
+                                    )
+                                {
+                                    error!(
+                                        ?stuck_for,
+                                        "ordinary write made no progress for too long; \
+                                         tearing down connection"
+                                    );
+                                    return;
+                                }
+                            }
+                            OrdinaryWriteProgress::Failed => return,
+                        }
+                    }
+                    _ = tokio::time::sleep(maintenance) => {
+                        if let SliceAttemptOutcome::TearDown { stuck_for } = record_slice_attempt(
+                            false,
+                            false,
+                            Instant::now(),
+                            &mut stream_write_wedged_since,
+                            &mut stream_flush_wedged_since,
+                        ) {
+                            error!(
+                                ?stuck_for,
+                                "ordinary write made no progress for too long; \
+                                 tearing down connection"
+                            );
+                            return;
+                        }
+                    }
+                    _ = immediate_write_queue.data_notify.notified() => {
+                        pending_immediate_cmd = immediate_write_queue.pop();
+                    }
+                    _ = write_queue.data_notify.notified() => {
+                        pending_cmd = write_queue.pop();
+                    }
+                    _ = streaming_queue.data_notify.notified() => {}
+                }
+                }
+                if completed_pending {
+                    pending_ordinary_write = None;
+                    if let Err(e) = drain_pending_ask_nacks(
+                        &mut stream,
+                        &bytes_written_counter,
+                        &mut bytes_since_flush,
+                        &mut local_streaming_queue,
+                        &mut pending_ordinary_write,
+                    )
+                    .await
+                    {
+                        warn!(
+                            peer = ?read_context.as_ref().map(|c| c.peer_addr),
+                            error = %e,
+                            "Failed to drain queued ask backpressure NACKs"
+                        );
+                        return;
+                    }
+                    if pending_ordinary_write.is_none() {
+                        if let Err(e) = park_ask_response_batch(
+                            &mut pending_ordinary_write,
+                            &mut response_batch,
+                        ) {
+                            warn!(
+                                peer = ?read_context.as_ref().map(|c| c.peer_addr),
+                                error = %e,
+                                "Failed to park response batch"
+                            );
+                            return;
+                        }
+                        if let Err(e) = park_direct_response_batch(
+                            &mut pending_ordinary_write,
+                            &mut direct_response_batch,
+                        ) {
+                            warn!(
+                                peer = ?read_context.as_ref().map(|c| c.peer_addr),
+                                error = %e,
+                                "Failed to park direct response batch"
+                            );
+                            return;
+                        }
+                    }
+                }
+                continue;
             }
 
             if !did_work
@@ -4095,7 +4482,7 @@ impl LockFreeStreamHandle {
                                 ) {
                                     AskBudgetAction::Dispatch => {}
                                     AskBudgetAction::Nack => {
-                                        if local_streaming_queue.has_room_for_ask_nack() {
+                                        if local_streaming_queue.has_room_for_ask_nack_occupying(pending_ask_nack_occupancy(&pending_ordinary_write)) {
                                             queue_ask_backpressure_nack(
                                                 &mut local_streaming_queue,
                                                 &result,
@@ -4103,18 +4490,20 @@ impl LockFreeStreamHandle {
                                             continue;
                                         }
                                         park_deferred_ask(
-                                            &mut deferred_asks,
-                                            result,
-                                            &mut local_streaming_queue,
-                                        );
+                                                &mut deferred_asks,
+                                                result,
+                                                &mut local_streaming_queue,
+                                                pending_ask_nack_occupancy(&pending_ordinary_write),
+                                            );
                                         continue;
                                     }
                                     AskBudgetAction::Defer => {
                                         park_deferred_ask(
-                                            &mut deferred_asks,
-                                            result,
-                                            &mut local_streaming_queue,
-                                        );
+                                                &mut deferred_asks,
+                                                result,
+                                                &mut local_streaming_queue,
+                                                pending_ask_nack_occupancy(&pending_ordinary_write),
+                                            );
                                         if let Err(e) = park_ask_response_batch(
                                             &mut pending_ordinary_write,
                                             &mut response_batch,
@@ -4231,7 +4620,7 @@ impl LockFreeStreamHandle {
                                 // reads new socket frames, it does not pop
                                 // `deferred_asks`.
                                 && (deferred_asks.len() < DEFERRED_ASK_CAP
-                                    || local_streaming_queue.has_room_for_ask_nack())
+                                    || local_streaming_queue.has_room_for_ask_nack_occupying(0))
                                 && (pending_stream_cmd.is_none()
                                     || (response_batch.total_bytes() < RESPONSE_BATCH_BYTE_CAP
                                         && direct_response_batch.total_bytes()
@@ -4314,7 +4703,7 @@ impl LockFreeStreamHandle {
                                     ) {
                                         AskBudgetAction::Dispatch => {}
                                         AskBudgetAction::Nack => {
-                                            if local_streaming_queue.has_room_for_ask_nack() {
+                                            if local_streaming_queue.has_room_for_ask_nack_occupying(pending_ask_nack_occupancy(&pending_ordinary_write)) {
                                                 queue_ask_backpressure_nack(
                                                     &mut local_streaming_queue,
                                                     &result,
@@ -4325,6 +4714,7 @@ impl LockFreeStreamHandle {
                                                 &mut deferred_asks,
                                                 result,
                                                 &mut local_streaming_queue,
+                                                pending_ask_nack_occupancy(&pending_ordinary_write),
                                             );
                                             break;
                                         }
@@ -4333,6 +4723,7 @@ impl LockFreeStreamHandle {
                                                 &mut deferred_asks,
                                                 result,
                                                 &mut local_streaming_queue,
+                                                pending_ask_nack_occupancy(&pending_ordinary_write),
                                             );
                                             break;
                                         }
@@ -6742,7 +7133,7 @@ mod route_interning_tests {
     /// leaves queue space, so the bind's `try_push` would succeed). None of the
     /// awaits below yield until the final `task.await`, so the writer never runs
     /// until cleanup and the queue stays genuinely full.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn qa_r3_cancelled_bind_enqueue_unbinds_route() {
         let (client, peer) = tokio::io::duplex(8);
         let (writer, task, _) = LockFreeStreamHandle::new(
@@ -6754,25 +7145,16 @@ mod route_interning_tests {
             None,
         );
 
-        // Saturate the write queue. Each push completes without yielding while
-        // there is space; a zero-duration timeout turns the parked (129th) push
-        // into a clean "queue is full" signal — no sleep-based synchronization.
-        // PR #183 review, round 12: `write_bytes_control` carries a complete
-        // V5 frame (this crate's wire protocol has no opaque-bytes case --
-        // see the module doc comment above `reject_oversize_write_payload`),
-        // so this must be a genuine, complete frame, not a bare literal.
+        // Saturate the write queue without awaiting, so the spawned writer is
+        // never polled. A zero-duration timeout can still schedule the writer
+        // on some runtimes and leave queue space.
         let pad_payload = vec![0u8; 8];
         let pad_header = crate::framing::write_gossip_frame_prefix(pad_payload.len());
         let mut pad_bytes = Vec::with_capacity(pad_header.len() + pad_payload.len());
         pad_bytes.extend_from_slice(&pad_header);
         pad_bytes.extend_from_slice(&pad_payload);
         let pad = bytes::Bytes::from(pad_bytes);
-        while let Ok(Ok(())) = tokio::time::timeout(
-            std::time::Duration::from_millis(0),
-            writer.write_bytes_control(pad.clone()),
-        )
-        .await
-        {}
+        while writer.write_bytes_nonblocking(pad.clone()).is_ok() {}
 
         // A routed ask for a fresh route: slot_for marks it bound, then the
         // RouteBind enqueue parks on the full queue and is cancelled at once.
@@ -6780,15 +7162,20 @@ mod route_interning_tests {
             actor_id: 42,
             type_hash: 7,
         };
-        let cancelled = tokio::time::timeout(
-            std::time::Duration::from_millis(0),
-            writer.write_routed_actor_ask(1, 42, 7, bytes::Bytes::from_static(b"ask")),
-        )
-        .await;
+        let mut ask = Box::pin(writer.write_routed_actor_ask(
+            1,
+            42,
+            7,
+            bytes::Bytes::from_static(b"ask"),
+        ));
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let polled = ask.as_mut().poll(&mut cx);
         assert!(
-            cancelled.is_err(),
-            "the RouteBind enqueue should park on the full write queue"
+            matches!(polled, std::task::Poll::Pending),
+            "the RouteBind enqueue should park on the full write queue, got {polled:?}"
         );
+        drop(ask);
 
         // R-3: the cancelled fresh allocation must roll back, so the next
         // slot_for still needs a bind. Before the fix the route stayed bound
