@@ -285,3 +285,77 @@ async fn qa_forward_timeout_includes_worker_queue_wait() {
         "timed forwards restart their budget when a worker finally dispatches them"
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn qa_zero_duration_forward_delivers_timeout_reply() {
+    use super::{ConnectionDirection, ConnectionHandle, CorrelationTracker};
+    let addr = "127.0.0.1:0".parse().unwrap();
+    let (io, mut peer) = tokio::io::duplex(65536);
+    let (writer, task, _) = LockFreeStreamHandle::new(
+        io,
+        addr,
+        ChannelId::TellAsk,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let writer = Arc::new(writer);
+    let connection = crate::RemoteConnection::from_handle(ConnectionHandle::<()>::new_stream(
+        addr,
+        ConnectionDirection::Outbound,
+        writer.clone(),
+        CorrelationTracker::new(),
+    ));
+    let completed = Arc::new(ForwardCompletions(AtomicUsize::new(0)));
+    let forwarder =
+        crate::ask_forwarder::AskForwarder::new_with_observer(1, 128, Some(completed.clone()));
+    let responder = crate::AskResponder::from_stream_handle(
+        9,
+        writer.clone(),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    );
+    forwarder
+        .try_forward_actor_ask_combined_timeout(
+            connection,
+            1,
+            1,
+            bytes::Bytes::from_static(b"request"),
+            Duration::ZERO,
+            responder,
+            bytes::Bytes::from_static(b"zero-timeout-reply"),
+            bytes::Bytes::from_static(b"error"),
+        )
+        .expect("zero duration must still be admitted so timeout_reply can be delivered");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while completed.0.load(Ordering::SeqCst) < 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker must complete the expired forward");
+    let mut buf = vec![0u8; 4096];
+    let mut written = Vec::new();
+    for _ in 0..20 {
+        match tokio::time::timeout(Duration::from_millis(50), peer.read(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => break,
+            Ok(Ok(n)) => written.extend_from_slice(&buf[..n]),
+            Err(_) => {
+                if !written.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+    drop(forwarder);
+    writer.shutdown();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        written
+            .windows(b"zero-timeout-reply".len())
+            .any(|w| w == b"zero-timeout-reply"),
+        "a zero-duration forward must still deliver timeout_reply"
+    );
+}

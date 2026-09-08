@@ -181,7 +181,7 @@ impl AskForwarder {
         timeout_reply: Bytes,
         error_reply: Bytes,
     ) -> Result<()> {
-        let deadline = admission_deadline(timeout)?;
+        let deadline = admission_deadline(timeout);
         self.try_send_task(ForwardTask {
             destination,
             actor_id,
@@ -208,7 +208,7 @@ impl AskForwarder {
         timeout_reply: Bytes,
         error_reply: Bytes,
     ) -> Result<()> {
-        let deadline = admission_deadline(timeout)?;
+        let deadline = admission_deadline(timeout);
         self.try_send_task(ForwardTask {
             destination,
             actor_id,
@@ -261,11 +261,15 @@ enum ForwardOutcome {
     ReplyUndeliverable,
 }
 
-fn admission_deadline(timeout: Duration) -> Result<Instant> {
+fn admission_deadline(timeout: Duration) -> Instant {
+    // A zero duration is already expired: enqueue it so the worker delivers
+    // `timeout_reply` without sending a destination ask, matching the prior
+    // queued-timeout contract.
     if timeout.is_zero() {
-        return Err(GossipError::Timeout);
+        Instant::now()
+    } else {
+        saturating_deadline(Instant::now(), timeout)
     }
-    Ok(saturating_deadline(Instant::now(), timeout))
 }
 
 fn saturating_deadline(started_at: Instant, timeout: Duration) -> Instant {
@@ -825,5 +829,11 @@ mod tests {
         );
 
         let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+
+    #[test]
+    fn zero_duration_is_an_already_expired_deadline() {
+        let deadline = admission_deadline(Duration::ZERO);
+        assert!(deadline <= Instant::now());
     }
 }
