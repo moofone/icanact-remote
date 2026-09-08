@@ -445,8 +445,17 @@ impl LocalStreamingQueue {
     /// caller that could add an entry checks this first, the queue can
     /// never be asked to hold more than its cap, so it never has to choose
     /// what to discard.
+    #[cfg(test)]
     fn has_room_for_ask_nack(&self) -> bool {
-        self.pending_ask_nacks.len() < PENDING_ASK_NACK_CAP
+        self.has_room_for_ask_nack_occupying(0)
+    }
+
+    /// `extra` counts an already-popped active NACK that still owns the wire.
+    fn has_room_for_ask_nack_occupying(&self, extra: usize) -> bool {
+        self.pending_ask_nacks
+            .len()
+            .saturating_add(extra)
+            < PENDING_ASK_NACK_CAP
     }
 
     /// Pop the oldest queued NACK header for `io_task` to attempt writing.
@@ -454,17 +463,6 @@ impl LocalStreamingQueue {
     /// `queue_ask_nack`.
     fn pop_ask_nack(&mut self) -> Option<[u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN]> {
         self.pending_ask_nacks.pop_front()
-    }
-
-    /// Put a NACK back at the head after a clean zero-byte write miss.
-    /// `drain_pending_ask_nacks` pops before attempting the write; if the
-    /// socket had no room, the header must return here so that ask still
-    /// has a terminal outcome.
-    fn requeue_ask_nack_front(
-        &mut self,
-        header: [u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN],
-    ) {
-        self.pending_ask_nacks.push_front(header);
     }
 
     /// Whether any backpressure NACK is still queued and unwritten.

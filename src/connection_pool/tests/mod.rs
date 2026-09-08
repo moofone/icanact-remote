@@ -3143,6 +3143,7 @@ fn streaming_admission_backpressure_nacks_instead_of_dropping_the_computed_respo
             &bytes_written_counter,
             &mut bytes_since_flush,
             &mut queue,
+            &mut None,
         )
         .await
         .expect("draining a queued NACK against a healthy transport must not error");
@@ -3194,6 +3195,7 @@ fn drain_pending_ask_nacks_reports_outstanding_work_past_the_per_turn_cap() {
             &bytes_written_counter,
             &mut bytes_since_flush,
             &mut queue,
+            &mut None,
         )
         .await
         .expect("draining against a healthy transport must not error");
@@ -3213,6 +3215,7 @@ fn drain_pending_ask_nacks_reports_outstanding_work_past_the_per_turn_cap() {
             &bytes_written_counter,
             &mut bytes_since_flush,
             &mut queue,
+            &mut None,
         )
         .await
         .expect("draining the remainder must not error");
@@ -3241,8 +3244,9 @@ fn drain_pending_ask_nacks_reports_outstanding_work_past_the_per_turn_cap() {
     });
 }
 
-/// A full duplex must not drop a NACK that timed out before any byte went
-/// out. The header is requeued and written once the peer reads.
+/// A full duplex must not drop a NACK that made no progress. The header is
+/// retained as I/O-owned pending state (never requeued from offset zero)
+/// and written once the peer reads.
 #[test]
 fn drain_pending_ask_nacks_requeues_on_zero_byte_write_miss() {
     run_multi_thread_test(async {
@@ -3260,11 +3264,13 @@ fn drain_pending_ask_nacks_requeues_on_zero_byte_write_miss() {
 
         let bytes_written_counter = Arc::new(AtomicUsize::new(0));
         let mut bytes_since_flush = 0usize;
+        let mut pending = None;
         let more_pending = drain_pending_ask_nacks(
             &mut server_half,
             &bytes_written_counter,
             &mut bytes_since_flush,
             &mut queue,
+            &mut pending,
         )
         .await
         .expect("a zero-byte miss is not a write error");
@@ -3274,8 +3280,15 @@ fn drain_pending_ask_nacks_requeues_on_zero_byte_write_miss() {
         );
         assert_eq!(
             queue.pending_ask_nack_count(),
-            1,
-            "a zero-byte miss must requeue the header, not drop the ask's terminal outcome"
+            0,
+            "a zero-byte miss must keep the header in pending write state, not requeue it"
+        );
+        assert!(
+            matches!(
+                pending,
+                Some(PendingOrdinaryWrite::AskNack { offset: 0, .. })
+            ),
+            "the popped NACK must remain the active frame at offset 0"
         );
         assert_eq!(bytes_written_counter.load(Ordering::Acquire), 0);
 
@@ -3289,16 +3302,18 @@ fn drain_pending_ask_nacks_requeues_on_zero_byte_write_miss() {
             &bytes_written_counter,
             &mut bytes_since_flush,
             &mut queue,
+            &mut pending,
         )
         .await
         .expect("draining after the peer made room must not error");
         assert!(!more_pending);
+        assert!(pending.is_none());
         assert_eq!(queue.pending_ask_nack_count(), 0);
 
         let mut header = [0u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN];
         tokio::io::AsyncReadExt::read_exact(&mut client_half, &mut header)
             .await
-            .expect("the requeued NACK must reach the wire once the peer reads");
+            .expect("the retained NACK must reach the wire once the peer reads");
         assert_eq!(
             u32::from_be_bytes(header[4..8].try_into().unwrap()),
             0x51_E11D
@@ -3329,12 +3344,12 @@ fn park_deferred_ask_does_not_grow_nack_queue_past_cap() {
     let mut deferred = std::collections::VecDeque::new();
     let mut queue = LocalStreamingQueue::new();
     for i in 0..DEFERRED_ASK_CAP as u32 {
-        park_deferred_ask(&mut deferred, ask(i), &mut queue);
+        park_deferred_ask(&mut deferred, ask(i), &mut queue, 0);
     }
     assert_eq!(deferred.len(), DEFERRED_ASK_CAP);
     assert_eq!(queue.pending_ask_nack_count(), 0);
 
-    park_deferred_ask(&mut deferred, ask(1_000), &mut queue);
+    park_deferred_ask(&mut deferred, ask(1_000), &mut queue, 0);
     assert_eq!(deferred.len(), DEFERRED_ASK_CAP);
     assert_eq!(queue.pending_ask_nack_count(), 1);
 
@@ -3346,7 +3361,7 @@ fn park_deferred_ask_does_not_grow_nack_queue_past_cap() {
     }
     let nacks_at_cap = queue.pending_ask_nack_count();
     assert!(!queue.has_room_for_ask_nack());
-    park_deferred_ask(&mut deferred, ask(3_000), &mut queue);
+    park_deferred_ask(&mut deferred, ask(3_000), &mut queue, 0);
     assert_eq!(
         queue.pending_ask_nack_count(),
         nacks_at_cap,
@@ -14512,6 +14527,7 @@ include!("qa_queue_close.rs");
 include!("qa_deadline.rs");
 include!("qa_response_budget.rs");
 include!("qa_scan_20260907.rs");
+mod qa_backpressure_scan;
 mod qa_remaining_deadlines {
     include!("qa_remaining_deadlines.rs");
 }
