@@ -1629,6 +1629,9 @@ where
 /// the ask is retained rather than growing `pending_ask_nacks` past
 /// `PENDING_ASK_NACK_CAP`.
 const DEFERRED_ASK_CAP: usize = 64;
+/// One extra already-read ask may sit behind a full NACK queue until a drain
+/// turn frees a slot. The read loop must stop admitting before this grows.
+const DEFERRED_ASK_HOLD_CAP: usize = DEFERRED_ASK_CAP + 1;
 
 fn actor_ask_correlation_id(result: &ReadIoResult) -> Option<u32> {
     match result {
@@ -1660,8 +1663,9 @@ fn queue_ask_backpressure_nack(
 /// Overwriting a single slot would silently drop the previous ask; a bounded
 /// deque keeps those frames out of the duplex. Overflow becomes a NACK only
 /// when `has_room_for_ask_nack` is true so this path cannot bypass the read
-/// loop's `PENDING_ASK_NACK_CAP` gate. If both caps are full the ask is
-/// retained until a drain turn frees NACK room.
+/// loop's `PENDING_ASK_NACK_CAP` gate. If both caps are full, at most one
+/// extra already-read ask is held (`DEFERRED_ASK_HOLD_CAP`); the read loop
+/// must stop admitting until a drain turn frees NACK or deferred room.
 fn park_deferred_ask(
     slot: &mut std::collections::VecDeque<ReadIoResult>,
     result: ReadIoResult,
@@ -1676,7 +1680,9 @@ fn park_deferred_ask(
         queue_ask_backpressure_nack(local_streaming_queue, &result);
         return;
     }
-    slot.push_back(result);
+    if slot.len() < DEFERRED_ASK_HOLD_CAP {
+        slot.push_back(result);
+    }
 }
 
 /// Write one bounded slice of a lazily framed `Bytes` response. Returning a
@@ -3946,7 +3952,12 @@ impl LockFreeStreamHandle {
                         // -- see the doc comment above this loop.)
                         && (deferred_asks.len() < DEFERRED_ASK_CAP
                             || local_streaming_queue.has_room_for_ask_nack_occupying(0)
-                            || !deferred_asks.is_empty())
+                            || (!deferred_asks.is_empty()
+                                && !inline_response_budget_exhausted(
+                                    &pending_ordinary_write,
+                                    &response_batch,
+                                    &direct_response_batch,
+                                )))
                         && (pending_stream_cmd.is_none()
                             || (response_batch.total_bytes() < RESPONSE_BATCH_BYTE_CAP
                                 && direct_response_batch.total_bytes()

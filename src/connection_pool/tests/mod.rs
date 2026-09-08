@@ -3369,8 +3369,19 @@ fn park_deferred_ask_does_not_grow_nack_queue_past_cap() {
     );
     assert_eq!(
         deferred.len(),
-        DEFERRED_ASK_CAP + 1,
+        DEFERRED_ASK_HOLD_CAP,
         "the already-read ask is retained until NACK room exists"
+    );
+    park_deferred_ask(&mut deferred, ask(4_000), &mut queue, 0);
+    assert_eq!(
+        deferred.len(),
+        DEFERRED_ASK_HOLD_CAP,
+        "deferred asks must not grow past one already-read overflow slot"
+    );
+    assert_eq!(
+        queue.pending_ask_nack_count(),
+        nacks_at_cap,
+        "further overflow must not grow the NACK queue either"
     );
 }
 

@@ -22,7 +22,6 @@ struct ForwardTask {
     payload: Bytes,
     responder: AskResponder,
     deadline: Option<Instant>,
-    use_combined_timeout: bool,
     timeout_reply: Option<Bytes>,
     error_reply: Option<Bytes>,
     _permit: Option<OwnedSemaphorePermit>,
@@ -162,7 +161,6 @@ impl AskForwarder {
             payload,
             responder,
             deadline: None,
-            use_combined_timeout: false,
             timeout_reply: None,
             error_reply: None,
             _permit: None,
@@ -191,7 +189,6 @@ impl AskForwarder {
             payload,
             responder,
             deadline: Some(deadline),
-            use_combined_timeout: false,
             timeout_reply: Some(timeout_reply),
             error_reply: Some(error_reply),
             _permit: None,
@@ -219,7 +216,6 @@ impl AskForwarder {
             payload,
             responder,
             deadline: Some(deadline),
-            use_combined_timeout: true,
             timeout_reply: Some(timeout_reply),
             error_reply: Some(error_reply),
             _permit: None,
@@ -467,19 +463,16 @@ async fn run_forward_task(task: ForwardTask) -> ForwardOutcome {
     let actor_id = task.actor_id;
     let type_hash = task.type_hash;
     let payload = task.payload.clone();
+    // Timed forwards always use `ask_actor_frame` so one SlotGuard covers
+    // identify-gate wait, write-queue admission, and the response wait.
+    // Timeout/cancel drops that guard and unregisters the correlation before
+    // returning `GossipError::Timeout`.
     let response = match remaining {
-        Some(timeout) if task.use_combined_timeout => {
+        Some(timeout) => {
             destination
                 .ask_actor_frame(actor_id, type_hash, payload, timeout)
                 .await
         }
-        Some(timeout) => tokio::time::timeout(
-            timeout,
-            destination.ask_actor_frame_no_timeout(actor_id, type_hash, payload),
-        )
-        .await
-        .map_err(|_| GossipError::Timeout)
-        .and_then(|reply| reply),
         None => {
             destination
                 .ask_actor_frame_no_timeout(actor_id, type_hash, payload)
