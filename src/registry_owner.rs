@@ -1071,15 +1071,23 @@ enum OwnerCommand {
         /// record lingers) -- legitimate, not evidence of a race, and
         /// there is no ownership-level identity there to be wrong about.
         expected_node_id: Option<PeerId>,
-        /// `Some(valid)` when granted -- `valid` is the SAME `Arc<AtomicU8>`
-        /// the owner-internal `reap_reserved` map stores for this address,
-        /// so the caller's `ReapReservation` guard and the owner's own
-        /// entry share one flag. `None` when refused. See
-        /// `PeerRegistryOwner::reap_reserved`'s doc comment for why this
-        /// exists: a one-time grant/refuse answer is not enough once the
-        /// destructive phase needs to keep re-checking validity long after
-        /// this reply was sent.
-        reply: oneshot::Sender<Option<Arc<AtomicU8>>>,
+        /// `Some(reservation)` when granted -- the reservation guard is
+        /// constructed HERE, owner-side, before the reply is sent, and its
+        /// `valid` is the SAME `Arc<AtomicU8>` the owner-internal
+        /// `reap_reserved` map stores for this address, so the caller's
+        /// guard and the owner's own entry share one flag. `None` when
+        /// refused. See `PeerRegistryOwner::reap_reserved`'s doc comment
+        /// for why this exists: a one-time grant/refuse answer is not
+        /// enough once the destructive phase needs to keep re-checking
+        /// validity long after this reply was sent.
+        ///
+        /// Shipping the guard itself -- not a bare flag the caller wraps
+        /// in a guard later -- is what closes G-4: if the requesting task
+        /// dies before it takes this response out of the channel, the
+        /// undelivered guard is dropped and its `Drop` releases the
+        /// reservation, so the address never stays `ReapInProgress` for a
+        /// claimant that no longer exists.
+        reply: oneshot::Sender<Option<ReapReservation>>,
     },
     /// Release a reservation `ReserveForReap` granted, whether the sweep
     /// used it to reap the address or is abandoning the candidate for
@@ -1690,6 +1698,17 @@ impl RegistryOwnerHandle {
     /// a caller holding a bare `true` to ever call the matching release, and
     /// nothing runs on its behalf if the caller's task ends without doing
     /// so.
+    ///
+    /// The guard is constructed OWNER-SIDE and shipped through the reply
+    /// itself, so the grant is never unguarded for even an instant (G-4):
+    /// the owner inserts `reap_reserved[addr]` and hands back the
+    /// already-built capability in the same step. A caller cancelled while
+    /// parked on this future's response -- the window a bare grant left
+    /// permanently `ReapInProgress` -- drops the undelivered guard, whose
+    /// `Drop` releases the reservation; a caller that receives it holds
+    /// exactly the same guard any earlier shape would have built. Either
+    /// way there is no state in which the entry exists without a guard
+    /// somewhere accountable for it.
     pub async fn reserve_for_reap(
         &self,
         addr: SocketAddr,
@@ -1711,35 +1730,12 @@ impl RegistryOwnerHandle {
         if self.shared.tx.send(command).await.is_err() {
             return None;
         }
-        let valid = response.await.ok().flatten()?;
-        Some(ReapReservation {
-            owner: self.clone(),
-            addr,
-            released: false,
-            valid,
-        })
-    }
-
-    /// Enqueue an `OwnerCommand::ReleaseReapReservation` for `addr` on the
-    /// dedicated, unbounded release channel -- see `OwnerShared::
-    /// release_tx`'s doc comment. Deliberately synchronous, not `async`:
-    /// `UnboundedSender::send` cannot suspend on capacity, and has no
-    /// `.await` point inside it for a task abort to land in the middle of,
-    /// so by the time this call returns, the release is either irrevocably
-    /// queued -- `Some`, carrying the reply receiver for a caller that can
-    /// afford to await confirmation the owner actually processed it -- or
-    /// the owner task is already gone (`None`), in which case there is
-    /// nothing left to release against. Callable from both the async
-    /// `ReapReservation::release` and its synchronous `Drop` impl for
-    /// exactly this reason.
-    fn enqueue_reap_release(&self, addr: SocketAddr) -> Option<oneshot::Receiver<()>> {
-        self.ensure_started();
-        let (reply, response) = oneshot::channel();
-        self.shared
-            .release_tx
-            .send(OwnerCommand::ReleaseReapReservation { addr, reply })
-            .ok()?;
-        Some(response)
+        // The guard arrives already constructed -- the owner built it
+        // before replying -- so the window between "the owner granted" and
+        // "the caller assembles its guard" cannot exist: if this task dies
+        // at the `.await`, the undelivered guard drops undelivered and
+        // releases itself (G-4).
+        response.await.ok().flatten()
     }
 
     /// Reserve `addr` for `peer_id` independently of any connection,
@@ -1961,7 +1957,7 @@ impl RegistryOwnerHandle {
                 routing,
                 commit_seq: 0,
             };
-            tokio::spawn(owner.run(rx, release_rx));
+            tokio::spawn(owner.run(self.shared.release_tx.clone(), rx, release_rx));
         }
     }
 
@@ -2087,10 +2083,31 @@ impl RegistryOwnerHandle {
 /// is reserved, so it cannot invalidate a reap after the destructive decision
 /// has crossed its linearization point.
 pub struct ReapReservation {
-    owner: RegistryOwnerHandle,
+    /// The unbounded release-channel sender this guard's release goes
+    /// through. Owner-side-built guards carry a clone taken inside the
+    /// owner task itself -- deliberately NOT the full
+    /// `RegistryOwnerHandle`, whose command-channel sender would keep the
+    /// owner's own mailbox alive from inside the owner task (see
+    /// `PeerRegistryOwner::run`).
+    release_tx: mpsc::UnboundedSender<OwnerCommand>,
     addr: SocketAddr,
     released: bool,
     valid: Arc<AtomicU8>,
+}
+
+/// Enqueue a `ReleaseReapReservation` on the dedicated unbounded release
+/// channel. Synchronous, no `.await` inside: safe from both `release()`
+/// and `Drop`. Shared by the handle API and the guards the owner task
+/// itself constructs.
+fn enqueue_reap_release_via(
+    release_tx: &mpsc::UnboundedSender<OwnerCommand>,
+    addr: SocketAddr,
+) -> Option<oneshot::Receiver<()>> {
+    let (reply, response) = oneshot::channel();
+    release_tx
+        .send(OwnerCommand::ReleaseReapReservation { addr, reply })
+        .ok()?;
+    Some(response)
 }
 
 impl ReapReservation {
@@ -2131,7 +2148,7 @@ impl ReapReservation {
     /// Release this reservation. The normal path: call once the sweep's
     /// destructive work for this address has actually finished.
     pub async fn release(mut self) {
-        match self.owner.enqueue_reap_release(self.addr) {
+        match enqueue_reap_release_via(&self.release_tx, self.addr) {
             Some(response) => {
                 // Durably enqueued the instant `enqueue_reap_release`
                 // returned, above -- see this type's doc comment. Disarm
@@ -2162,12 +2179,17 @@ impl Drop for ReapReservation {
         // Best-effort fallback for a hard task abort -- see this type's
         // doc comment. Synchronous, like `enqueue_reap_release` itself:
         // `Drop::drop` cannot `.await`, but nothing here needs to.
-        if self.owner.enqueue_reap_release(self.addr).is_none() {
-            warn!(
+        match enqueue_reap_release_via(&self.release_tx, self.addr) {
+            None => warn!(
                 addr = %self.addr,
                 "reap reservation guard dropped without releasing -- owner task already gone; \
                  nothing to release"
-            );
+            ),
+            Some(_release) => debug!(
+                addr = %self.addr,
+                "reap reservation guard dropped without a claimant releasing it -- released \
+                 best-effort via the release channel"
+            ),
         }
     }
 }
@@ -2362,6 +2384,14 @@ impl PeerRegistryOwner {
     /// instant.
     async fn run(
         mut self,
+        // A clone of the UNBOUNDED release-channel sender only -- never the
+        // full `RegistryOwnerHandle`, whose command-channel sender would
+        // keep `rx`'s channel alive from inside this very task and prevent
+        // it from ever observing "all senders dropped" (the owner task
+        // would outlive every external handle). The release channel does
+        // not gate this loop's exit: `rx.recv()` returning `None` breaks
+        // the loop regardless of `release_rx`.
+        release_tx: mpsc::UnboundedSender<OwnerCommand>,
         mut rx: mpsc::Receiver<OwnerCommand>,
         mut release_rx: mpsc::UnboundedReceiver<OwnerCommand>,
     ) {
@@ -2369,13 +2399,13 @@ impl PeerRegistryOwner {
             tokio::select! {
                 biased;
                 Some(command) = release_rx.recv() => {
-                    self.handle(command);
+                    self.handle(command, &release_tx);
                 }
                 command = rx.recv() => {
                     let Some(command) = command else {
                         break;
                     };
-                    self.handle(command);
+                    self.handle(command, &release_tx);
                 }
             }
             // Drain whatever else is already queued on EITHER channel
@@ -2387,11 +2417,11 @@ impl PeerRegistryOwner {
             // snapshot that justifies it.
             loop {
                 if let Ok(command) = release_rx.try_recv() {
-                    self.handle(command);
+                    self.handle(command, &release_tx);
                     continue;
                 }
                 if let Ok(command) = rx.try_recv() {
-                    self.handle(command);
+                    self.handle(command, &release_tx);
                     continue;
                 }
                 break;
@@ -2400,7 +2430,7 @@ impl PeerRegistryOwner {
         debug!("registry owner task stopped: all senders dropped");
     }
 
-    fn handle(&mut self, command: OwnerCommand) {
+    fn handle(&mut self, command: OwnerCommand, release_tx: &mpsc::UnboundedSender<OwnerCommand>) {
         match command {
             OwnerCommand::Claim {
                 addr,
@@ -2513,7 +2543,28 @@ impl PeerRegistryOwner {
                     expected_pin,
                     expected_node_id,
                 );
-                let _ = reply.send(granted);
+                // G-4: the guard is constructed HERE -- before the reply
+                // crosses the channel -- so the reservation's release path
+                // exists the moment the grant does. If the requesting task
+                // is gone (cancelled between sending the command and
+                // awaiting the response, or aborted mid-await), the guard
+                // drops undelivered and its `Drop` releases the
+                // reservation; a bare grant shipped into a dead channel
+                // would have left `reap_reserved` pinned forever, refusing
+                // every later claim for the address.
+                let response = granted.map(|valid| ReapReservation {
+                    release_tx: release_tx.clone(),
+                    addr,
+                    released: false,
+                    valid,
+                });
+                if reply.send(response).is_err() {
+                    debug!(
+                        addr = %addr,
+                        "reap reservation dropped without a claimant; the guard's own drop \
+                         released it"
+                    );
+                }
             }
             OwnerCommand::ReleaseReapReservation { addr, reply } => {
                 self.reap_reserved.remove(&addr);
@@ -5247,6 +5298,156 @@ mod tests {
         assert!(
             commit.is_accepted(),
             "a reservation left by an aborted task must not survive it -- got {commit:?}"
+        );
+    }
+
+    /// G-4: `reserve_for_reap`'s guard is (was) constructed only AFTER the
+    /// caller's `response.await` resolves, while the owner inserts the
+    /// `reap_reserved` entry and replies BEFORE that. A caller cancelled in
+    /// that window -- the exact `select!`-shaped cancellation a
+    /// `cleanup_dead_peers` sweep is built around -- drops the response
+    /// without ever building a guard, so nothing ever releases the entry:
+    /// every later `claim`/`migrate`/`configure_peer` for the address is
+    /// refused with `ReapInProgress` forever.
+    ///
+    /// This test is the deterministic form of that window: the command goes
+    /// out over the owner's real mailbox, the grant is observed in
+    /// `reap_reserved`, and THEN the response is dropped without a claimant
+    /// ever taking it. The reservation must be released (the response must
+    /// BE the already-constructed guard, whose drop releases it) and the
+    /// address must be claimable again.
+    #[tokio::test]
+    async fn dropping_the_reservation_response_without_a_claimant_releases_the_reservation() {
+        let (owner, _publisher) = owner_handle();
+        let reserved_addr = addr(30_302);
+        let session_source = addr(30_303);
+        let node = peer("cancelled-reserve-reap");
+
+        let (reply, response) = tokio::sync::oneshot::channel();
+        owner
+            .shared
+            .tx
+            .send(OwnerCommand::ReserveForReap {
+                addr: reserved_addr,
+                evidence_before: std::time::Instant::now(),
+                expected_ownership: None,
+                expected_pin: None,
+                expected_node_id: None,
+                reply,
+            })
+            .await
+            .expect("the owner task must be alive");
+
+        // Wait until the owner has actually GRANTED the reservation -- the
+        // entry is in `reap_reserved`. That is the whole G-4 window: the
+        // grant exists, the claimant does not.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if owner.is_reap_reserved_for_test(reserved_addr).await {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the owner must grant the reservation for this test to exercise its window"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        // The caller dies without ever taking the response out of the
+        // channel -- on the pre-fix shape this was a bare
+        // `Arc<AtomicU8>` whose drop is meaningless; the entry leaked.
+        drop(response);
+
+        // The reservation must be released even though no guard was ever
+        // constructed claimant-side.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if !owner.is_reap_reserved_for_test(reserved_addr).await {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a reservation whose response died unread must be released -- the address \
+                 would be unclaimable forever (G-4)"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        // The mitigation plan's acceptance check: a later claim on the
+        // address succeeds.
+        let commit = owner
+            .claim_connection_scoped(
+                reserved_addr,
+                claim_of(node, ClaimKind::Verified),
+                session_source,
+            )
+            .await;
+        assert!(
+            commit.is_accepted(),
+            "an address whose reservation response died unread must be claimable -- got {commit:?}"
+        );
+    }
+
+    /// G-4's other half: the caller cancelled BEFORE the owner processed
+    /// the command at all. The reply channel dies with the requesting
+    /// task, so when the owner gets around to `ReserveForReap` there is no
+    /// claimant -- and shipping a bare grant into a dead channel (the old
+    /// `let _ = reply.send(...)`) leaves the just-inserted reservation
+    /// behind with nobody ever able to release it. The guard must be
+    /// constructed owner-side so this path drops it -- releasing the
+    /// reservation -- instead.
+    #[tokio::test]
+    async fn cancelling_reserve_for_reap_before_the_owner_processes_releases_the_reservation() {
+        let (owner, _publisher) = owner_handle();
+        let reserved_addr = addr(30_304);
+        let session_source = addr(30_305);
+        let node = peer("cancelled-reserve-reap-early");
+
+        let (reply, response) = tokio::sync::oneshot::channel();
+        owner
+            .shared
+            .tx
+            .send(OwnerCommand::ReserveForReap {
+                addr: reserved_addr,
+                evidence_before: std::time::Instant::now(),
+                expected_ownership: None,
+                expected_pin: None,
+                expected_node_id: None,
+                reply,
+            })
+            .await
+            .expect("the owner task must be alive");
+
+        // Abandon the response before the owner has necessarily processed
+        // the command: whether the grant was already sitting in the
+        // channel or the owner finds a dead reply later, the outcome must
+        // converge to "no reservation left behind".
+        drop(response);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if !owner.is_reap_reserved_for_test(reserved_addr).await {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a reserve_for_reap whose caller died before claiming the grant must not \
+                 leave the reservation behind -- the address would be unclaimable forever"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        let commit = owner
+            .claim_connection_scoped(
+                reserved_addr,
+                claim_of(node, ClaimKind::Verified),
+                session_source,
+            )
+            .await;
+        assert!(
+            commit.is_accepted(),
+            "an address whose unanswered reservation was dropped must be claimable -- \
+             got {commit:?}"
         );
     }
 
