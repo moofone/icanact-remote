@@ -1738,28 +1738,6 @@ impl RegistryOwnerHandle {
         response.await.ok().flatten()
     }
 
-    /// Enqueue an `OwnerCommand::ReleaseReapReservation` for `addr` on the
-    /// dedicated, unbounded release channel -- see `OwnerShared::
-    /// release_tx`'s doc comment. Deliberately synchronous, not `async`:
-    /// `UnboundedSender::send` cannot suspend on capacity, and has no
-    /// `.await` point inside it for a task abort to land in the middle of,
-    /// so by the time this call returns, the release is either irrevocably
-    /// queued -- `Some`, carrying the reply receiver for a caller that can
-    /// afford to await confirmation the owner actually processed it -- or
-    /// the owner task is already gone (`None`), in which case there is
-    /// nothing left to release against. Callable from both the async
-    /// `ReapReservation::release` and its synchronous `Drop` impl for
-    /// exactly this reason.
-    fn enqueue_reap_release(&self, addr: SocketAddr) -> Option<oneshot::Receiver<()>> {
-        self.ensure_started();
-        let (reply, response) = oneshot::channel();
-        self.shared
-            .release_tx
-            .send(OwnerCommand::ReleaseReapReservation { addr, reply })
-            .ok()?;
-        Some(response)
-    }
-
     /// Reserve `addr` for `peer_id` independently of any connection,
     /// atomically replacing any address this peer was previously pinned at.
     /// Returns the evicted address, if this peer held a DIFFERENT pin
@@ -1979,7 +1957,7 @@ impl RegistryOwnerHandle {
                 routing,
                 commit_seq: 0,
             };
-            tokio::spawn(owner.run(self.clone(), rx, release_rx));
+            tokio::spawn(owner.run(self.shared.release_tx.clone(), rx, release_rx));
         }
     }
 
@@ -2105,10 +2083,31 @@ impl RegistryOwnerHandle {
 /// is reserved, so it cannot invalidate a reap after the destructive decision
 /// has crossed its linearization point.
 pub struct ReapReservation {
-    owner: RegistryOwnerHandle,
+    /// The unbounded release-channel sender this guard's release goes
+    /// through. Owner-side-built guards carry a clone taken inside the
+    /// owner task itself -- deliberately NOT the full
+    /// `RegistryOwnerHandle`, whose command-channel sender would keep the
+    /// owner's own mailbox alive from inside the owner task (see
+    /// `PeerRegistryOwner::run`).
+    release_tx: mpsc::UnboundedSender<OwnerCommand>,
     addr: SocketAddr,
     released: bool,
     valid: Arc<AtomicU8>,
+}
+
+/// Enqueue a `ReleaseReapReservation` on the dedicated unbounded release
+/// channel. Synchronous, no `.await` inside: safe from both `release()`
+/// and `Drop`. Shared by the handle API and the guards the owner task
+/// itself constructs.
+fn enqueue_reap_release_via(
+    release_tx: &mpsc::UnboundedSender<OwnerCommand>,
+    addr: SocketAddr,
+) -> Option<oneshot::Receiver<()>> {
+    let (reply, response) = oneshot::channel();
+    release_tx
+        .send(OwnerCommand::ReleaseReapReservation { addr, reply })
+        .ok()?;
+    Some(response)
 }
 
 impl ReapReservation {
@@ -2149,7 +2148,7 @@ impl ReapReservation {
     /// Release this reservation. The normal path: call once the sweep's
     /// destructive work for this address has actually finished.
     pub async fn release(mut self) {
-        match self.owner.enqueue_reap_release(self.addr) {
+        match enqueue_reap_release_via(&self.release_tx, self.addr) {
             Some(response) => {
                 // Durably enqueued the instant `enqueue_reap_release`
                 // returned, above -- see this type's doc comment. Disarm
@@ -2180,7 +2179,7 @@ impl Drop for ReapReservation {
         // Best-effort fallback for a hard task abort -- see this type's
         // doc comment. Synchronous, like `enqueue_reap_release` itself:
         // `Drop::drop` cannot `.await`, but nothing here needs to.
-        match self.owner.enqueue_reap_release(self.addr) {
+        match enqueue_reap_release_via(&self.release_tx, self.addr) {
             None => warn!(
                 addr = %self.addr,
                 "reap reservation guard dropped without releasing -- owner task already gone; \
@@ -2385,7 +2384,14 @@ impl PeerRegistryOwner {
     /// instant.
     async fn run(
         mut self,
-        handle: RegistryOwnerHandle,
+        // A clone of the UNBOUNDED release-channel sender only -- never the
+        // full `RegistryOwnerHandle`, whose command-channel sender would
+        // keep `rx`'s channel alive from inside this very task and prevent
+        // it from ever observing "all senders dropped" (the owner task
+        // would outlive every external handle). The release channel does
+        // not gate this loop's exit: `rx.recv()` returning `None` breaks
+        // the loop regardless of `release_rx`.
+        release_tx: mpsc::UnboundedSender<OwnerCommand>,
         mut rx: mpsc::Receiver<OwnerCommand>,
         mut release_rx: mpsc::UnboundedReceiver<OwnerCommand>,
     ) {
@@ -2393,13 +2399,13 @@ impl PeerRegistryOwner {
             tokio::select! {
                 biased;
                 Some(command) = release_rx.recv() => {
-                    self.handle(command, &handle);
+                    self.handle(command, &release_tx);
                 }
                 command = rx.recv() => {
                     let Some(command) = command else {
                         break;
                     };
-                    self.handle(command, &handle);
+                    self.handle(command, &release_tx);
                 }
             }
             // Drain whatever else is already queued on EITHER channel
@@ -2411,11 +2417,11 @@ impl PeerRegistryOwner {
             // snapshot that justifies it.
             loop {
                 if let Ok(command) = release_rx.try_recv() {
-                    self.handle(command, &handle);
+                    self.handle(command, &release_tx);
                     continue;
                 }
                 if let Ok(command) = rx.try_recv() {
-                    self.handle(command, &handle);
+                    self.handle(command, &release_tx);
                     continue;
                 }
                 break;
@@ -2424,7 +2430,7 @@ impl PeerRegistryOwner {
         debug!("registry owner task stopped: all senders dropped");
     }
 
-    fn handle(&mut self, command: OwnerCommand, owner_handle: &RegistryOwnerHandle) {
+    fn handle(&mut self, command: OwnerCommand, release_tx: &mpsc::UnboundedSender<OwnerCommand>) {
         match command {
             OwnerCommand::Claim {
                 addr,
@@ -2547,7 +2553,7 @@ impl PeerRegistryOwner {
                 // would have left `reap_reserved` pinned forever, refusing
                 // every later claim for the address.
                 let response = granted.map(|valid| ReapReservation {
-                    owner: owner_handle.clone(),
+                    release_tx: release_tx.clone(),
                     addr,
                     released: false,
                     valid,
