@@ -51,6 +51,18 @@ tracing-test = "0.2.5"
 name = "interest_advertise_convergence_delivery"
 required-features = ["test-helpers"]
 
+[[test]]
+name = "gossip_dead_peer_actor_cleanup"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "tie_break_reconnect_storm"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "typed_tls_end_to_end"
+required-features = ["test-helpers"]
+
 [[bench]]
 name = "archived_access"
 harness = false
