@@ -108,8 +108,23 @@ fn scheduler_keeps_each_yielded_lease_progress_record() {
     };
     finish_streaming_command_slice_owned(first, false, &queue, &mut yielded, &mut pending);
     finish_streaming_command_slice_owned(second, false, &queue, &mut yielded, &mut pending);
+    for offset in 3..=64 {
+        finish_streaming_command_slice_owned(
+            PendingStreamingCommand {
+                command: StreamingCommand::WriteBytes(bytes::Bytes::from_static(b"more")),
+                offset,
+                from_shared_queue: false,
+                yield_after_frame: true,
+            },
+            false,
+            &queue,
+            &mut yielded,
+            &mut pending,
+        );
+    }
+    assert_eq!(yielded.len(), 64);
     assert_eq!(yielded.front().map(|value| value.offset), Some(1));
-    assert_eq!(yielded.back().map(|value| value.offset), Some(2));
+    assert_eq!(yielded.back().map(|value| value.offset), Some(64));
 }
 
 #[tokio::test]
@@ -314,6 +329,7 @@ async fn closing_slots_reclaims_and_reports_connection_closed() {
     assert!(matches!(waiting.as_mut().poll(&mut cx), Poll::Pending));
 
     slots.close_and_reclaim();
+    record.activate();
     let result = waiting.await;
     assert!(matches!(
         result,
@@ -321,6 +337,85 @@ async fn closing_slots_reclaims_and_reports_connection_closed() {
             if addr == "127.0.0.1:41005".parse::<std::net::SocketAddr>().unwrap()
     ));
     assert_eq!(slots.reserved(), 0);
+}
+
+#[tokio::test]
+async fn dropping_unpolled_reply_future_cancels_reserved_record() {
+    let slots = crate::connection_pool::reply_slots::ReplySlots::new(
+        1,
+        "127.0.0.1:41009".parse().unwrap(),
+        Arc::new(Notify::new()),
+    );
+    let jobs = Arc::new(Semaphore::new(1));
+    let bytes = Arc::new(Semaphore::new(16));
+    let record = slots
+        .try_reserve(
+            1,
+            16,
+            Arc::new(crate::ReplyPayload::from_static(b"cancelled")),
+            jobs.try_acquire_owned().unwrap(),
+            bytes.try_acquire_many_owned(16).unwrap(),
+        )
+        .unwrap();
+    let record_for_assertion = Arc::clone(&record);
+    let (io, _peer) = tokio::io::duplex(64);
+    let (handle, writer_task, _reader_task) = LockFreeStreamHandle::new(
+        io,
+        "127.0.0.1:41010".parse().unwrap(),
+        ChannelId::TellAsk,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let handle = Arc::new(handle);
+    let lease = crate::ReplyLease::new(Arc::clone(&handle), record);
+    let future = lease.reply_bytes(crate::ReplyPayload::from_static(b"reply"));
+    drop(future);
+    assert!(record_for_assertion.is_cancelled());
+    handle.shutdown();
+    let _ = writer_task.await;
+}
+
+#[tokio::test]
+async fn flush_pending_keeps_leased_stage_for_resume() {
+    let slots = crate::connection_pool::reply_slots::ReplySlots::new(
+        1,
+        "127.0.0.1:41011".parse().unwrap(),
+        Arc::new(Notify::new()),
+    );
+    let jobs = Arc::new(Semaphore::new(1));
+    let bytes = Arc::new(Semaphore::new(8));
+    let record = slots
+        .try_reserve(
+            1,
+            8,
+            Arc::new(crate::ReplyPayload::from_static(b"cancelled")),
+            jobs.try_acquire_owned().unwrap(),
+            bytes.try_acquire_many_owned(8).unwrap(),
+        )
+        .unwrap();
+    let mut response = LeasedResponse {
+        record,
+        stage: LeasedResponseStage::Flushing,
+    };
+    let mut stream = PendingWriter;
+    let next_stream_id = std::sync::atomic::AtomicU32::new(1);
+    let mut pending_offset = 0;
+    {
+        let future = write_leased_response_command_slice(
+            &mut stream,
+            &mut pending_offset,
+            &mut response,
+            1,
+            1024,
+            &next_stream_id,
+        );
+        tokio::pin!(future);
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(future.as_mut().poll(&mut cx), Poll::Pending));
+    }
+    assert!(matches!(response.stage, LeasedResponseStage::Flushing));
 }
 
 #[tokio::test]

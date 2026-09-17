@@ -47,7 +47,6 @@ async fn rejected_claim_has_no_wire_bytes_and_releases_capacity() {
         rejected,
         icanact_remote::ReplyLeaseAdmissionError::ClaimUnavailable(_)
     ));
-
     let mut bytes = [0u8; 16];
     let read = tokio::time::timeout(
         std::time::Duration::from_millis(100),
@@ -55,6 +54,17 @@ async fn rejected_claim_has_no_wire_bytes_and_releases_capacity() {
     )
     .await;
     assert!(read.is_err());
+
+    let replacement = icanact_remote::AskResponder::from_stream_handle_for_test(
+        81,
+        Arc::clone(&handle),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .try_reply_lease(&budget, 32)
+    .expect("discarded sibling reservation must release capacity");
+    replacement
+        .try_reply_bytes(ReplyPayload::from_static(b"replacement"))
+        .unwrap();
     drop(first);
     handle.shutdown();
     let _ = writer_task.await;
