@@ -371,6 +371,21 @@ async fn shutdown_drains_waiting_and_inflight_with_observer_accounting() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn concurrent_idle_shutdown_observers_share_reclamation() {
+    let forwarder = AskForwarder::new(1, 128);
+    let first = tokio::spawn({
+        let forwarder = forwarder.clone();
+        async move { forwarder.shutdown(Duration::ZERO).await }
+    });
+    let second = tokio::spawn({
+        let forwarder = forwarder.clone();
+        async move { forwarder.shutdown(Duration::from_secs(1)).await }
+    });
+    assert!(first.await.unwrap().is_ok());
+    assert!(second.await.unwrap().is_ok());
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn shutdown_closed_receiver_does_not_spin_while_peer_progresses() {
     let (caller, gateway) = pair().await;
     let (downstream, sink) = pair().await;

@@ -58,9 +58,9 @@ struct WorkerControl {
     // shutdown path uses this edge-triggered wake in addition to the atomic
     // state so closure is observed without waiting for grace to elapse.
     shutdown_wake: Notify,
-    shutdown_in_progress: AtomicBool,
-    shutdown_result: Mutex<Option<ShutdownResult>>,
+    shutdown: Mutex<ShutdownState>,
     shutdown_done: Notify,
+    reconciliation: Mutex<ObserverReconciliation>,
 }
 
 struct AskForwarderInner {
@@ -124,9 +124,13 @@ impl AskForwarder {
             abnormal: AtomicBool::new(false),
             observer: completion_observer.clone(),
             shutdown_wake: Notify::new(),
-            shutdown_in_progress: AtomicBool::new(false),
-            shutdown_result: Mutex::new(None),
+            shutdown: Mutex::new(ShutdownState {
+                terminal: None,
+                leader: false,
+                reclamation_complete: false,
+            }),
             shutdown_done: Notify::new(),
+            reconciliation: Mutex::new(ObserverReconciliation { complete: false }),
         });
 
         let mut worker_senders = Vec::with_capacity(workers);
@@ -178,25 +182,26 @@ impl AskForwarder {
     /// success.
     pub async fn shutdown(&self, grace: Duration) -> Result<()> {
         let control = Arc::clone(&self.inner.control);
-        loop {
-            if let Some(result) = read_shutdown_result(&control) {
-                return result.into_result();
+        let terminal = loop {
+            match claim_shutdown(&control) {
+                ShutdownClaim::Complete(result) => return result.into_result(),
+                ShutdownClaim::Leader(terminal) => break terminal,
+                ShutdownClaim::Waiting => {}
             }
-            if control
-                .shutdown_in_progress
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                break;
-            }
+
+            // Register before rechecking leadership. If the leader is
+            // cancelled between these operations, its drop notification is
+            // retained by Notify and this caller will take over rather than
+            // sleeping forever on a lost wake.
             let notified = control.shutdown_done.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            if let Some(result) = read_shutdown_result(&control) {
-                return result.into_result();
+            match check_shutdown_wait(&control) {
+                ShutdownWait::Complete(result) => return result.into_result(),
+                ShutdownWait::Retry => continue,
+                ShutdownWait::Wait => notified.await,
             }
-            notified.await;
-        }
+        };
 
         let mut leader = ShutdownLeader {
             control: control.clone(),
@@ -221,46 +226,38 @@ impl AskForwarder {
             control.shutdown_wake.notify_one();
         }
 
-        if wait_for_workers(&control, grace).await {
+        if terminal.is_none() && wait_for_workers(&control, grace).await {
             let abnormal = control.abnormal.load(Ordering::Acquire);
             let missing = finalize_observer_gaps(&control);
             if abnormal || missing {
                 // A worker that exited abnormally may have dropped admitted
                 // tasks. Do not publish a false Drained state.
                 control.forced.store(true, Ordering::Release);
-                complete_shutdown(&control, ShutdownResult::TimedOut);
+                set_shutdown_result(&control, ShutdownResult::TimedOut);
+                reap_join_handles(&self.inner).await;
+                finish_shutdown(&control, ShutdownResult::TimedOut);
                 leader.finished = true;
                 return Err(GossipError::Timeout);
             }
-            complete_shutdown(&control, ShutdownResult::Drained);
+            reap_join_handles(&self.inner).await;
+            finish_shutdown(&control, ShutdownResult::Drained);
             leader.finished = true;
             return Ok(());
         }
-        // Persist the forced terminal result before aborting or awaiting any
-        // worker. If this leader is cancelled after abort, later observers
-        // must not retry and falsely turn the expired drain into Drained.
+
+        // Persist the forced terminal reason before aborting or awaiting any
+        // worker. The reason is sticky, but reclamation remains incomplete;
+        // concurrent callers must await that separate completion state.
         control.forced.store(true, Ordering::Release);
-        complete_shutdown(&control, ShutdownResult::TimedOut);
-        leader.finished = true;
+        set_shutdown_result(&control, ShutdownResult::TimedOut);
         for handle in &self.inner.abort_handles {
             handle.abort();
         }
-        let joins = {
-            let mut guard = self
-                .inner
-                .joins
-                .lock()
-                .unwrap_or_else(|err| err.into_inner());
-            std::mem::take(&mut *guard)
-        };
-        for join in joins {
-            let _ = join.await;
-        }
-
-        // Worker joins establish that no completion can race the forced
-        // observer reconciliation below. Grace expiry remains a timeout even
-        // when abort/reclamation itself succeeds.
+        wait_for_all_workers(&control).await;
         finalize_observer_gaps(&control);
+        reap_join_handles(&self.inner).await;
+        finish_shutdown(&control, ShutdownResult::TimedOut);
+        leader.finished = true;
         Err(GossipError::Timeout)
     }
 
@@ -392,30 +389,122 @@ struct ShutdownLeader {
 impl Drop for ShutdownLeader {
     fn drop(&mut self) {
         if !self.finished {
-            self.control
-                .shutdown_in_progress
-                .store(false, Ordering::Release);
+            let mut state = self
+                .control
+                .shutdown
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            state.leader = false;
+            drop(state);
             self.control.shutdown_done.notify_waiters();
         }
     }
 }
 
-fn read_shutdown_result(control: &WorkerControl) -> Option<ShutdownResult> {
-    control
-        .shutdown_result
-        .lock()
-        .unwrap_or_else(|err| err.into_inner())
-        .as_ref()
-        .copied()
+#[derive(Clone, Copy)]
+struct ShutdownState {
+    terminal: Option<ShutdownResult>,
+    leader: bool,
+    reclamation_complete: bool,
 }
 
-fn complete_shutdown(control: &WorkerControl, result: ShutdownResult) {
-    let mut guard = control
-        .shutdown_result
+enum ShutdownClaim {
+    Complete(ShutdownResult),
+    Leader(Option<ShutdownResult>),
+    Waiting,
+}
+
+enum ShutdownWait {
+    Complete(ShutdownResult),
+    Retry,
+    Wait,
+}
+
+fn claim_shutdown(control: &WorkerControl) -> ShutdownClaim {
+    let mut state = control
+        .shutdown
         .lock()
         .unwrap_or_else(|err| err.into_inner());
-    *guard = Some(result);
+    if state.reclamation_complete {
+        return ShutdownClaim::Complete(
+            state
+                .terminal
+                .expect("reclamation completion requires a terminal result"),
+        );
+    }
+    if state.leader {
+        ShutdownClaim::Waiting
+    } else {
+        state.leader = true;
+        ShutdownClaim::Leader(state.terminal)
+    }
+}
+
+fn check_shutdown_wait(control: &WorkerControl) -> ShutdownWait {
+    let state = control
+        .shutdown
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if state.reclamation_complete {
+        ShutdownWait::Complete(
+            state
+                .terminal
+                .expect("reclamation completion requires a terminal result"),
+        )
+    } else if !state.leader {
+        ShutdownWait::Retry
+    } else {
+        ShutdownWait::Wait
+    }
+}
+
+struct ObserverReconciliation {
+    complete: bool,
+}
+
+fn set_shutdown_result(control: &WorkerControl, result: ShutdownResult) {
+    let mut state = control
+        .shutdown
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if state.terminal.is_none() {
+        state.terminal = Some(result);
+    }
+}
+
+fn finish_shutdown(control: &WorkerControl, result: ShutdownResult) {
+    let mut state = control
+        .shutdown
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if state.terminal.is_none() {
+        state.terminal = Some(result);
+    }
+    state.reclamation_complete = true;
+    drop(state);
     control.shutdown_done.notify_waiters();
+}
+
+async fn wait_for_all_workers(control: &WorkerControl) {
+    loop {
+        let notified = control.done.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if control.remaining.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        notified.await;
+    }
+}
+
+async fn reap_join_handles(inner: &AskForwarderInner) {
+    let joins = {
+        let mut guard = inner.joins.lock().unwrap_or_else(|err| err.into_inner());
+        std::mem::take(&mut *guard)
+    };
+    for join in joins {
+        let _ = join.await;
+    }
 }
 
 enum ForwardOutcome {
@@ -481,6 +570,9 @@ struct WorkerExit {
 impl Drop for WorkerExit {
     fn drop(&mut self) {
         if self.control.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // The last worker may reconcile dropped tasks, but the mutex makes
+            // this the only reconciliation owner. Shutdown completion is
+            // published only after this callback sequence has returned.
             finalize_observer_gaps(&self.control);
             self.control.done.notify_waiters();
         }
@@ -488,23 +580,30 @@ impl Drop for WorkerExit {
 }
 
 /// Reconcile accepted tasks whose worker futures were dropped by forced or
-/// abnormal termination. Called after the last worker exits (including an
-/// abort before its first poll) and again after shutdown joins; the atomic
-/// counters make the repeated call harmless.
+/// abnormal termination. The ownership mutex covers the read/callback/update
+/// sequence, so a last-worker drop and shutdown finalizer cannot emit the same
+/// missing error twice or publish completion before callbacks finish.
 fn finalize_observer_gaps(control: &WorkerControl) -> bool {
-    let admitted = control.admitted.load(Ordering::Acquire);
-    let completed = control.completed.load(Ordering::Acquire);
-    if completed >= admitted {
+    let mut reconciliation = control
+        .reconciliation
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    if reconciliation.complete {
         return false;
     }
-    let missing = admitted - completed;
+    let admitted = control.admitted.load(Ordering::Acquire);
+    let completed = control.completed.load(Ordering::Acquire);
+    let missing = admitted.saturating_sub(completed);
     if let Some(observer) = control.observer.as_deref() {
         for _ in 0..missing {
             observer.record_error();
         }
     }
-    control.completed.fetch_add(missing, Ordering::AcqRel);
-    true
+    if missing != 0 {
+        control.completed.fetch_add(missing, Ordering::AcqRel);
+    }
+    reconciliation.complete = true;
+    missing != 0
 }
 
 async fn run_forward_worker(
