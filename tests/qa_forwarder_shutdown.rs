@@ -385,6 +385,73 @@ async fn concurrent_idle_shutdown_observers_share_reclamation() {
     assert!(second.await.unwrap().is_ok());
 }
 
+/// A canceled public shutdown caller must relinquish leadership so a later
+/// caller can still close and reclaim an in-flight worker.
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_shutdown_owner_can_be_replaced_publicly() {
+    let (caller, gateway) = pair().await;
+    let (downstream, sink) = pair().await;
+    sink.registry
+        .set_actor_message_handler(Arc::new(ReplyAfter(Duration::from_secs(30))))
+        .await;
+    connect_nodes(&gateway, &sink).await;
+    let destination = connection(&gateway, &sink).await;
+    let submitted = Arc::new(AtomicUsize::new(0));
+    let forwarder = AskForwarder::new(1, 128);
+    gateway
+        .registry
+        .set_actor_ask_handler_sync(Arc::new(ForwardingHandler {
+            forwarder: forwarder.clone(),
+            destination,
+            submitted: submitted.clone(),
+            timeout: None,
+        }))
+        .await;
+    connect_nodes(&caller, &gateway).await;
+    let caller_connection = connection(&caller, &gateway).await;
+    let ask = tokio::spawn(async move {
+        caller_connection
+            .ask_actor_frame(
+                ACTOR,
+                TYPE,
+                Bytes::from_static(b"cancelled-shutdown"),
+                Duration::from_secs(2),
+            )
+            .await
+    });
+    assert!(
+        wait_for_condition(Duration::from_secs(2), || async {
+            submitted.load(Ordering::SeqCst) == 1
+        })
+        .await
+    );
+
+    // The long grace period keeps the first caller in its worker wait while
+    // the destination ask remains in flight; cancellation therefore occurs
+    // before that caller can publish terminal completion.
+    let leader = tokio::spawn({
+        let forwarder = forwarder.clone();
+        async move { forwarder.shutdown(Duration::from_secs(1)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    leader.abort();
+    assert!(
+        leader.await.is_err(),
+        "the first public shutdown must cancel"
+    );
+
+    assert!(matches!(
+        forwarder.shutdown(Duration::ZERO).await,
+        Err(icanact_remote::GossipError::Timeout)
+    ));
+    assert!(ask.await.unwrap().is_err());
+
+    caller.shutdown().await;
+    gateway.shutdown().await;
+    downstream.shutdown().await;
+    sink.shutdown().await;
+}
+
 /// Public transport coverage for the same ownership invariant exercised by
 /// the deterministic cfg(test) module hooks: accepted asks span the worker's
 /// queued, waiting, and in-flight sets when forced shutdown starts, and every

@@ -1,4 +1,6 @@
 use std::collections::VecDeque;
+use std::future::{Future, poll_fn};
+use std::pin::Pin;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -121,6 +123,7 @@ struct LifecycleTestHooks {
     leader_after_claim: Option<Arc<AsyncPause>>,
     waiting_before_registration: Option<Arc<AsyncPause>>,
     after_forced_abort: Option<Arc<AsyncPause>>,
+    join_before_await: Option<Arc<AsyncPause>>,
     worker_exit_after_remaining: Option<Arc<SyncPause>>,
     reconciliation_after_claim: Option<Arc<SyncPause>>,
     ownership_snapshot: Option<Arc<AsyncPause>>,
@@ -619,14 +622,52 @@ async fn wait_for_all_workers(control: &WorkerControl) {
     }
 }
 
+struct JoinHandleReaper<'a> {
+    inner: &'a AskForwarderInner,
+    joins: Vec<JoinHandle<()>>,
+    complete: bool,
+}
+
+impl Drop for JoinHandleReaper<'_> {
+    fn drop(&mut self) {
+        if self.complete || self.joins.is_empty() {
+            return;
+        }
+        let mut guard = self
+            .inner
+            .joins
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        guard.append(&mut self.joins);
+    }
+}
+
 async fn reap_join_handles(inner: &AskForwarderInner) {
     let joins = {
         let mut guard = inner.joins.lock().unwrap_or_else(|err| err.into_inner());
         std::mem::take(&mut *guard)
     };
-    for join in joins {
-        let _ = join.await;
+    let mut reaper = JoinHandleReaper {
+        inner,
+        joins,
+        complete: false,
+    };
+    while !reaper.joins.is_empty() {
+        #[cfg(test)]
+        if let Some(hook) = lifecycle_test_hook(inner.control.as_ref(), |hooks| {
+            hooks.join_before_await.clone()
+        }) {
+            hook.pause().await;
+        }
+        // Keep the handle in the guard until its poll is ready. If this
+        // future is cancelled while the worker is still running, Drop can
+        // restore that unfinished handle for the next shutdown leader. Remove
+        // a completed handle immediately so it is never polled twice after a
+        // cancellation between joins.
+        let _ = poll_fn(|cx| Pin::new(&mut reaper.joins[0]).poll(cx)).await;
+        reaper.joins.swap_remove(0);
     }
+    reaper.complete = true;
 }
 
 enum ForwardOutcome {
@@ -1446,16 +1487,31 @@ mod tests {
         .expect("the concurrent caller must observe the active leader");
 
         after_forced_abort.release();
-        assert!(
+        let observed_reconciliation = tokio::time::timeout(Duration::from_secs(2), async {
+            while observer.error.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        // Release the follower's own registration gate before checking that it
+        // remains pending; otherwise the timeout would only prove that the
+        // test hook is still holding the follower.
+        waiting_before_registration.release();
+        let follower_still_waiting =
             tokio::time::timeout(Duration::from_millis(100), &mut follower)
                 .await
-                .is_err(),
-            "a post-abort caller must await reclamation, not only the sticky timeout reason"
-        );
-        assert_eq!(observer.error.load(Ordering::SeqCst), 1);
-        waiting_before_registration.release();
+                .is_err();
 
         worker_exit_after_remaining.release();
+        assert!(
+            observed_reconciliation,
+            "shutdown must reconcile before joining"
+        );
+        assert!(
+            follower_still_waiting,
+            "a post-abort caller must await reclamation after registering"
+        );
         assert!(matches!(
             leader.await.expect("leader task must not panic"),
             Err(GossipError::Timeout)
@@ -1476,6 +1532,103 @@ mod tests {
             .expect("writer task must not panic");
         source.shutdown().await;
         sink.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_shutdown_join_owner_keeps_paused_last_worker_for_successor() {
+        let worker_exit_after_remaining = SyncPause::new();
+        let join_before_await = AsyncPause::new();
+        let waiting_before_registration = AsyncPause::new();
+        let hooks = Arc::new(LifecycleTestHooks {
+            waiting_before_registration: Some(waiting_before_registration.clone()),
+            join_before_await: Some(join_before_await.clone()),
+            worker_exit_after_remaining: Some(worker_exit_after_remaining.clone()),
+            ..Default::default()
+        });
+        let forwarder = AskForwarder::new_with_test_hooks(1, 128, None, hooks);
+
+        let leader_cancel = Arc::new(Notify::new());
+        let (leader_done_tx, leader_done_rx) = std::sync::mpsc::channel();
+        let leader_thread = {
+            let forwarder = forwarder.clone();
+            let leader_cancel = leader_cancel.clone();
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("shutdown executor must build");
+                runtime.block_on(async move {
+                    tokio::select! {
+                        result = forwarder.shutdown(Duration::from_millis(10)) => {
+                            leader_done_tx.send(Some(result)).expect("leader result receiver");
+                        }
+                        _ = leader_cancel.notified() => {
+                            leader_done_tx.send(None).expect("leader cancellation receiver");
+                        }
+                    }
+                });
+            })
+        };
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            worker_exit_after_remaining.wait_until_entered(),
+        )
+        .await
+        .expect("the last worker must decrement before join reclamation");
+        assert_eq!(forwarder.inner.control.remaining.load(Ordering::SeqCst), 0);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            join_before_await.wait_until_entered(),
+        )
+        .await
+        .expect("the leader must enter join await while the worker is paused");
+
+        let mut follower = tokio::spawn({
+            let forwarder = forwarder.clone();
+            async move { forwarder.shutdown(Duration::ZERO).await }
+        });
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            waiting_before_registration.wait_until_entered(),
+        )
+        .await
+        .expect("the successor must reach its registration gate");
+
+        // Cancellation drops the only active shutdown leader after it has
+        // claimed the join handle, so a successor must inherit that handle.
+        leader_cancel.notify_one();
+        assert!(
+            leader_done_rx
+                .recv()
+                .expect("leader completion receiver")
+                .is_none(),
+            "the join owner must be cancelled"
+        );
+        leader_thread
+            .join()
+            .expect("shutdown executor thread must not panic");
+
+        // This release is deliberately before the noncompletion assertion:
+        // the follower must be waiting on the retained worker join, not its
+        // own registration hook.
+        waiting_before_registration.release();
+        let returned_while_worker_paused =
+            tokio::time::timeout(Duration::from_millis(100), &mut follower)
+                .await
+                .is_ok();
+        worker_exit_after_remaining.release();
+
+        assert!(
+            !returned_while_worker_paused,
+            "the successor must not publish completion before the paused worker is joined"
+        );
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), follower)
+                .await
+                .expect("successor must finish after worker release")
+                .expect("successor task must not panic"),
+            Ok(())
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
