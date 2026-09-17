@@ -1,7 +1,10 @@
 mod common;
 
 use bytes::Bytes;
-use common::{DynError, TlsHandle, connect_bidirectional, create_tls_node, wait_for_condition};
+use common::{
+    DynError, TlsHandle, capture_connection_diagnostics, connect_bidirectional, create_tls_node,
+    wait_for_condition,
+};
 use icanact_remote::lifecycle::{TransportLifecycleEvent, TransportLifecycleRecorderGuard};
 use icanact_remote::registry::{ActorMessageHandlerSync, ActorResponse, RegistryChange};
 use icanact_remote::{
@@ -416,9 +419,15 @@ async fn connect_bidirectional_bounded(a: &TlsHandle, b: &TlsHandle) -> Result<(
     let peer_ids = [a.registry.peer_id.clone(), b.registry.peer_id.clone()];
     let outbound_baseline = snapshot_outbound_dial_resolution_counts(&peer_ids);
     let result = connect_bidirectional(a, b).await;
+    if result.is_err() {
+        capture_connection_diagnostics("chaos/connect_bidirectional", a, b).await;
+    }
     let resolution_entered =
         wait_for_dial_resolution_entered(&peer_ids, &outbound_baseline, Duration::from_secs(3))
             .await;
+    if !resolution_entered {
+        capture_connection_diagnostics("chaos/dial-resolution", a, b).await;
+    }
     assert!(
         resolution_entered,
         "outbound dial resolution for {peer_ids:?} never started in at least one direction"
