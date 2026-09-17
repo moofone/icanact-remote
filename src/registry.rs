@@ -11560,6 +11560,15 @@ impl<T: 'static> GossipRegistry<T> {
                         // performs a single atomic compare-and-clear against
                         // `current` and declines (a safe no-op) if a
                         // concurrent publish has already superseded it.
+                        #[cfg(feature = "test-helpers")]
+                        crate::lifecycle::record_test_helper_event(|sequence| {
+                            crate::lifecycle::TransportTestHelperEvent::TeardownAttempt {
+                                peer: peer_id.clone(),
+                                addr: current.addr,
+                                instance_id: failed_id,
+                                sequence,
+                            }
+                        });
                         crate::lifecycle::record_transport_event(
                             crate::lifecycle::TransportLifecycleEvent::SocketFailureMatchedInstanceTeardownAttempt {
                                 peer: peer_id.clone(),
@@ -11611,6 +11620,16 @@ impl<T: 'static> GossipRegistry<T> {
                             // accounting; a CAS loss must be structurally
                             // unable to reach it, not merely discouraged by a
                             // flag some later block remembers to check.
+                            #[cfg(feature = "test-helpers")]
+                            crate::lifecycle::record_test_helper_event(|sequence| {
+                                crate::lifecycle::TransportTestHelperEvent::MarkFailed {
+                                    peer: Some(peer_id.clone()),
+                                    addr: failed_peer_addr,
+                                    instance_id: Some(failed_id),
+                                    applied: false,
+                                    sequence,
+                                }
+                            });
                             return Ok(());
                         }
                         info!(
@@ -11755,6 +11774,16 @@ impl<T: 'static> GossipRegistry<T> {
         }
 
         // IMMEDIATELY mark peer as failed in our local state
+        #[cfg(feature = "test-helpers")]
+        crate::lifecycle::record_test_helper_event(|sequence| {
+            crate::lifecycle::TransportTestHelperEvent::MarkFailed {
+                peer: peer_id.clone(),
+                addr: failed_peer_addr,
+                instance_id: failed_instance_id,
+                applied: true,
+                sequence,
+            }
+        });
         let mut crossed_threshold = false;
         {
             let mut gossip_state = self.gossip_state.lock().await;
@@ -13332,6 +13361,29 @@ impl<T: 'static> GossipRegistry<T> {
     }
 
     async fn mark_peer_connected_inner(&self, addr: SocketAddr, require_live: bool) {
+        #[cfg(feature = "test-helpers")]
+        {
+            let peer = self.connection_pool.get_peer_id_by_addr(&addr);
+            let instance_id = peer.as_ref().and_then(|peer_id| {
+                self.connection_pool
+                    .peer_current_connection_snapshot(peer_id)
+                    .and_then(|connection| {
+                        connection
+                            .stream_handle
+                            .as_ref()
+                            .map(|handle| handle.instance_id())
+                    })
+            });
+            crate::lifecycle::record_test_helper_event(|sequence| {
+                crate::lifecycle::TransportTestHelperEvent::MarkConnected {
+                    peer,
+                    addr,
+                    instance_id,
+                    require_live,
+                    sequence,
+                }
+            });
+        }
         let now = current_timestamp();
         let did_mark = {
             let mut gossip_state = self.gossip_state.lock().await;
