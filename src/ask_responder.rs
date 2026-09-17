@@ -364,11 +364,15 @@ pub struct AskResponder {
 /// guard and a subsequent enqueue attempt was rejected — never when the
 /// claim was already taken by a sibling responder (see [`TryReplyError`]).
 pub struct ImmediateReplyFallback {
-    responder: AskResponder,
+    pub(crate) responder: AskResponder,
     error: GossipError,
 }
 
 impl ImmediateReplyFallback {
+    pub(crate) fn from_claimed_responder(responder: AskResponder, error: GossipError) -> Self {
+        Self { responder, error }
+    }
+
     /// The immediate-enqueue error that selected this fallback path.
     pub fn error(&self) -> &GossipError {
         &self.error
@@ -397,6 +401,16 @@ impl ImmediateReplyFallback {
             .sink
             .send_response_bytes(self.responder.correlation_id, response)
             .await
+    }
+
+    /// Transfer this already-claimed fallback into a bounded transport lease.
+    /// The transfer path deliberately does not call `claim_reply` again.
+    pub fn try_into_reply_lease(
+        self,
+        budget: &crate::ReplyDeliveryBudget,
+        max_reply_bytes: usize,
+    ) -> std::result::Result<crate::ReplyLease, crate::ReplyLeaseAdmissionError> {
+        crate::reply_lease::reserve_for_responder(self.responder, budget, max_reply_bytes, true)
     }
 }
 
@@ -427,6 +441,25 @@ impl TryReplyError {
 }
 
 impl AskResponder {
+    pub fn try_reply_lease(
+        self,
+        budget: &crate::ReplyDeliveryBudget,
+        max_reply_bytes: usize,
+    ) -> std::result::Result<crate::ReplyLease, crate::ReplyLeaseAdmissionError> {
+        crate::reply_lease::reserve_for_responder(self, budget, max_reply_bytes, false)
+    }
+
+    pub(crate) fn claim_for_lease(&self) -> Result<()> {
+        claim_reply(&self.used)
+    }
+
+    pub(crate) fn stream_handle_for_lease(&self) -> Result<Arc<LockFreeStreamHandle>> {
+        match &self.sink {
+            AskResponseSink::StreamHandle(handle) => Ok(Arc::clone(handle)),
+            AskResponseSink::DeferredWriter(writer) => writer.stream_handle(),
+        }
+    }
+
     pub(crate) fn from_stream_handle(
         correlation_id: u32,
         stream_handle: Arc<LockFreeStreamHandle>,
@@ -649,7 +682,7 @@ impl ResponseWriter {
         self.stream_handle.store(Some(stream_handle));
     }
 
-    fn stream_handle(&self) -> Result<Arc<LockFreeStreamHandle>> {
+    pub(crate) fn stream_handle(&self) -> Result<Arc<LockFreeStreamHandle>> {
         self.stream_handle.load_full().ok_or_else(|| {
             GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,

@@ -39,6 +39,7 @@ pub mod registry;
 pub mod registry_owner;
 pub mod remote_actor_location;
 pub mod remote_actor_ref;
+pub mod reply_lease;
 mod route_interning;
 #[cfg(any(test, feature = "test-helpers", debug_assertions))]
 pub mod test_helpers;
@@ -60,7 +61,9 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub use aligned::{AlignedBytes, AlignedBytesPool, PAYLOAD_ALIGNMENT, PooledAlignedBuffer};
 pub use ask_forwarder::{AskForwardObserver, AskForwarder};
-pub use ask_responder::{AskContext, AskReplyObserver, AskResponder, TellContext, TryReplyError};
+pub use ask_responder::{
+    AskContext, AskReplyObserver, AskResponder, ImmediateReplyFallback, TellContext, TryReplyError,
+};
 pub use config::{ConnectionRecoveryPolicy, GossipConfig};
 pub use dns::{DnsResolver, TokioDnsResolver};
 
@@ -90,6 +93,7 @@ pub use pubsub::{
 pub use registry::{ClockEchoV1, ClockProbeV1, GossipExtensionsV1, PeerClockSnapshot};
 pub use remote_actor_location::RemoteActorLocation;
 pub use remote_actor_ref::{RemoteActorRef, RemoteConnection};
+pub use reply_lease::{ReplyDeliveryBudget, ReplyLease, ReplyLeaseAdmissionError, ReplyPayload};
 pub use transport::{RegistryTransportBootstrap, TransportWireKind};
 pub use typed::{
     ArchivedBytes, WireEncode, WireType, decode_typed, decode_typed_archived, encode_typed,

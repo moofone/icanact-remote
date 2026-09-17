@@ -617,7 +617,10 @@ enum PendingOrdinaryWrite {
 }
 
 fn pending_ask_nack_occupancy(pending: &Option<PendingOrdinaryWrite>) -> usize {
-    usize::from(matches!(pending, Some(PendingOrdinaryWrite::AskNack { .. })))
+    usize::from(matches!(
+        pending,
+        Some(PendingOrdinaryWrite::AskNack { .. })
+    ))
 }
 
 /// Park `batch` as a one-poll `PendingOrdinaryWrite::Chunks` so the IO loop
@@ -1084,12 +1087,7 @@ where
             if *offset >= header.len() {
                 return OrdinaryWriteProgress::Complete(0);
             }
-            match poll_vectored_nowait(
-                stream,
-                &[std::io::IoSlice::new(&header[*offset..])],
-            )
-            .await
-            {
+            match poll_vectored_nowait(stream, &[std::io::IoSlice::new(&header[*offset..])]).await {
                 OrdinaryWriteProgress::Partial(0) => OrdinaryWriteProgress::Partial(0),
                 OrdinaryWriteProgress::Partial(n) | OrdinaryWriteProgress::Complete(n) => {
                     *offset += n;
@@ -1212,7 +1210,9 @@ where
                 Poll::Ready(OrdinaryWriteProgress::Partial(0)) => {
                     Poll::Ready(OrdinaryWriteProgress::Partial(0))
                 }
-                Poll::Ready(OrdinaryWriteProgress::Partial(n) | OrdinaryWriteProgress::Complete(n)) => {
+                Poll::Ready(
+                    OrdinaryWriteProgress::Partial(n) | OrdinaryWriteProgress::Complete(n),
+                ) => {
                     *offset += n;
                     if *offset >= total {
                         Poll::Ready(OrdinaryWriteProgress::Complete(n))
@@ -1234,13 +1234,13 @@ where
                 match poll_vectored(stream, &[std::io::IoSlice::new(chunk)], cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(OrdinaryWriteProgress::Partial(0)) => {
-                        return Poll::Ready(OrdinaryWriteProgress::Partial(0))
+                        return Poll::Ready(OrdinaryWriteProgress::Partial(0));
                     }
-                    Poll::Ready(OrdinaryWriteProgress::Partial(n) | OrdinaryWriteProgress::Complete(n)) => {
-                        n
-                    }
+                    Poll::Ready(
+                        OrdinaryWriteProgress::Partial(n) | OrdinaryWriteProgress::Complete(n),
+                    ) => n,
                     Poll::Ready(OrdinaryWriteProgress::Failed) => {
-                        return Poll::Ready(OrdinaryWriteProgress::Failed)
+                        return Poll::Ready(OrdinaryWriteProgress::Failed);
                     }
                 }
             };
@@ -1260,7 +1260,9 @@ where
                 Poll::Ready(OrdinaryWriteProgress::Partial(0)) => {
                     Poll::Ready(OrdinaryWriteProgress::Partial(0))
                 }
-                Poll::Ready(OrdinaryWriteProgress::Partial(n) | OrdinaryWriteProgress::Complete(n)) => {
+                Poll::Ready(
+                    OrdinaryWriteProgress::Partial(n) | OrdinaryWriteProgress::Complete(n),
+                ) => {
                     *offset += n;
                     if *offset >= header.len() {
                         Poll::Ready(OrdinaryWriteProgress::Complete(n))
@@ -1884,6 +1886,269 @@ where
     Ok((0, true, false))
 }
 
+fn lease_stream_chunk_size(max_message_size: usize) -> Result<usize> {
+    let max_chunk = max_message_size.saturating_sub(framing::STREAM_REQUEST_START_HEADER_LEN);
+    if max_chunk == 0 {
+        return Err(GossipError::InvalidConfig(format!(
+            "max_message_size={} too small for leased streaming",
+            max_message_size
+        )));
+    }
+    Ok(STREAM_CHUNK_SIZE.min(max_chunk))
+}
+
+fn allocate_lease_stream_id(next_stream_id: &AtomicU32) -> Result<u32> {
+    loop {
+        let current = next_stream_id.load(Ordering::Acquire);
+        if current == u32::MAX {
+            return Err(GossipError::Shutdown);
+        }
+        let next = current.checked_add(2).ok_or(GossipError::Shutdown)?;
+        if next_stream_id
+            .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Ok(current);
+        }
+    }
+}
+
+async fn write_inline_lease_slice<S>(
+    stream: &mut S,
+    pending_offset: &mut usize,
+    header: &[u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN],
+    payload: &[u8],
+) -> std::io::Result<(usize, bool)>
+where
+    S: AsyncWrite + Unpin,
+{
+    let total_len = header.len().saturating_add(payload.len());
+    if *pending_offset >= total_len {
+        return Ok((0, true));
+    }
+    let budget = STREAM_WRITE_SLICE_BYTES.min(total_len - *pending_offset);
+    let mut slices = [std::io::IoSlice::new(&[]); 2];
+    let slice_count = if *pending_offset < header.len() {
+        let header_end = (*pending_offset + budget).min(header.len());
+        slices[0] = std::io::IoSlice::new(&header[*pending_offset..header_end]);
+        let header_bytes = header_end - *pending_offset;
+        if header_bytes < budget {
+            slices[1] = std::io::IoSlice::new(&payload[..budget - header_bytes]);
+            2
+        } else {
+            1
+        }
+    } else {
+        let payload_offset = *pending_offset - header.len();
+        slices[0] = std::io::IoSlice::new(&payload[payload_offset..payload_offset + budget]);
+        1
+    };
+    let written = write_vectored_once(stream, &slices[..slice_count]).await?;
+    *pending_offset += written;
+    Ok((written, *pending_offset >= total_len))
+}
+
+async fn write_leased_response_command_slice<S>(
+    stream: &mut S,
+    pending_offset: &mut usize,
+    response: &mut LeasedResponse,
+    streaming_threshold: usize,
+    max_message_size: usize,
+    next_stream_id: &AtomicU32,
+) -> std::io::Result<(usize, bool, bool)>
+where
+    S: AsyncWrite + Unpin,
+{
+    let stage = std::mem::replace(&mut response.stage, LeasedResponseStage::Complete);
+    match stage {
+        LeasedResponseStage::Reserved => {
+            *pending_offset = 0;
+            let next = if response.record.is_cancelled() {
+                LeasedResponseStage::WritingTerminal {
+                    header: crate::framing::write_ask_response_header(
+                        crate::MessageType::Response,
+                        response.record.correlation_id(),
+                        response.record.terminal_payload().len(),
+                    ),
+                    payload: response.record.terminal_payload(),
+                }
+            } else if let Some(payload) = response.record.normal_payload() {
+                if payload.len() > streaming_threshold
+                    || payload.len()
+                        > max_message_size.saturating_sub(framing::ASK_RESPONSE_HEADER_LEN)
+                {
+                    match (
+                        lease_stream_chunk_size(max_message_size),
+                        allocate_lease_stream_id(next_stream_id),
+                    ) {
+                        (Ok(chunk_size), Ok(stream_id)) => LeasedResponseStage::WritingNormal(
+                            Box::new(BytesStreamingResponse::new(
+                                stream_id,
+                                response.record.correlation_id(),
+                                payload.as_bytes().clone(),
+                                payload.len(),
+                                chunk_size,
+                            )),
+                        ),
+                        _ => LeasedResponseStage::WritingTerminal {
+                            header: crate::framing::write_ask_response_header(
+                                crate::MessageType::Response,
+                                response.record.correlation_id(),
+                                response.record.terminal_payload().len(),
+                            ),
+                            payload: response.record.terminal_payload(),
+                        },
+                    }
+                } else {
+                    LeasedResponseStage::WritingInline {
+                        header: crate::framing::write_ask_response_header(
+                            crate::MessageType::Response,
+                            response.record.correlation_id(),
+                            payload.len(),
+                        ),
+                        payload,
+                    }
+                }
+            } else {
+                LeasedResponseStage::WritingTerminal {
+                    header: crate::framing::write_ask_response_header(
+                        crate::MessageType::Response,
+                        response.record.correlation_id(),
+                        response.record.terminal_payload().len(),
+                    ),
+                    payload: response.record.terminal_payload(),
+                }
+            };
+            response.stage = next;
+            Ok((0, false, false))
+        }
+        LeasedResponseStage::WritingInline { header, payload } => {
+            if response.record.is_cancelled() && *pending_offset == 0 {
+                *pending_offset = 0;
+                response.stage = LeasedResponseStage::WritingTerminal {
+                    header: crate::framing::write_ask_response_header(
+                        crate::MessageType::Response,
+                        response.record.correlation_id(),
+                        response.record.terminal_payload().len(),
+                    ),
+                    payload: response.record.terminal_payload(),
+                };
+                return Ok((0, false, false));
+            }
+            let (written, complete) =
+                write_inline_lease_slice(stream, pending_offset, &header, payload.as_ref()).await?;
+            response.stage = if complete {
+                LeasedResponseStage::Flushing
+            } else {
+                LeasedResponseStage::WritingInline { header, payload }
+            };
+            Ok((written, false, false))
+        }
+        LeasedResponseStage::WritingNormal(mut normal) => {
+            let frame_started = normal.frame_index != 0 || normal.frame_offset != 0;
+            let final_frame = normal.frame_index.saturating_add(1) >= normal.chunk_count;
+            if response.record.is_cancelled() && !frame_started {
+                *pending_offset = 0;
+                response.stage = if normal.frame_index == 0 {
+                    LeasedResponseStage::WritingTerminal {
+                        header: crate::framing::write_ask_response_header(
+                            crate::MessageType::Response,
+                            response.record.correlation_id(),
+                            response.record.terminal_payload().len(),
+                        ),
+                        payload: response.record.terminal_payload(),
+                    }
+                } else {
+                    LeasedResponseStage::WritingAbort {
+                        header: crate::framing::write_stream_abort_header(normal.stream_id, 0),
+                    }
+                };
+                return Ok((0, false, false));
+            }
+            let (written, complete, frame_boundary) =
+                write_bytes_streaming_command_slice(stream, pending_offset, &mut normal).await?;
+            if complete {
+                response.stage = LeasedResponseStage::Flushing;
+                return Ok((written, false, false));
+            }
+            if response.record.is_cancelled() && frame_boundary && !final_frame {
+                response.stage = LeasedResponseStage::WritingAbort {
+                    header: crate::framing::write_stream_abort_header(normal.stream_id, 0),
+                };
+                *pending_offset = 0;
+                return Ok((written, false, false));
+            }
+            response.stage = LeasedResponseStage::WritingNormal(normal);
+            Ok((written, false, frame_boundary))
+        }
+        LeasedResponseStage::WritingAbort { header } => {
+            let (written, complete) =
+                write_fixed_lease_slice(stream, pending_offset, &header).await?;
+            response.stage = if complete {
+                *pending_offset = 0;
+                LeasedResponseStage::WritingTerminal {
+                    header: crate::framing::write_ask_response_header(
+                        crate::MessageType::Response,
+                        response.record.correlation_id(),
+                        response.record.terminal_payload().len(),
+                    ),
+                    payload: response.record.terminal_payload(),
+                }
+            } else {
+                LeasedResponseStage::WritingAbort { header }
+            };
+            Ok((written, false, false))
+        }
+        LeasedResponseStage::WritingTerminal { header, payload } => {
+            let (written, complete) = write_inline_lease_slice(
+                stream,
+                pending_offset,
+                &header,
+                payload.as_bytes().as_ref(),
+            )
+            .await?;
+            response.stage = if complete {
+                LeasedResponseStage::Flushing
+            } else {
+                LeasedResponseStage::WritingTerminal { header, payload }
+            };
+            Ok((written, false, false))
+        }
+        LeasedResponseStage::Flushing => {
+            stream.flush().await?;
+            response.record.finish();
+            response.stage = LeasedResponseStage::Complete;
+            Ok((0, true, false))
+        }
+        LeasedResponseStage::Complete => {
+            response.record.finish();
+            Ok((0, true, false))
+        }
+    }
+}
+
+async fn write_fixed_lease_slice<S, const N: usize>(
+    stream: &mut S,
+    pending_offset: &mut usize,
+    bytes: &[u8; N],
+) -> std::io::Result<(usize, bool)>
+where
+    S: AsyncWrite + Unpin,
+{
+    if *pending_offset >= bytes.len() {
+        return Ok((0, true));
+    }
+    let end = (*pending_offset + STREAM_WRITE_SLICE_BYTES).min(bytes.len());
+    let written = write_vectored_once(
+        stream,
+        &[std::io::IoSlice::new(&bytes[*pending_offset..end])],
+    )
+    .await?;
+    *pending_offset += written;
+    Ok((written, *pending_offset >= bytes.len()))
+}
+
+#[expect(dead_code, reason = "legacy unit tests exercise the uncontextualized writer helper")]
 async fn write_streaming_command_slice<S>(
     stream: &mut S,
     pending: &mut PendingStreamingCommand,
@@ -1891,7 +2156,41 @@ async fn write_streaming_command_slice<S>(
 where
     S: AsyncWrite + Unpin,
 {
+    static TEST_NEXT_STREAM_ID: AtomicU32 = AtomicU32::new(1);
+    write_streaming_command_slice_with_context(
+        stream,
+        pending,
+        STREAMING_THRESHOLD,
+        MASTER_BUFFER_SIZE,
+        &TEST_NEXT_STREAM_ID,
+    )
+    .await
+}
+
+async fn write_streaming_command_slice_with_context<S>(
+    stream: &mut S,
+    pending: &mut PendingStreamingCommand,
+    streaming_threshold: usize,
+    max_message_size: usize,
+    next_stream_id: &AtomicU32,
+) -> std::io::Result<(usize, bool)>
+where
+    S: AsyncWrite + Unpin,
+{
     pending.yield_after_frame = false;
+    if let StreamingCommand::LeasedResponse(response) = &mut pending.command {
+        let (written, complete, yield_after_frame) = write_leased_response_command_slice(
+            stream,
+            &mut pending.offset,
+            response,
+            streaming_threshold,
+            max_message_size,
+            next_stream_id,
+        )
+        .await?;
+        pending.yield_after_frame = yield_after_frame;
+        return Ok((written, complete));
+    }
     if let StreamingCommand::BytesResponse(response) = &mut pending.command {
         let (written, complete, yield_after_frame) =
             write_bytes_streaming_command_slice(stream, &mut pending.offset, response).await?;
@@ -2000,6 +2299,9 @@ where
         StreamingCommand::BytesResponse(_) => {
             unreachable!("bytes responses are handled by write_bytes_streaming_command_slice")
         }
+        StreamingCommand::LeasedResponse(_) => {
+            unreachable!("leased responses are handled by write_leased_response_command_slice")
+        }
     };
     pending.offset += written;
     Ok((written, pending.offset == total_len))
@@ -2089,6 +2391,8 @@ pub struct LockFreeStreamHandle {
     immediate_write_queue: Arc<WriteQueue>,
     /// Bounded streaming command queue for background task.
     streaming_queue: Arc<StreamingQueue>,
+    /// Bounded lease records whose delivery is owned by this IO task.
+    reply_slots: Arc<crate::connection_pool::reply_slots::ReplySlots>,
     /// Buffer configuration that determines sizes and thresholds
     buffer_config: BufferConfig,
     /// Max allowed frame payload size (msg_len, excluding 4-byte length prefix).
@@ -2134,6 +2438,10 @@ impl LockFreeStreamHandle {
 
     pub fn instance_id(&self) -> u64 {
         self.instance_id
+    }
+
+    pub(crate) fn reply_slots(&self) -> Arc<crate::connection_pool::reply_slots::ReplySlots> {
+        Arc::clone(&self.reply_slots)
     }
 
     /// Arm the identify gate: `write_routed_actor_ask` on this handle will
@@ -2268,6 +2576,12 @@ impl LockFreeStreamHandle {
         let write_queue = WriteQueue::new(buffer_config.write_queue_capacity(), addr);
         let immediate_write_queue = WriteQueue::new(128, addr);
         let streaming_queue = StreamingQueue::new(buffer_config.write_queue_capacity(), addr);
+        let next_stream_id = Arc::new(AtomicU32::new(1));
+        let reply_slots = crate::connection_pool::reply_slots::ReplySlots::new(
+            instance_id,
+            addr,
+            exit_notify.clone(),
+        );
 
         let max_message_size = read_context
             .as_ref()
@@ -2287,6 +2601,9 @@ impl LockFreeStreamHandle {
             let write_queue = write_queue.clone();
             let immediate_write_queue = immediate_write_queue.clone();
             let streaming_queue = streaming_queue.clone();
+            let reply_slots = reply_slots.clone();
+            let next_stream_id = next_stream_id.clone();
+            let streaming_threshold = buffer_config.streaming_threshold();
 
             tokio::spawn(async move {
                 info!(
@@ -2303,6 +2620,9 @@ impl LockFreeStreamHandle {
                     write_queue,
                     immediate_write_queue,
                     streaming_queue,
+                    reply_slots,
+                    streaming_threshold,
+                    next_stream_id,
                     read_context,
                     instance_id,
                     exit_flag_for_task,
@@ -2325,7 +2645,7 @@ impl LockFreeStreamHandle {
                 addr,
                 channel_id,
                 sequence_counter: Arc::new(AtomicUsize::new(0)),
-                next_stream_id: Arc::new(AtomicU32::new(1)),
+                next_stream_id,
                 bytes_written, // This now tracks actual TCP bytes written
                 shutdown_signal,
                 flush_pending,
@@ -2339,6 +2659,7 @@ impl LockFreeStreamHandle {
                 write_queue,
                 immediate_write_queue,
                 streaming_queue,
+                reply_slots,
                 buffer_config,
                 max_message_size,
                 schema_hash,
@@ -2363,6 +2684,9 @@ impl LockFreeStreamHandle {
         write_queue: Arc<WriteQueue>,
         immediate_write_queue: Arc<WriteQueue>,
         streaming_queue: Arc<StreamingQueue>,
+        reply_slots: Arc<crate::connection_pool::reply_slots::ReplySlots>,
+        streaming_threshold: usize,
+        next_stream_id: Arc<AtomicU32>,
         read_context: Option<ReadContext>,
         instance_id: u64,
         exit_flag: Arc<AtomicBool>,
@@ -2454,6 +2778,7 @@ impl LockFreeStreamHandle {
             write_queue: Arc<WriteQueue>,
             immediate_write_queue: Arc<WriteQueue>,
             streaming_queue: Arc<StreamingQueue>,
+            reply_slots: Arc<crate::connection_pool::reply_slots::ReplySlots>,
             response_correlation: Option<Arc<CorrelationTracker>>,
             registry_weak: Option<std::sync::Weak<GossipRegistry>>,
             peer_addr: Option<SocketAddr>,
@@ -2469,6 +2794,7 @@ impl LockFreeStreamHandle {
                 self.notify.notify_waiters();
                 // Wake parked `push()` callers so they observe `closed` and
                 // return `ConnectionClosed` rather than hanging on a full queue.
+                self.reply_slots.close_and_reclaim();
                 self.write_queue.close_and_reclaim();
                 self.immediate_write_queue.close_and_reclaim();
                 self.streaming_queue.close_and_reclaim();
@@ -2647,6 +2973,7 @@ impl LockFreeStreamHandle {
             write_queue: write_queue.clone(),
             immediate_write_queue: immediate_write_queue.clone(),
             streaming_queue: streaming_queue.clone(),
+            reply_slots: reply_slots.clone(),
             response_correlation: read_context
                 .as_ref()
                 .and_then(|ctx| ctx.response_correlation.clone()),
@@ -2786,10 +3113,9 @@ impl LockFreeStreamHandle {
             // turn that completes that frame; clearing them here would silently
             // drop responses that were intentionally deferred.
             if pending_stream_cmd.is_none() && pending_ordinary_write.is_none() {
-                if let Err(e) = park_ask_response_batch(
-                    &mut pending_ordinary_write,
-                    &mut response_batch,
-                ) {
+                if let Err(e) =
+                    park_ask_response_batch(&mut pending_ordinary_write, &mut response_batch)
+                {
                     warn!(
                         peer = ?read_context.as_ref().map(|c| c.peer_addr),
                         error = %e,
@@ -2821,6 +3147,13 @@ impl LockFreeStreamHandle {
                 None
             } else if let Some(pending) = pending_stream_cmd.take() {
                 Some(pending)
+            } else if let Some(record) = reply_slots.pop_ready() {
+                Some(PendingStreamingCommand::local(
+                    StreamingCommand::LeasedResponse(Box::new(LeasedResponse {
+                        record,
+                        stage: LeasedResponseStage::Reserved,
+                    })),
+                ))
             } else {
                 let source = choose_streaming_source(
                     prefer_shared_streaming,
@@ -2861,7 +3194,12 @@ impl LockFreeStreamHandle {
             };
             if let Some(mut pending) = next_stream {
                 did_work = true;
-                let command_is_flush = matches!(&pending.command, StreamingCommand::Flush);
+                let command_is_flush = matches!(&pending.command, StreamingCommand::Flush)
+                    || matches!(
+                        &pending.command,
+                        StreamingCommand::LeasedResponse(response)
+                            if matches!(response.stage, LeasedResponseStage::Flushing)
+                    );
                 // Bounded, not a plain `.await` -- see the invariant on
                 // `STREAM_WRITE_SLICE_TIMEOUT`. A timeout is not an error: it
                 // means this specific attempt made zero progress, which is
@@ -2874,7 +3212,13 @@ impl LockFreeStreamHandle {
                 // `record_slice_attempt` and `STREAM_FLUSH_STUCK_TEARDOWN`.
                 let (written, complete) = match tokio::time::timeout(
                     STREAM_WRITE_SLICE_TIMEOUT,
-                    write_streaming_command_slice(&mut stream, &mut pending),
+                    write_streaming_command_slice_with_context(
+                        &mut stream,
+                        &mut pending,
+                        streaming_threshold,
+                        max_message_size,
+                        &next_stream_id,
+                    ),
                 )
                 .await
                 {
@@ -4092,7 +4436,9 @@ impl LockFreeStreamHandle {
                             ) {
                                 AskBudgetAction::Dispatch => {}
                                 AskBudgetAction::Nack => {
-                                    if local_streaming_queue.has_room_for_ask_nack_occupying(pending_ask_nack_occupancy(&pending_ordinary_write)) {
+                                    if local_streaming_queue.has_room_for_ask_nack_occupying(
+                                        pending_ask_nack_occupancy(&pending_ordinary_write),
+                                    ) {
                                         queue_ask_backpressure_nack(
                                             &mut local_streaming_queue,
                                             &result,
@@ -4100,20 +4446,20 @@ impl LockFreeStreamHandle {
                                         continue;
                                     }
                                     park_deferred_ask(
-                                                &mut deferred_asks,
-                                                result,
-                                                &mut local_streaming_queue,
-                                                pending_ask_nack_occupancy(&pending_ordinary_write),
-                                            );
+                                        &mut deferred_asks,
+                                        result,
+                                        &mut local_streaming_queue,
+                                        pending_ask_nack_occupancy(&pending_ordinary_write),
+                                    );
                                     break;
                                 }
                                 AskBudgetAction::Defer => {
                                     park_deferred_ask(
-                                                &mut deferred_asks,
-                                                result,
-                                                &mut local_streaming_queue,
-                                                pending_ask_nack_occupancy(&pending_ordinary_write),
-                                            );
+                                        &mut deferred_asks,
+                                        result,
+                                        &mut local_streaming_queue,
+                                        pending_ask_nack_occupancy(&pending_ordinary_write),
+                                    );
                                     continue;
                                 }
                             }
@@ -4279,8 +4625,7 @@ impl LockFreeStreamHandle {
             // can drain; do not yield_now-spin on Pending writes.
             if (pending_ordinary_write.is_some() && did_work)
                 || (pending_ordinary_write.is_none()
-                    && (!deferred_asks.is_empty()
-                        || local_streaming_queue.has_pending_ask_nacks()))
+                    && (!deferred_asks.is_empty() || local_streaming_queue.has_pending_ask_nacks()))
             {
                 tokio::task::yield_now().await;
             }
@@ -4289,80 +4634,78 @@ impl LockFreeStreamHandle {
             {
                 let mut completed_pending = false;
                 let maintenance = stream_write_wedged_since
-                    .map(|started| {
-                        STREAM_WRITE_STUCK_TEARDOWN.saturating_sub(started.elapsed())
-                    })
+                    .map(|started| STREAM_WRITE_STUCK_TEARDOWN.saturating_sub(started.elapsed()))
                     .unwrap_or(STREAM_WRITE_SLICE_TIMEOUT);
                 {
-                let pending = pending_ordinary_write
-                    .as_mut()
-                    .expect("pending ordinary write checked above");
-                tokio::select! {
-                    biased;
-                    progress = wait_pending_ordinary(&mut stream, pending) => {
-                        match progress {
-                            OrdinaryWriteProgress::Complete(n) => {
-                                bytes_written_counter.fetch_add(n, Ordering::Relaxed);
-                                bytes_since_flush += n;
-                                completed_pending = true;
-                                ordinary_write_stalled = false;
-                                record_slice_attempt(
-                                    false,
-                                    n > 0,
-                                    Instant::now(),
-                                    &mut stream_write_wedged_since,
-                                    &mut stream_flush_wedged_since,
-                                );
-                            }
-                            OrdinaryWriteProgress::Partial(n) => {
-                                bytes_written_counter.fetch_add(n, Ordering::Relaxed);
-                                bytes_since_flush += n;
-                                if n > 0 {
+                    let pending = pending_ordinary_write
+                        .as_mut()
+                        .expect("pending ordinary write checked above");
+                    tokio::select! {
+                        biased;
+                        progress = wait_pending_ordinary(&mut stream, pending) => {
+                            match progress {
+                                OrdinaryWriteProgress::Complete(n) => {
+                                    bytes_written_counter.fetch_add(n, Ordering::Relaxed);
+                                    bytes_since_flush += n;
+                                    completed_pending = true;
                                     ordinary_write_stalled = false;
-                                } else if let SliceAttemptOutcome::TearDown { stuck_for } =
                                     record_slice_attempt(
                                         false,
-                                        false,
+                                        n > 0,
                                         Instant::now(),
                                         &mut stream_write_wedged_since,
                                         &mut stream_flush_wedged_since,
-                                    )
-                                {
-                                    error!(
-                                        ?stuck_for,
-                                        "ordinary write made no progress for too long; \
-                                         tearing down connection"
                                     );
-                                    return;
                                 }
+                                OrdinaryWriteProgress::Partial(n) => {
+                                    bytes_written_counter.fetch_add(n, Ordering::Relaxed);
+                                    bytes_since_flush += n;
+                                    if n > 0 {
+                                        ordinary_write_stalled = false;
+                                    } else if let SliceAttemptOutcome::TearDown { stuck_for } =
+                                        record_slice_attempt(
+                                            false,
+                                            false,
+                                            Instant::now(),
+                                            &mut stream_write_wedged_since,
+                                            &mut stream_flush_wedged_since,
+                                        )
+                                    {
+                                        error!(
+                                            ?stuck_for,
+                                            "ordinary write made no progress for too long; \
+                                             tearing down connection"
+                                        );
+                                        return;
+                                    }
+                                }
+                                OrdinaryWriteProgress::Failed => return,
                             }
-                            OrdinaryWriteProgress::Failed => return,
                         }
-                    }
-                    _ = tokio::time::sleep(maintenance) => {
-                        if let SliceAttemptOutcome::TearDown { stuck_for } = record_slice_attempt(
-                            false,
-                            false,
-                            Instant::now(),
-                            &mut stream_write_wedged_since,
-                            &mut stream_flush_wedged_since,
-                        ) {
-                            error!(
-                                ?stuck_for,
-                                "ordinary write made no progress for too long; \
-                                 tearing down connection"
-                            );
-                            return;
+                        _ = tokio::time::sleep(maintenance) => {
+                            if let SliceAttemptOutcome::TearDown { stuck_for } = record_slice_attempt(
+                                false,
+                                false,
+                                Instant::now(),
+                                &mut stream_write_wedged_since,
+                                &mut stream_flush_wedged_since,
+                            ) {
+                                error!(
+                                    ?stuck_for,
+                                    "ordinary write made no progress for too long; \
+                                     tearing down connection"
+                                );
+                                return;
+                            }
                         }
+                        _ = immediate_write_queue.data_notify.notified() => {
+                            pending_immediate_cmd = immediate_write_queue.pop();
+                        }
+                        _ = write_queue.data_notify.notified() => {
+                            pending_cmd = write_queue.pop();
+                        }
+                        _ = streaming_queue.data_notify.notified() => {}
                     }
-                    _ = immediate_write_queue.data_notify.notified() => {
-                        pending_immediate_cmd = immediate_write_queue.pop();
-                    }
-                    _ = write_queue.data_notify.notified() => {
-                        pending_cmd = write_queue.pop();
-                    }
-                    _ = streaming_queue.data_notify.notified() => {}
-                }
                 }
                 if completed_pending {
                     pending_ordinary_write = None;
@@ -4434,6 +4777,15 @@ impl LockFreeStreamHandle {
                     }
                     if let Some(cmd) = streaming_queue.prepare_park() {
                         pending_stream_cmd = Some(PendingStreamingCommand::shared(cmd));
+                        continue;
+                    }
+                    if let Some(record) = reply_slots.pop_ready() {
+                        pending_stream_cmd = Some(PendingStreamingCommand::local(
+                            StreamingCommand::LeasedResponse(Box::new(LeasedResponse {
+                                record,
+                                stage: LeasedResponseStage::Reserved,
+                            })),
+                        ));
                         continue;
                     }
                     tokio::select! {
@@ -4869,6 +5221,15 @@ impl LockFreeStreamHandle {
                     }
                 } else {
                     // Pre-park drain; see the read-armed variant above.
+                    if let Some(record) = reply_slots.pop_ready() {
+                        pending_stream_cmd = Some(PendingStreamingCommand::local(
+                            StreamingCommand::LeasedResponse(Box::new(LeasedResponse {
+                                record,
+                                stage: LeasedResponseStage::Reserved,
+                            })),
+                        ));
+                        continue;
+                    }
                     if let Some(cmd) = immediate_write_queue.prepare_park() {
                         pending_immediate_cmd = Some(cmd);
                         continue;
@@ -4881,7 +5242,9 @@ impl LockFreeStreamHandle {
                         pending_stream_cmd = Some(PendingStreamingCommand::shared(cmd));
                         continue;
                     }
+                    let reply_ready_notify = reply_slots.notify();
                     tokio::select! {
+                        _ = reply_ready_notify.notified() => {}
                         _ = streaming_queue.data_notify.notified() => {
                             // Wake on streaming commands; drained at the top of the loop.
                         }
@@ -7162,12 +7525,8 @@ mod route_interning_tests {
             actor_id: 42,
             type_hash: 7,
         };
-        let mut ask = Box::pin(writer.write_routed_actor_ask(
-            1,
-            42,
-            7,
-            bytes::Bytes::from_static(b"ask"),
-        ));
+        let mut ask =
+            Box::pin(writer.write_routed_actor_ask(1, 42, 7, bytes::Bytes::from_static(b"ask")));
         let waker = futures::task::noop_waker();
         let mut cx = std::task::Context::from_waker(&waker);
         let polled = ask.as_mut().poll(&mut cx);

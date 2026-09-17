@@ -29,6 +29,10 @@ enum StreamingCommand {
     /// payload and generates each frame header lazily instead of expanding a
     /// large response into one queue command per frame.
     BytesResponse(Box<BytesStreamingResponse>),
+    /// A bounded, connection-owned response lease. The slot record carries
+    /// cancellation and terminal payload ownership; this command carries only
+    /// the IO owner's frame progress.
+    LeasedResponse(Box<LeasedResponse>),
     /// Abort a partially transmitted stream. This stays on the streaming FIFO
     /// so it cannot overtake data chunks that were already accepted.
     Abort { stream_id: u32, reason: u32 },
@@ -60,6 +64,29 @@ struct PooledStreamingResponse {
 }
 
 /// A lazily framed response backed by an already-owned `Bytes` payload.
+struct LeasedResponse {
+    record: std::sync::Arc<crate::connection_pool::reply_slots::ReplySlotRecord>,
+    stage: LeasedResponseStage,
+}
+
+enum LeasedResponseStage {
+    Reserved,
+    WritingNormal(Box<BytesStreamingResponse>),
+    WritingInline {
+        header: [u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN],
+        payload: crate::ReplyPayload,
+    },
+    WritingAbort {
+        header: [u8; crate::framing::STREAM_DATA_FRAME_HEADER_LEN],
+    },
+    WritingTerminal {
+        header: [u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN],
+        payload: std::sync::Arc<crate::ReplyPayload>,
+    },
+    Flushing,
+    Complete,
+}
+
 struct BytesStreamingResponse {
     stream_id: u32,
     correlation_id: u32,
@@ -108,10 +135,14 @@ impl BytesStreamingResponse {
         if frame_index == 0 {
             return self.payload_len.min(self.chunk_size);
         }
-        let consumed = self
-            .chunk_size
-            .saturating_add(frame_index.saturating_sub(1).saturating_mul(self.chunk_size));
-        self.payload_len.saturating_sub(consumed).min(self.chunk_size)
+        let consumed = self.chunk_size.saturating_add(
+            frame_index
+                .saturating_sub(1)
+                .saturating_mul(self.chunk_size),
+        );
+        self.payload_len
+            .saturating_sub(consumed)
+            .min(self.chunk_size)
     }
 
     fn frame_header(&self, frame_index: usize) -> InlineFrameHeader {
@@ -262,10 +293,14 @@ impl PooledStreamingResponse {
         if frame_index == 0 {
             return self.payload_len.min(self.chunk_size);
         }
-        let consumed = self
-            .chunk_size
-            .saturating_add(frame_index.saturating_sub(1).saturating_mul(self.chunk_size));
-        self.payload_len.saturating_sub(consumed).min(self.chunk_size)
+        let consumed = self.chunk_size.saturating_add(
+            frame_index
+                .saturating_sub(1)
+                .saturating_mul(self.chunk_size),
+        );
+        self.payload_len
+            .saturating_sub(consumed)
+            .min(self.chunk_size)
     }
 
     fn frame_header(&self, frame_index: usize) -> InlineFrameHeader {
@@ -452,10 +487,7 @@ impl LocalStreamingQueue {
 
     /// `extra` counts an already-popped active NACK that still owns the wire.
     fn has_room_for_ask_nack_occupying(&self, extra: usize) -> bool {
-        self.pending_ask_nacks
-            .len()
-            .saturating_add(extra)
-            < PENDING_ASK_NACK_CAP
+        self.pending_ask_nacks.len().saturating_add(extra) < PENDING_ASK_NACK_CAP
     }
 
     /// Pop the oldest queued NACK header for `io_task` to attempt writing.
@@ -490,9 +522,7 @@ impl LocalStreamingQueue {
         }
         let command = self.queue.pop_front()?;
         let command_bytes = streaming_command_bytes(&command);
-        self.queued_bytes = self
-            .queued_bytes
-            .saturating_sub(command_bytes);
+        self.queued_bytes = self.queued_bytes.saturating_sub(command_bytes);
         self.response_in_flight = !matches!(&command, StreamingCommand::Flush);
         self.in_flight_bytes = if self.response_in_flight {
             command_bytes
@@ -529,17 +559,13 @@ impl LocalStreamingQueue {
     }
 
     fn can_defer_response(&self, command_count: usize, response_bytes: usize) -> bool {
-        let retained_without_deferred = self
-            .queued_bytes
-            .saturating_add(self.in_flight_bytes);
+        let retained_without_deferred = self.queued_bytes.saturating_add(self.in_flight_bytes);
         let bounded_footprint = response_bytes <= STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP
             && retained_without_deferred.saturating_add(response_bytes)
                 <= STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP;
         self.deferred.is_none()
             && command_count <= self.response_reserve_commands
-            && self
-                .retained_commands()
-                .saturating_add(command_count)
+            && self.retained_commands().saturating_add(command_count)
                 <= STREAMING_RESPONSE_QUEUE_COMMAND_CAP
             && bounded_footprint
     }
@@ -551,9 +577,7 @@ impl LocalStreamingQueue {
     /// normal queue cap is admitted without deferral only as the sole retained
     /// response.
     fn can_admit_response(&self, command_count: usize, response_bytes: usize) -> bool {
-        let fits_queue = self
-            .retained_commands()
-            .saturating_add(command_count)
+        let fits_queue = self.retained_commands().saturating_add(command_count)
             <= STREAMING_RESPONSE_QUEUE_COMMAND_CAP
             && self.retained_bytes().saturating_add(response_bytes)
                 <= STREAMING_RESPONSE_QUEUE_BYTE_CAP;
@@ -620,9 +644,7 @@ impl LocalStreamingQueue {
     {
         let commands: Vec<_> = commands.into_iter().collect();
         let added_bytes: usize = commands.iter().map(streaming_command_bytes).sum();
-        let fits_queue = self
-            .retained_commands()
-            .saturating_add(commands.len())
+        let fits_queue = self.retained_commands().saturating_add(commands.len())
             <= STREAMING_RESPONSE_QUEUE_COMMAND_CAP
             && self.retained_bytes().saturating_add(added_bytes)
                 <= STREAMING_RESPONSE_QUEUE_BYTE_CAP;
@@ -661,7 +683,10 @@ fn streaming_command_bytes(command: &StreamingCommand) -> usize {
         StreamingCommand::OwnedChunks(chunks) => chunks.iter().map(bytes::Bytes::len).sum(),
         StreamingCommand::PooledResponse(response) => response.retained_len(),
         StreamingCommand::BytesResponse(response) => response.retained_len(),
-        StreamingCommand::Abort { stream_id, reason } => crate::framing::write_stream_abort_header(*stream_id, *reason).len(),
+        StreamingCommand::LeasedResponse(_) => 0,
+        StreamingCommand::Abort { stream_id, reason } => {
+            crate::framing::write_stream_abort_header(*stream_id, *reason).len()
+        }
     }
 }
 
@@ -745,6 +770,10 @@ impl std::fmt::Debug for StreamingCommand {
                 .debug_struct("BytesResponse")
                 .field("payload_len", &response.payload_len)
                 .field("chunk_count", &response.chunk_count)
+                .finish(),
+            StreamingCommand::LeasedResponse(response) => f
+                .debug_struct("LeasedResponse")
+                .field("correlation_id", &response.record.correlation_id())
                 .finish(),
             StreamingCommand::Abort { stream_id, reason } => f
                 .debug_struct("Abort")

@@ -42,6 +42,8 @@ include!("correlation.rs");
 include!("handle.rs");
 include!("pool_connect.rs");
 
+pub(crate) mod reply_slots;
+
 pub(crate) mod transport_stream;
 
 #[cfg(test)]
