@@ -27,13 +27,39 @@ struct ForwardTask {
     _permit: Option<OwnedSemaphorePermit>,
 }
 
+#[derive(Clone, Copy)]
+enum ShutdownResult {
+    Drained,
+    TimedOut,
+}
+
+impl ShutdownResult {
+    fn into_result(self) -> Result<()> {
+        match self {
+            Self::Drained => Ok(()),
+            Self::TimedOut => Err(GossipError::Timeout),
+        }
+    }
+}
+
 struct WorkerControl {
     closed: AtomicBool,
     remaining: AtomicUsize,
     done: Notify,
+    // A worker can be parked in `rx.recv()` while admission is open. The
+    // shutdown path uses this edge-triggered wake in addition to the atomic
+    // state so closure is observed without waiting for grace to elapse.
+    shutdown_wake: Notify,
+    shutdown_in_progress: AtomicBool,
+    shutdown_result: Mutex<Option<ShutdownResult>>,
+    shutdown_done: Notify,
 }
 
 struct AskForwarderInner {
+    // Serialize the closed check with the enqueue. This makes every task
+    // admitted before closure visible to the draining worker and prevents an
+    // `Ok(())` enqueue from racing a shutdown that closes the receiver.
+    admission: Mutex<()>,
     workers: Vec<mpsc::Sender<ForwardTask>>,
     next_worker: AtomicUsize,
     control: Arc<WorkerControl>,
@@ -84,6 +110,10 @@ impl AskForwarder {
             closed: AtomicBool::new(false),
             remaining: AtomicUsize::new(workers),
             done: Notify::new(),
+            shutdown_wake: Notify::new(),
+            shutdown_in_progress: AtomicBool::new(false),
+            shutdown_result: Mutex::new(None),
+            shutdown_done: Notify::new(),
         });
 
         let mut worker_senders = Vec::with_capacity(workers);
@@ -105,6 +135,7 @@ impl AskForwarder {
         }
 
         let inner = Arc::new(AskForwarderInner {
+            admission: Mutex::new(()),
             workers: worker_senders,
             next_worker: AtomicUsize::new(0),
             control,
@@ -121,8 +152,53 @@ impl AskForwarder {
     /// state. A timeout is returned as [`GossipError::Timeout`] rather than
     /// success.
     pub async fn shutdown(&self, grace: Duration) -> Result<()> {
-        self.inner.control.closed.store(true, Ordering::Release);
-        if wait_for_workers(&self.inner.control, grace).await {
+        let control = Arc::clone(&self.inner.control);
+        loop {
+            if let Some(result) = read_shutdown_result(&control) {
+                return result.into_result();
+            }
+            if control
+                .shutdown_in_progress
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+            let notified = control.shutdown_done.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(result) = read_shutdown_result(&control) {
+                return result.into_result();
+            }
+            notified.await;
+        }
+
+        let mut leader = ShutdownLeader {
+            control: control.clone(),
+            finished: false,
+        };
+        {
+            // No successful enqueue can occur after this lock is released.
+            // The worker can therefore close its receiver after one final
+            // channel drain without dropping an accepted task.
+            let _admission = self
+                .inner
+                .admission
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            control.closed.store(true, Ordering::Release);
+        }
+        // Wake every worker, including one already parked in `recv`. Repeated
+        // notify_one calls also cover a worker that has not registered its
+        // notified future yet.
+        control.shutdown_wake.notify_waiters();
+        for _ in &self.inner.workers {
+            control.shutdown_wake.notify_one();
+        }
+
+        if wait_for_workers(&control, grace).await {
+            complete_shutdown(&control, ShutdownResult::Drained);
+            leader.finished = true;
             return Ok(());
         }
         for handle in &self.inner.abort_handles {
@@ -139,11 +215,12 @@ impl AskForwarder {
         for join in joins {
             let _ = join.await;
         }
-        if wait_for_workers(&self.inner.control, Duration::from_secs(2)).await {
-            Ok(())
-        } else {
-            Err(GossipError::Timeout)
-        }
+
+        // Grace expiry is a real timeout even when abort/reclamation itself
+        // succeeds. Report that fact consistently to every shutdown caller.
+        complete_shutdown(&control, ShutdownResult::TimedOut);
+        leader.finished = true;
+        Err(GossipError::Timeout)
     }
 
     pub fn try_forward_actor_ask_no_timeout(
@@ -223,6 +300,11 @@ impl AskForwarder {
     }
 
     fn try_send_task(&self, mut task: ForwardTask) -> Result<()> {
+        let _admission = self
+            .inner
+            .admission
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
         if self.inner.control.closed.load(Ordering::Acquire) {
             return Err(GossipError::Shutdown);
         }
@@ -252,6 +334,40 @@ impl Drop for AskForwarderInner {
             handle.abort();
         }
     }
+}
+
+struct ShutdownLeader {
+    control: Arc<WorkerControl>,
+    finished: bool,
+}
+
+impl Drop for ShutdownLeader {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.control
+                .shutdown_in_progress
+                .store(false, Ordering::Release);
+            self.control.shutdown_done.notify_waiters();
+        }
+    }
+}
+
+fn read_shutdown_result(control: &WorkerControl) -> Option<ShutdownResult> {
+    control
+        .shutdown_result
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .as_ref()
+        .copied()
+}
+
+fn complete_shutdown(control: &WorkerControl, result: ShutdownResult) {
+    let mut guard = control
+        .shutdown_result
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    *guard = Some(result);
+    control.shutdown_done.notify_waiters();
 }
 
 enum ForwardOutcome {
@@ -295,12 +411,14 @@ async fn wait_for_workers(control: &WorkerControl, grace: Duration) -> bool {
     let sleep = tokio::time::sleep(grace);
     tokio::pin!(sleep);
     loop {
+        let notified = control.done.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         if control.remaining.load(Ordering::Acquire) == 0 {
             return true;
         }
-        let notified = control.done.notified();
         tokio::select! {
-            _ = notified => {}
+            _ = &mut notified => {}
             _ = &mut sleep => {
                 return control.remaining.load(Ordering::Acquire) == 0;
             }
@@ -334,9 +452,24 @@ async fn run_forward_worker(
     let mut rx_closed = false;
 
     loop {
-        if control.closed.load(Ordering::Acquire) && waiting.is_empty() && inflight.is_empty() {
-            rx.close();
-            rx_closed = true;
+        if control.closed.load(Ordering::Acquire) && !rx_closed {
+            // Admission is serialized with shutdown, so this final try_recv
+            // sweep sees every task whose sender returned Ok(()). Only after
+            // the queue is empty is it safe to close the receiver.
+            loop {
+                match rx.try_recv() {
+                    Ok(task) => waiting.push_back(task),
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        rx.close();
+                        rx_closed = true;
+                        break;
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        rx_closed = true;
+                        break;
+                    }
+                }
+            }
         }
         expire_waiting(&mut waiting, worker_observer.as_deref());
         dispatch_waiting(
@@ -364,6 +497,7 @@ async fn run_forward_worker(
                 }
             }
             _ = sleep_until_deadline(earliest), if earliest.is_some() => {}
+            _ = control.shutdown_wake.notified() => {}
         }
     }
 }
@@ -835,5 +969,222 @@ mod tests {
     fn zero_duration_is_an_already_expired_deadline() {
         let deadline = admission_deadline(Duration::ZERO);
         assert!(deadline <= Instant::now());
+    }
+
+    struct NeverResponds;
+
+    impl crate::registry::ActorMessageHandler for NeverResponds {
+        fn handle_actor_message(
+            &self,
+            _actor_id: u64,
+            _type_hash: u32,
+            _payload: crate::AlignedBytes,
+            _correlation_id: Option<u32>,
+        ) -> crate::registry::ActorMessageFuture<'_> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    async fn test_destination() -> (
+        RemoteConnection,
+        crate::GossipRegistryHandle,
+        crate::GossipRegistryHandle,
+    ) {
+        let config = crate::GossipConfig {
+            gossip_interval: Duration::from_secs(3_600),
+            ..Default::default()
+        };
+        let source = crate::GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:0".parse().unwrap(),
+            crate::KeyPair::new_for_testing("ask-forwarder-shutdown-source").to_secret_key(),
+            Some(config.clone()),
+            crate::BuilderTlsBootstrap,
+        )
+        .await
+        .expect("source registry");
+        let sink = crate::GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:0".parse().unwrap(),
+            crate::KeyPair::new_for_testing("ask-forwarder-shutdown-sink").to_secret_key(),
+            Some(config),
+            crate::BuilderTlsBootstrap,
+        )
+        .await
+        .expect("sink registry");
+        sink.registry
+            .set_actor_message_handler(Arc::new(NeverResponds))
+            .await;
+        source
+            .add_peer(&sink.registry.peer_id)
+            .await
+            .connect(&sink.registry.bind_addr)
+            .await
+            .expect("connect source to sink");
+
+        let destination = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(peer) = source.lookup_peer(&sink.registry.peer_id).await
+                    && let Some(connection) = peer.connection_ref()
+                {
+                    break connection;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("source must publish its destination connection");
+        (destination, source, sink)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_drains_admitted_queue() {
+        let (destination, source, sink) = test_destination().await;
+        let addr = "127.0.0.1:0".parse().unwrap();
+        let (io, mut peer) = tokio::io::duplex(65536);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            io,
+            addr,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let writer = Arc::new(writer);
+        let completed = Arc::new(AtomicUsize::new(0));
+        struct CountCompletions(Arc<AtomicUsize>);
+        impl AskForwardObserver for CountCompletions {
+            fn record_success(&self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn record_error(&self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let forwarder = AskForwarder::new_with_observer(
+            1,
+            128,
+            Some(Arc::new(CountCompletions(completed.clone()))),
+        );
+        let responder =
+            AskResponder::from_stream_handle(10, writer.clone(), Arc::new(AtomicBool::new(false)));
+
+        // The worker has not been polled yet, so this accepted task is still
+        // in its channel when shutdown closes admission. Shutdown must receive
+        // it, complete its expired terminal reply, and account for it.
+        forwarder
+            .try_forward_actor_ask_combined_timeout(
+                destination,
+                1,
+                1,
+                Bytes::from_static(b"request"),
+                Duration::ZERO,
+                responder,
+                Bytes::from_static(b"drained-timeout-reply"),
+                Bytes::from_static(b"error"),
+            )
+            .expect("the task must be admitted before shutdown");
+        forwarder
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("shutdown should report a completed drain");
+        assert_eq!(completed.load(Ordering::SeqCst), 1);
+
+        let mut written = vec![0u8; 4096];
+        let n = tokio::time::timeout(Duration::from_secs(2), peer.read(&mut written))
+            .await
+            .expect("drained terminal reply must reach the response writer")
+            .expect("response writer read must succeed");
+        assert!(
+            written[..n]
+                .windows(b"drained-timeout-reply".len())
+                .any(|w| w == b"drained-timeout-reply"),
+            "shutdown must not drop a task accepted before closure"
+        );
+
+        writer.shutdown();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        source.shutdown().await;
+        sink.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_wakes_idle_worker() {
+        let forwarder = AskForwarder::new(1, 128);
+        // Establish that the worker is already parked in `recv` rather than
+        // merely observing closure at its first poll.
+        tokio::task::yield_now().await;
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            forwarder.shutdown(Duration::from_secs(5)),
+        )
+        .await;
+        if result.is_err() {
+            // Keep a failed RED run from leaving the worker around until
+            // runtime teardown; the assertion below still reports the wakeup.
+            let _ = forwarder.shutdown(Duration::ZERO).await;
+        }
+        let shutdown = result.expect("shutdown must wake an idle worker");
+        assert!(shutdown.is_ok(), "an idle worker should drain successfully");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_truthfully_reports_expiry() {
+        let (destination, source, sink) = test_destination().await;
+        let addr = "127.0.0.1:0".parse().unwrap();
+        let (io, peer) = tokio::io::duplex(65536);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            io,
+            addr,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let writer = Arc::new(writer);
+        let forwarder = AskForwarder::new(1, 128);
+        forwarder
+            .try_forward_actor_ask_no_timeout(
+                destination.clone(),
+                1,
+                1,
+                Bytes::from_static(b"request"),
+                AskResponder::from_stream_handle(
+                    11,
+                    writer.clone(),
+                    Arc::new(AtomicBool::new(false)),
+                ),
+            )
+            .expect("the no-timeout task must be admitted");
+
+        // Confirm that the task is in flight before expiring shutdown grace.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while destination.bytes_written() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the worker must dispatch before shutdown");
+        drop(peer);
+
+        let first_shutdown = forwarder.shutdown(Duration::ZERO).await;
+        assert!(
+            matches!(first_shutdown, Err(GossipError::Timeout)),
+            "shutdown must report grace expiry even after aborting work"
+        );
+        let repeated_shutdown = forwarder.shutdown(Duration::from_secs(1)).await;
+        assert!(
+            matches!(repeated_shutdown, Err(GossipError::Timeout)),
+            "repeated shutdown calls must report the same terminal outcome"
+        );
+
+        writer.shutdown();
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        source.shutdown().await;
+        sink.shutdown().await;
     }
 }
