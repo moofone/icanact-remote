@@ -229,12 +229,13 @@ impl ReplyLease {
         stream_handle: Arc<LockFreeStreamHandle>,
         record: Arc<crate::connection_pool::reply_slots::ReplySlotRecord>,
         reply_observer: Option<Arc<dyn crate::AskReplyObserver>>,
+        observer_notified: bool,
     ) -> Self {
         Self {
             record,
             stream_handle,
             reply_observer,
-            observer_notified: false,
+            observer_notified,
             transferred: false,
         }
     }
@@ -359,7 +360,7 @@ pub(crate) fn reserve_for_responder(
         }
         return Err(ReplyLeaseAdmissionError::Unavailable { responder, error });
     }
-    let reply_observer = responder.reply_observer_for_lease();
+    let (reply_observer, observer_notified) = responder.reply_observer_for_lease();
     let record = match stream_handle.reply_slots().try_reserve(
         responder.correlation_id(),
         max_reply_bytes,
@@ -389,5 +390,6 @@ pub(crate) fn reserve_for_responder(
         stream_handle,
         record,
         reply_observer,
+        observer_notified,
     ))
 }

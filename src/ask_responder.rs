@@ -354,6 +354,9 @@ pub struct AskResponder {
     /// and sibling responders for this correlation reaches the wire.
     used: Arc<AtomicBool>,
     reply_observer: Option<Arc<dyn AskReplyObserver>>,
+    /// Kept with the claimed responder when an immediate enqueue is transferred
+    /// into a lease, preventing fallback retry from notifying twice.
+    observer_notified: bool,
 }
 
 /// Exclusive fallback ownership after an immediate reply was rejected before
@@ -453,8 +456,8 @@ impl AskResponder {
         claim_reply(&self.used)
     }
 
-    pub(crate) fn reply_observer_for_lease(&self) -> Option<Arc<dyn AskReplyObserver>> {
-        self.reply_observer.clone()
+    pub(crate) fn reply_observer_for_lease(&self) -> (Option<Arc<dyn AskReplyObserver>>, bool) {
+        (self.reply_observer.clone(), self.observer_notified)
     }
 
     pub(crate) fn stream_handle_for_lease(&self) -> Result<Arc<LockFreeStreamHandle>> {
@@ -492,6 +495,7 @@ impl AskResponder {
             sink: AskResponseSink::StreamHandle(stream_handle),
             used,
             reply_observer,
+            observer_notified: false,
         }
     }
 
@@ -514,6 +518,7 @@ impl AskResponder {
             sink: AskResponseSink::DeferredWriter(writer),
             used,
             reply_observer,
+            observer_notified: false,
         }
     }
 
@@ -521,7 +526,7 @@ impl AskResponder {
         self.correlation_id
     }
 
-    pub async fn reply(self, response: Bytes) -> Result<()> {
+    pub async fn reply(mut self, response: Bytes) -> Result<()> {
         claim_reply(&self.used)?;
         self.notify_observer(&response);
         self.sink
@@ -537,7 +542,7 @@ impl AskResponder {
     /// lost if the caller does not retry from the returned error. Use
     /// [`Self::try_reply_bytes_with_fallback`] when the caller needs an
     /// exclusive retry or fallback path.
-    pub fn try_reply_bytes(self, response: Bytes) -> Result<()> {
+    pub fn try_reply_bytes(mut self, response: Bytes) -> Result<()> {
         claim_reply(&self.used)?;
         self.notify_observer(&response);
         self.sink
@@ -549,7 +554,7 @@ impl AskResponder {
     /// rejected enqueue while this call owns the claim (retryable via the
     /// returned fallback, which cannot be raced by a sibling).
     pub fn try_reply_bytes_with_fallback(
-        self,
+        mut self,
         response: Bytes,
     ) -> std::result::Result<(), TryReplyError> {
         if let Err(error) = claim_reply(&self.used) {
@@ -595,7 +600,7 @@ impl AskResponder {
     /// the reply claim, preserving at-most-once ownership across sibling
     /// responders. Use [`Self::try_reply_bytes_immediate_with_fallback`] when
     /// the caller needs an exclusive retry or fallback path.
-    pub fn try_reply_bytes_immediate(self, response: Bytes) -> Result<()> {
+    pub fn try_reply_bytes_immediate(mut self, response: Bytes) -> Result<()> {
         claim_reply(&self.used)?;
         self.notify_observer(&response);
         self.sink
@@ -607,7 +612,7 @@ impl AskResponder {
     /// enqueue while this call owns the claim (retryable via the returned
     /// fallback, which cannot be raced by a sibling).
     pub fn try_reply_bytes_immediate_with_fallback(
-        self,
+        mut self,
         response: Bytes,
     ) -> std::result::Result<(), TryReplyError> {
         if let Err(error) = claim_reply(&self.used) {
@@ -626,7 +631,7 @@ impl AskResponder {
         }
     }
 
-    pub async fn reply_typed<M>(self, value: &M) -> Result<()>
+    pub async fn reply_typed<M>(mut self, value: &M) -> Result<()>
     where
         M: crate::typed::WireEncode,
     {
@@ -647,11 +652,13 @@ impl AskResponder {
     }
 
     #[inline]
-    fn notify_observer(&self, response: &Bytes) {
+    fn notify_observer(&mut self, response: &Bytes) {
         if response.len() <= crate::MAX_STREAM_SIZE
+            && !self.observer_notified
             && let Some(observer) = &self.reply_observer
         {
             observer.reply_claimed(Bytes::copy_from_slice(response.as_ref()));
+            self.observer_notified = true;
         }
     }
 }
@@ -749,6 +756,7 @@ impl ResponseWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection_pool::{BufferConfig, ChannelId};
     use std::sync::Mutex;
 
     #[derive(Default)]
@@ -930,6 +938,54 @@ mod tests {
     /// claimed the shared guard must see `ClaimUnavailable`, never `Enqueue` —
     /// otherwise a caller that retries every `Err` through the fallback path
     /// would send a duplicate response for an ask that was already answered.
+    #[tokio::test]
+    async fn lease_transfer_does_not_re_notify_observer() {
+        let writer = Arc::new(ResponseWriter::new("127.0.0.1:12351".parse().unwrap()));
+        let observer = Arc::new(RecordingReplyObserver::default());
+        let context = AskContext::from_writer(16, &writer, None)
+            .with_reply_observer(Arc::clone(&observer) as Arc<dyn AskReplyObserver>);
+        let fallback = match context
+            .responder()
+            .try_reply_bytes_with_fallback(Bytes::from_static(b"first"))
+        {
+            Err(TryReplyError::Enqueue(fallback)) => fallback,
+            Ok(()) => panic!("an unbound writer must reject the initial enqueue"),
+            Err(TryReplyError::ClaimUnavailable(error)) => {
+                panic!("the responder should own the claim: {error:?}")
+            }
+        };
+
+        let (io, _peer) = tokio::io::duplex(4096);
+        let (handle, writer_task, _reader_task) = LockFreeStreamHandle::new(
+            io,
+            "127.0.0.1:12352".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        writer.bind_stream_handle(Arc::new(handle));
+        let budget =
+            crate::ReplyDeliveryBudget::new(1, 32, crate::ReplyPayload::from_static(b"cancelled"))
+                .unwrap();
+        let lease = fallback.try_into_reply_lease(&budget, 9).unwrap();
+        lease
+            .try_reply_bytes(crate::ReplyPayload::from_static(b"second"))
+            .unwrap();
+        assert_eq!(
+            observer
+                .payloads
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            1,
+            "transferring an already-observed fallback into a lease must not notify twice"
+        );
+
+        writer.stream_handle().unwrap().shutdown();
+        let _ = writer_task.await;
+    }
+
     #[test]
     fn claim_already_taken_by_sibling_is_not_an_enqueue_fallback() {
         let writer = Arc::new(ResponseWriter::new("127.0.0.1:12348".parse().unwrap()));
