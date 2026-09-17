@@ -86,3 +86,7 @@ harness = false
 [[bench]]
 name = "pubsub_job_pattern"
 harness = false
+
+[[bench]]
+name = "stream_lease"
+harness = false

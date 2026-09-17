@@ -94,6 +94,14 @@ pub use registry::{ClockEchoV1, ClockProbeV1, GossipExtensionsV1, PeerClockSnaps
 pub use remote_actor_location::RemoteActorLocation;
 pub use remote_actor_ref::{RemoteActorRef, RemoteConnection};
 pub use reply_lease::{ReplyDeliveryBudget, ReplyLease, ReplyLeaseAdmissionError, ReplyPayload};
+
+/// Connection-local construction hooks used by the bounded lease
+/// qualification suite and benchmark harness. They are absent from normal
+/// builds so lease admission remains an inbound-responder API.
+#[cfg(feature = "test-helpers")]
+pub mod lease_test_support {
+    pub use crate::connection_pool::{BufferConfig, ChannelId, LockFreeStreamHandle};
+}
 pub use transport::{RegistryTransportBootstrap, TransportWireKind};
 pub use typed::{
     ArchivedBytes, WireEncode, WireType, decode_typed, decode_typed_archived, encode_typed,

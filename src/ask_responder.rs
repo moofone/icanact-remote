@@ -453,6 +453,10 @@ impl AskResponder {
         claim_reply(&self.used)
     }
 
+    pub(crate) fn reply_observer_for_lease(&self) -> Option<Arc<dyn AskReplyObserver>> {
+        self.reply_observer.clone()
+    }
+
     pub(crate) fn stream_handle_for_lease(&self) -> Result<Arc<LockFreeStreamHandle>> {
         match &self.sink {
             AskResponseSink::StreamHandle(handle) => Ok(Arc::clone(handle)),
@@ -466,6 +470,15 @@ impl AskResponder {
         used: Arc<AtomicBool>,
     ) -> Self {
         Self::from_stream_handle_with_observer(correlation_id, stream_handle, used, None)
+    }
+
+    #[cfg(feature = "test-helpers")]
+    pub fn from_stream_handle_for_test(
+        correlation_id: u32,
+        stream_handle: Arc<LockFreeStreamHandle>,
+        used: Arc<AtomicBool>,
+    ) -> Self {
+        Self::from_stream_handle(correlation_id, stream_handle, used)
     }
 
     fn from_stream_handle_with_observer(

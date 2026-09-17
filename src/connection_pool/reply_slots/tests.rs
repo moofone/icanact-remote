@@ -7,12 +7,9 @@ use crate::{AskResponder, ReplyDeliveryBudget, ReplyPayload};
 
 #[tokio::test]
 async fn slot_exhaustion_does_not_claim_responder() {
-    let budget = ReplyDeliveryBudget::new(
-        64,
-        64 * b"reply".len(),
-        ReplyPayload::from_static(b"duplicate-suppressed"),
-    )
-    .expect("valid reply budget");
+    let budget =
+        ReplyDeliveryBudget::new(64, 64 * b"reply".len(), ReplyPayload::from_static(b"dupe"))
+            .expect("valid reply budget");
     let (io, _peer) = tokio::io::duplex(4096);
     let (handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
         io,
@@ -81,7 +78,7 @@ async fn cancel_before_start_writes_only_duplicate_suppressed() {
     let responder =
         AskResponder::from_stream_handle(77, Arc::clone(&handle), Arc::new(AtomicBool::new(false)));
     let lease = responder
-        .try_reply_lease(&budget, 5)
+        .try_reply_lease(&budget, 32)
         .expect("lease admission");
     drop(lease);
 
@@ -109,8 +106,9 @@ async fn cancel_before_start_writes_only_duplicate_suppressed() {
 async fn published_lease_releases_after_terminal_flush() {
     use tokio::io::AsyncReadExt;
 
-    let budget = ReplyDeliveryBudget::new(1, 5, ReplyPayload::from_static(b"duplicate-suppressed"))
-        .expect("valid reply budget");
+    let budget =
+        ReplyDeliveryBudget::new(1, 32, ReplyPayload::from_static(b"duplicate-suppressed"))
+            .expect("valid reply budget");
     let (io, mut peer) = tokio::io::duplex(4096);
     let (handle, writer_task, _reader_task) = LockFreeStreamHandle::new(
         io,
@@ -124,7 +122,7 @@ async fn published_lease_releases_after_terminal_flush() {
     let responder =
         AskResponder::from_stream_handle(78, Arc::clone(&handle), Arc::new(AtomicBool::new(false)));
     let lease = responder
-        .try_reply_lease(&budget, 5)
+        .try_reply_lease(&budget, 32)
         .expect("lease admission");
     lease
         .try_reply_bytes(ReplyPayload::copy_from_slice(b"reply"))
@@ -145,7 +143,7 @@ async fn published_lease_releases_after_terminal_flush() {
 
     let next =
         AskResponder::from_stream_handle(79, Arc::clone(&handle), Arc::new(AtomicBool::new(false)))
-            .try_reply_lease(&budget, 5)
+            .try_reply_lease(&budget, 32)
             .expect("terminal flush must release the budget and slot");
     drop(next);
     handle.shutdown();

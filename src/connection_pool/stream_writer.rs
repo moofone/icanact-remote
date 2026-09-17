@@ -1959,8 +1959,10 @@ async fn write_leased_response_command_slice<S>(
 where
     S: AsyncWrite + Unpin,
 {
-    let stage = std::mem::replace(&mut response.stage, LeasedResponseStage::Complete);
-    match stage {
+    // Keep the stage in `response` while an async write is pending. Moving it
+    // to a temporary before the await loses the frame state when the slice
+    // timeout drops this future.
+    match &mut response.stage {
         LeasedResponseStage::Reserved => {
             *pending_offset = 0;
             let next = if response.record.is_cancelled() {
@@ -2036,16 +2038,16 @@ where
                 return Ok((0, false, false));
             }
             let (written, complete) =
-                write_inline_lease_slice(stream, pending_offset, &header, payload.as_ref()).await?;
-            response.stage = if complete {
-                LeasedResponseStage::Flushing
-            } else {
-                LeasedResponseStage::WritingInline { header, payload }
-            };
+                write_inline_lease_slice(stream, pending_offset, header, payload.as_ref()).await?;
+            if complete {
+                response.stage = LeasedResponseStage::Flushing;
+            }
             Ok((written, false, false))
         }
-        LeasedResponseStage::WritingNormal(mut normal) => {
-            let frame_started = normal.frame_index != 0 || normal.frame_offset != 0;
+        LeasedResponseStage::WritingNormal(normal) => {
+            // `frame_offset` is the commit state for the current frame.
+            // `frame_index != 0` only says that an earlier frame completed.
+            let frame_started = normal.frame_offset != 0;
             let final_frame = normal.frame_index.saturating_add(1) >= normal.chunk_count;
             if response.record.is_cancelled() && !frame_started {
                 *pending_offset = 0;
@@ -2066,52 +2068,47 @@ where
                 return Ok((0, false, false));
             }
             let (written, complete, frame_boundary) =
-                write_bytes_streaming_command_slice(stream, pending_offset, &mut normal).await?;
+                write_bytes_streaming_command_slice(stream, pending_offset, normal).await?;
             if complete {
                 response.stage = LeasedResponseStage::Flushing;
                 return Ok((written, false, false));
             }
             if response.record.is_cancelled() && frame_boundary && !final_frame {
+                let stream_id = normal.stream_id;
                 response.stage = LeasedResponseStage::WritingAbort {
-                    header: crate::framing::write_stream_abort_header(normal.stream_id, 0),
+                    header: crate::framing::write_stream_abort_header(stream_id, 0),
                 };
                 *pending_offset = 0;
                 return Ok((written, false, false));
             }
-            response.stage = LeasedResponseStage::WritingNormal(normal);
             Ok((written, false, frame_boundary))
         }
         LeasedResponseStage::WritingAbort { header } => {
-            let (written, complete) =
-                write_fixed_lease_slice(stream, pending_offset, &header).await?;
-            response.stage = if complete {
+            let (written, complete) = write_fixed_lease_slice(stream, pending_offset, header).await?;
+            if complete {
                 *pending_offset = 0;
-                LeasedResponseStage::WritingTerminal {
+                response.stage = LeasedResponseStage::WritingTerminal {
                     header: crate::framing::write_ask_response_header(
                         crate::MessageType::Response,
                         response.record.correlation_id(),
                         response.record.terminal_payload().len(),
                     ),
                     payload: response.record.terminal_payload(),
-                }
-            } else {
-                LeasedResponseStage::WritingAbort { header }
-            };
+                };
+            }
             Ok((written, false, false))
         }
         LeasedResponseStage::WritingTerminal { header, payload } => {
             let (written, complete) = write_inline_lease_slice(
                 stream,
                 pending_offset,
-                &header,
+                header,
                 payload.as_bytes().as_ref(),
             )
             .await?;
-            response.stage = if complete {
-                LeasedResponseStage::Flushing
-            } else {
-                LeasedResponseStage::WritingTerminal { header, payload }
-            };
+            if complete {
+                response.stage = LeasedResponseStage::Flushing;
+            }
             Ok((written, false, false))
         }
         LeasedResponseStage::Flushing => {
@@ -2307,6 +2304,7 @@ where
     Ok((written, pending.offset == total_len))
 }
 
+#[expect(dead_code, reason = "legacy unit tests exercise the single-slot helper")]
 #[inline]
 fn finish_streaming_command_slice(
     pending: PendingStreamingCommand,
@@ -2327,12 +2325,41 @@ fn finish_streaming_command_slice(
 }
 
 #[inline]
+fn finish_streaming_command_slice_owned(
+    pending: PendingStreamingCommand,
+    complete: bool,
+    streaming_queue: &StreamingQueue,
+    yielded_slot: &mut std::collections::VecDeque<PendingStreamingCommand>,
+    pending_slot: &mut Option<PendingStreamingCommand>,
+) {
+    if complete {
+        if pending.from_shared_queue {
+            streaming_queue.notify_space();
+        }
+    } else if pending.yield_after_frame && !pending.from_shared_queue {
+        yielded_slot.push_back(pending);
+    } else {
+        *pending_slot = Some(pending);
+    }
+}
+
+#[expect(dead_code, reason = "legacy unit tests exercise the single-slot helper")]
+#[inline]
 fn should_flush_stream_output(
     bytes_since_flush: usize,
     pending_stream_cmd: Option<&PendingStreamingCommand>,
     yielded_stream_cmd: Option<&PendingStreamingCommand>,
 ) -> bool {
     bytes_since_flush > 0 && pending_stream_cmd.is_none() && yielded_stream_cmd.is_none()
+}
+
+#[inline]
+fn should_flush_stream_output_owned(
+    bytes_since_flush: usize,
+    pending_stream_cmd: Option<&PendingStreamingCommand>,
+    yielded_stream_cmd: &std::collections::VecDeque<PendingStreamingCommand>,
+) -> bool {
+    bytes_since_flush > 0 && pending_stream_cmd.is_none() && yielded_stream_cmd.is_empty()
 }
 
 #[inline]
@@ -3037,7 +3064,10 @@ impl LockFreeStreamHandle {
         // being forced ahead of shared streaming work. Keeping the pending
         // command out of `LocalStreamingQueue` preserves its in-flight byte
         // accounting while allowing the source scheduler to alternate.
-        let mut yielded_stream_cmd: Option<PendingStreamingCommand> = None;
+        // Bounded by REPLY_SLOT_CAP: every queued item is an owned lease
+        // progress record, so no suspended delivery can overwrite another.
+        let mut yielded_stream_cmd: std::collections::VecDeque<PendingStreamingCommand> =
+            std::collections::VecDeque::with_capacity(crate::connection_pool::reply_slots::REPLY_SLOT_CAP);
         // Alternate local response frames with producer-owned shared stream
         // frames whenever both are ready. This is state local to the IO owner
         // and adds no synchronization to the messaging hot path.
@@ -3147,24 +3177,27 @@ impl LockFreeStreamHandle {
                 None
             } else if let Some(pending) = pending_stream_cmd.take() {
                 Some(pending)
-            } else if let Some(record) = reply_slots.pop_ready() {
-                Some(PendingStreamingCommand::local(
-                    StreamingCommand::LeasedResponse(Box::new(LeasedResponse {
-                        record,
-                        stage: LeasedResponseStage::Reserved,
-                    })),
-                ))
             } else {
                 let source = choose_streaming_source(
                     prefer_shared_streaming,
-                    local_streaming_queue.has_pending() || yielded_stream_cmd.is_some(),
+                    local_streaming_queue.has_pending()
+                        || !yielded_stream_cmd.is_empty()
+                        || !reply_slots.ready.is_empty(),
                     streaming_queue.has_pending(),
                 );
                 match source {
                     Some(StreamingSource::Local) => {
-                        if let Some(pending) = yielded_stream_cmd.take() {
+                        if let Some(pending) = yielded_stream_cmd.pop_front() {
                             prefer_shared_streaming = true;
                             Some(pending)
+                        } else if let Some(record) = reply_slots.pop_ready() {
+                            prefer_shared_streaming = true;
+                            Some(PendingStreamingCommand::local(
+                                StreamingCommand::LeasedResponse(Box::new(LeasedResponse {
+                                    record,
+                                    stage: LeasedResponseStage::Reserved,
+                                })),
+                            ))
                         } else if let Some(command) = local_streaming_queue.pop_front() {
                             prefer_shared_streaming = true;
                             Some(PendingStreamingCommand::local(command))
@@ -3179,9 +3212,17 @@ impl LockFreeStreamHandle {
                         if let Some(command) = streaming_queue.pop() {
                             prefer_shared_streaming = false;
                             Some(PendingStreamingCommand::shared(command))
-                        } else if let Some(pending) = yielded_stream_cmd.take() {
+                        } else if let Some(pending) = yielded_stream_cmd.pop_front() {
                             prefer_shared_streaming = true;
                             Some(pending)
+                        } else if let Some(record) = reply_slots.pop_ready() {
+                            prefer_shared_streaming = true;
+                            Some(PendingStreamingCommand::local(
+                                StreamingCommand::LeasedResponse(Box::new(LeasedResponse {
+                                    record,
+                                    stage: LeasedResponseStage::Reserved,
+                                })),
+                            ))
                         } else {
                             local_streaming_queue.pop_front().map(|command| {
                                 prefer_shared_streaming = true;
@@ -3261,7 +3302,7 @@ impl LockFreeStreamHandle {
                     flush_pending.store(false, Ordering::Release);
                     bytes_since_flush = 0;
                 }
-                finish_streaming_command_slice(
+                finish_streaming_command_slice_owned(
                     pending,
                     complete,
                     &streaming_queue,
@@ -4212,10 +4253,10 @@ impl LockFreeStreamHandle {
             }
 
             bytes_since_flush += total_bytes_written;
-            if should_flush_stream_output(
+            if should_flush_stream_output_owned(
                 bytes_since_flush,
                 pending_stream_cmd.as_ref(),
-                yielded_stream_cmd.as_ref(),
+                &yielded_stream_cmd,
             ) {
                 match bounded_stream_flush(
                     &mut stream,
@@ -4788,6 +4829,7 @@ impl LockFreeStreamHandle {
                         ));
                         continue;
                     }
+                    let reply_ready_notify = reply_slots.notify();
                     tokio::select! {
                         biased;
                         // Prefer a readable socket over a leftover write-queue
@@ -5204,6 +5246,12 @@ impl LockFreeStreamHandle {
                         }
                         _ = write_queue.data_notify.notified() => {
                             pending_cmd = write_queue.pop();
+                        }
+                        _ = reply_ready_notify.notified() => {
+                            // A lease activation may be the only event on a
+                            // quiet, read-enabled connection. The next loop
+                            // turn drains the ready queue with the same
+                            // subscribe-before-check ordering.
                         }
                         // Deliberately NOT also waiting on either queue's
                         // `space_notify` here: this task is the consumer,
@@ -9812,3 +9860,6 @@ mod write_payload_length_mismatch_tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
     }
 }
+
+#[cfg(test)]
+mod stream_writer_lease_tests;

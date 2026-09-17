@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 use crate::connection_pool::LockFreeStreamHandle;
+use crate::framing;
 
 /// An exact-sized, shared response payload.
 ///
@@ -73,6 +74,17 @@ impl ReplyDeliveryBudget {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "reply delivery limits must be non-zero",
+            )
+            .into());
+        }
+        // Tokio reserves the high semaphore bits for internal state. Check
+        // before construction so invalid configuration returns an error rather
+        // than triggering Semaphore::new's assertion.
+        const MAX_SEMAPHORE_PERMITS: usize = usize::MAX >> 3;
+        if job_limit > MAX_SEMAPHORE_PERMITS || byte_limit > MAX_SEMAPHORE_PERMITS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "reply delivery limits exceed semaphore permit range",
             )
             .into());
         }
@@ -184,6 +196,8 @@ impl fmt::Debug for ReplyLeaseAdmissionError {
 pub struct ReplyLease {
     pub(crate) record: Arc<crate::connection_pool::reply_slots::ReplySlotRecord>,
     pub(crate) stream_handle: Arc<LockFreeStreamHandle>,
+    reply_observer: Option<Arc<dyn crate::AskReplyObserver>>,
+    observer_notified: bool,
     transferred: bool,
 }
 
@@ -205,31 +219,60 @@ impl ReplyLease {
         Self {
             record,
             stream_handle,
+            reply_observer: None,
+            observer_notified: false,
             transferred: false,
+        }
+    }
+
+    fn with_observer(
+        stream_handle: Arc<LockFreeStreamHandle>,
+        record: Arc<crate::connection_pool::reply_slots::ReplySlotRecord>,
+        reply_observer: Option<Arc<dyn crate::AskReplyObserver>>,
+    ) -> Self {
+        Self {
+            record,
+            stream_handle,
+            reply_observer,
+            observer_notified: false,
+            transferred: false,
+        }
+    }
+
+    fn notify_observer(&mut self, payload: &ReplyPayload) {
+        if self.observer_notified {
+            return;
+        }
+        if let Some(observer) = &self.reply_observer {
+            observer.reply_claimed(Bytes::copy_from_slice(payload.as_ref()));
+            self.observer_notified = true;
         }
     }
 
     /// Publish one response to the existing connection IO owner without
     /// waiting for peer acknowledgement.
     pub fn try_reply_bytes(mut self, payload: ReplyPayload) -> crate::Result<()> {
-        self.transferred = true;
-        if let Err(error) = self.record.publish(payload) {
+        if let Err(error) = self.record.publish(payload.clone()) {
             self.record.cancel();
             return Err(error);
         }
+        self.notify_observer(&payload);
         self.record.activate();
+        self.transferred = true;
         Ok(())
     }
 
     /// Publish a response and retain the lease until its terminal flush.
     pub async fn reply_bytes(mut self, payload: ReplyPayload) -> crate::Result<()> {
-        self.transferred = true;
-        if let Err(error) = self.record.publish(payload) {
+        if let Err(error) = self.record.publish(payload.clone()) {
             self.record.cancel();
             return Err(error);
         }
+        self.notify_observer(&payload);
         self.record.activate();
-        self.record.wait_complete().await
+        let result = self.record.wait_complete().await;
+        self.transferred = true;
+        result
     }
 }
 
@@ -275,10 +318,52 @@ pub(crate) fn reserve_for_responder(
         }
     };
 
+    let terminal_payload = budget.cancelled_reply();
+    if max_reply_bytes == 0 || max_reply_bytes > crate::MAX_STREAM_SIZE {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "reply reservation is outside the streaming payload limit",
+        )
+        .into();
+        if claimed {
+            return Err(ReplyLeaseAdmissionError::FallbackUnavailable {
+                fallback: crate::ImmediateReplyFallback::from_claimed_responder(responder, error),
+            });
+        }
+        return Err(ReplyLeaseAdmissionError::Unavailable { responder, error });
+    }
+    if terminal_payload.len() > max_reply_bytes {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "reply reservation is smaller than its cancellation payload",
+        )
+        .into();
+        if claimed {
+            return Err(ReplyLeaseAdmissionError::FallbackUnavailable {
+                fallback: crate::ImmediateReplyFallback::from_claimed_responder(responder, error),
+            });
+        }
+        return Err(ReplyLeaseAdmissionError::Unavailable { responder, error });
+    }
+    let terminal_frame_len =
+        framing::ASK_RESPONSE_HEADER_LEN.saturating_add(terminal_payload.len());
+    if terminal_frame_len > stream_handle.max_message_size() {
+        let error = crate::GossipError::InvalidConfig(format!(
+            "max_message_size={} cannot carry the terminal leased reply",
+            stream_handle.max_message_size()
+        ));
+        if claimed {
+            return Err(ReplyLeaseAdmissionError::FallbackUnavailable {
+                fallback: crate::ImmediateReplyFallback::from_claimed_responder(responder, error),
+            });
+        }
+        return Err(ReplyLeaseAdmissionError::Unavailable { responder, error });
+    }
+    let reply_observer = responder.reply_observer_for_lease();
     let record = match stream_handle.reply_slots().try_reserve(
         responder.correlation_id(),
         max_reply_bytes,
-        budget.cancelled_reply(),
+        terminal_payload,
         job_permit,
         byte_permit,
     ) {
@@ -296,9 +381,13 @@ pub(crate) fn reserve_for_responder(
     };
 
     if !claimed && let Err(error) = responder.claim_for_lease() {
-        record.cancel();
+        record.discard();
         return Err(ReplyLeaseAdmissionError::ClaimUnavailable(error));
     }
 
-    Ok(ReplyLease::new(stream_handle, record))
+    Ok(ReplyLease::with_observer(
+        stream_handle,
+        record,
+        reply_observer,
+    ))
 }
