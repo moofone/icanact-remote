@@ -69,3 +69,43 @@ async fn rejected_claim_has_no_wire_bytes_and_releases_capacity() {
     handle.shutdown();
     let _ = writer_task.await;
 }
+
+#[cfg(feature = "test-helpers")]
+#[tokio::test]
+async fn closed_sync_lease_publication_rejects_after_real_transport_exit() {
+    use icanact_remote::AskResponder;
+    use icanact_remote::lease_test_support::{BufferConfig, ChannelId, LockFreeStreamHandle};
+    use std::sync::{Arc, atomic::AtomicBool};
+
+    let budget =
+        ReplyDeliveryBudget::new(1, 32, ReplyPayload::from_static(b"duplicate-suppressed"))
+            .expect("valid budget");
+    let (io, _peer) = tokio::io::duplex(4096);
+    let (handle, writer_task, _reader_task) = LockFreeStreamHandle::new(
+        io,
+        "127.0.0.1:40571".parse().expect("test address"),
+        ChannelId::TellAsk,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let handle = Arc::new(handle);
+    let lease = AskResponder::from_stream_handle_for_test(
+        82,
+        Arc::clone(&handle),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .try_reply_lease(&budget, 32)
+    .expect("lease admission");
+
+    handle.shutdown();
+    handle.wait_for_exit().await;
+    let error = lease
+        .try_reply_bytes(ReplyPayload::from_static(b"late"))
+        .expect_err("closed transport must reject synchronous publication");
+    assert!(matches!(
+        error,
+        icanact_remote::GossipError::ConnectionClosed(_)
+    ));
+    let _ = writer_task.await;
+}

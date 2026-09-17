@@ -1,9 +1,10 @@
 use std::sync::{Arc, atomic::AtomicBool};
+use tokio::sync::Semaphore;
 
 use bytes::Bytes;
 
 use crate::connection_pool::{BufferConfig, ChannelId, LockFreeStreamHandle};
-use crate::{AskResponder, ReplyDeliveryBudget, ReplyPayload};
+use crate::{AskReplyObserver, AskResponder, ReplyDeliveryBudget, ReplyPayload};
 
 #[tokio::test]
 async fn slot_exhaustion_does_not_claim_responder() {
@@ -100,6 +101,134 @@ async fn cancel_before_start_writes_only_duplicate_suppressed() {
 
     handle.shutdown();
     let _ = writer_task.await;
+}
+
+#[tokio::test]
+async fn close_before_publish_is_rejected_without_fresh_responder() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Observer(AtomicUsize);
+    impl AskReplyObserver for Observer {
+        fn reply_claimed(&self, _payload: Bytes) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let budget =
+        ReplyDeliveryBudget::new(2, 64, ReplyPayload::from_static(b"duplicate-suppressed"))
+            .expect("valid reply budget");
+    let (io, _peer) = tokio::io::duplex(4096);
+    let (handle, writer_task, _reader_task) = LockFreeStreamHandle::new(
+        io,
+        "127.0.0.1:40568".parse().expect("test address"),
+        ChannelId::TellAsk,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let handle = Arc::new(handle);
+    let observer = Arc::new(Observer(AtomicUsize::new(0)));
+    let context = crate::AskContext::from_stream_handle_with_request_id(79, &handle, None, None)
+        .with_reply_observer(Arc::clone(&observer) as Arc<dyn AskReplyObserver>);
+    let lease = context
+        .responder()
+        .try_reply_lease(&budget, 32)
+        .expect("lease admission");
+    handle.reply_slots().close_and_reclaim();
+
+    let result = lease.try_reply_bytes(ReplyPayload::from_static(b"late"));
+    assert!(matches!(
+        result,
+        Err(crate::GossipError::ConnectionClosed(addr))
+            if addr == "127.0.0.1:40568".parse::<std::net::SocketAddr>().expect("address")
+    ));
+    assert_eq!(observer.0.load(Ordering::SeqCst), 0);
+    assert_eq!(handle.reply_slots().reserved(), 0);
+    let sibling_result = context
+        .responder()
+        .try_reply_bytes(Bytes::from_static(b"sibling"));
+    assert!(matches!(
+        sibling_result,
+        Err(crate::GossipError::Network(error))
+            if error.kind() == std::io::ErrorKind::AlreadyExists
+    ));
+
+    handle.shutdown();
+    let _ = writer_task.await;
+}
+
+#[test]
+fn publication_close_race_linearizes_to_single_outcome() {
+    use std::sync::Barrier;
+
+    let slots = crate::connection_pool::reply_slots::ReplySlots::new(
+        1,
+        "127.0.0.1:40569".parse().expect("test address"),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let jobs = Arc::new(Semaphore::new(1));
+    let bytes = Arc::new(Semaphore::new(32));
+    let record = slots
+        .try_reserve(
+            1,
+            32,
+            Arc::new(ReplyPayload::from_static(b"cancelled")),
+            jobs.try_acquire_owned().expect("job permit"),
+            bytes.try_acquire_many_owned(32).expect("byte permit"),
+        )
+        .expect("reserve");
+    let start = Arc::new(Barrier::new(2));
+    let publish_record = Arc::clone(&record);
+    let publish_start = Arc::clone(&start);
+    let close_slots = Arc::clone(&slots);
+    let publish = std::thread::scope(|scope| {
+        let publisher = scope.spawn(move || {
+            publish_start.wait();
+            publish_record.publish(ReplyPayload::from_static(b"reply"))
+        });
+        let closer = scope.spawn(move || {
+            start.wait();
+            close_slots.close_and_reclaim();
+        });
+        let result = publisher.join().expect("publisher thread");
+        closer.join().expect("closer thread");
+        result
+    });
+    assert!(
+        publish.is_ok() || matches!(publish, Err(crate::GossipError::ConnectionClosed(_))),
+        "publication must linearize before close or be rejected by close: {publish:?}"
+    );
+    assert_eq!(slots.reserved(), 0);
+}
+
+#[test]
+fn publication_close_race_has_no_second_publication() {
+    let slots = crate::connection_pool::reply_slots::ReplySlots::new(
+        1,
+        "127.0.0.1:40569".parse().expect("test address"),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let jobs = Arc::new(Semaphore::new(1));
+    let bytes = Arc::new(Semaphore::new(32));
+    let record = slots
+        .try_reserve(
+            1,
+            32,
+            Arc::new(ReplyPayload::from_static(b"cancelled")),
+            jobs.try_acquire_owned().expect("job permit"),
+            bytes.try_acquire_many_owned(32).expect("byte permit"),
+        )
+        .expect("reserve");
+
+    let publish = record.publish(ReplyPayload::from_static(b"reply"));
+    slots.close_and_reclaim();
+    let late_publish = record.publish(ReplyPayload::from_static(b"again"));
+    assert!(publish.is_ok() || matches!(publish, Err(crate::GossipError::ConnectionClosed(_))));
+    assert!(matches!(
+        late_publish,
+        Err(crate::GossipError::ConnectionClosed(_)) | Err(crate::GossipError::Network(_))
+    ));
+    assert_eq!(slots.reserved(), 0);
 }
 
 #[tokio::test]

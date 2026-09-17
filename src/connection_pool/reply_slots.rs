@@ -12,6 +12,9 @@ pub(crate) const REPLY_SLOT_CAP: usize = 64;
 const STATE_RESERVED: u8 = 0;
 const STATE_COMPLETE: u8 = 2;
 const STATE_COMPLETION_CLOSED: u8 = 1;
+const PUBLICATION_OPEN: u8 = 0;
+const PUBLICATION_CLOSED: u8 = 1;
+const PUBLICATION_WRITING: u8 = 2;
 const RESERVATION_CLOSED: usize = 1usize << (usize::BITS - 1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,12 +37,18 @@ pub(crate) struct ReplySlotRecord {
     cancelled: AtomicBool,
     activated: AtomicBool,
     state: AtomicU8,
+    /// Publication has its own tiny state machine so close and synchronous
+    /// publication have one linearization point. `PUBLICATION_WRITING` is
+    /// held only while storing the payload in `OnceLock`.
+    publication_state: AtomicU8,
     completion: Notify,
     // The record owns these permits for its entire transport lifetime. Keeping
     // them as fields avoids a release lock and makes writer-owned retention
     // part of the same bounded record.
     _job_permit: OwnedSemaphorePermit,
     _byte_permit: OwnedSemaphorePermit,
+    #[cfg(any(test, feature = "test-helpers"))]
+    stats: Arc<crate::connection_pool::lease_stats::LeaseStats>,
 }
 
 impl ReplySlotRecord {
@@ -72,13 +81,61 @@ impl ReplySlotRecord {
                 max: self.max_reply_bytes,
             });
         }
-        self.normal_payload.set(payload).map_err(|_| {
+        loop {
+            match self.publication_state.load(Ordering::Acquire) {
+                PUBLICATION_CLOSED => {
+                    return Err(crate::GossipError::ConnectionClosed(self.addr));
+                }
+                PUBLICATION_OPEN => {
+                    if self
+                        .publication_state
+                        .compare_exchange(
+                            PUBLICATION_OPEN,
+                            PUBLICATION_WRITING,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    break;
+                }
+                PUBLICATION_WRITING => std::hint::spin_loop(),
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "invalid reply publication state",
+                    )
+                    .into());
+                }
+            }
+        }
+        if self.cancelled.load(Ordering::Acquire) {
+            self.publication_state
+                .store(PUBLICATION_OPEN, Ordering::Release);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "reply lease was cancelled",
+            )
+            .into());
+        }
+        let result = self.normal_payload.set(payload).map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 "reply lease already has a submitted response",
             )
             .into()
-        })
+        });
+        if result.is_ok() {
+            #[cfg(any(test, feature = "test-helpers"))]
+            self.stats
+                .retained_payload_owners
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.publication_state
+            .store(PUBLICATION_OPEN, Ordering::Release);
+        result
     }
 
     pub(crate) fn normal_payload(&self) -> Option<ReplyPayload> {
@@ -94,7 +151,18 @@ impl ReplySlotRecord {
     }
 
     pub(crate) fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        let was_cancelled = self.cancelled.swap(true, Ordering::AcqRel);
+        #[cfg(any(test, feature = "test-helpers"))]
+        if !was_cancelled {
+            self.stats
+                .cancellation_publications
+                .fetch_add(1, Ordering::Relaxed);
+            if self.state.load(Ordering::Acquire) != STATE_RESERVED {
+                self.stats
+                    .too_late_cancellations
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
         self.activate();
     }
 
@@ -104,7 +172,7 @@ impl ReplySlotRecord {
             // the record active. Wake the owner again so it rechecks the
             // record instead of sleeping through that state change.
             if let Some(slots) = self.slots.upgrade() {
-                slots.ready_notify.notify_one();
+                slots.lease_notify.notify_one();
             }
             return;
         }
@@ -138,7 +206,7 @@ impl ReplySlotRecord {
             slots.finish(self.index, self.generation);
             return;
         }
-        slots.ready_notify.notify_one();
+        slots.lease_notify.notify_one();
     }
 
     pub(crate) async fn wait_complete(&self) -> crate::Result<()> {
@@ -174,11 +242,73 @@ impl ReplySlotRecord {
             )
             .is_ok()
         {
+            #[cfg(any(test, feature = "test-helpers"))]
+            {
+                self.stats.live_slots.fetch_sub(1, Ordering::Relaxed);
+                if self.normal_payload.get().is_some() && !self.is_cancelled() {
+                    self.stats
+                        .normal_completions
+                        .fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.stats
+                        .terminal_completions
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+            }
             self.completion.notify_waiters();
         }
     }
 
+    #[inline]
+    pub(crate) fn note_abort(&self) {
+        #[cfg(any(test, feature = "test-helpers"))]
+        self.stats
+            .actual_stream_aborts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn note_frame_progress(&self, bytes: usize) {
+        #[cfg(any(test, feature = "test-helpers"))]
+        self.stats
+            .frame_progress
+            .fetch_add(bytes, Ordering::Relaxed);
+        #[cfg(not(any(test, feature = "test-helpers")))]
+        let _ = bytes;
+    }
+
+    #[inline]
+    pub(crate) fn note_flush_progress(&self) {
+        #[cfg(any(test, feature = "test-helpers"))]
+        self.stats.flush_progress.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn close_publication(&self) {
+        loop {
+            match self.publication_state.load(Ordering::Acquire) {
+                PUBLICATION_OPEN => {
+                    if self
+                        .publication_state
+                        .compare_exchange(
+                            PUBLICATION_OPEN,
+                            PUBLICATION_CLOSED,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        )
+                        .is_ok()
+                    {
+                        return;
+                    }
+                }
+                PUBLICATION_CLOSED => return,
+                PUBLICATION_WRITING => std::hint::spin_loop(),
+                _ => return,
+            }
+        }
+    }
+
     fn complete_closed(&self) {
+        self.close_publication();
         if self
             .state
             .compare_exchange(
@@ -189,6 +319,8 @@ impl ReplySlotRecord {
             )
             .is_ok()
         {
+            #[cfg(any(test, feature = "test-helpers"))]
+            self.stats.live_slots.fetch_sub(1, Ordering::Relaxed);
             self.completion.notify_waiters();
         }
     }
@@ -204,6 +336,18 @@ impl ReplySlotRecord {
 
 impl Drop for ReplySlotRecord {
     fn drop(&mut self) {
+        #[cfg(any(test, feature = "test-helpers"))]
+        {
+            self.stats.reserved_jobs.fetch_sub(1, Ordering::Relaxed);
+            self.stats
+                .reserved_bytes
+                .fetch_sub(self.max_reply_bytes, Ordering::Relaxed);
+            if self.normal_payload.get().is_some() {
+                self.stats
+                    .retained_payload_owners
+                    .fetch_sub(1, Ordering::Relaxed);
+            }
+        }
         if let Some(slots) = self.slots.upgrade() {
             slots.recycle(self.index, self.generation);
         }
@@ -214,7 +358,9 @@ pub(crate) struct ReplySlots {
     instance_id: u64,
     addr: SocketAddr,
     pub(crate) ready: ArrayQueue<Arc<ReplySlotRecord>>,
-    ready_notify: Arc<Notify>,
+    /// Lease activation never shares this notifier with lifecycle waiters.
+    lease_notify: Arc<Notify>,
+    exit_notify: Arc<Notify>,
     free: ArrayQueue<usize>,
     generations: Box<[AtomicU64]>,
     table: Box<[ArcSwapOption<ReplySlotRecord>]>,
@@ -224,10 +370,12 @@ pub(crate) struct ReplySlots {
     // their table entry yet, allowing close to sweep without a publication
     // race.
     reservation_state: AtomicUsize,
+    #[cfg(any(test, feature = "test-helpers"))]
+    stats: Arc<crate::connection_pool::lease_stats::LeaseStats>,
 }
 
 impl ReplySlots {
-    pub(crate) fn new(instance_id: u64, addr: SocketAddr, ready_notify: Arc<Notify>) -> Arc<Self> {
+    pub(crate) fn new(instance_id: u64, addr: SocketAddr, exit_notify: Arc<Notify>) -> Arc<Self> {
         let free = ArrayQueue::new(REPLY_SLOT_CAP);
         for index in 0..REPLY_SLOT_CAP {
             let _ = free.push(index);
@@ -244,12 +392,15 @@ impl ReplySlots {
             instance_id,
             addr,
             ready: ArrayQueue::new(REPLY_SLOT_CAP),
-            ready_notify,
+            lease_notify: Arc::new(Notify::new()),
+            exit_notify,
             free,
             generations,
             table,
             closed: AtomicBool::new(false),
             reservation_state: AtomicUsize::new(0),
+            #[cfg(any(test, feature = "test-helpers"))]
+            stats: Arc::new(crate::connection_pool::lease_stats::LeaseStats::default()),
         })
     }
 
@@ -295,11 +446,22 @@ impl ReplySlots {
             cancelled: AtomicBool::new(false),
             activated: AtomicBool::new(false),
             state: AtomicU8::new(STATE_RESERVED),
+            publication_state: AtomicU8::new(PUBLICATION_OPEN),
             completion: Notify::new(),
             _job_permit: job_permit,
             _byte_permit: byte_permit,
+            #[cfg(any(test, feature = "test-helpers"))]
+            stats: Arc::clone(&self.stats),
         });
         self.table[index].store(Some(Arc::clone(&record)));
+        #[cfg(any(test, feature = "test-helpers"))]
+        {
+            self.stats.live_slots.fetch_add(1, Ordering::Relaxed);
+            self.stats.reserved_jobs.fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .reserved_bytes
+                .fetch_add(max_reply_bytes, Ordering::Relaxed);
+        }
         self.end_reservation();
         if self.closed.load(Ordering::Acquire) {
             self.remove_closed(index, generation);
@@ -345,8 +507,13 @@ impl ReplySlots {
         self.ready.pop()
     }
 
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub(crate) fn stats_snapshot(&self) -> crate::connection_pool::lease_stats::LeaseStatsSnapshot {
+        self.stats.snapshot(self.free.len(), self.ready.len())
+    }
+
     pub(crate) fn notify(&self) -> Arc<Notify> {
-        Arc::clone(&self.ready_notify)
+        Arc::clone(&self.lease_notify)
     }
 
     pub(crate) fn finish(&self, index: usize, generation: u64) {
@@ -412,7 +579,8 @@ impl ReplySlots {
                 record.complete_closed();
             }
         }
-        self.ready_notify.notify_waiters();
+        self.lease_notify.notify_waiters();
+        self.exit_notify.notify_waiters();
     }
 
     #[cfg(test)]

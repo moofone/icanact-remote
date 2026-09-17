@@ -690,14 +690,62 @@ fn streaming_command_bytes(command: &StreamingCommand) -> usize {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StreamingSource {
     Local,
     Shared,
 }
 
+/// Fair source rotation for streaming work. Each selection advances the cursor
+/// by one lane, while the writer keeps the selected command until its current
+/// frame is complete. This makes the quantum one safe frame rather than one
+/// arbitrary socket write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamingLane {
+    Resumed,
+    Lease,
+    Local,
+    Shared,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StreamingRotation {
+    next: usize,
+}
+
+impl StreamingRotation {
+    fn new() -> Self {
+        Self { next: 0 }
+    }
+
+    fn choose(
+        &mut self,
+        resumed_ready: bool,
+        lease_ready: bool,
+        local_ready: bool,
+        shared_ready: bool,
+    ) -> Option<StreamingLane> {
+        let ready = [resumed_ready, lease_ready, local_ready, shared_ready];
+        for step in 0..ready.len() {
+            let index = (self.next + step) % ready.len();
+            if ready[index] {
+                self.next = (index + 1) % ready.len();
+                return Some(match index {
+                    0 => StreamingLane::Resumed,
+                    1 => StreamingLane::Lease,
+                    2 => StreamingLane::Local,
+                    _ => StreamingLane::Shared,
+                });
+            }
+        }
+        None
+    }
+}
+
 /// Pick the next streaming source without allowing a continuously replenished
 /// local response queue to starve producer-owned shared streams.
+#[cfg(test)]
 fn choose_streaming_source(
     prefer_shared: bool,
     local_ready: bool,

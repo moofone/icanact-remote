@@ -986,6 +986,52 @@ mod tests {
         let _ = writer_task.await;
     }
 
+    #[tokio::test]
+    async fn polled_reply_future_drop_cancels_after_publication() {
+        let (io, _peer) = tokio::io::duplex(4096);
+        let (handle, writer_task, _reader_task) = LockFreeStreamHandle::new(
+            io,
+            "127.0.0.1:12353".parse().expect("test address"),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let handle = Arc::new(handle);
+        let budget =
+            crate::ReplyDeliveryBudget::new(1, 32, crate::ReplyPayload::from_static(b"cancelled"))
+                .expect("valid budget");
+        let lease = AskResponder::from_stream_handle(
+            17,
+            Arc::clone(&handle),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .try_reply_lease(&budget, 9)
+        .expect("lease admission");
+        let record = Arc::clone(&lease.record);
+        {
+            let future = lease.reply_bytes(crate::ReplyPayload::from_static(b"reply"));
+            tokio::pin!(future);
+            let waker = futures::task::noop_waker();
+            let mut cx = std::task::Context::from_waker(&waker);
+            assert!(matches!(
+                future.as_mut().poll(&mut cx),
+                std::task::Poll::Pending
+            ));
+            assert!(
+                record.normal_payload().is_some(),
+                "poll must publish before waiting"
+            );
+        }
+        assert!(
+            record.is_cancelled(),
+            "dropping a polled reply must cancel the lease"
+        );
+
+        handle.shutdown();
+        let _ = writer_task.await;
+    }
+
     #[test]
     fn claim_already_taken_by_sibling_is_not_an_enqueue_fallback() {
         let writer = Arc::new(ResponseWriter::new("127.0.0.1:12348".parse().unwrap()));

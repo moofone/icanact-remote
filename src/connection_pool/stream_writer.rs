@@ -2039,6 +2039,7 @@ where
             }
             let (written, complete) =
                 write_inline_lease_slice(stream, pending_offset, header, payload.as_ref()).await?;
+            response.record.note_frame_progress(written);
             if complete {
                 response.stage = LeasedResponseStage::Flushing;
             }
@@ -2069,12 +2070,14 @@ where
             }
             let (written, complete, frame_boundary) =
                 write_bytes_streaming_command_slice(stream, pending_offset, normal).await?;
+            response.record.note_frame_progress(written);
             if complete {
                 response.stage = LeasedResponseStage::Flushing;
                 return Ok((written, false, false));
             }
             if response.record.is_cancelled() && frame_boundary && !final_frame {
                 let stream_id = normal.stream_id;
+                response.record.note_abort();
                 response.stage = LeasedResponseStage::WritingAbort {
                     header: crate::framing::write_stream_abort_header(stream_id, 0),
                 };
@@ -2085,6 +2088,7 @@ where
         }
         LeasedResponseStage::WritingAbort { header } => {
             let (written, complete) = write_fixed_lease_slice(stream, pending_offset, header).await?;
+            response.record.note_frame_progress(written);
             if complete {
                 *pending_offset = 0;
                 response.stage = LeasedResponseStage::WritingTerminal {
@@ -2106,6 +2110,7 @@ where
                 payload.as_bytes().as_ref(),
             )
             .await?;
+            response.record.note_frame_progress(written);
             if complete {
                 response.stage = LeasedResponseStage::Flushing;
             }
@@ -2113,6 +2118,7 @@ where
         }
         LeasedResponseStage::Flushing => {
             stream.flush().await?;
+            response.record.note_flush_progress();
             response.record.finish();
             response.stage = LeasedResponseStage::Complete;
             Ok((0, true, false))
@@ -2145,7 +2151,7 @@ where
     Ok((written, *pending_offset >= bytes.len()))
 }
 
-#[expect(dead_code, reason = "legacy unit tests exercise the uncontextualized writer helper")]
+#[cfg(test)]
 async fn write_streaming_command_slice<S>(
     stream: &mut S,
     pending: &mut PendingStreamingCommand,
@@ -2304,7 +2310,7 @@ where
     Ok((written, pending.offset == total_len))
 }
 
-#[expect(dead_code, reason = "legacy unit tests exercise the single-slot helper")]
+#[cfg(test)]
 #[inline]
 fn finish_streaming_command_slice(
     pending: PendingStreamingCommand,
@@ -2343,7 +2349,7 @@ fn finish_streaming_command_slice_owned(
     }
 }
 
-#[expect(dead_code, reason = "legacy unit tests exercise the single-slot helper")]
+#[cfg(test)]
 #[inline]
 fn should_flush_stream_output(
     bytes_since_flush: usize,
@@ -3068,10 +3074,11 @@ impl LockFreeStreamHandle {
         // progress record, so no suspended delivery can overwrite another.
         let mut yielded_stream_cmd: std::collections::VecDeque<PendingStreamingCommand> =
             std::collections::VecDeque::with_capacity(crate::connection_pool::reply_slots::REPLY_SLOT_CAP);
-        // Alternate local response frames with producer-owned shared stream
-        // frames whenever both are ready. This is state local to the IO owner
-        // and adds no synchronization to the messaging hot path.
-        let mut prefer_shared_streaming = true;
+        // Rotate resumed commands, newly activated leases, local responses,
+        // and producer-owned shared streams. The selected command remains
+        // pending until its current frame completes, so rotation never splices
+        // a competing source into a partial frame.
+        let mut streaming_rotation = StreamingRotation::new();
         let max_message_size = read_context
             .as_ref()
             .map(|ctx| ctx.max_message_size)
@@ -3178,59 +3185,37 @@ impl LockFreeStreamHandle {
             } else if let Some(pending) = pending_stream_cmd.take() {
                 Some(pending)
             } else {
-                let source = choose_streaming_source(
-                    prefer_shared_streaming,
-                    local_streaming_queue.has_pending()
-                        || !yielded_stream_cmd.is_empty()
-                        || !reply_slots.ready.is_empty(),
-                    streaming_queue.has_pending(),
-                );
-                match source {
-                    Some(StreamingSource::Local) => {
-                        if let Some(pending) = yielded_stream_cmd.pop_front() {
-                            prefer_shared_streaming = true;
-                            Some(pending)
-                        } else if let Some(record) = reply_slots.pop_ready() {
-                            prefer_shared_streaming = true;
-                            Some(PendingStreamingCommand::local(
+                // Readiness is advisory because producers can race a pop. If
+                // that happens, advance the cursor and retry the other lanes;
+                // no wakeup or command is lost.
+                loop {
+                    let lane = streaming_rotation.choose(
+                        !yielded_stream_cmd.is_empty(),
+                        !reply_slots.ready.is_empty(),
+                        local_streaming_queue.has_pending(),
+                        streaming_queue.has_pending(),
+                    );
+                    let Some(lane) = lane else { break None };
+                    let pending = match lane {
+                        StreamingLane::Resumed => yielded_stream_cmd.pop_front(),
+                        StreamingLane::Lease => reply_slots.pop_ready().map(|record| {
+                            PendingStreamingCommand::local(
                                 StreamingCommand::LeasedResponse(Box::new(LeasedResponse {
                                     record,
                                     stage: LeasedResponseStage::Reserved,
                                 })),
-                            ))
-                        } else if let Some(command) = local_streaming_queue.pop_front() {
-                            prefer_shared_streaming = true;
-                            Some(PendingStreamingCommand::local(command))
-                        } else {
-                            streaming_queue.pop().map(|command| {
-                                prefer_shared_streaming = false;
-                                PendingStreamingCommand::shared(command)
-                            })
-                        }
+                            )
+                        }),
+                        StreamingLane::Local => local_streaming_queue
+                            .pop_front()
+                            .map(PendingStreamingCommand::local),
+                        StreamingLane::Shared => streaming_queue
+                            .pop()
+                            .map(PendingStreamingCommand::shared),
+                    };
+                    if pending.is_some() {
+                        break pending;
                     }
-                    Some(StreamingSource::Shared) => {
-                        if let Some(command) = streaming_queue.pop() {
-                            prefer_shared_streaming = false;
-                            Some(PendingStreamingCommand::shared(command))
-                        } else if let Some(pending) = yielded_stream_cmd.pop_front() {
-                            prefer_shared_streaming = true;
-                            Some(pending)
-                        } else if let Some(record) = reply_slots.pop_ready() {
-                            prefer_shared_streaming = true;
-                            Some(PendingStreamingCommand::local(
-                                StreamingCommand::LeasedResponse(Box::new(LeasedResponse {
-                                    record,
-                                    stage: LeasedResponseStage::Reserved,
-                                })),
-                            ))
-                        } else {
-                            local_streaming_queue.pop_front().map(|command| {
-                                prefer_shared_streaming = true;
-                                PendingStreamingCommand::local(command)
-                            })
-                        }
-                    }
-                    None => None,
                 }
             };
             if let Some(mut pending) = next_stream {
@@ -4681,6 +4666,11 @@ impl LockFreeStreamHandle {
                     let pending = pending_ordinary_write
                         .as_mut()
                         .expect("pending ordinary write checked above");
+                    // Lease activation is independent of lifecycle exit
+                    // notification. Register it in this park too: a lease may
+                    // become ready while an ordinary frame is stalled, and
+                    // the next boundary must re-check the ready set.
+                    let lease_notify = reply_slots.notify();
                     tokio::select! {
                         biased;
                         progress = wait_pending_ordinary(&mut stream, pending) => {
@@ -4746,6 +4736,7 @@ impl LockFreeStreamHandle {
                             pending_cmd = write_queue.pop();
                         }
                         _ = streaming_queue.data_notify.notified() => {}
+                        _ = lease_notify.notified() => {}
                     }
                 }
                 if completed_pending {

@@ -100,7 +100,12 @@ pub use reply_lease::{ReplyDeliveryBudget, ReplyLease, ReplyLeaseAdmissionError,
 /// builds so lease admission remains an inbound-responder API.
 #[cfg(feature = "test-helpers")]
 pub mod lease_test_support {
+    pub use crate::connection_pool::lease_stats::LeaseStatsSnapshot;
     pub use crate::connection_pool::{BufferConfig, ChannelId, LockFreeStreamHandle};
+
+    pub fn lease_stats(handle: &LockFreeStreamHandle) -> LeaseStatsSnapshot {
+        handle.reply_slots().stats_snapshot()
+    }
 }
 pub use transport::{RegistryTransportBootstrap, TransportWireKind};
 pub use typed::{

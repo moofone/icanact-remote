@@ -212,6 +212,7 @@ impl fmt::Debug for ReplyLease {
 }
 
 impl ReplyLease {
+    #[cfg(test)]
     pub(crate) fn new(
         stream_handle: Arc<LockFreeStreamHandle>,
         record: Arc<crate::connection_pool::reply_slots::ReplySlotRecord>,
@@ -254,7 +255,14 @@ impl ReplyLease {
     /// waiting for peer acknowledgement.
     pub fn try_reply_bytes(mut self, payload: ReplyPayload) -> crate::Result<()> {
         if let Err(error) = self.record.publish(payload.clone()) {
-            self.record.cancel();
+            if matches!(error, crate::GossipError::ConnectionClosed(_)) {
+                // Close won the publication linearization. The claim remains
+                // consumed, but it must not activate a terminal frame or
+                // notify an observer after transport teardown.
+                self.transferred = true;
+            } else {
+                self.record.cancel();
+            }
             return Err(error);
         }
         self.notify_observer(&payload);
@@ -266,7 +274,11 @@ impl ReplyLease {
     /// Publish a response and retain the lease until its terminal flush.
     pub async fn reply_bytes(mut self, payload: ReplyPayload) -> crate::Result<()> {
         if let Err(error) = self.record.publish(payload.clone()) {
-            self.record.cancel();
+            if matches!(error, crate::GossipError::ConnectionClosed(_)) {
+                self.transferred = true;
+            } else {
+                self.record.cancel();
+            }
             return Err(error);
         }
         self.notify_observer(&payload);
