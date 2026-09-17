@@ -3,9 +3,9 @@ mod common;
 use bytes::Bytes;
 use common::{
     DynError, TlsHandle, capture_connection_diagnostics, connect_bidirectional, create_tls_node,
-    wait_for_condition,
+    install_natural_lifecycle_recorder, wait_for_condition,
 };
-use icanact_remote::lifecycle::{TransportLifecycleEvent, TransportLifecycleRecorderGuard};
+use icanact_remote::lifecycle::TransportLifecycleEvent;
 use icanact_remote::registry::{ActorMessageHandlerSync, ActorResponse, RegistryChange};
 use icanact_remote::{
     AlignedBytes, BuilderTlsBootstrap, GossipConfig, GossipRegistryHandle, KeyPair, PeerId,
@@ -211,39 +211,25 @@ fn lifecycle_outbound_dial_resolution_peer(event: &TransportLifecycleEvent) -> O
     }
 }
 
-/// Installs the process-wide transport lifecycle recorder exactly once, for
-/// the remainder of this test binary's run, so [`wait_for_dial_resolution_
-/// entered`] and [`wait_for_peer_quiescence`] can observe real tie-break/
-/// finalization activity instead of guessing a fixed sleep covers it.
-///
-/// Deliberately never uninstalled: `TransportLifecycleRecorderGuard`'s
-/// uninstall-on-drop exists so concurrently running tests never clobber each
-/// other's recorder, but every test in this file wants the SAME recorder for
-/// its entire run, and each `tests/*.rs` file is its own separate test
-/// binary/process (`lifecycle`'s recorder statics are not shared with any
-/// other file), so there is no other installer here to protect against by
-/// ever uninstalling it.
+/// Installs one recorder for this test binary. The writer in `common` uses a
+/// bounded `try_send`, so lifecycle callbacks never wait on file I/O or a
+/// process-wide recorder-install guard.
 fn ensure_lifecycle_quiescence_recorder_installed() {
-    static INSTALLED: Once = Once::new();
-    INSTALLED.call_once(|| {
-        std::mem::forget(TransportLifecycleRecorderGuard::install(Arc::new(
-            |event: TransportLifecycleEvent| {
-                if let Some(peer) = lifecycle_outbound_dial_resolution_peer(&event) {
-                    let mut counts = peer_outbound_dial_resolution_counts()
-                        .lock()
-                        .expect("peer outbound dial resolution counts mutex poisoned");
-                    *counts.entry(peer.clone()).or_insert(0) += 1;
-                }
-                let Some(peer) = lifecycle_event_peer(&event) else {
-                    return;
-                };
-                let mut counts = peer_lifecycle_event_counts()
-                    .lock()
-                    .expect("peer lifecycle event counts mutex poisoned");
-                *counts.entry(peer.clone()).or_insert(0) += 1;
-            },
-        )));
-    });
+    install_natural_lifecycle_recorder(Arc::new(|event: &TransportLifecycleEvent| {
+        if let Some(peer) = lifecycle_outbound_dial_resolution_peer(event) {
+            let mut counts = peer_outbound_dial_resolution_counts()
+                .lock()
+                .expect("peer outbound dial resolution counts mutex poisoned");
+            *counts.entry(peer.clone()).or_insert(0) += 1;
+        }
+        let Some(peer) = lifecycle_event_peer(event) else {
+            return;
+        };
+        let mut counts = peer_lifecycle_event_counts()
+            .lock()
+            .expect("peer lifecycle event counts mutex poisoned");
+        *counts.entry(peer.clone()).or_insert(0) += 1;
+    }));
 }
 
 /// Snapshots the current outbound-dial-resolution counts for `peer_ids`, to

@@ -67,6 +67,10 @@ required-features = ["test-helpers"]
 name = "remote_actor_ref_self_heal"
 required-features = ["test-helpers"]
 
+[[test]]
+name = "qa_r1_lifecycle_evidence"
+required-features = ["test-helpers"]
+
 [[bench]]
 name = "archived_access"
 harness = false

@@ -334,6 +334,26 @@ pub enum TransportTestHelperEvent {
         require_live: bool,
         sequence: u64,
     },
+    MarkConnectedAttempt {
+        peer: Option<PeerId>,
+        addr: SocketAddr,
+        instance_id: Option<u64>,
+        require_live: bool,
+        sequence: u64,
+    },
+    MarkConnectedDeclined {
+        peer: Option<PeerId>,
+        addr: SocketAddr,
+        instance_id: Option<u64>,
+        require_live: bool,
+        sequence: u64,
+    },
+    MarkFailedAttempt {
+        peer: Option<PeerId>,
+        addr: SocketAddr,
+        instance_id: Option<u64>,
+        sequence: u64,
+    },
     MarkFailed {
         peer: Option<PeerId>,
         addr: SocketAddr,
@@ -448,17 +468,31 @@ pub(crate) fn record_transport_event(event: TransportLifecycleEvent) {
 /// absent from release builds, so the observation seam adds no hot-path work
 /// unless the explicitly requested `test-helpers` feature is enabled.
 #[cfg(feature = "test-helpers")]
-pub(crate) fn record_test_helper_event<F>(make_event: F)
-where
-    F: FnOnce(u64) -> TransportTestHelperEvent,
-{
-    static NEXT_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let sequence = NEXT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+#[cfg(feature = "test-helpers")]
+static NEXT_TEST_HELPER_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(feature = "test-helpers")]
+pub(crate) fn next_test_helper_sequence() -> u64 {
+    NEXT_TEST_HELPER_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(feature = "test-helpers")]
+pub(crate) fn dispatch_test_helper_event(event: TransportTestHelperEvent) {
     let recorder = test_helper_recorder_cell()
         .read()
         .expect("transport test-helper recorder lock poisoned")
         .clone();
     if let Some(recorder) = recorder {
-        recorder(make_event(sequence));
+        recorder(event);
     }
+}
+
+#[cfg(feature = "test-helpers")]
+pub(crate) fn record_test_helper_event<F>(make_event: F)
+where
+    F: FnOnce(u64) -> TransportTestHelperEvent,
+{
+    let sequence = next_test_helper_sequence();
+    dispatch_test_helper_event(make_event(sequence));
 }

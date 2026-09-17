@@ -1,14 +1,60 @@
-use icanact_remote::{GossipConfig, GossipRegistryHandle, KeyPair, PeerId, SecretKey};
+use icanact_remote::{
+    GossipConfig, GossipRegistryHandle, KeyPair, PeerId, SecretKey, TransportLifecycleEvent,
+};
 use std::fs::OpenOptions;
 use std::future::Future;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::sync::{Mutex, Once, OnceLock};
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 pub type DynError = Box<dyn std::error::Error + Send + Sync>;
 pub type TlsHandle = GossipRegistryHandle<icanact_remote::BuilderTlsBootstrap>;
+
+const NATURAL_LIFECYCLE_EVIDENCE_PATH: &str =
+    "/tmp/icanact-qa-20260918/r1/committed-accounting-evidence.log";
+
+pub fn install_natural_lifecycle_recorder(
+    on_event: Arc<dyn Fn(&TransportLifecycleEvent) + Send + Sync + 'static>,
+) {
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<TransportLifecycleEvent>(4096);
+        let _ = std::thread::Builder::new()
+            .name("icanact-r1-lifecycle-log".into())
+            .spawn(move || {
+                let _ = std::fs::create_dir_all("/tmp/icanact-qa-20260918/r1");
+                let Ok(mut file) = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(NATURAL_LIFECYCLE_EVIDENCE_PATH)
+                else {
+                    return;
+                };
+                let command = std::env::args().collect::<Vec<_>>().join(" ");
+                let revision = std::process::Command::new("git")
+                    .args(["rev-parse", "HEAD"])
+                    .output()
+                    .ok()
+                    .and_then(|output| String::from_utf8(output.stdout).ok())
+                    .map(|value| value.trim().to_owned())
+                    .unwrap_or_else(|| "unknown".into());
+                let _ = writeln!(
+                    file,
+                    "capture_start command={command:?} features=test-helpers/all-features revision={revision}"
+                );
+                while let Ok(event) = receiver.recv() {
+                    let _ = writeln!(file, "event={event:?}");
+                }
+            });
+        let recorder = Arc::new(move |event: TransportLifecycleEvent| {
+            on_event(&event);
+            let _ = sender.try_send(event);
+        });
+        icanact_remote::set_transport_lifecycle_recorder(Some(recorder));
+    });
+}
 
 static CRYPTO_INIT: Once = Once::new();
 

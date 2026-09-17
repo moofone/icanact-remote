@@ -146,6 +146,17 @@ fn evidence_events(
     events.lock().expect("event log mutex poisoned").clone()
 }
 
+async fn peer_failures(node: &TlsHandle, addr: std::net::SocketAddr) -> usize {
+    node.registry
+        .gossip_state
+        .lock()
+        .await
+        .peers
+        .get(&addr)
+        .map(|peer| peer.failures)
+        .unwrap_or_default()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ordered_lifecycle_evidence_proves_publication_and_stale_teardown_fencing()
 -> Result<(), DynError> {
@@ -390,6 +401,175 @@ async fn ordered_lifecycle_evidence_proves_publication_and_stale_teardown_fencin
         node_a.client().current_peer_connection_instance(&peer_b),
         Some(replacement_instance),
         "final current instance must be the replacement, never the stale instance"
+    );
+
+    replacement_b.shutdown().await;
+    node_a.shutdown().await;
+    drop(event_sender);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn successful_cas_tail_does_not_fence_replacement() -> Result<(), DynError> {
+    let config = GossipConfig {
+        connection_timeout: EVIDENCE_TIMEOUT,
+        response_timeout: EVIDENCE_TIMEOUT,
+        ..Default::default()
+    };
+    let key_a = KeyPair::new_for_testing("qa-r1-committed-accounting-a");
+    let key_b = KeyPair::new_for_testing("qa-r1-committed-accounting-b");
+    let node_a = create_tls_node_with_keypair(key_a, config.clone()).await?;
+    let node_b = create_tls_node_with_keypair(key_b.clone(), config.clone()).await?;
+    let addr_b = node_b.registry.bind_addr;
+    let peer_b = node_b.registry.peer_id.clone();
+
+    let (event_sender, mut events) = unbounded_channel::<TransportTestHelperEvent>();
+    let recorded = Arc::new(Mutex::new(Vec::<TransportTestHelperEvent>::new()));
+    let teardown_gate = Gate::new();
+    let teardown_entered = Arc::new(AtomicBool::new(false));
+    let teardown_once = Arc::new(AtomicBool::new(true));
+    let failure_started = Arc::new(AtomicBool::new(false));
+    let recorder_events = Arc::clone(&recorded);
+    let recorder_sender = event_sender.clone();
+    let recorder_gate = teardown_gate.clone();
+    let recorder_entered = Arc::clone(&teardown_entered);
+    let recorder_once = Arc::clone(&teardown_once);
+    let recorder_failure_started = Arc::clone(&failure_started);
+    let recorder_peer_b = peer_b.clone();
+    let _guard = TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
+        if let TransportLifecycleEvent::SocketFailurePoolTeardownComplete {
+            peer: Some(peer),
+            addr,
+        } = &event
+            && *peer == recorder_peer_b
+            && *addr == addr_b
+            && recorder_failure_started.load(Ordering::Acquire)
+            && recorder_once.swap(false, Ordering::AcqRel)
+        {
+            // CAS retirement has succeeded before this event. The old
+            // handler is now held before discovery/accounting, allowing a
+            // replacement to publish and commit its own connected mark.
+            recorder_entered.store(true, Ordering::Release);
+            recorder_gate.wait();
+        }
+    }));
+    _guard.install_test_helper_recorder(Arc::new(move |event| {
+        recorder_events
+            .lock()
+            .expect("event log mutex poisoned")
+            .push(event.clone());
+        recorder_sender
+            .send(event)
+            .expect("lifecycle recorder channel closed");
+    }));
+
+    connect_bidirectional(&node_a, &node_b).await?;
+    assert!(
+        common::wait_for_condition(EVIDENCE_TIMEOUT, || async {
+            node_a
+                .client()
+                .current_peer_connection_instance(&peer_b)
+                .is_some()
+        })
+        .await,
+        "initial current B instance did not settle"
+    );
+    let old_instance = node_a
+        .client()
+        .current_peer_connection_instance(&peer_b)
+        .expect("initial current B instance");
+
+    failure_started.store(true, Ordering::Release);
+    let failure_registry = node_a.registry.clone();
+    let failure_task = tokio::spawn(async move {
+        failure_registry
+            .handle_peer_connection_failure(addr_b, Some(old_instance))
+            .await
+    });
+    assert!(
+        common::wait_for_condition(EVIDENCE_TIMEOUT, || async {
+            teardown_entered.load(Ordering::Acquire)
+        })
+        .await,
+        "successful-CAS teardown-complete gate did not open"
+    );
+    let _successful_cas_teardown = next_event(&mut events, |event| {
+        matches!(
+            event,
+            TransportTestHelperEvent::TeardownAttempt {
+                peer,
+                addr,
+                instance_id,
+                ..
+            } if *peer == peer_b && *addr == addr_b && *instance_id == old_instance
+        )
+    })
+    .await;
+
+    node_b.shutdown().await;
+    let replacement_b = node_at(addr_b, key_b, config).await?;
+    connect_bidirectional(&node_a, &replacement_b).await?;
+
+    let replacement_publication = next_event(&mut events, |event| {
+        publication_for(event, &peer_b, addr_b, None)
+            && matches!(
+                event,
+                TransportTestHelperEvent::PublicationCommitted { instance_id, .. }
+                    if *instance_id != old_instance
+            )
+    })
+    .await;
+    let replacement_instance = match replacement_publication {
+        TransportTestHelperEvent::PublicationCommitted { instance_id, .. } => instance_id,
+        _ => unreachable!(),
+    };
+    let replacement_mark = next_event(&mut events, |event| {
+        mark_connected_for(event, &peer_b, addr_b, replacement_instance)
+    })
+    .await;
+    assert!(
+        event_sequence(&replacement_mark).unwrap()
+            > event_sequence(&replacement_publication).unwrap(),
+        "replacement committed mark must follow replacement publication"
+    );
+
+    teardown_gate.open();
+    failure_task
+        .await
+        .expect("stale failure task panicked")
+        .expect("stale failure task failed");
+    let old_failure = next_event(&mut events, |event| {
+        matches!(
+            event,
+            TransportTestHelperEvent::MarkFailed {
+                peer: Some(peer),
+                addr,
+                instance_id: Some(instance_id),
+                ..
+            } if *peer == peer_b && *addr == addr_b && *instance_id == old_instance
+        )
+    })
+    .await;
+    assert!(
+        event_sequence(&old_failure).unwrap() > event_sequence(&replacement_mark).unwrap(),
+        "old accounting decision must be observed after replacement commit"
+    );
+    assert!(
+        matches!(
+            old_failure,
+            TransportTestHelperEvent::MarkFailed { applied: false, .. }
+        ),
+        "old successful-CAS cleanup must decline accounting after replacement commit"
+    );
+    assert_eq!(
+        peer_failures(&node_a, addr_b).await,
+        0,
+        "old successful-CAS cleanup must not mark the replacement failed"
+    );
+    assert_eq!(
+        node_a.client().current_peer_connection_instance(&peer_b),
+        Some(replacement_instance),
+        "replacement remains current after old cleanup release"
     );
 
     replacement_b.shutdown().await;

@@ -11773,31 +11773,74 @@ impl<T: 'static> GossipRegistry<T> {
             }
         }
 
-        // IMMEDIATELY mark peer as failed in our local state
+        // Record the accounting attempt before taking the state lock. The
+        // attempt is observational only; the applied/declined outcome below
+        // is captured while holding `gossip_state` and dispatched afterward.
         #[cfg(feature = "test-helpers")]
-        crate::lifecycle::record_test_helper_event(|sequence| {
+        {
+            let sequence = crate::lifecycle::next_test_helper_sequence();
+            crate::lifecycle::dispatch_test_helper_event(
+                crate::lifecycle::TransportTestHelperEvent::MarkFailedAttempt {
+                    peer: peer_id.clone(),
+                    addr: failed_peer_addr,
+                    instance_id: failed_instance_id,
+                    sequence,
+                },
+            );
+        }
+        let mut crossed_threshold = false;
+        #[cfg(feature = "test-helpers")]
+        let decision_event = {
+            let mut gossip_state = self.gossip_state.lock().await;
+            let current_instance_id = peer_id.as_ref().and_then(|peer_id| {
+                self.connection_pool
+                    .peer_current_connection_snapshot(peer_id)
+                    .and_then(|connection| {
+                        connection
+                            .stream_handle
+                            .as_ref()
+                            .map(|handle| handle.instance_id())
+                    })
+            });
+            let replacement_is_current = failed_instance_id
+                .zip(current_instance_id)
+                .is_some_and(|(failed, current)| failed != current);
+            let mut applied = false;
+            if !replacement_is_current {
+                if let Some(peer_info) = gossip_state.peers.get_mut(&failed_peer_addr) {
+                    let was_below = peer_info.failures < self.config.max_peer_failures;
+                    peer_info.failures = self.config.max_peer_failures;
+                    peer_info.last_failure_time = Some(current_time);
+                    // Capture at the actual write, not before the intervening
+                    // teardown awaits.
+                    peer_info.last_failure_instant = Some(std::time::Instant::now());
+                    peer_info.last_attempt = current_time;
+                    crossed_threshold = was_below;
+                    applied = true;
+                    info!(
+                        peer = %failed_peer_addr,
+                        retry_after_secs = self.config.peer_retry_interval.as_secs(),
+                        "marked peer as disconnected in local state, will retry after interval"
+                    );
+                }
+            }
             crate::lifecycle::TransportTestHelperEvent::MarkFailed {
                 peer: peer_id.clone(),
                 addr: failed_peer_addr,
                 instance_id: failed_instance_id,
-                applied: true,
-                sequence,
+                applied,
+                sequence: crate::lifecycle::next_test_helper_sequence(),
             }
-        });
-        let mut crossed_threshold = false;
+        };
+        #[cfg(not(feature = "test-helpers"))]
         {
             let mut gossip_state = self.gossip_state.lock().await;
             if let Some(peer_info) = gossip_state.peers.get_mut(&failed_peer_addr) {
                 let was_below = peer_info.failures < self.config.max_peer_failures;
                 peer_info.failures = self.config.max_peer_failures;
                 peer_info.last_failure_time = Some(current_time);
-                // Captured HERE, at the write, not hoisted before the
-                // `clear_discovery_state_if_no_live_connection(...).await`
-                // above -- see `apply_gossip_results`'s matching comment
-                // for why an instant captured before an intervening await
-                // can be stale relative to when this write actually runs.
                 peer_info.last_failure_instant = Some(std::time::Instant::now());
-                peer_info.last_attempt = current_time; // Update last_attempt so retry happens after interval
+                peer_info.last_attempt = current_time;
                 crossed_threshold = was_below;
                 info!(
                     peer = %failed_peer_addr,
@@ -11806,6 +11849,8 @@ impl<T: 'static> GossipRegistry<T> {
                 );
             }
         }
+        #[cfg(feature = "test-helpers")]
+        crate::lifecycle::dispatch_test_helper_event(decision_event);
 
         // NOTE: the tie-break reconnect cooldown (`note_tie_break_eviction`)
         // is deliberately *not* armed here. This handler fires for every
@@ -13374,27 +13419,48 @@ impl<T: 'static> GossipRegistry<T> {
                             .map(|handle| handle.instance_id())
                     })
             });
-            crate::lifecycle::record_test_helper_event(|sequence| {
-                crate::lifecycle::TransportTestHelperEvent::MarkConnected {
+            let sequence = crate::lifecycle::next_test_helper_sequence();
+            crate::lifecycle::dispatch_test_helper_event(
+                crate::lifecycle::TransportTestHelperEvent::MarkConnectedAttempt {
                     peer,
                     addr,
                     instance_id,
                     require_live,
                     sequence,
-                }
-            });
+                },
+            );
         }
         let now = current_timestamp();
-        let did_mark = {
+        #[cfg(feature = "test-helpers")]
+        let decision_event = {
             let mut gossip_state = self.gossip_state.lock().await;
 
+            let peer = self.connection_pool.get_peer_id_by_addr(&addr);
+            let instance_id = peer.as_ref().and_then(|peer_id| {
+                self.connection_pool
+                    .peer_current_connection_snapshot(peer_id)
+                    .and_then(|connection| {
+                        connection
+                            .stream_handle
+                            .as_ref()
+                            .map(|handle| handle.instance_id())
+                    })
+            });
             if require_live && !self.connection_pool.has_connection(&addr) {
                 debug!(
                     addr = %addr,
                     "declining to (re-)mark peer connected; no live pool connection exists \
                      for this address right now"
                 );
-                false
+                Some(
+                    crate::lifecycle::TransportTestHelperEvent::MarkConnectedDeclined {
+                        peer,
+                        addr,
+                        instance_id,
+                        require_live,
+                        sequence: crate::lifecycle::next_test_helper_sequence(),
+                    },
+                )
             } else {
                 // A fresh connection was established and verified by the
                 // caller (post-handshake / first framed message received).
@@ -13434,9 +13500,64 @@ impl<T: 'static> GossipRegistry<T> {
                 self.record_peer_discovery_connected(&mut gossip_state, addr);
 
                 debug!(addr = %addr, "marked peer as connected");
+                Some(crate::lifecycle::TransportTestHelperEvent::MarkConnected {
+                    peer,
+                    addr,
+                    instance_id,
+                    require_live,
+                    sequence: crate::lifecycle::next_test_helper_sequence(),
+                })
+            }
+        };
+        #[cfg(not(feature = "test-helpers"))]
+        let did_mark = {
+            let mut gossip_state = self.gossip_state.lock().await;
+
+            if require_live && !self.connection_pool.has_connection(&addr) {
+                debug!(
+                    addr = %addr,
+                    "declining to (re-)mark peer connected; no live pool connection exists \
+                     for this address right now"
+                );
+                false
+            } else {
+                if let Some(peer_info) = gossip_state.peers.get_mut(&addr) {
+                    peer_info.failures = 0;
+                    peer_info.last_failure_time = None;
+                    peer_info.last_failure_instant = None;
+                    peer_info.last_success = peer_info.last_success.max(now);
+                    peer_info.last_response_received_ms = peer_info
+                        .last_response_received_ms
+                        .max(crate::current_timestamp_millis());
+                }
+                if let Some(peer_info) = gossip_state.known_peers.get_mut(&addr) {
+                    peer_info.failures = 0;
+                    peer_info.last_failure_time = None;
+                    peer_info.last_success = now;
+                    if let Some(node_id) = peer_info.node_id {
+                        let _ = self.peer_capability_addr_to_node.upsert_sync(addr, node_id);
+                        let caps = self
+                            .peer_capabilities_by_node
+                            .read_sync(&node_id, |_, v| *v);
+                        if let Some(caps) = caps {
+                            let _ = self.peer_capabilities.upsert_sync(addr, caps);
+                        }
+                    }
+                }
+                self.record_peer_discovery_connected(&mut gossip_state, addr);
+                debug!(addr = %addr, "marked peer as connected");
                 true
             }
         };
+        #[cfg(feature = "test-helpers")]
+        let did_mark = matches!(
+            &decision_event,
+            Some(crate::lifecycle::TransportTestHelperEvent::MarkConnected { .. })
+        );
+        #[cfg(feature = "test-helpers")]
+        if let Some(event) = decision_event {
+            crate::lifecycle::dispatch_test_helper_event(event);
+        }
 
         if !did_mark {
             return;
