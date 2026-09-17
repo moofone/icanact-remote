@@ -385,6 +385,69 @@ async fn concurrent_idle_shutdown_observers_share_reclamation() {
     assert!(second.await.unwrap().is_ok());
 }
 
+/// Public transport coverage for the same ownership invariant exercised by
+/// the deterministic cfg(test) module hooks: accepted asks span the worker's
+/// queued, waiting, and in-flight sets when forced shutdown starts, and every
+/// one receives exactly one terminal observer outcome.
+#[tokio::test(flavor = "current_thread")]
+async fn shutdown_reconciles_queued_waiting_and_inflight_public_work() {
+    let (caller, gateway) = pair().await;
+    let (downstream, sink) = pair().await;
+    sink.registry
+        .set_actor_message_handler(Arc::new(ReplyAfter(Duration::from_secs(30))))
+        .await;
+    connect_nodes(&gateway, &sink).await;
+    let destination = connection(&gateway, &sink).await;
+    let submitted = Arc::new(AtomicUsize::new(0));
+    let observer = Arc::new(Counts::default());
+    let forwarder = AskForwarder::new_with_observer(1, 128, Some(observer.clone()));
+    gateway
+        .registry
+        .set_actor_ask_handler_sync(Arc::new(ForwardingHandler {
+            forwarder: forwarder.clone(),
+            destination,
+            submitted: submitted.clone(),
+            timeout: None,
+        }))
+        .await;
+    connect_nodes(&caller, &gateway).await;
+    let caller_connection = connection(&caller, &gateway).await;
+    let mut asks = Vec::new();
+    for _ in 0..20 {
+        let connection = caller_connection.clone();
+        asks.push(tokio::spawn(async move {
+            connection
+                .ask_actor_frame(
+                    ACTOR,
+                    TYPE,
+                    Bytes::from_static(b"ownership"),
+                    Duration::from_secs(2),
+                )
+                .await
+        }));
+    }
+    assert!(
+        wait_for_condition(Duration::from_secs(2), || async {
+            submitted.load(Ordering::SeqCst) == 20
+        })
+        .await
+    );
+    assert!(matches!(
+        forwarder.shutdown(Duration::ZERO).await,
+        Err(icanact_remote::GossipError::Timeout)
+    ));
+    for ask in asks {
+        assert!(ask.await.unwrap().is_err());
+    }
+    assert_eq!(observer.success.load(Ordering::SeqCst), 0);
+    assert_eq!(observer.error.load(Ordering::SeqCst), 20);
+
+    caller.shutdown().await;
+    gateway.shutdown().await;
+    downstream.shutdown().await;
+    sink.shutdown().await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn shutdown_closed_receiver_does_not_spin_while_peer_progresses() {
     let (caller, gateway) = pair().await;

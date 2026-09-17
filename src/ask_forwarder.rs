@@ -42,10 +42,96 @@ impl ShutdownResult {
     }
 }
 
+#[cfg(test)]
+struct AsyncPause {
+    entered: Notify,
+    release: Notify,
+    used: AtomicBool,
+}
+
+#[cfg(test)]
+impl AsyncPause {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: Notify::new(),
+            release: Notify::new(),
+            used: AtomicBool::new(false),
+        })
+    }
+
+    async fn wait_until_entered(&self) {
+        self.entered.notified().await;
+    }
+
+    async fn pause(&self) {
+        if self.used.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.entered.notify_one();
+        self.release.notified().await;
+    }
+
+    fn release(&self) {
+        self.release.notify_one();
+    }
+}
+
+#[cfg(test)]
+struct SyncPause {
+    entered: Notify,
+    released: std::sync::Condvar,
+    state: Mutex<bool>,
+}
+
+#[cfg(test)]
+impl SyncPause {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: Notify::new(),
+            released: std::sync::Condvar::new(),
+            state: Mutex::new(false),
+        })
+    }
+
+    async fn wait_until_entered(&self) {
+        self.entered.notified().await;
+    }
+
+    fn pause(&self) {
+        self.entered.notify_one();
+        let mut released = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        while !*released {
+            released = self
+                .released
+                .wait(released)
+                .unwrap_or_else(|err| err.into_inner());
+        }
+    }
+
+    fn release(&self) {
+        let mut released = self.state.lock().unwrap_or_else(|err| err.into_inner());
+        *released = true;
+        self.released.notify_one();
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct LifecycleTestHooks {
+    leader_after_claim: Option<Arc<AsyncPause>>,
+    waiting_before_registration: Option<Arc<AsyncPause>>,
+    after_forced_abort: Option<Arc<AsyncPause>>,
+    worker_exit_after_remaining: Option<Arc<SyncPause>>,
+    reconciliation_after_claim: Option<Arc<SyncPause>>,
+    ownership_snapshot: Option<Arc<AsyncPause>>,
+}
+
 struct WorkerControl {
     closed: AtomicBool,
     remaining: AtomicUsize,
     done: Notify,
+    #[cfg(test)]
+    test_hooks: Mutex<Option<Arc<LifecycleTestHooks>>>,
     // Count every task admitted before closure and every terminal outcome
     // observed by the worker. Forced cancellation accounts for the gap so a
     // dropped queued/in-flight task cannot silently disappear from metrics.
@@ -118,6 +204,8 @@ impl AskForwarder {
             closed: AtomicBool::new(false),
             remaining: AtomicUsize::new(workers),
             done: Notify::new(),
+            #[cfg(test)]
+            test_hooks: Mutex::new(None),
             admitted: AtomicUsize::new(0),
             completed: AtomicUsize::new(0),
             forced: AtomicBool::new(false),
@@ -176,6 +264,23 @@ impl AskForwarder {
         Self { inner }
     }
 
+    #[cfg(test)]
+    fn new_with_test_hooks(
+        workers: usize,
+        capacity: usize,
+        completion_observer: Option<Arc<dyn AskForwardObserver>>,
+        hooks: Arc<LifecycleTestHooks>,
+    ) -> Self {
+        let forwarder = Self::new_with_observer(workers, capacity, completion_observer);
+        *forwarder
+            .inner
+            .control
+            .test_hooks
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = Some(hooks);
+        forwarder
+    }
+
     /// Close admission, drain until `grace`, then abort remaining work and
     /// wait for workers to finish. Repeated calls observe the same terminal
     /// state. A timeout is returned as [`GossipError::Timeout`] rather than
@@ -186,7 +291,14 @@ impl AskForwarder {
             match claim_shutdown(&control) {
                 ShutdownClaim::Complete(result) => return result.into_result(),
                 ShutdownClaim::Leader(terminal) => break terminal,
-                ShutdownClaim::Waiting => {}
+                ShutdownClaim::Waiting => {
+                    #[cfg(test)]
+                    if let Some(hook) = lifecycle_test_hook(&control, |hooks| {
+                        hooks.waiting_before_registration.clone()
+                    }) {
+                        hook.pause().await;
+                    }
+                }
             }
 
             // Register before rechecking leadership. If the leader is
@@ -207,6 +319,11 @@ impl AskForwarder {
             control: control.clone(),
             finished: false,
         };
+        #[cfg(test)]
+        if let Some(hook) = lifecycle_test_hook(&control, |hooks| hooks.leader_after_claim.clone())
+        {
+            hook.pause().await;
+        }
         {
             // No successful enqueue can occur after this lock is released.
             // The worker can therefore close its receiver after one final
@@ -252,6 +369,11 @@ impl AskForwarder {
         set_shutdown_result(&control, ShutdownResult::TimedOut);
         for handle in &self.inner.abort_handles {
             handle.abort();
+        }
+        #[cfg(test)]
+        if let Some(hook) = lifecycle_test_hook(&control, |hooks| hooks.after_forced_abort.clone())
+        {
+            hook.pause().await;
         }
         wait_for_all_workers(&control).await;
         finalize_observer_gaps(&control);
@@ -569,14 +691,36 @@ struct WorkerExit {
 
 impl Drop for WorkerExit {
     fn drop(&mut self) {
-        if self.control.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-            // The last worker may reconcile dropped tasks, but the mutex makes
-            // this the only reconciliation owner. Shutdown completion is
-            // published only after this callback sequence has returned.
-            finalize_observer_gaps(&self.control);
+        let was_last = self.control.remaining.fetch_sub(1, Ordering::AcqRel) == 1;
+        if was_last {
+            // Publish the worker-count transition before reconciliation so a
+            // shutdown finalizer can contend for the reconciliation mutex.
+            // That mutex makes this the only reconciliation owner, while
+            // shutdown completion is still published only after callbacks
+            // have returned.
             self.control.done.notify_waiters();
+            #[cfg(test)]
+            if let Some(hook) = lifecycle_test_hook(&self.control, |hooks| {
+                hooks.worker_exit_after_remaining.clone()
+            }) {
+                hook.pause();
+            }
+            finalize_observer_gaps(&self.control);
         }
     }
+}
+
+#[cfg(test)]
+fn lifecycle_test_hook<T>(
+    control: &WorkerControl,
+    select: impl FnOnce(&LifecycleTestHooks) -> Option<Arc<T>>,
+) -> Option<Arc<T>> {
+    control
+        .test_hooks
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .as_deref()
+        .and_then(select)
 }
 
 /// Reconcile accepted tasks whose worker futures were dropped by forced or
@@ -594,6 +738,12 @@ fn finalize_observer_gaps(control: &WorkerControl) -> bool {
     let admitted = control.admitted.load(Ordering::Acquire);
     let completed = control.completed.load(Ordering::Acquire);
     let missing = admitted.saturating_sub(completed);
+    #[cfg(test)]
+    if let Some(hook) =
+        lifecycle_test_hook(control, |hooks| hooks.reconciliation_after_claim.clone())
+    {
+        hook.pause();
+    }
     if let Some(observer) = control.observer.as_deref() {
         for _ in 0..missing {
             observer.record_error();
@@ -644,6 +794,17 @@ async fn run_forward_worker(
             worker_observer.as_deref(),
             &control,
         );
+
+        #[cfg(test)]
+        if !waiting.is_empty()
+            && !inflight.is_empty()
+            && !rx_closed
+            && !rx.is_empty()
+            && let Some(hook) =
+                lifecycle_test_hook(&control, |hooks| hooks.ownership_snapshot.clone())
+        {
+            hook.pause().await;
+        }
 
         if rx_closed && waiting.is_empty() && inflight.is_empty() {
             break;
@@ -1158,6 +1319,360 @@ mod tests {
     fn zero_duration_is_an_already_expired_deadline() {
         let deadline = admission_deadline(Duration::ZERO);
         assert!(deadline <= Instant::now());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_shutdown_leader_is_taken_over_without_a_third_caller() {
+        let leader_after_claim = AsyncPause::new();
+        let waiting_before_registration = AsyncPause::new();
+        let hooks = Arc::new(LifecycleTestHooks {
+            leader_after_claim: Some(leader_after_claim.clone()),
+            waiting_before_registration: Some(waiting_before_registration.clone()),
+            ..Default::default()
+        });
+        let forwarder = AskForwarder::new_with_test_hooks(1, 128, None, hooks);
+
+        let leader = tokio::spawn({
+            let forwarder = forwarder.clone();
+            async move { forwarder.shutdown(Duration::ZERO).await }
+        });
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            leader_after_claim.wait_until_entered(),
+        )
+        .await
+        .expect("leader must reach the cancellable post-claim interleaving");
+
+        let follower = tokio::spawn({
+            let forwarder = forwarder.clone();
+            async move { forwarder.shutdown(Duration::from_secs(1)).await }
+        });
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            waiting_before_registration.wait_until_entered(),
+        )
+        .await
+        .expect("follower must reach the pre-registration interleaving");
+
+        // Cancel the only leader while the follower has not registered its
+        // notification. The follower must recheck leadership after registering
+        // and take over; no third caller is allowed to provide the wake.
+        leader.abort();
+        assert!(
+            leader.await.is_err(),
+            "the first shutdown must be cancelled"
+        );
+        waiting_before_registration.release();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), follower)
+                .await
+                .expect("the follower must not strand after leader cancellation")
+                .expect("the follower task must not panic")
+                .is_ok()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_post_abort_shutdown_waits_for_worker_reclamation() {
+        let after_forced_abort = AsyncPause::new();
+        let waiting_before_registration = AsyncPause::new();
+        let worker_exit_after_remaining = SyncPause::new();
+        let hooks = Arc::new(LifecycleTestHooks {
+            after_forced_abort: Some(after_forced_abort.clone()),
+            waiting_before_registration: Some(waiting_before_registration.clone()),
+            worker_exit_after_remaining: Some(worker_exit_after_remaining.clone()),
+            ..Default::default()
+        });
+        let observer = Arc::new(LifecycleObserver::default());
+        let (destination, source, sink) = test_destination().await;
+        let (io, peer) = tokio::io::duplex(65536);
+        let (writer, writer_task, _) = LockFreeStreamHandle::new(
+            io,
+            test_addr(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let writer = Arc::new(writer);
+        let forwarder = AskForwarder::new_with_test_hooks(1, 128, Some(observer.clone()), hooks);
+        forwarder
+            .try_forward_actor_ask_no_timeout(
+                destination.clone(),
+                1,
+                1,
+                Bytes::from_static(b"post-abort"),
+                AskResponder::from_stream_handle(
+                    12,
+                    writer.clone(),
+                    Arc::new(AtomicBool::new(false)),
+                ),
+            )
+            .expect("the in-flight task must be admitted");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while destination.bytes_written() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the task must reach the in-flight destination call");
+
+        let leader = tokio::spawn({
+            let forwarder = forwarder.clone();
+            async move { forwarder.shutdown(Duration::ZERO).await }
+        });
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            after_forced_abort.wait_until_entered(),
+        )
+        .await
+        .expect("shutdown must persist timeout before reclamation");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            worker_exit_after_remaining.wait_until_entered(),
+        )
+        .await
+        .expect("the aborted worker must reach its reclamation interleaving");
+
+        let mut follower = tokio::spawn({
+            let forwarder = forwarder.clone();
+            async move { forwarder.shutdown(Duration::from_secs(1)).await }
+        });
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            waiting_before_registration.wait_until_entered(),
+        )
+        .await
+        .expect("the concurrent caller must observe the active leader");
+
+        after_forced_abort.release();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut follower)
+                .await
+                .is_err(),
+            "a post-abort caller must await reclamation, not only the sticky timeout reason"
+        );
+        assert_eq!(observer.error.load(Ordering::SeqCst), 1);
+        waiting_before_registration.release();
+
+        worker_exit_after_remaining.release();
+        assert!(matches!(
+            leader.await.expect("leader task must not panic"),
+            Err(GossipError::Timeout)
+        ));
+        assert!(matches!(
+            follower.await.expect("follower task must not panic"),
+            Err(GossipError::Timeout)
+        ));
+        assert_eq!(observer.error.load(Ordering::SeqCst), 1);
+        assert_eq!(forwarder.inner.control.completed.load(Ordering::SeqCst), 1);
+        assert_eq!(forwarder.inner.permits.available_permits(), 144);
+
+        drop(peer);
+        writer.shutdown();
+        tokio::time::timeout(Duration::from_secs(2), writer_task)
+            .await
+            .expect("writer task must be reclaimed")
+            .expect("writer task must not panic");
+        source.shutdown().await;
+        sink.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn last_worker_and_shutdown_reconcile_observer_gap_exactly_once() {
+        let worker_exit_after_remaining = SyncPause::new();
+        let reconciliation_after_claim = SyncPause::new();
+        let hooks = Arc::new(LifecycleTestHooks {
+            worker_exit_after_remaining: Some(worker_exit_after_remaining.clone()),
+            reconciliation_after_claim: Some(reconciliation_after_claim.clone()),
+            ..Default::default()
+        });
+        let observer = Arc::new(LifecycleObserver::default());
+        let (destination, source, sink) = test_destination().await;
+        let (io, peer) = tokio::io::duplex(65536);
+        let (writer, writer_task, _) = LockFreeStreamHandle::new(
+            io,
+            test_addr(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let writer = Arc::new(writer);
+        let forwarder = AskForwarder::new_with_test_hooks(1, 128, Some(observer.clone()), hooks);
+        forwarder
+            .try_forward_actor_ask_no_timeout(
+                destination.clone(),
+                1,
+                1,
+                Bytes::from_static(b"reconcile-once"),
+                AskResponder::from_stream_handle(
+                    13,
+                    writer.clone(),
+                    Arc::new(AtomicBool::new(false)),
+                ),
+            )
+            .expect("the in-flight task must be admitted");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while destination.bytes_written() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the task must reach the in-flight destination call");
+
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+        let shutdown_forwarder = forwarder.clone();
+        let shutdown_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("shutdown executor must build");
+            let result = runtime.block_on(shutdown_forwarder.shutdown(Duration::ZERO));
+            shutdown_tx.send(result).expect("shutdown result receiver");
+        });
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            worker_exit_after_remaining.wait_until_entered(),
+        )
+        .await
+        .expect("the last worker must decrement before reconciliation");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            reconciliation_after_claim.wait_until_entered(),
+        )
+        .await
+        .expect("shutdown must contend for reconciliation while the worker is exiting");
+        assert_eq!(observer.error.load(Ordering::SeqCst), 0);
+        assert_eq!(forwarder.inner.control.completed.load(Ordering::SeqCst), 0);
+
+        // Let shutdown own and finish the callback/update sequence, then let
+        // the last worker run its second reconciliation attempt.
+        reconciliation_after_claim.release();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while observer.error.load(Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the single reconciliation owner must account for the gap");
+        worker_exit_after_remaining.release();
+
+        let shutdown_result =
+            tokio::task::spawn_blocking(move || shutdown_rx.recv().expect("shutdown result"))
+                .await
+                .expect("shutdown result waiter must not panic");
+        assert!(matches!(shutdown_result, Err(GossipError::Timeout)));
+        shutdown_thread
+            .join()
+            .expect("shutdown executor thread must not panic");
+        assert_eq!(observer.error.load(Ordering::SeqCst), 1);
+        assert_eq!(forwarder.inner.control.completed.load(Ordering::SeqCst), 1);
+
+        drop(peer);
+        writer.shutdown();
+        tokio::time::timeout(Duration::from_secs(2), writer_task)
+            .await
+            .expect("writer task must be reclaimed")
+            .expect("writer task must not panic");
+        source.shutdown().await;
+        sink.shutdown().await;
+    }
+
+    #[derive(Default)]
+    struct LifecycleObserver {
+        success: AtomicUsize,
+        error: AtomicUsize,
+    }
+
+    impl AskForwardObserver for LifecycleObserver {
+        fn record_success(&self) {
+            self.success.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn record_error(&self) {
+            self.error.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_accounts_simultaneous_queued_waiting_and_inflight_ownership() {
+        let ownership_snapshot = AsyncPause::new();
+        let hooks = Arc::new(LifecycleTestHooks {
+            ownership_snapshot: Some(ownership_snapshot.clone()),
+            ..Default::default()
+        });
+        let observer = Arc::new(LifecycleObserver::default());
+        let (destination, source, sink) = test_destination().await;
+        let (io, peer) = tokio::io::duplex(65536);
+        let (writer, writer_task, _) = LockFreeStreamHandle::new(
+            io,
+            test_addr(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let writer = Arc::new(writer);
+        let forwarder = AskForwarder::new_with_test_hooks(1, 128, Some(observer.clone()), hooks);
+        const ADMITTED: usize = 20;
+        for index in 0..ADMITTED {
+            forwarder
+                .try_forward_actor_ask_no_timeout(
+                    destination.clone(),
+                    1,
+                    1,
+                    Bytes::from_static(b"ownership"),
+                    AskResponder::from_stream_handle(
+                        100 + index as u32,
+                        writer.clone(),
+                        Arc::new(AtomicBool::new(false)),
+                    ),
+                )
+                .expect("all ownership-probe tasks must be admitted");
+        }
+
+        // The worker hook is reached only after at least one task is queued in
+        // the receiver, one is waiting behind MAX_INFLIGHT_PER_WORKER, and
+        // one is owned by the in-flight set at the same instant.
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            ownership_snapshot.wait_until_entered(),
+        )
+        .await
+        .expect("all three worker ownership locations must coexist");
+        assert_eq!(
+            forwarder.inner.control.admitted.load(Ordering::SeqCst),
+            ADMITTED
+        );
+
+        let shutdown = tokio::spawn({
+            let forwarder = forwarder.clone();
+            async move { forwarder.shutdown(Duration::ZERO).await }
+        });
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(3), shutdown)
+                .await
+                .expect("forced ownership reconciliation must finish")
+                .expect("shutdown task must not panic"),
+            Err(GossipError::Timeout)
+        ));
+        assert_eq!(observer.success.load(Ordering::SeqCst), 0);
+        assert_eq!(observer.error.load(Ordering::SeqCst), ADMITTED);
+        assert_eq!(
+            forwarder.inner.control.completed.load(Ordering::SeqCst),
+            ADMITTED
+        );
+        assert_eq!(forwarder.inner.permits.available_permits(), 144);
+
+        drop(peer);
+        writer.shutdown();
+        tokio::time::timeout(Duration::from_secs(2), writer_task)
+            .await
+            .expect("writer task must be reclaimed")
+            .expect("writer task must not panic");
+        source.shutdown().await;
+        sink.shutdown().await;
     }
 
     struct NeverResponds;
