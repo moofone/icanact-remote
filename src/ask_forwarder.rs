@@ -46,6 +46,14 @@ struct WorkerControl {
     closed: AtomicBool,
     remaining: AtomicUsize,
     done: Notify,
+    // Count every task admitted before closure and every terminal outcome
+    // observed by the worker. Forced cancellation accounts for the gap so a
+    // dropped queued/in-flight task cannot silently disappear from metrics.
+    admitted: AtomicUsize,
+    completed: AtomicUsize,
+    forced: AtomicBool,
+    abnormal: AtomicBool,
+    observer: Option<Arc<dyn AskForwardObserver>>,
     // A worker can be parked in `rx.recv()` while admission is open. The
     // shutdown path uses this edge-triggered wake in addition to the atomic
     // state so closure is observed without waiting for grace to elapse.
@@ -110,6 +118,11 @@ impl AskForwarder {
             closed: AtomicBool::new(false),
             remaining: AtomicUsize::new(workers),
             done: Notify::new(),
+            admitted: AtomicUsize::new(0),
+            completed: AtomicUsize::new(0),
+            forced: AtomicBool::new(false),
+            abnormal: AtomicBool::new(false),
+            observer: completion_observer.clone(),
             shutdown_wake: Notify::new(),
             shutdown_in_progress: AtomicBool::new(false),
             shutdown_result: Mutex::new(None),
@@ -123,12 +136,24 @@ impl AskForwarder {
             let (tx, rx) = mpsc::channel::<ForwardTask>(capacity);
             let worker_observer = completion_observer.clone();
             let worker_control = control.clone();
-            let handle = tokio::spawn(run_forward_worker(
-                rx,
-                worker_observer,
-                worker_control,
-                max_inflight,
-            ));
+            let worker_control_for_run = worker_control.clone();
+            let worker_exit = WorkerExit {
+                control: worker_control.clone(),
+            };
+            let handle = tokio::spawn(async move {
+                let result = std::panic::AssertUnwindSafe(run_forward_worker(
+                    rx,
+                    worker_observer,
+                    worker_control_for_run,
+                    max_inflight,
+                ))
+                .catch_unwind()
+                .await;
+                if result.is_err() {
+                    worker_control.abnormal.store(true, Ordering::Release);
+                }
+                drop(worker_exit);
+            });
             abort_handles.push(handle.abort_handle());
             joins.push(handle);
             worker_senders.push(tx);
@@ -197,10 +222,26 @@ impl AskForwarder {
         }
 
         if wait_for_workers(&control, grace).await {
+            let abnormal = control.abnormal.load(Ordering::Acquire);
+            let missing = finalize_observer_gaps(&control);
+            if abnormal || missing {
+                // A worker that exited abnormally may have dropped admitted
+                // tasks. Do not publish a false Drained state.
+                control.forced.store(true, Ordering::Release);
+                complete_shutdown(&control, ShutdownResult::TimedOut);
+                leader.finished = true;
+                return Err(GossipError::Timeout);
+            }
             complete_shutdown(&control, ShutdownResult::Drained);
             leader.finished = true;
             return Ok(());
         }
+        // Persist the forced terminal result before aborting or awaiting any
+        // worker. If this leader is cancelled after abort, later observers
+        // must not retry and falsely turn the expired drain into Drained.
+        control.forced.store(true, Ordering::Release);
+        complete_shutdown(&control, ShutdownResult::TimedOut);
+        leader.finished = true;
         for handle in &self.inner.abort_handles {
             handle.abort();
         }
@@ -216,10 +257,10 @@ impl AskForwarder {
             let _ = join.await;
         }
 
-        // Grace expiry is a real timeout even when abort/reclamation itself
-        // succeeds. Report that fact consistently to every shutdown caller.
-        complete_shutdown(&control, ShutdownResult::TimedOut);
-        leader.finished = true;
+        // Worker joins establish that no completion can race the forced
+        // observer reconciliation below. Grace expiry remains a timeout even
+        // when abort/reclamation itself succeeds.
+        finalize_observer_gaps(&control);
         Err(GossipError::Timeout)
     }
 
@@ -315,21 +356,28 @@ impl AskForwarder {
             .try_acquire_owned()
             .map_err(|_| GossipError::WriteQueueFull)?;
         task._permit = Some(permit);
+        // Count before sending so a worker that runs immediately cannot
+        // publish completion before admission is visible to shutdown.
+        self.inner.control.admitted.fetch_add(1, Ordering::AcqRel);
         let worker_count = self.inner.workers.len();
         let worker_idx = self.inner.next_worker.fetch_add(1, Ordering::Relaxed) % worker_count;
-        self.inner.workers[worker_idx]
-            .try_send(task)
-            .map_err(|err| match err {
-                mpsc::error::TrySendError::Full(_) => GossipError::WriteQueueFull,
-                mpsc::error::TrySendError::Closed(_) => GossipError::Shutdown,
-            })?;
-        Ok(())
+        match self.inner.workers[worker_idx].try_send(task) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.inner.control.admitted.fetch_sub(1, Ordering::AcqRel);
+                Err(match err {
+                    mpsc::error::TrySendError::Full(_) => GossipError::WriteQueueFull,
+                    mpsc::error::TrySendError::Closed(_) => GossipError::Shutdown,
+                })
+            }
+        }
     }
 }
 
 impl Drop for AskForwarderInner {
     fn drop(&mut self) {
         self.control.closed.store(true, Ordering::Release);
+        self.control.forced.store(true, Ordering::Release);
         for handle in &self.abort_handles {
             handle.abort();
         }
@@ -433,9 +481,30 @@ struct WorkerExit {
 impl Drop for WorkerExit {
     fn drop(&mut self) {
         if self.control.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+            finalize_observer_gaps(&self.control);
             self.control.done.notify_waiters();
         }
     }
+}
+
+/// Reconcile accepted tasks whose worker futures were dropped by forced or
+/// abnormal termination. Called after the last worker exits (including an
+/// abort before its first poll) and again after shutdown joins; the atomic
+/// counters make the repeated call harmless.
+fn finalize_observer_gaps(control: &WorkerControl) -> bool {
+    let admitted = control.admitted.load(Ordering::Acquire);
+    let completed = control.completed.load(Ordering::Acquire);
+    if completed >= admitted {
+        return false;
+    }
+    let missing = admitted - completed;
+    if let Some(observer) = control.observer.as_deref() {
+        for _ in 0..missing {
+            observer.record_error();
+        }
+    }
+    control.completed.fetch_add(missing, Ordering::AcqRel);
+    true
 }
 
 async fn run_forward_worker(
@@ -444,9 +513,6 @@ async fn run_forward_worker(
     control: Arc<WorkerControl>,
     max_inflight: usize,
 ) {
-    let _exit = WorkerExit {
-        control: control.clone(),
-    };
     let mut inflight = FuturesUnordered::new();
     let mut waiting: VecDeque<ForwardTask> = VecDeque::new();
     let mut rx_closed = false;
@@ -471,12 +537,13 @@ async fn run_forward_worker(
                 }
             }
         }
-        expire_waiting(&mut waiting, worker_observer.as_deref());
+        expire_waiting(&mut waiting, worker_observer.as_deref(), &control);
         dispatch_waiting(
             &mut waiting,
             &mut inflight,
             max_inflight,
             worker_observer.as_deref(),
+            &control,
         );
 
         if rx_closed && waiting.is_empty() && inflight.is_empty() {
@@ -485,15 +552,27 @@ async fn run_forward_worker(
 
         let earliest = earliest_deadline(&waiting);
         tokio::select! {
-            maybe_task = rx.recv() => {
+            maybe_task = rx.recv(), if !rx_closed => {
                 match maybe_task {
                     Some(task) => waiting.push_back(task),
                     None => rx_closed = true,
                 }
             }
             Some(completed) = inflight.next(), if !inflight.is_empty() => {
-                if let Some(completed) = completed {
-                    handle_completed_forward(completed, worker_observer.as_deref());
+                match completed {
+                    Some(outcome) => {
+                        handle_completed_forward(outcome, worker_observer.as_deref(), &control);
+                    }
+                    None => {
+                        // The isolated forward caught a panic. The worker
+                        // survived, but this admitted task still needs one
+                        // terminal error observation.
+                        handle_completed_forward(
+                            ForwardOutcome::Error,
+                            worker_observer.as_deref(),
+                            &control,
+                        );
+                    }
                 }
             }
             _ = sleep_until_deadline(earliest), if earliest.is_some() => {}
@@ -518,7 +597,11 @@ async fn sleep_until_deadline(deadline: Option<Instant>) {
     tokio::time::sleep(wait).await;
 }
 
-fn expire_waiting(waiting: &mut VecDeque<ForwardTask>, observer: Option<&dyn AskForwardObserver>) {
+fn expire_waiting(
+    waiting: &mut VecDeque<ForwardTask>,
+    observer: Option<&dyn AskForwardObserver>,
+    control: &WorkerControl,
+) {
     let now = Instant::now();
     let mut index = 0usize;
     while index < waiting.len() {
@@ -527,7 +610,7 @@ fn expire_waiting(waiting: &mut VecDeque<ForwardTask>, observer: Option<&dyn Ask
             .is_some_and(|deadline| deadline <= now)
         {
             let task = waiting.remove(index).expect("index in range");
-            complete_expired_queued(task, observer);
+            complete_expired_queued(task, observer, control);
         } else {
             index += 1;
         }
@@ -541,6 +624,7 @@ fn dispatch_waiting(
     >,
     max_inflight: usize,
     observer: Option<&dyn AskForwardObserver>,
+    control: &WorkerControl,
 ) {
     while inflight.len() < max_inflight {
         let Some(task) = waiting.pop_front() else {
@@ -550,14 +634,18 @@ fn dispatch_waiting(
             .deadline
             .is_some_and(|deadline| deadline <= Instant::now())
         {
-            complete_expired_queued(task, observer);
+            complete_expired_queued(task, observer, control);
             continue;
         }
         inflight.push(Box::pin(run_forward_task_isolated(task)));
     }
 }
 
-fn complete_expired_queued(task: ForwardTask, observer: Option<&dyn AskForwardObserver>) {
+fn complete_expired_queued(
+    task: ForwardTask,
+    observer: Option<&dyn AskForwardObserver>,
+    control: &WorkerControl,
+) {
     let outcome = if let Some(reply) = task.timeout_reply.clone() {
         if try_deliver_terminal_reply(task.responder, reply) {
             ForwardOutcome::Timeout
@@ -568,7 +656,7 @@ fn complete_expired_queued(task: ForwardTask, observer: Option<&dyn AskForwardOb
         drop(task.responder);
         ForwardOutcome::Timeout
     };
-    handle_completed_forward(outcome, observer);
+    handle_completed_forward(outcome, observer, control);
 }
 
 /// ACTOR_REM_2 R16k: isolate a panicking forwarded-ask future so it kills only
@@ -699,7 +787,9 @@ fn try_deliver_terminal_reply(responder: AskResponder, reply: Bytes) -> bool {
 fn handle_completed_forward(
     outcome: ForwardOutcome,
     completion_observer: Option<&dyn AskForwardObserver>,
+    control: &WorkerControl,
 ) {
+    control.completed.fetch_add(1, Ordering::AcqRel);
     let Some(observer) = completion_observer else {
         return;
     };
