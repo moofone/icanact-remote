@@ -1039,8 +1039,11 @@ async fn deliver_result_reply(
 ) -> ForwardOutcome {
     match task.deadline {
         None => {
-            deliver_forwarded_reply(task.responder, reply).await;
-            success
+            if deliver_forwarded_reply_outcome(task.responder, reply).await {
+                success
+            } else {
+                ForwardOutcome::ReplyUndeliverable
+            }
         }
         Some(deadline) => {
             let remaining = remaining_until(deadline);

@@ -14,6 +14,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(feature = "test-helpers")]
+use icanact_remote::lease_test_support::{BufferConfig, ChannelId, LockFreeStreamHandle};
+
 const ACTOR: u64 = 41;
 const TYPE: u32 = 0xF04D_0001;
 
@@ -367,6 +370,89 @@ async fn shutdown_drains_waiting_and_inflight_with_observer_accounting() {
     caller.shutdown().await;
     gateway.shutdown().await;
     downstream.shutdown().await;
+    sink.shutdown().await;
+}
+
+#[cfg(feature = "test-helpers")]
+#[tokio::test(flavor = "current_thread")]
+async fn no_timeout_return_delivery_failure_is_accounted_as_error() {
+    let (source, sink) = pair().await;
+    sink.registry
+        .set_actor_message_handler(Arc::new(ReplyAfter(Duration::ZERO)))
+        .await;
+    connect_nodes(&source, &sink).await;
+    let destination = connection(&source, &sink).await;
+
+    let failed_observer = Arc::new(Counts::default());
+    let failed_forwarder = AskForwarder::new_with_observer(1, 128, Some(failed_observer.clone()));
+    let (failed_io, _failed_peer) = tokio::io::duplex(4096);
+    let (failed_writer, failed_writer_task, _failed_reader_task) = LockFreeStreamHandle::new(
+        failed_io,
+        "127.0.0.1:40573".parse().expect("test address"),
+        ChannelId::TellAsk,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let failed_writer = Arc::new(failed_writer);
+    failed_writer.shutdown();
+    failed_writer.wait_for_exit().await;
+    failed_forwarder
+        .try_forward_actor_ask_no_timeout(
+            destination.clone(),
+            ACTOR,
+            TYPE,
+            Bytes::from_static(b"failed-return-delivery"),
+            icanact_remote::AskResponder::from_stream_handle_for_test(
+                100,
+                failed_writer.clone(),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ),
+        )
+        .expect("failed-delivery task must be admitted");
+    failed_forwarder
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("failed return delivery still completes worker drain");
+    assert_eq!(failed_observer.success.load(Ordering::SeqCst), 0);
+    assert_eq!(failed_observer.error.load(Ordering::SeqCst), 1);
+    failed_writer_task.await.expect("failed writer must exit");
+
+    let success_observer = Arc::new(Counts::default());
+    let success_forwarder = AskForwarder::new_with_observer(1, 128, Some(success_observer.clone()));
+    let (success_io, _success_peer) = tokio::io::duplex(4096);
+    let (success_writer, success_writer_task, _success_reader_task) = LockFreeStreamHandle::new(
+        success_io,
+        "127.0.0.1:40574".parse().expect("test address"),
+        ChannelId::TellAsk,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let success_writer = Arc::new(success_writer);
+    success_forwarder
+        .try_forward_actor_ask_no_timeout(
+            destination,
+            ACTOR,
+            TYPE,
+            Bytes::from_static(b"successful-return-delivery"),
+            icanact_remote::AskResponder::from_stream_handle_for_test(
+                101,
+                success_writer.clone(),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ),
+        )
+        .expect("successful-delivery task must be admitted");
+    success_forwarder
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("successful return delivery must drain");
+    assert_eq!(success_observer.success.load(Ordering::SeqCst), 1);
+    assert_eq!(success_observer.error.load(Ordering::SeqCst), 0);
+    success_writer.shutdown();
+    success_writer_task.await.expect("success writer must exit");
+
+    source.shutdown().await;
     sink.shutdown().await;
 }
 
