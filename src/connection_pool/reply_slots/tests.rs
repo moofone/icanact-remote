@@ -217,8 +217,6 @@ fn publication_close_race_has_no_second_publication() {
 
 #[test]
 fn publication_close_controlled_overlap_has_one_linearized_result() {
-    use std::sync::{Arc, Barrier};
-
     let slots = crate::connection_pool::reply_slots::ReplySlots::new(
         1,
         "127.0.0.1:40571".parse().expect("test address"),
@@ -235,16 +233,22 @@ fn publication_close_controlled_overlap_has_one_linearized_result() {
             bytes.try_acquire_many_owned(32).expect("byte permit"),
         )
         .expect("reserve");
-    let gate = Arc::new(Barrier::new(2));
+    let gate = record.publication_test_gate();
+    gate.arm();
     let publisher_record = Arc::clone(&record);
-    let publisher_gate = Arc::clone(&gate);
-    let publisher = std::thread::spawn(move || {
-        publisher_gate.wait();
-        publisher_record.publish(ReplyPayload::from_static(b"reply"))
+    let publisher =
+        std::thread::spawn(move || publisher_record.publish(ReplyPayload::from_static(b"reply")));
+    gate.wait_publisher_entered();
+
+    let close_slots = Arc::clone(&slots);
+    let closer = std::thread::spawn(move || {
+        close_slots.close_and_reclaim();
     });
-    gate.wait();
-    slots.close_and_reclaim();
+    gate.wait_close_observed();
+    gate.release();
+
     let publication = publisher.join().expect("publisher must not panic");
+    closer.join().expect("closer must not panic");
     assert!(
         publication.is_ok() || matches!(publication, Err(crate::GossipError::ConnectionClosed(_))),
         "close/publication must have one linearized outcome: {publication:?}"
@@ -262,6 +266,88 @@ fn publication_close_controlled_overlap_has_one_linearized_result() {
     assert_eq!(stats.terminal_completions, 0);
     assert_eq!(stats.reserved_jobs, 0);
     assert_eq!(stats.reserved_bytes, 0);
+}
+
+#[test]
+fn payload_destruction_before_capacity_release() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct PayloadOwner {
+        bytes: Vec<u8>,
+        dropped_before_capacity_release: Arc<AtomicBool>,
+        jobs: Arc<Semaphore>,
+        bytes_permits: Arc<Semaphore>,
+        slots: Arc<crate::connection_pool::reply_slots::ReplySlots>,
+    }
+
+    impl AsRef<[u8]> for PayloadOwner {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    impl Drop for PayloadOwner {
+        fn drop(&mut self) {
+            if self.jobs.available_permits() == 0
+                && self.bytes_permits.available_permits() == 0
+                && self.slots.free_count()
+                    == crate::connection_pool::reply_slots::REPLY_SLOT_CAP - 1
+            {
+                self.dropped_before_capacity_release
+                    .store(true, Ordering::Release);
+            }
+        }
+    }
+
+    let slots = crate::connection_pool::reply_slots::ReplySlots::new(
+        1,
+        "127.0.0.1:40574".parse().expect("test address"),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let jobs = Arc::new(Semaphore::new(1));
+    let bytes_permits = Arc::new(Semaphore::new(32));
+    let dropped = Arc::new(AtomicBool::new(false));
+    let normal_owner = PayloadOwner {
+        bytes: vec![7; 8],
+        dropped_before_capacity_release: Arc::clone(&dropped),
+        jobs: Arc::clone(&jobs),
+        bytes_permits: Arc::clone(&bytes_permits),
+        slots: Arc::clone(&slots),
+    };
+    let terminal_owner = PayloadOwner {
+        bytes: b"cancelled".to_vec(),
+        dropped_before_capacity_release: Arc::clone(&dropped),
+        jobs: Arc::clone(&jobs),
+        bytes_permits: Arc::clone(&bytes_permits),
+        slots: Arc::clone(&slots),
+    };
+    let record = slots
+        .try_reserve(
+            1,
+            32,
+            Arc::new(crate::ReplyPayload::from_owner(terminal_owner)),
+            Arc::clone(&jobs).try_acquire_owned().expect("job permit"),
+            Arc::clone(&bytes_permits)
+                .try_acquire_many_owned(32)
+                .expect("byte permit"),
+        )
+        .expect("reservation");
+    record
+        .publish(crate::ReplyPayload::from_owner(normal_owner))
+        .expect("publication");
+    record.finish();
+    drop(record);
+
+    assert!(
+        dropped.load(Ordering::Acquire),
+        "normal payload must be destroyed while permits are held and before slot recycle"
+    );
+    assert_eq!(jobs.available_permits(), 1);
+    assert_eq!(bytes_permits.available_permits(), 32);
+    assert_eq!(
+        slots.free_count(),
+        crate::connection_pool::reply_slots::REPLY_SLOT_CAP
+    );
 }
 
 #[tokio::test]

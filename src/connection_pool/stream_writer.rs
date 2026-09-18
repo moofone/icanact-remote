@@ -4778,7 +4778,10 @@ impl LockFreeStreamHandle {
                             pending_cmd = write_queue.pop();
                         }
                         _ = streaming_queue.data_notify.notified() => {}
-                        _ = lease_notify.notified() => {}
+                        _ = lease_notify.notified() => {
+                            #[cfg(test)]
+                            reply_slots.lease_test_gate().hold_lease_branch().await;
+                        }
                     }
                 }
                 if completed_pending {

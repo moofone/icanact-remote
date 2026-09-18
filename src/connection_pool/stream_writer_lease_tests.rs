@@ -1,8 +1,8 @@
 use super::*;
 use crate::AskResponder;
 use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Notify, Semaphore};
 
@@ -201,17 +201,11 @@ impl AsyncWrite for ParkAwareDuplex {
         poll
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
@@ -290,24 +284,18 @@ async fn suspended_partial_header_payload_and_flush_writes_resume() {
     record
         .publish(crate::ReplyPayload::from_static(b"streamed-payload"))
         .expect("normal publication");
-    let mut pending = PendingStreamingCommand::local(StreamingCommand::LeasedResponse(
-        Box::new(LeasedResponse {
+    let mut pending = PendingStreamingCommand::local(StreamingCommand::LeasedResponse(Box::new(
+        LeasedResponse {
             record,
             stage: LeasedResponseStage::Reserved,
-        }),
-    ));
+        },
+    )));
     let mut writer = PendingOnceWriter::new();
     let next_stream_id = std::sync::atomic::AtomicU32::new(1);
 
-    write_streaming_command_slice_with_context(
-        &mut writer,
-        &mut pending,
-        1,
-        1024,
-        &next_stream_id,
-    )
-    .await
-    .expect("select normal streaming stage");
+    write_streaming_command_slice_with_context(&mut writer, &mut pending, 1, 1024, &next_stream_id)
+        .await
+        .expect("select normal streaming stage");
     let (_, complete) = write_streaming_command_slice_with_context(
         &mut writer,
         &mut pending,
@@ -406,13 +394,15 @@ async fn leased_write_keeps_frame_stage_when_write_future_is_dropped() {
             bytes.try_acquire_many_owned(8).unwrap(),
         )
         .unwrap();
-    record.publish(crate::ReplyPayload::from_static(b"reply")).unwrap();
-    let mut pending = PendingStreamingCommand::local(StreamingCommand::LeasedResponse(
-        Box::new(LeasedResponse {
+    record
+        .publish(crate::ReplyPayload::from_static(b"reply"))
+        .unwrap();
+    let mut pending = PendingStreamingCommand::local(StreamingCommand::LeasedResponse(Box::new(
+        LeasedResponse {
             record,
             stage: LeasedResponseStage::Reserved,
-        }),
-    ));
+        },
+    )));
     let mut stream = PendingWriter;
     let next_stream_id = std::sync::atomic::AtomicU32::new(1);
 
@@ -571,7 +561,7 @@ fn resumed_queue_overflow_cannot_bypass_rotation() {
 }
 
 #[tokio::test]
-async fn parked_ordinary_writer_wakes_only_after_lease_activation() {
+async fn lease_only_wake() {
     use tokio::io::AsyncReadExt;
 
     let addr = "127.0.0.1:41015".parse().expect("test address");
@@ -629,12 +619,9 @@ async fn parked_ordinary_writer_wakes_only_after_lease_activation() {
     // or socket drain can satisfy this gate.
     let parked_wait = parked.notified();
     tokio::pin!(parked_wait);
-    tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        &mut parked_wait,
-    )
-    .await
-    .expect("the owner must reach the blocked ordinary write");
+    tokio::time::timeout(std::time::Duration::from_secs(2), &mut parked_wait)
+        .await
+        .expect("the owner must reach the blocked ordinary write");
     assert!(saw_pending.load(std::sync::atomic::Ordering::Acquire));
     let budget = crate::ReplyDeliveryBudget::new(
         1,
@@ -642,6 +629,10 @@ async fn parked_ordinary_writer_wakes_only_after_lease_activation() {
         crate::ReplyPayload::from_static(b"duplicate-suppressed"),
     )
     .expect("valid budget");
+    let lease_gate = handle.reply_slots().lease_test_gate();
+    lease_gate.arm();
+    let lease_branch_observed = lease_gate.wait_observed();
+    tokio::pin!(lease_branch_observed);
     let lease = AskResponder::from_stream_handle(
         41015,
         Arc::clone(&handle),
@@ -650,6 +641,14 @@ async fn parked_ordinary_writer_wakes_only_after_lease_activation() {
     .try_reply_lease(&budget, 32)
     .expect("lease admission");
     drop(lease);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        &mut lease_branch_observed,
+    )
+    .await
+    .expect("the lease notification must select its dedicated branch");
+    assert_eq!(handle.reply_slots().stats_snapshot().ready_depth, 1);
+    lease_gate.release();
 
     let terminal = b"duplicate-suppressed";
     let ordinary_wire_len = ordinary_header.len() + ordinary.len();
@@ -741,7 +740,7 @@ async fn lease_notifier_idle_exit_race_does_not_lose_wakeup() {
 }
 
 #[tokio::test]
-async fn saturated_sources_preserve_frame_boundary_rotation() {
+async fn sustained_saturated_rotation() {
     use tokio::io::AsyncReadExt;
 
     const PAYLOAD_LEN: usize = 4 * 1024 * 1024;
@@ -889,7 +888,9 @@ async fn saturated_sources_preserve_frame_boundary_rotation() {
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             let mut control = [0u8; crate::framing::LENGTH_PREFIX_LEN];
-            peer.read_exact(&mut control).await.expect("replacement control");
+            peer.read_exact(&mut control)
+                .await
+                .expect("replacement control");
             let decoded = crate::framing::decode_control(control).expect("replacement encoding");
             let mut body = vec![0u8; decoded.body_len];
             peer.read_exact(&mut body).await.expect("replacement body");
@@ -946,7 +947,10 @@ async fn rejected_sibling_claim_does_not_activate_a_terminal_reply() {
         peer.read_exact(&mut bytes),
     )
     .await;
-    assert!(read.is_err(), "rejected claim must not activate a wire reply");
+    assert!(
+        read.is_err(),
+        "rejected claim must not activate a wire reply"
+    );
 
     drop(first);
     handle.shutdown();
@@ -975,7 +979,10 @@ fn generation_exhaustion_does_not_consume_the_last_free_slot() {
         Err(crate::GossipError::Network(error))
             if error.kind() == std::io::ErrorKind::WouldBlock
     ));
-    assert_eq!(slots.free_count(), crate::connection_pool::reply_slots::REPLY_SLOT_CAP);
+    assert_eq!(
+        slots.free_count(),
+        crate::connection_pool::reply_slots::REPLY_SLOT_CAP
+    );
 }
 
 #[tokio::test]
@@ -1107,14 +1114,10 @@ async fn production_abort_terminal_settles_correlation() {
     let parsed_abort = {
         let mut result = None;
         for _ in 0..16 {
-            if let Some(parsed) = read_message_step(
-                &mut parser,
-                &mut read_state,
-                &context,
-                &mut streaming_state,
-            )
-            .await
-            .expect("parse abort frame")
+            if let Some(parsed) =
+                read_message_step(&mut parser, &mut read_state, &context, &mut streaming_state)
+                    .await
+                    .expect("parse abort frame")
             {
                 result = Some(parsed);
                 break;
@@ -1155,19 +1158,21 @@ async fn production_abort_terminal_settles_correlation() {
         correlation_id,
         terminal.len(),
     );
-    source.write_all(&header).await.expect("terminal header write");
-    source.write_all(terminal).await.expect("terminal payload write");
+    source
+        .write_all(&header)
+        .await
+        .expect("terminal header write");
+    source
+        .write_all(terminal)
+        .await
+        .expect("terminal payload write");
     let parsed_response = {
         let mut result = None;
         for _ in 0..16 {
-            if let Some(parsed) = read_message_step(
-                &mut parser,
-                &mut read_state,
-                &context,
-                &mut streaming_state,
-            )
-            .await
-            .expect("parse terminal response")
+            if let Some(parsed) =
+                read_message_step(&mut parser, &mut read_state, &context, &mut streaming_state)
+                    .await
+                    .expect("parse terminal response")
             {
                 result = Some(parsed);
                 break;
@@ -1198,14 +1203,11 @@ async fn production_abort_terminal_settles_correlation() {
     )
     .await
     .expect("production terminal-response processing");
-    let received = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        waiter,
-    )
-    .await
-    .expect("untimed requester must settle")
-    .expect("requester task must not panic")
-    .expect("terminal response must settle correlation");
+    let received = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+        .await
+        .expect("untimed requester must settle")
+        .expect("requester task must not panic")
+        .expect("terminal response must settle correlation");
     assert_eq!(received.as_ref(), b"cancelled");
     guard.disarm();
 }
@@ -1348,7 +1350,10 @@ async fn partial_final_frame_cancel_counts_too_late_once() {
     .expect("commit only the first final-frame byte");
     assert_eq!(written, 1);
     assert!(!complete);
-    assert!(matches!(response.stage, LeasedResponseStage::WritingInline { .. }));
+    assert!(matches!(
+        response.stage,
+        LeasedResponseStage::WritingInline { .. }
+    ));
 
     record.cancel();
     let (_, next_complete, _) = write_leased_response_command_slice(
@@ -1384,7 +1389,7 @@ async fn partial_final_frame_cancel_counts_too_late_once() {
 }
 
 #[tokio::test]
-async fn cancellation_between_frames_aborts_then_settles_terminal_reply_lease_stats() {
+async fn suspended_frame_cancel() {
     let slots = crate::connection_pool::reply_slots::ReplySlots::new(
         1,
         "127.0.0.1:41008".parse().unwrap(),
@@ -1554,7 +1559,7 @@ async fn cancellation_between_frames_aborts_then_settles_terminal_reply_lease_st
 }
 
 #[tokio::test]
-async fn io_exit_reclaims_ready_active_and_pending_ownership() {
+async fn active_io_exit_reclaims() {
     let (io, _peer) = tokio::io::duplex(64 * 1024);
     let (handle, writer_task, _reader_task) = LockFreeStreamHandle::new(
         io,
@@ -1565,12 +1570,9 @@ async fn io_exit_reclaims_ready_active_and_pending_ownership() {
         None,
     );
     let handle = Arc::new(handle);
-    let budget = crate::ReplyDeliveryBudget::new(
-        3,
-        3 * 64,
-        crate::ReplyPayload::from_static(b"cancelled"),
-    )
-    .expect("valid budget");
+    let budget =
+        crate::ReplyDeliveryBudget::new(3, 3 * 64, crate::ReplyPayload::from_static(b"cancelled"))
+            .expect("valid budget");
     let pending = AskResponder::from_stream_handle(
         21,
         Arc::clone(&handle),
@@ -1607,9 +1609,12 @@ async fn io_exit_reclaims_ready_active_and_pending_ownership() {
     assert_eq!(stats.live_slots, 0);
     assert_eq!(stats.reserved_jobs, 0);
     assert_eq!(stats.reserved_bytes, 0);
+    assert_eq!(stats.retained_payload_owners, 0);
+    assert_eq!(stats.ready_depth, 0);
     assert_eq!(handle.reply_slots().reserved(), 0);
     assert_eq!(stats.normal_completions, 0);
     assert_eq!(stats.discarded_reservations, 0);
+    assert_eq!(budget.available_test_permits(), (3, 3 * 64));
 }
 
 #[tokio::test]

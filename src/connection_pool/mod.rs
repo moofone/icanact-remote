@@ -44,6 +44,9 @@ include!("pool_connect.rs");
 
 pub(crate) mod reply_slots;
 
+#[cfg(test)]
+mod lease_test_support;
+
 #[cfg(any(test, feature = "test-helpers"))]
 pub(crate) mod lease_stats;
 

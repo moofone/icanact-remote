@@ -65,8 +65,8 @@ struct PooledStreamingResponse {
 
 /// A lazily framed response backed by an already-owned `Bytes` payload.
 struct LeasedResponse {
-    record: std::sync::Arc<crate::connection_pool::reply_slots::ReplySlotRecord>,
     stage: LeasedResponseStage,
+    record: std::sync::Arc<crate::connection_pool::reply_slots::ReplySlotRecord>,
 }
 
 enum LeasedResponseStage {

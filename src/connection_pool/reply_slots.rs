@@ -38,8 +38,9 @@ pub(crate) struct ReplySlotRecord {
     instance_id: u64,
     addr: SocketAddr,
     max_reply_bytes: usize,
-    terminal_payload: Arc<ReplyPayload>,
-    normal_payload: std::sync::OnceLock<ReplyPayload>,
+    terminal_payload: ArcSwapOption<ReplyPayload>,
+    normal_payload: ArcSwapOption<ReplyPayload>,
+    normal_published: AtomicBool,
     cancelled: AtomicBool,
     activated: AtomicBool,
     state: AtomicU8,
@@ -52,8 +53,10 @@ pub(crate) struct ReplySlotRecord {
     too_late_recorded: AtomicBool,
     /// Publication has its own tiny state machine so close and synchronous
     /// publication have one linearization point. `PUBLICATION_WRITING` is
-    /// held only while storing the payload in `OnceLock`.
+    /// held only while storing the payload in the publication cell.
     publication_state: AtomicU8,
+    #[cfg(test)]
+    publication_test_gate: Arc<crate::connection_pool::lease_test_support::PublicationGate>,
     completion: Notify,
     // The record owns these permits for its entire transport lifetime. Keeping
     // them as fields avoids a release lock and makes writer-owned retention
@@ -133,13 +136,18 @@ impl ReplySlotRecord {
             )
             .into());
         }
-        let result = self.normal_payload.set(payload).map_err(|_| {
-            std::io::Error::new(
+        #[cfg(test)]
+        self.publication_test_gate.publisher_transition();
+        let result = if self.normal_published.swap(true, Ordering::AcqRel) {
+            Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 "reply lease already has a submitted response",
             )
-            .into()
-        });
+            .into())
+        } else {
+            self.normal_payload.store(Some(Arc::new(payload)));
+            Ok(())
+        };
         if result.is_ok() {
             #[cfg(any(test, feature = "test-helpers"))]
             self.stats
@@ -152,11 +160,15 @@ impl ReplySlotRecord {
     }
 
     pub(crate) fn normal_payload(&self) -> Option<ReplyPayload> {
-        self.normal_payload.get().cloned()
+        self.normal_payload
+            .load_full()
+            .map(|payload| (*payload).clone())
     }
 
     pub(crate) fn terminal_payload(&self) -> Arc<ReplyPayload> {
-        Arc::clone(&self.terminal_payload)
+        self.terminal_payload
+            .load_full()
+            .unwrap_or_else(|| Arc::new(ReplyPayload::from_static(&[])))
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
@@ -357,7 +369,11 @@ impl ReplySlotRecord {
                     }
                 }
                 PUBLICATION_CLOSED => return,
-                PUBLICATION_WRITING => std::hint::spin_loop(),
+                PUBLICATION_WRITING => {
+                    #[cfg(test)]
+                    self.publication_test_gate.close_transition();
+                    std::hint::spin_loop()
+                }
                 _ => return,
             }
         }
@@ -410,28 +426,37 @@ impl ReplySlotRecord {
             self.completion.notify_waiters();
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn publication_test_gate(
+        &self,
+    ) -> Arc<crate::connection_pool::lease_test_support::PublicationGate> {
+        Arc::clone(&self.publication_test_gate)
+    }
 }
 
 impl Drop for ReplySlotRecord {
     fn drop(&mut self) {
         let slots = self.slots.upgrade();
-        // Release the budget permits before publishing the slot back into the
-        // free set. This makes free-slot observation an actual capacity gate,
-        // rather than a signal that races the record's field destruction.
-        drop(self._job_permit.take());
-        drop(self._byte_permit.take());
+        // Payload references protect the reservation just like their record
+        // does. Explicitly remove both transport-owned references first, so a
+        // payload owner cannot outlive the permits, accounting, or slot.
+        drop(self.normal_payload.swap(None));
+        drop(self.terminal_payload.swap(None));
         #[cfg(any(test, feature = "test-helpers"))]
         {
             self.stats.reserved_jobs.fetch_sub(1, Ordering::Release);
             self.stats
                 .reserved_bytes
                 .fetch_sub(self.max_reply_bytes, Ordering::Release);
-            if self.normal_payload.get().is_some() {
+            if self.normal_published.load(Ordering::Acquire) {
                 self.stats
                     .retained_payload_owners
                     .fetch_sub(1, Ordering::Release);
             }
         }
+        drop(self._job_permit.take());
+        drop(self._byte_permit.take());
         if let Some(slots) = slots {
             slots.recycle(self.index, self.generation);
         }
@@ -456,6 +481,8 @@ pub(crate) struct ReplySlots {
     reservation_state: AtomicUsize,
     #[cfg(any(test, feature = "test-helpers"))]
     stats: Arc<crate::connection_pool::lease_stats::LeaseStats>,
+    #[cfg(test)]
+    lease_test_gate: Arc<crate::connection_pool::lease_test_support::LeaseWakeGate>,
 }
 
 impl ReplySlots {
@@ -485,6 +512,10 @@ impl ReplySlots {
             reservation_state: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-helpers"))]
             stats: Arc::new(crate::connection_pool::lease_stats::LeaseStats::default()),
+            #[cfg(test)]
+            lease_test_gate: Arc::new(
+                crate::connection_pool::lease_test_support::LeaseWakeGate::new(),
+            ),
         })
     }
 
@@ -525,8 +556,14 @@ impl ReplySlots {
             instance_id: self.instance_id,
             addr: self.addr,
             max_reply_bytes,
-            terminal_payload,
-            normal_payload: std::sync::OnceLock::new(),
+            terminal_payload: {
+                let payload = terminal_payload;
+                let stored = ArcSwapOption::empty();
+                stored.store(Some(payload));
+                stored
+            },
+            normal_payload: ArcSwapOption::empty(),
+            normal_published: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
             activated: AtomicBool::new(false),
             state: AtomicU8::new(STATE_RESERVED),
@@ -535,6 +572,10 @@ impl ReplySlots {
             #[cfg(any(test, feature = "test-helpers"))]
             too_late_recorded: AtomicBool::new(false),
             publication_state: AtomicU8::new(PUBLICATION_OPEN),
+            #[cfg(test)]
+            publication_test_gate: Arc::new(
+                crate::connection_pool::lease_test_support::PublicationGate::new(),
+            ),
             completion: Notify::new(),
             _job_permit: Some(job_permit),
             _byte_permit: Some(byte_permit),
@@ -602,6 +643,13 @@ impl ReplySlots {
 
     pub(crate) fn notify(&self) -> Arc<Notify> {
         Arc::clone(&self.lease_notify)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lease_test_gate(
+        &self,
+    ) -> Arc<crate::connection_pool::lease_test_support::LeaseWakeGate> {
+        Arc::clone(&self.lease_test_gate)
     }
 
     pub(crate) fn finish(&self, index: usize, generation: u64) {

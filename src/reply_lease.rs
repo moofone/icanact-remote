@@ -34,6 +34,14 @@ impl ReplyPayload {
     pub fn as_bytes(&self) -> &Bytes {
         &self.0
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_owner<T>(owner: T) -> Self
+    where
+        T: AsRef<[u8]> + Send + Sync + 'static,
+    {
+        Self(Bytes::from_owner(owner))
+    }
 }
 
 impl AsRef<[u8]> for ReplyPayload {
@@ -151,6 +159,14 @@ impl ReplyDeliveryBudget {
     pub(crate) fn cancelled_reply(&self) -> Arc<ReplyPayload> {
         Arc::clone(&self.cancelled_reply)
     }
+
+    #[cfg(test)]
+    pub(crate) fn available_test_permits(&self) -> (usize, usize) {
+        (
+            self.job_permits.available_permits(),
+            self.byte_permits.available_permits(),
+        )
+    }
 }
 
 /// Why admission did not produce a lease.
@@ -255,6 +271,7 @@ impl ReplyLease {
     /// waiting for peer acknowledgement.
     pub fn try_reply_bytes(mut self, payload: ReplyPayload) -> crate::Result<()> {
         if let Err(error) = self.record.publish(payload.clone()) {
+            drop(payload);
             if matches!(error, crate::GossipError::ConnectionClosed(_)) {
                 // Close won the publication linearization. The claim remains
                 // consumed, but it must not activate a terminal frame or
@@ -266,6 +283,7 @@ impl ReplyLease {
             return Err(error);
         }
         self.notify_observer(&payload);
+        drop(payload);
         self.record.activate();
         self.transferred = true;
         Ok(())
@@ -274,6 +292,7 @@ impl ReplyLease {
     /// Publish a response and retain the lease until its terminal flush.
     pub async fn reply_bytes(mut self, payload: ReplyPayload) -> crate::Result<()> {
         if let Err(error) = self.record.publish(payload.clone()) {
+            drop(payload);
             if matches!(error, crate::GossipError::ConnectionClosed(_)) {
                 self.transferred = true;
             } else {
@@ -282,6 +301,7 @@ impl ReplyLease {
             return Err(error);
         }
         self.notify_observer(&payload);
+        drop(payload);
         self.record.activate();
         let result = self.record.wait_complete().await;
         self.transferred = true;
