@@ -345,6 +345,14 @@ struct LocalStreamingQueue {
     /// another ask; otherwise its handler could produce a response that cannot
     /// be admitted after ownership has already moved here.
     response_in_flight: bool,
+    /// A yielded response is parked in the writer's bounded resumed set. Its
+    /// queue-resident Flush must not be selected until that response resumes.
+    suspended_response: bool,
+    /// The response frame is complete, but its paired Flush still owns the
+    /// retained payload reservation until that Flush completes.
+    flush_pending: bool,
+    /// The currently in-flight response was admitted with a paired Flush.
+    response_expects_flush: bool,
     in_flight_bytes: usize,
     wire_blocked: bool,
     /// Reserve normal queue room for one configured response frame when
@@ -440,6 +448,9 @@ impl LocalStreamingQueue {
             queue: std::collections::VecDeque::new(),
             queued_bytes: 0,
             response_in_flight: false,
+            suspended_response: false,
+            flush_pending: false,
+            response_expects_flush: false,
             in_flight_bytes: 0,
             response_reserve_bytes,
             response_reserve_commands,
@@ -513,23 +524,67 @@ impl LocalStreamingQueue {
     }
 
     fn pop_front(&mut self) -> Option<StreamingCommand> {
-        if self.queue.is_empty() && !self.response_in_flight {
+        // A response and its Flush form one retained unit. Once the response
+        // yields at a frame boundary, do not let the Flush (or a later local
+        // response) overtake it; the writer calls `response_finished` only
+        // after the response's final frame has committed.
+        if self.response_in_flight && self.suspended_response {
+            return None;
+        }
+        if self.queue.is_empty() {
             if let Some(deferred) = self.deferred.take() {
                 self.queued_bytes = deferred.iter().map(streaming_command_bytes).sum();
                 self.deferred_bytes = 0;
                 self.queue.extend(deferred);
             }
         }
+        let command = self.queue.front()?;
+        if matches!(command, StreamingCommand::Flush) && self.suspended_response {
+            return None;
+        }
         let command = self.queue.pop_front()?;
         let command_bytes = streaming_command_bytes(&command);
         self.queued_bytes = self.queued_bytes.saturating_sub(command_bytes);
-        self.response_in_flight = !matches!(&command, StreamingCommand::Flush);
-        self.in_flight_bytes = if self.response_in_flight {
-            command_bytes
+        if matches!(&command, StreamingCommand::Flush) {
+            // Keep the response's reservation until the actual Flush completes.
+            // `flush_finished` clears it after the writer's flush future returns.
+            if !self.flush_pending {
+                self.in_flight_bytes = 0;
+            }
         } else {
-            0
-        };
+            self.response_in_flight = true;
+            self.response_expects_flush =
+                matches!(self.queue.front(), Some(StreamingCommand::Flush));
+            self.in_flight_bytes = command_bytes;
+        }
         Some(command)
+    }
+
+    fn response_yielded(&mut self) {
+        if self.response_in_flight {
+            self.suspended_response = true;
+        }
+    }
+
+    fn response_finished(&mut self) {
+        if !self.response_in_flight {
+            return;
+        }
+        self.response_in_flight = false;
+        self.suspended_response = false;
+        if self.response_expects_flush {
+            self.flush_pending = true;
+        } else {
+            self.in_flight_bytes = 0;
+        }
+        self.response_expects_flush = false;
+    }
+
+    fn flush_finished(&mut self) {
+        if self.flush_pending {
+            self.flush_pending = false;
+            self.in_flight_bytes = 0;
+        }
     }
 
     fn set_wire_blocked(&mut self, blocked: bool) {
@@ -554,7 +609,7 @@ impl LocalStreamingQueue {
     fn retained_commands(&self) -> usize {
         self.queue
             .len()
-            .saturating_add(usize::from(self.response_in_flight))
+            .saturating_add(usize::from(self.response_in_flight || self.flush_pending))
             .saturating_add(self.deferred.as_ref().map_or(0, Vec::len))
     }
 
@@ -769,6 +824,9 @@ struct PendingStreamingCommand {
     command: StreamingCommand,
     offset: usize,
     from_shared_queue: bool,
+    /// This command came from the read-pipeline local response queue and may
+    /// therefore complete that queue's response/Flush reservation.
+    from_local_response_queue: bool,
     yield_after_frame: bool,
 }
 
@@ -778,6 +836,7 @@ impl PendingStreamingCommand {
             command,
             offset: 0,
             from_shared_queue: true,
+            from_local_response_queue: false,
             yield_after_frame: false,
         }
     }
@@ -787,6 +846,17 @@ impl PendingStreamingCommand {
             command,
             offset: 0,
             from_shared_queue: false,
+            from_local_response_queue: false,
+            yield_after_frame: false,
+        }
+    }
+
+    fn local_response(command: StreamingCommand) -> Self {
+        Self {
+            command,
+            offset: 0,
+            from_shared_queue: false,
+            from_local_response_queue: true,
             yield_after_frame: false,
         }
     }

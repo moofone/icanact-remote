@@ -11,6 +11,12 @@ pub(crate) const REPLY_SLOT_CAP: usize = 64;
 
 const STATE_RESERVED: u8 = 0;
 const STATE_COMPLETE: u8 = 2;
+#[cfg(any(test, feature = "test-helpers"))]
+const WIRE_OUTCOME_UNSET: u8 = 0;
+#[cfg(any(test, feature = "test-helpers"))]
+const WIRE_OUTCOME_NORMAL: u8 = 1;
+#[cfg(any(test, feature = "test-helpers"))]
+const WIRE_OUTCOME_TERMINAL: u8 = 2;
 const STATE_COMPLETION_CLOSED: u8 = 1;
 const PUBLICATION_OPEN: u8 = 0;
 const PUBLICATION_CLOSED: u8 = 1;
@@ -37,6 +43,10 @@ pub(crate) struct ReplySlotRecord {
     cancelled: AtomicBool,
     activated: AtomicBool,
     state: AtomicU8,
+    #[cfg(any(test, feature = "test-helpers"))]
+    /// Final outcome selected by the writer and committed on the wire. This
+    /// deliberately does not infer outcome from payload/cancellation state.
+    wire_outcome: AtomicU8,
     /// Publication has its own tiny state machine so close and synchronous
     /// publication have one linearization point. `PUBLICATION_WRITING` is
     /// held only while storing the payload in `OnceLock`.
@@ -245,11 +255,14 @@ impl ReplySlotRecord {
             #[cfg(any(test, feature = "test-helpers"))]
             {
                 self.stats.live_slots.fetch_sub(1, Ordering::Relaxed);
-                if self.normal_payload.get().is_some() && !self.is_cancelled() {
+                if self.wire_outcome.load(Ordering::Acquire) == WIRE_OUTCOME_NORMAL {
                     self.stats
                         .normal_completions
                         .fetch_add(1, Ordering::Relaxed);
                 } else {
+                    // An unset outcome is conservative: connection teardown,
+                    // cancellation, and terminal fallback are not successful
+                    // normal wire completions.
                     self.stats
                         .terminal_completions
                         .fetch_add(1, Ordering::Relaxed);
@@ -260,11 +273,30 @@ impl ReplySlotRecord {
     }
 
     #[inline]
+    pub(crate) fn note_normal_outcome(&self) {
+        #[cfg(any(test, feature = "test-helpers"))]
+        self.wire_outcome
+            .store(WIRE_OUTCOME_NORMAL, Ordering::Release);
+    }
+
+    #[inline]
+    pub(crate) fn note_terminal_outcome(&self) {
+        #[cfg(any(test, feature = "test-helpers"))]
+        self.wire_outcome
+            .store(WIRE_OUTCOME_TERMINAL, Ordering::Release);
+    }
+
+    /// Record an abort only after its complete frame has reached the writer.
+    #[inline]
     pub(crate) fn note_abort(&self) {
         #[cfg(any(test, feature = "test-helpers"))]
-        self.stats
-            .actual_stream_aborts
-            .fetch_add(1, Ordering::Relaxed);
+        {
+            self.stats
+                .actual_stream_aborts
+                .fetch_add(1, Ordering::Relaxed);
+            self.wire_outcome
+                .store(WIRE_OUTCOME_TERMINAL, Ordering::Release);
+        }
     }
 
     #[inline]
@@ -446,6 +478,8 @@ impl ReplySlots {
             cancelled: AtomicBool::new(false),
             activated: AtomicBool::new(false),
             state: AtomicU8::new(STATE_RESERVED),
+            #[cfg(any(test, feature = "test-helpers"))]
+            wire_outcome: AtomicU8::new(WIRE_OUTCOME_UNSET),
             publication_state: AtomicU8::new(PUBLICATION_OPEN),
             completion: Notify::new(),
             _job_permit: job_permit,

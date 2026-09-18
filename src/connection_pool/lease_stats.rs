@@ -66,6 +66,38 @@ mod tests {
     use std::sync::{Arc, atomic::AtomicBool};
     use tokio::io::AsyncReadExt;
 
+    #[test]
+    fn stats_classify_committed_wire_outcome() {
+        let slots = crate::connection_pool::reply_slots::ReplySlots::new(
+            1,
+            "127.0.0.1:40572".parse().expect("test address"),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let jobs = Arc::new(tokio::sync::Semaphore::new(1));
+        let bytes = Arc::new(tokio::sync::Semaphore::new(16));
+        let record = slots
+            .try_reserve(
+                1,
+                16,
+                Arc::new(ReplyPayload::from_static(b"cancelled")),
+                jobs.try_acquire_owned().expect("job permit"),
+                bytes.try_acquire_many_owned(16).expect("byte permit"),
+            )
+            .expect("lease reservation");
+        record
+            .publish(ReplyPayload::from_static(b"normal-payload"))
+            .expect("normal publication");
+        // The payload is normal, but the writer selected a terminal outcome.
+        // Stats must report the committed writer outcome rather than infer it
+        // from publication/cancellation state.
+        record.note_terminal_outcome();
+        record.complete();
+        let stats = slots.stats_snapshot();
+        assert_eq!(stats.normal_completions, 0);
+        assert_eq!(stats.terminal_completions, 1);
+        record.finish();
+    }
+
     #[tokio::test]
     async fn stats_track_reservation_publication_and_abort() {
         let budget =

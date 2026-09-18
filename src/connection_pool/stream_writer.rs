@@ -2041,6 +2041,7 @@ where
                 write_inline_lease_slice(stream, pending_offset, header, payload.as_ref()).await?;
             response.record.note_frame_progress(written);
             if complete {
+                response.record.note_normal_outcome();
                 response.stage = LeasedResponseStage::Flushing;
             }
             Ok((written, false, false))
@@ -2072,12 +2073,12 @@ where
                 write_bytes_streaming_command_slice(stream, pending_offset, normal).await?;
             response.record.note_frame_progress(written);
             if complete {
+                response.record.note_normal_outcome();
                 response.stage = LeasedResponseStage::Flushing;
                 return Ok((written, false, false));
             }
             if response.record.is_cancelled() && frame_boundary && !final_frame {
                 let stream_id = normal.stream_id;
-                response.record.note_abort();
                 response.stage = LeasedResponseStage::WritingAbort {
                     header: crate::framing::write_stream_abort_header(stream_id, 0),
                 };
@@ -2087,9 +2088,11 @@ where
             Ok((written, false, frame_boundary))
         }
         LeasedResponseStage::WritingAbort { header } => {
-            let (written, complete) = write_fixed_lease_slice(stream, pending_offset, header).await?;
+            let (written, complete) =
+                write_fixed_lease_slice(stream, pending_offset, header).await?;
             response.record.note_frame_progress(written);
             if complete {
+                response.record.note_abort();
                 *pending_offset = 0;
                 response.stage = LeasedResponseStage::WritingTerminal {
                     header: crate::framing::write_ask_response_header(
@@ -2112,6 +2115,7 @@ where
             .await?;
             response.record.note_frame_progress(written);
             if complete {
+                response.record.note_terminal_outcome();
                 response.stage = LeasedResponseStage::Flushing;
             }
             Ok((written, false, false))
@@ -2343,7 +2347,15 @@ fn finish_streaming_command_slice_owned(
             streaming_queue.notify_space();
         }
     } else if pending.yield_after_frame && !pending.from_shared_queue {
-        yielded_slot.push_back(pending);
+        // A yielded command retains its payload and progress state. Keep the
+        // resumable set bounded by the connection's lease-slot budget; when
+        // full, park this one command as the current pending item instead of
+        // growing an unbounded side queue.
+        if yielded_slot.len() < crate::connection_pool::reply_slots::REPLY_SLOT_CAP {
+            yielded_slot.push_back(pending);
+        } else {
+            *pending_slot = Some(pending);
+        }
     } else {
         *pending_slot = Some(pending);
     }
@@ -3073,7 +3085,9 @@ impl LockFreeStreamHandle {
         // Bounded by REPLY_SLOT_CAP: every queued item is an owned lease
         // progress record, so no suspended delivery can overwrite another.
         let mut yielded_stream_cmd: std::collections::VecDeque<PendingStreamingCommand> =
-            std::collections::VecDeque::with_capacity(crate::connection_pool::reply_slots::REPLY_SLOT_CAP);
+            std::collections::VecDeque::with_capacity(
+                crate::connection_pool::reply_slots::REPLY_SLOT_CAP,
+            );
         // Rotate resumed commands, newly activated leases, local responses,
         // and producer-owned shared streams. The selected command remains
         // pending until its current frame completes, so rotation never splices
@@ -3199,19 +3213,19 @@ impl LockFreeStreamHandle {
                     let pending = match lane {
                         StreamingLane::Resumed => yielded_stream_cmd.pop_front(),
                         StreamingLane::Lease => reply_slots.pop_ready().map(|record| {
-                            PendingStreamingCommand::local(
-                                StreamingCommand::LeasedResponse(Box::new(LeasedResponse {
+                            PendingStreamingCommand::local(StreamingCommand::LeasedResponse(
+                                Box::new(LeasedResponse {
                                     record,
                                     stage: LeasedResponseStage::Reserved,
-                                })),
-                            )
+                                }),
+                            ))
                         }),
                         StreamingLane::Local => local_streaming_queue
                             .pop_front()
-                            .map(PendingStreamingCommand::local),
-                        StreamingLane::Shared => streaming_queue
-                            .pop()
-                            .map(PendingStreamingCommand::shared),
+                            .map(PendingStreamingCommand::local_response),
+                        StreamingLane::Shared => {
+                            streaming_queue.pop().map(PendingStreamingCommand::shared)
+                        }
                     };
                     if pending.is_some() {
                         break pending;
@@ -3286,6 +3300,17 @@ impl LockFreeStreamHandle {
                 if command_is_flush && complete {
                     flush_pending.store(false, Ordering::Release);
                     bytes_since_flush = 0;
+                }
+                if pending.from_local_response_queue {
+                    if complete {
+                        if matches!(&pending.command, StreamingCommand::Flush) {
+                            local_streaming_queue.flush_finished();
+                        } else {
+                            local_streaming_queue.response_finished();
+                        }
+                    } else if pending.yield_after_frame {
+                        local_streaming_queue.response_yielded();
+                    }
                 }
                 finish_streaming_command_slice_owned(
                     pending,
