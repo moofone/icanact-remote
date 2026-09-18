@@ -11767,25 +11767,6 @@ impl<T: 'static> GossipRegistry<T> {
         self.invalidate_session_state_on_teardown(failed_peer_addr, pre_teardown_session_epoch)
             .await;
 
-        if let Some(cell) = self.peer_disconnect_handler.load_full() {
-            // Skip launching the notifier if we're already shutting
-            // down — the spawn would otherwise hold an Arc reference
-            // and keep the handler alive past shutdown_and_wait.
-            if !self.shutdown.load(Ordering::Acquire) {
-                let handler = cell.handler.clone();
-                let peer_id = peer_id.clone();
-                let shutdown = self.shutdown.clone();
-                tokio::spawn(async move {
-                    if shutdown.load(Ordering::Acquire) {
-                        return;
-                    }
-                    handler
-                        .handle_peer_disconnect(failed_peer_addr, peer_id)
-                        .await;
-                });
-            }
-        }
-
         // Record the accounting attempt before taking the state lock. The
         // attempt is observational only; the applied/declined outcome below
         // is captured while holding `gossip_state` and dispatched afterward.
@@ -11803,6 +11784,9 @@ impl<T: 'static> GossipRegistry<T> {
         }
         let mut crossed_threshold = false;
         let mut applied = false;
+        let replacement_is_current;
+        #[cfg(feature = "test-helpers")]
+        let mark_failed_event;
         {
             let mut gossip_state = self.gossip_state.lock().await;
             let current_instance_id = peer_id.as_ref().and_then(|peer_id| {
@@ -11815,7 +11799,7 @@ impl<T: 'static> GossipRegistry<T> {
                             .map(|handle| handle.instance_id())
                     })
             });
-            let replacement_is_current = failed_instance_id
+            replacement_is_current = failed_instance_id
                 .zip(current_instance_id)
                 .is_some_and(|(failed, current)| failed != current);
             if !replacement_is_current {
@@ -11836,17 +11820,46 @@ impl<T: 'static> GossipRegistry<T> {
                     );
                 }
             }
+            #[cfg(feature = "test-helpers")]
+            {
+                // Allocate this sequence while the accounting decision still
+                // holds `gossip_state`, matching `mark_peer_connected_inner`.
+                mark_failed_event = crate::lifecycle::TransportTestHelperEvent::MarkFailed {
+                    peer: peer_id.clone(),
+                    addr: failed_peer_addr,
+                    instance_id: failed_instance_id,
+                    applied,
+                    sequence: crate::lifecycle::next_test_helper_sequence(),
+                };
+            }
         }
         #[cfg(feature = "test-helpers")]
-        crate::lifecycle::dispatch_test_helper_event(
-            crate::lifecycle::TransportTestHelperEvent::MarkFailed {
-                peer: peer_id.clone(),
-                addr: failed_peer_addr,
-                instance_id: failed_instance_id,
-                applied,
-                sequence: crate::lifecycle::next_test_helper_sequence(),
-            },
-        );
+        crate::lifecycle::dispatch_test_helper_event(mark_failed_event);
+
+        // A failure that lost the instance fence is stale: its peer is live
+        // again, so neither peer-wide failure notification nor its detached
+        // callback may be emitted. Genuine failures still notify exactly as
+        // before, but only after their accounting decision has been observed.
+        if !replacement_is_current {
+            if let Some(cell) = self.peer_disconnect_handler.load_full() {
+                // Skip launching the notifier if we're already shutting
+                // down — the spawn would otherwise hold an Arc reference
+                // and keep the handler alive past shutdown_and_wait.
+                if !self.shutdown.load(Ordering::Acquire) {
+                    let handler = cell.handler.clone();
+                    let peer_id = peer_id.clone();
+                    let shutdown = self.shutdown.clone();
+                    tokio::spawn(async move {
+                        if shutdown.load(Ordering::Acquire) {
+                            return;
+                        }
+                        handler
+                            .handle_peer_disconnect(failed_peer_addr, peer_id)
+                            .await;
+                    });
+                }
+            }
+        }
 
         // NOTE: the tie-break reconnect cooldown (`note_tie_break_eviction`)
         // is deliberately *not* armed here. This handler fires for every

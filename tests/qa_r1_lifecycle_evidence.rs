@@ -1,12 +1,14 @@
 mod common;
 
 use common::{DynError, TlsHandle, connect_bidirectional, create_tls_node_with_keypair};
+use futures::future::BoxFuture;
 use icanact_remote::lifecycle::TransportTestHelperEvent;
+use icanact_remote::registry::PeerDisconnectHandler;
 use icanact_remote::{
     BuilderTlsBootstrap, GossipConfig, GossipRegistryHandle, KeyPair, PeerId, TransportDirection,
     TransportLifecycleEvent, TransportLifecycleRecorderGuard,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
@@ -468,6 +470,21 @@ async fn successful_cas_tail_does_not_fence_replacement() -> Result<(), DynError
             .expect("lifecycle recorder channel closed");
     }));
 
+    let disconnect_invocations = Arc::new(AtomicUsize::new(0));
+    struct CountingDisconnectHandler {
+        invocations: Arc<AtomicUsize>,
+    }
+    impl PeerDisconnectHandler for CountingDisconnectHandler {
+        fn handle_peer_disconnect(
+            &self,
+            _peer_addr: std::net::SocketAddr,
+            _peer_id: Option<PeerId>,
+        ) -> BoxFuture<'_, ()> {
+            self.invocations.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        }
+    }
+
     connect_bidirectional(&node_a, &node_b).await?;
     assert!(
         common::wait_for_condition(EVIDENCE_TIMEOUT, || async {
@@ -483,7 +500,6 @@ async fn successful_cas_tail_does_not_fence_replacement() -> Result<(), DynError
         .client()
         .current_peer_connection_instance(&peer_b)
         .expect("initial current B instance");
-
     failure_started.store(true, Ordering::Release);
     let failure_registry = node_a.registry.clone();
     let failure_task = tokio::spawn(async move {
@@ -537,6 +553,12 @@ async fn successful_cas_tail_does_not_fence_replacement() -> Result<(), DynError
             > event_sequence(&replacement_publication).unwrap(),
         "replacement committed mark must follow replacement publication"
     );
+    node_a
+        .registry
+        .set_peer_disconnect_handler(Arc::new(CountingDisconnectHandler {
+            invocations: Arc::clone(&disconnect_invocations),
+        }))
+        .await;
 
     teardown_gate.open();
     failure_task
@@ -570,6 +592,12 @@ async fn successful_cas_tail_does_not_fence_replacement() -> Result<(), DynError
         peer_failures(&node_a, addr_b).await,
         0,
         "old successful-CAS cleanup must not mark the replacement failed"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        disconnect_invocations.load(Ordering::SeqCst),
+        0,
+        "stale successful-CAS cleanup must not notify the peer-disconnect handler"
     );
     assert_eq!(
         node_a.client().current_peer_connection_instance(&peer_b),
