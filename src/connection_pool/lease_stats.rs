@@ -13,6 +13,7 @@ pub(crate) struct LeaseStats {
     pub(crate) reserved_bytes: AtomicUsize,
     pub(crate) retained_payload_owners: AtomicUsize,
     pub(crate) cancellation_publications: AtomicUsize,
+    pub(crate) discarded_reservations: AtomicUsize,
     pub(crate) actual_stream_aborts: AtomicUsize,
     pub(crate) normal_completions: AtomicUsize,
     pub(crate) terminal_completions: AtomicUsize,
@@ -30,6 +31,7 @@ pub struct LeaseStatsSnapshot {
     pub reserved_bytes: usize,
     pub retained_payload_owners: usize,
     pub cancellation_publications: usize,
+    pub discarded_reservations: usize,
     pub actual_stream_aborts: usize,
     pub normal_completions: usize,
     pub terminal_completions: usize,
@@ -48,6 +50,7 @@ impl LeaseStats {
             reserved_bytes: self.reserved_bytes.load(Ordering::Acquire),
             retained_payload_owners: self.retained_payload_owners.load(Ordering::Acquire),
             cancellation_publications: self.cancellation_publications.load(Ordering::Acquire),
+            discarded_reservations: self.discarded_reservations.load(Ordering::Acquire),
             actual_stream_aborts: self.actual_stream_aborts.load(Ordering::Acquire),
             normal_completions: self.normal_completions.load(Ordering::Acquire),
             terminal_completions: self.terminal_completions.load(Ordering::Acquire),
@@ -96,6 +99,57 @@ mod tests {
         assert_eq!(stats.normal_completions, 0);
         assert_eq!(stats.terminal_completions, 1);
         record.finish();
+    }
+
+    #[test]
+    fn stats_distinguish_discard_from_committed_and_too_late_cancel() {
+        let slots = crate::connection_pool::reply_slots::ReplySlots::new(
+            1,
+            "127.0.0.1:40573".parse().expect("test address"),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let jobs = Arc::new(tokio::sync::Semaphore::new(2));
+        let bytes = Arc::new(tokio::sync::Semaphore::new(32));
+        let discarded = slots
+            .try_reserve(
+                1,
+                16,
+                Arc::new(ReplyPayload::from_static(b"cancelled")),
+                jobs.clone().try_acquire_owned().expect("job permit"),
+                bytes
+                    .clone()
+                    .try_acquire_many_owned(16)
+                    .expect("byte permit"),
+            )
+            .expect("discarded reservation");
+        discarded.discard();
+        let after_discard = slots.stats_snapshot();
+        assert_eq!(after_discard.discarded_reservations, 1);
+        assert_eq!(after_discard.normal_completions, 0);
+        assert_eq!(
+            after_discard.terminal_completions, 0,
+            "discarded reservations did not deliver a terminal frame"
+        );
+
+        let committed = slots
+            .try_reserve(
+                2,
+                16,
+                Arc::new(ReplyPayload::from_static(b"cancelled")),
+                jobs.try_acquire_owned().expect("job permit"),
+                bytes.try_acquire_many_owned(16).expect("byte permit"),
+            )
+            .expect("committed reservation");
+        committed
+            .publish(ReplyPayload::from_static(b"reply"))
+            .expect("normal publication");
+        committed.note_normal_outcome();
+        committed.cancel();
+        let after_late_cancel = slots.stats_snapshot();
+        assert_eq!(
+            after_late_cancel.too_late_cancellations, 1,
+            "cancellation after writer outcome commit must be classified as too late"
+        );
     }
 
     #[tokio::test]

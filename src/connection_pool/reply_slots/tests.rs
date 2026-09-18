@@ -158,9 +158,7 @@ async fn close_before_publish_is_rejected_without_fresh_responder() {
 }
 
 #[test]
-fn publication_close_race_linearizes_to_single_outcome() {
-    use std::sync::Barrier;
-
+fn close_before_publication_is_rejected_at_the_close_linearization_point() {
     let slots = crate::connection_pool::reply_slots::ReplySlots::new(
         1,
         "127.0.0.1:40569".parse().expect("test address"),
@@ -177,27 +175,13 @@ fn publication_close_race_linearizes_to_single_outcome() {
             bytes.try_acquire_many_owned(32).expect("byte permit"),
         )
         .expect("reserve");
-    let start = Arc::new(Barrier::new(2));
-    let publish_record = Arc::clone(&record);
-    let publish_start = Arc::clone(&start);
-    let close_slots = Arc::clone(&slots);
-    let publish = std::thread::scope(|scope| {
-        let publisher = scope.spawn(move || {
-            publish_start.wait();
-            publish_record.publish(ReplyPayload::from_static(b"reply"))
-        });
-        let closer = scope.spawn(move || {
-            start.wait();
-            close_slots.close_and_reclaim();
-        });
-        let result = publisher.join().expect("publisher thread");
-        closer.join().expect("closer thread");
-        result
-    });
-    assert!(
-        publish.is_ok() || matches!(publish, Err(crate::GossipError::ConnectionClosed(_))),
-        "publication must linearize before close or be rejected by close: {publish:?}"
-    );
+
+    slots.close_and_reclaim();
+    let publish = record.publish(ReplyPayload::from_static(b"reply"));
+    assert!(matches!(
+        publish,
+        Err(crate::GossipError::ConnectionClosed(_))
+    ));
     assert_eq!(slots.reserved(), 0);
 }
 
@@ -223,7 +207,7 @@ fn publication_close_race_has_no_second_publication() {
     let publish = record.publish(ReplyPayload::from_static(b"reply"));
     slots.close_and_reclaim();
     let late_publish = record.publish(ReplyPayload::from_static(b"again"));
-    assert!(publish.is_ok() || matches!(publish, Err(crate::GossipError::ConnectionClosed(_))));
+    assert!(publish.is_ok(), "publication precedes the explicit close");
     assert!(matches!(
         late_publish,
         Err(crate::GossipError::ConnectionClosed(_)) | Err(crate::GossipError::Network(_))

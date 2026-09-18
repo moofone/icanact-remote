@@ -2,6 +2,15 @@
 /// read side. Ordinary tell/ask commands never use this slice machinery.
 const STREAM_WRITE_SLICE_BYTES: usize = 64 * 1024;
 
+/// Every resumable source is admitted through one of the bounded owners below:
+/// reply slots cap leased responses and the local response queue caps queued
+/// response commands. Shared queue commands do not yield at frame boundaries.
+/// The sum is therefore the maximum number of commands that can be retained
+/// in the resumed rotation; a yielded command must never fall back to
+/// `pending_stream_cmd`, whose fast path would bypass rotation.
+const RESUMABLE_STREAM_COMMAND_CAP: usize =
+    crate::connection_pool::reply_slots::REPLY_SLOT_CAP + STREAMING_RESPONSE_QUEUE_COMMAND_CAP;
+
 #[cfg(test)]
 mod qa_queue_retention_review {
     use super::*;
@@ -2347,15 +2356,13 @@ fn finish_streaming_command_slice_owned(
             streaming_queue.notify_space();
         }
     } else if pending.yield_after_frame && !pending.from_shared_queue {
-        // A yielded command retains its payload and progress state. Keep the
-        // resumable set bounded by the connection's lease-slot budget; when
-        // full, park this one command as the current pending item instead of
-        // growing an unbounded side queue.
-        if yielded_slot.len() < crate::connection_pool::reply_slots::REPLY_SLOT_CAP {
-            yielded_slot.push_back(pending);
-        } else {
-            *pending_slot = Some(pending);
-        }
+        // A yielded command retains its payload and progress state. The
+        // admission gates on reply slots and LocalStreamingQueue bound the
+        // number of such commands to RESUMABLE_STREAM_COMMAND_CAP. Never put
+        // a yielded command in pending_slot: the next loop treats that slot as
+        // an in-flight owner and would run every remaining frame without
+        // returning to source rotation.
+        yielded_slot.push_back(pending);
     } else {
         *pending_slot = Some(pending);
     }
@@ -3082,12 +3089,11 @@ impl LockFreeStreamHandle {
         // being forced ahead of shared streaming work. Keeping the pending
         // command out of `LocalStreamingQueue` preserves its in-flight byte
         // accounting while allowing the source scheduler to alternate.
-        // Bounded by REPLY_SLOT_CAP: every queued item is an owned lease
-        // progress record, so no suspended delivery can overwrite another.
+        // Bounded by RESUMABLE_STREAM_COMMAND_CAP: every queued item belongs
+        // to either the fixed reply-slot set or the bounded local response
+        // command set. Shared producer commands never enter this queue.
         let mut yielded_stream_cmd: std::collections::VecDeque<PendingStreamingCommand> =
-            std::collections::VecDeque::with_capacity(
-                crate::connection_pool::reply_slots::REPLY_SLOT_CAP,
-            );
+            std::collections::VecDeque::with_capacity(RESUMABLE_STREAM_COMMAND_CAP);
         // Rotate resumed commands, newly activated leases, local responses,
         // and producer-owned shared streams. The selected command remains
         // pending until its current frame completes, so rotation never splices

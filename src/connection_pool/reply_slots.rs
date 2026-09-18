@@ -167,7 +167,12 @@ impl ReplySlotRecord {
             self.stats
                 .cancellation_publications
                 .fetch_add(1, Ordering::Relaxed);
-            if self.state.load(Ordering::Acquire) != STATE_RESERVED {
+            if self.state.load(Ordering::Acquire) != STATE_RESERVED
+                || self.wire_outcome.load(Ordering::Acquire) != WIRE_OUTCOME_UNSET
+            {
+                // Once the writer has selected and committed a wire outcome,
+                // cancellation can no longer alter delivery, even though the
+                // record remains reserved until its terminal flush.
                 self.stats
                     .too_late_cancellations
                     .fetch_add(1, Ordering::Relaxed);
@@ -361,7 +366,29 @@ impl ReplySlotRecord {
         if let Some(slots) = self.slots.upgrade() {
             slots.discard(self.index, self.generation);
         } else {
-            self.complete();
+            self.complete_discarded();
+        }
+    }
+
+    fn complete_discarded(&self) {
+        if self
+            .state
+            .compare_exchange(
+                STATE_RESERVED,
+                STATE_COMPLETE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            #[cfg(any(test, feature = "test-helpers"))]
+            {
+                self.stats.live_slots.fetch_sub(1, Ordering::Relaxed);
+                self.stats
+                    .discarded_reservations
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            self.completion.notify_waiters();
         }
     }
 }
@@ -566,7 +593,7 @@ impl ReplySlots {
         };
         if record.generation == generation {
             let _ = self.table[index].compare_and_swap(&record, None);
-            record.complete();
+            record.complete_discarded();
         }
     }
 
