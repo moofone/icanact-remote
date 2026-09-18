@@ -2702,71 +2702,31 @@ struct PeerLivenessStatus {
     updated_at: Instant,
 }
 
-/// Upper bound for completed failure IDs that arrived above the contiguous
-/// watermark. IDs are process-global and never reused, so once the watermark
-/// passes an ID it can be rejected forever without retaining that ID.
-const COMPLETED_FAILURE_OUT_OF_ORDER_LIMIT: usize = 1024;
-
-#[derive(Default)]
-struct CompletedFailureInstanceState {
-    watermark: u64,
-    out_of_order: HashSet<u64>,
-}
-
 /// Exactly-once ownership for identified failure callbacks.
 ///
-/// Most callbacks arrive in instance-id order and collapse into `watermark`.
-/// Reconnect races can deliver a newer callback before an older one, so a
-/// bounded set retains those out-of-order IDs. When a newer ID is far enough
-/// ahead, the watermark advances and older IDs are permanently treated as
-/// completed; this is monotonic (not time-based) reclamation and therefore
-/// cannot re-admit a late duplicate.
+/// Instance IDs are globally allocated but callbacks can arrive out of order:
+/// a later connection may fail before an earlier callback is delivered. Keep
+/// the claimed IDs themselves rather than inferring completion from numeric
+/// order. A numeric watermark would classify an unseen sparse ID as already
+/// complete and silently lose its lifecycle cleanup.
 struct CompletedFailureInstances {
-    state: std::sync::Mutex<CompletedFailureInstanceState>,
+    claimed: std::sync::Mutex<HashSet<u64>>,
 }
 
 impl Default for CompletedFailureInstances {
     fn default() -> Self {
         Self {
-            state: std::sync::Mutex::new(CompletedFailureInstanceState::default()),
+            claimed: std::sync::Mutex::new(HashSet::new()),
         }
     }
 }
 
 impl CompletedFailureInstances {
     fn claim(&self, instance_id: u64) -> bool {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if instance_id <= state.watermark || !state.out_of_order.insert(instance_id) {
-            return false;
-        }
-
-        let cutoff = instance_id.saturating_sub(COMPLETED_FAILURE_OUT_OF_ORDER_LIMIT as u64);
-        if cutoff > state.watermark {
-            state.watermark = cutoff;
-            let watermark = state.watermark;
-            state.out_of_order.retain(|id| *id > watermark);
-        }
-        while state.watermark < u64::MAX {
-            let next = state.watermark + 1;
-            if state.out_of_order.remove(&next) {
-                state.watermark = next;
-            } else {
-                break;
-            }
-        }
-        true
-    }
-
-    #[cfg(test)]
-    fn retained_marker_count(&self) -> usize {
-        self.state
+        self.claimed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .out_of_order
-            .len()
+            .insert(instance_id)
     }
 }
 
@@ -11521,8 +11481,8 @@ impl<T: 'static> GossipRegistry<T> {
     /// marker. Stream instance ids are process-global and are never reused;
     /// the marker therefore makes discovery/authentication/accounting and the
     /// user callback exactly-once even when multiple exit/recovery paths race.
-    /// The marker store uses a monotonic watermark and a bounded set for
-    /// out-of-order IDs, so it cannot grow with registry lifetime.
+    /// Do not collapse IDs by numeric order: stream teardown callbacks are
+    /// allowed to arrive sparsely and out of order.
     fn claim_failure_lifecycle(&self, failed_instance_id: Option<u64>) -> bool {
         failed_instance_id
             .is_none_or(|instance_id| self.completed_failure_instances.claim(instance_id))
@@ -11539,6 +11499,12 @@ impl<T: 'static> GossipRegistry<T> {
         failed_instance_id: Option<u64>,
         delivery_epoch: u64,
     ) -> bool {
+        // Take the same generation lock used by session arming before making
+        // either part of the delivery decision. Publication may complete
+        // while this notifier is waiting for the lock; checking the pool only
+        // after acquiring it makes that replacement visible before the old
+        // epoch is accepted.
+        let gossip_state = self.gossip_state.lock().await;
         if let Some(peer_id) = peer_id {
             let current_instance_id = self
                 .connection_pool
@@ -11554,9 +11520,7 @@ impl<T: 'static> GossipRegistry<T> {
             }
         }
 
-        self.gossip_state
-            .lock()
-            .await
+        gossip_state
             .peers
             .get(&failed_peer_addr)
             .is_none_or(|peer_info| peer_info.current_session_epoch == delivery_epoch)
@@ -13777,6 +13741,7 @@ impl<T: 'static> GossipRegistry<T> {
                 if let Some(peer_info) = gossip_state.known_peers.get_mut(&addr) {
                     peer_info.failures = 0;
                     peer_info.last_failure_time = None;
+                    peer_info.last_failure_instant = None;
                     peer_info.last_success = now;
                     if let Some(node_id) = peer_info.node_id {
                         let _ = self.peer_capability_addr_to_node.upsert_sync(addr, node_id);
@@ -14351,32 +14316,119 @@ mod tests {
     }
 
     #[test]
-    fn completed_failure_markers_are_bounded_and_exactly_once() {
+    fn completed_failure_markers_deduplicate_sparse_ids_without_watermarking_gaps() {
         let markers = CompletedFailureInstances::default();
-        assert!(markers.claim(1));
+        assert!(markers.claim(10));
+        assert!(markers.claim(1), "a lower, unseen instance must still run");
+        assert!(markers.claim(1_000_000));
         assert!(
-            !markers.claim(1),
+            markers.claim(2),
+            "a sparse lower ID must not be inferred complete"
+        );
+        assert!(
+            !markers.claim(10),
             "a repeated callback must be deduplicated"
         );
+        assert!(!markers.claim(1_000_000));
+    }
 
-        // Leave one gap so this exercises the bounded out-of-order set rather
-        // than only the fast contiguous-watermark path.
-        for instance_id in 3..=(COMPLETED_FAILURE_OUT_OF_ORDER_LIMIT as u64 + 3) {
-            assert!(markers.claim(instance_id));
+    #[tokio::test]
+    async fn disconnect_notification_rechecks_replacement_after_lock_wait() {
+        let registry = GossipRegistry::<()>::new(test_addr(18_081), test_config());
+        let peer_id = test_peer_id("disconnect-fence-peer");
+        let peer_addr = test_addr(9_081);
+        registry
+            .add_peer_with_node_id(
+                peer_addr,
+                Some(peer_id.to_node_id()),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+        let old = publish_connected_instance(&registry, &peer_id, peer_addr).await;
+        let old_instance = old
+            .stream_handle
+            .as_ref()
+            .expect("test stream handle")
+            .instance_id();
+        registry
+            .arm_sequence_reset_for_new_session(
+                peer_addr,
+                peer_id.to_node_id(),
+                peer_addr,
+                &peer_id,
+                &old,
+            )
+            .await;
+        let delivery_epoch = registry
+            .gossip_state
+            .lock()
+            .await
+            .peers
+            .get(&peer_addr)
+            .expect("peer state")
+            .current_session_epoch;
+
+        // Hold the generation lock so the notifier is definitely waiting.
+        let state_guard = registry.gossip_state.lock().await;
+        let notifier_registry = registry.clone();
+        let notifier_peer = peer_id.clone();
+        let notifier = tokio::spawn(async move {
+            notifier_registry
+                .disconnect_notification_is_current(
+                    peer_addr,
+                    Some(&notifier_peer),
+                    Some(old_instance),
+                    delivery_epoch,
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        let replacement = publish_connected_instance(&registry, &peer_id, peer_addr).await;
+        drop(state_guard);
+
+        assert!(
+            !notifier.await.expect("notifier task must not panic"),
+            "a replacement published while delivery waits must fence the old epoch"
+        );
+        replacement.abort_tasks();
+        old.abort_tasks();
+    }
+
+    #[tokio::test]
+    async fn mark_peer_connected_clears_known_peer_failure_instant() {
+        let registry = GossipRegistry::<()>::new(test_addr(18_082), test_config());
+        let peer_id = test_peer_id("mark-connected-parity-peer");
+        let peer_addr = test_addr(9_082);
+        registry
+            .add_peer_with_node_id(
+                peer_addr,
+                Some(peer_id.to_node_id()),
+                crate::addr_ownership::ClaimKind::Verified,
+            )
+            .await;
+        let connection = publish_connected_instance(&registry, &peer_id, peer_addr).await;
+        {
+            let mut state = registry.gossip_state.lock().await;
+            let mut known = state
+                .peers
+                .get(&peer_addr)
+                .cloned()
+                .expect("active peer state");
+            known.failures = registry.config.max_peer_failures;
+            known.last_failure_time = Some(current_timestamp());
+            known.last_failure_instant = Some(Instant::now());
+            state.known_peers.put(peer_addr, known);
         }
-        assert!(
-            markers.retained_marker_count() <= COMPLETED_FAILURE_OUT_OF_ORDER_LIMIT,
-            "out-of-order completion markers must remain bounded"
-        );
-        assert!(!markers.claim(1), "reclaimed IDs must not be re-admitted");
-        assert!(
-            !markers.claim(2),
-            "watermark-covered IDs must stay deduplicated"
-        );
-        assert!(
-            !markers.claim(COMPLETED_FAILURE_OUT_OF_ORDER_LIMIT as u64 + 3),
-            "a retained out-of-order marker must still deduplicate"
-        );
+
+        registry.mark_peer_connected(peer_addr).await;
+
+        let mut state = registry.gossip_state.lock().await;
+        let known = state.known_peers.get(&peer_addr).expect("known peer state");
+        assert_eq!(known.failures, 0);
+        assert!(known.last_failure_time.is_none());
+        assert!(known.last_failure_instant.is_none());
+        drop(state);
+        connection.abort_tasks();
     }
 
     #[test]

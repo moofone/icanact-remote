@@ -207,6 +207,34 @@ async fn publication_close_public_publisher_first_notifies_once() {
     let _ = writer_task.await;
 }
 
+#[tokio::test]
+async fn completion_before_first_wait_poll_is_observed() {
+    let slots = crate::connection_pool::reply_slots::ReplySlots::new(
+        1,
+        "127.0.0.1:40567".parse().expect("test address"),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let jobs = Arc::new(Semaphore::new(1));
+    let bytes = Arc::new(Semaphore::new(32));
+    let record = slots
+        .try_reserve(
+            1,
+            32,
+            Arc::new(ReplyPayload::from_static(b"cancelled")),
+            jobs.try_acquire_owned().expect("job permit"),
+            bytes.try_acquire_many_owned(32).expect("byte permit"),
+        )
+        .expect("reserve");
+
+    // The writer can finish a record before its consumer gets scheduled for
+    // the first time. The wait must observe that completion without parking.
+    record.complete();
+    tokio::time::timeout(std::time::Duration::from_secs(1), record.wait_complete())
+        .await
+        .expect("completed reply slot must not wait forever")
+        .expect("normal completion");
+}
+
 #[test]
 fn close_before_publication_is_rejected_at_the_close_linearization_point() {
     let slots = crate::connection_pool::reply_slots::ReplySlots::new(

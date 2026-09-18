@@ -250,6 +250,11 @@ impl ReplySlotRecord {
     pub(crate) async fn wait_complete(&self) -> crate::Result<()> {
         loop {
             let notified = self.completion.notified();
+            tokio::pin!(notified);
+            // Register this waiter before observing state. `complete()` may
+            // publish between the observation and the first await; enabling
+            // the pinned future closes that complete-before-first-poll gap.
+            notified.as_mut().enable();
             match self.state.load(Ordering::Acquire) {
                 STATE_COMPLETE => return Ok(()),
                 STATE_COMPLETION_CLOSED => {
