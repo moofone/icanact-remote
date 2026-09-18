@@ -130,16 +130,48 @@ impl<'a> TellContext<'a> {
     }
 }
 
+/// A borrowed view of the first reply claimed for one deferred ask.
+///
+/// The view is valid only for the duration of [`AskReplyObserver::reply_claimed`].
+/// It can describe a typed reply as two segments: an optional type-hash prefix
+/// and the pooled payload body. Observers that need retention must reserve
+/// their own bounded storage and copy while the callback is running.
+pub struct ReplyPayloadRef<'a> {
+    prefix: Option<&'a [u8]>,
+    payload: &'a [u8],
+    len: usize,
+}
+
+impl<'a> ReplyPayloadRef<'a> {
+    pub(crate) fn new(prefix: Option<&'a [u8]>, payload: &'a [u8], len: usize) -> Self {
+        Self {
+            prefix,
+            payload,
+            len,
+        }
+    }
+
+    pub fn prefix(&self) -> Option<&'a [u8]> {
+        self.prefix
+    }
+
+    pub fn payload(&self) -> &'a [u8] {
+        self.payload
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+}
+
 /// Observes the first reply claimed for one deferred ask.
 ///
 /// The observer is called at most once for a context, after the responder's
-/// shared single-use claim succeeds and before transport enqueue. It receives
-/// an owned, exact-sized copy of the wire payload so an observer may retain it
-/// without keeping a larger decode or pool allocation alive. The callback must
-/// remain nonblocking: it runs on the responder's reply path, including the
-/// synchronous `try_reply_*` paths.
+/// shared single-use claim succeeds and before transport enqueue. The callback
+/// must remain nonblocking: it runs on the responder's reply path, including
+/// the synchronous `try_reply_*` paths.
 pub trait AskReplyObserver: Send + Sync {
-    fn reply_claimed(&self, payload: Bytes);
+    fn reply_claimed(&self, payload: ReplyPayloadRef<'_>);
 }
 
 #[derive(Clone)]
@@ -639,8 +671,12 @@ impl AskResponder {
         let payload = crate::typed::encode_typed_pooled(value)?;
         let (payload, prefix, payload_len) = crate::typed::typed_payload_parts::<M>(payload);
         if self.reply_observer.is_some() && payload_len <= crate::MAX_STREAM_SIZE {
+            self.notify_observer_parts(
+                prefix.as_ref().map(|prefix| prefix.as_slice()),
+                payload.chunk(),
+                payload_len,
+            );
             let bytes = pooled_payload_into_bytes(prefix, payload);
-            self.notify_observer(&bytes);
             return self
                 .sink
                 .send_response_bytes(self.correlation_id, bytes)
@@ -653,11 +689,16 @@ impl AskResponder {
 
     #[inline]
     fn notify_observer(&mut self, response: &Bytes) {
-        if response.len() <= crate::MAX_STREAM_SIZE
+        self.notify_observer_parts(None, response.as_ref(), response.len());
+    }
+
+    #[inline]
+    fn notify_observer_parts(&mut self, prefix: Option<&[u8]>, payload: &[u8], len: usize) {
+        if len <= crate::MAX_STREAM_SIZE
             && !self.observer_notified
             && let Some(observer) = &self.reply_observer
         {
-            observer.reply_claimed(Bytes::copy_from_slice(response.as_ref()));
+            observer.reply_claimed(ReplyPayloadRef::new(prefix, payload, len));
             self.observer_notified = true;
         }
     }
@@ -765,11 +806,16 @@ mod tests {
     }
 
     impl AskReplyObserver for RecordingReplyObserver {
-        fn reply_claimed(&self, payload: Bytes) {
+        fn reply_claimed(&self, payload: ReplyPayloadRef<'_>) {
+            let mut owned = Vec::with_capacity(payload.len());
+            if let Some(prefix) = payload.prefix() {
+                owned.extend_from_slice(prefix);
+            }
+            owned.extend_from_slice(payload.payload());
             self.payloads
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(payload);
+                .push(Bytes::from(owned));
         }
     }
 

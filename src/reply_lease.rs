@@ -262,7 +262,11 @@ impl ReplyLease {
             return;
         }
         if let Some(observer) = &self.reply_observer {
-            observer.reply_claimed(Bytes::copy_from_slice(payload.as_ref()));
+            observer.reply_claimed(crate::ReplyPayloadRef::new(
+                None,
+                payload.as_ref(),
+                payload.len(),
+            ));
             self.observer_notified = true;
         }
     }

@@ -2023,7 +2023,7 @@ async fn lease_preserves_reply_observer_ownership_once() {
 
     struct Observer(AtomicUsize);
     impl crate::AskReplyObserver for Observer {
-        fn reply_claimed(&self, _payload: bytes::Bytes) {
+        fn reply_claimed(&self, _payload: crate::ReplyPayloadRef<'_>) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
     }

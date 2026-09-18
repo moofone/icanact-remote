@@ -62,7 +62,8 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 pub use aligned::{AlignedBytes, AlignedBytesPool, PAYLOAD_ALIGNMENT, PooledAlignedBuffer};
 pub use ask_forwarder::{AskForwardObserver, AskForwarder};
 pub use ask_responder::{
-    AskContext, AskReplyObserver, AskResponder, ImmediateReplyFallback, TellContext, TryReplyError,
+    AskContext, AskReplyObserver, AskResponder, ImmediateReplyFallback, ReplyPayloadRef,
+    TellContext, TryReplyError,
 };
 pub use config::{ConnectionRecoveryPolicy, GossipConfig};
 pub use dns::{DnsResolver, TokioDnsResolver};
