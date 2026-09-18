@@ -385,6 +385,11 @@ async fn ordered_lifecycle_evidence_proves_publication_and_stale_teardown_fencin
     .await;
     let stale_failure_sequence = event_sequence(&stale_failure_mark).unwrap();
     assert!(stale_failure_sequence > replacement_publication_sequence);
+    assert_eq!(
+        peer_failures(&node_a, addr_b).await,
+        0,
+        "a stale teardown must not poison the replacement's live-peer accounting"
+    );
 
     assert!(
         common::wait_for_condition(EVIDENCE_TIMEOUT, || async {
