@@ -745,6 +745,18 @@ impl<T> ConnectionPool<T> {
                             // dead, with nothing left to clear it again
                             // later. Same guard the inbound accept path's
                             // equivalent re-mark uses.
+                            #[cfg(feature = "test-helpers")]
+                            if let Some(peer) = registry_arc.connection_pool.get_peer_id_by_addr(&addr) {
+                                crate::lifecycle::record_test_helper_event(|sequence| {
+                                    crate::lifecycle::TransportTestHelperEvent::PreRemark {
+                                        peer,
+                                        addr,
+                                        instance_id: connection_instance_id,
+                                        direction: crate::lifecycle::TransportDirection::Outbound,
+                                        sequence,
+                                    }
+                                });
+                            }
                             registry_arc.mark_peer_connected_if_live(addr).await;
                             info!(
                                 target: "icanact_remote_lifecycle",

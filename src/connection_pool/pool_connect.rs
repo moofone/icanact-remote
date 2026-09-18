@@ -1293,6 +1293,18 @@ impl<T> ConnectionPool<T> {
             })
             .unwrap_or(false);
         if still_current {
+            #[cfg(feature = "test-helpers")]
+            if let Some(instance_id) = instance_id {
+                crate::lifecycle::record_test_helper_event(|sequence| {
+                    crate::lifecycle::TransportTestHelperEvent::PublicationCommitted {
+                        peer: peer_id.clone(),
+                        addr: peer_state_addr,
+                        instance_id,
+                        direction: crate::lifecycle::TransportDirection::Inbound,
+                        sequence,
+                    }
+                });
+            }
             return true;
         }
 
@@ -4064,6 +4076,18 @@ impl<T> ConnectionPool<T> {
         // connection that the teardown paths later decremented, underflowing
         // `connection_counter`.
         self.count_in_new_instance(stream_handle.instance_id());
+        #[cfg(feature = "test-helpers")]
+        if let Some(peer_id) = peer_id_opt.as_ref() {
+            crate::lifecycle::record_test_helper_event(|sequence| {
+                crate::lifecycle::TransportTestHelperEvent::PublicationCommitted {
+                    peer: peer_id.clone(),
+                    addr,
+                    instance_id: stream_handle.instance_id(),
+                    direction: crate::lifecycle::TransportDirection::Outbound,
+                    sequence,
+                }
+            });
+        }
         debug!(
             "CONNECTION POOL: Added connection via get_connection to {} - pool now has {} connections",
             addr,

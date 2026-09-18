@@ -1,12 +1,60 @@
-use icanact_remote::{GossipConfig, GossipRegistryHandle, KeyPair, SecretKey};
+use icanact_remote::{
+    GossipConfig, GossipRegistryHandle, KeyPair, PeerId, SecretKey, TransportLifecycleEvent,
+};
+use std::fs::OpenOptions;
 use std::future::Future;
+use std::io::Write;
 use std::net::SocketAddr;
-use std::sync::Once;
+use std::sync::{Arc, Mutex, Once, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 pub type DynError = Box<dyn std::error::Error + Send + Sync>;
 pub type TlsHandle = GossipRegistryHandle<icanact_remote::BuilderTlsBootstrap>;
+
+const NATURAL_LIFECYCLE_EVIDENCE_PATH: &str =
+    "/tmp/icanact-qa-20260918/r1/committed-accounting-evidence.log";
+
+pub fn install_natural_lifecycle_recorder(
+    on_event: Arc<dyn Fn(&TransportLifecycleEvent) + Send + Sync + 'static>,
+) {
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<TransportLifecycleEvent>(4096);
+        let _ = std::thread::Builder::new()
+            .name("icanact-r1-lifecycle-log".into())
+            .spawn(move || {
+                let _ = std::fs::create_dir_all("/tmp/icanact-qa-20260918/r1");
+                let Ok(mut file) = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(NATURAL_LIFECYCLE_EVIDENCE_PATH)
+                else {
+                    return;
+                };
+                let command = std::env::args().collect::<Vec<_>>().join(" ");
+                let revision = std::process::Command::new("git")
+                    .args(["rev-parse", "HEAD"])
+                    .output()
+                    .ok()
+                    .and_then(|output| String::from_utf8(output.stdout).ok())
+                    .map(|value| value.trim().to_owned())
+                    .unwrap_or_else(|| "unknown".into());
+                let _ = writeln!(
+                    file,
+                    "capture_start command={command:?} features=test-helpers/all-features revision={revision}"
+                );
+                while let Ok(event) = receiver.recv() {
+                    let _ = writeln!(file, "event={event:?}");
+                }
+            });
+        let recorder = Arc::new(move |event: TransportLifecycleEvent| {
+            on_event(&event);
+            let _ = sender.try_send(event);
+        });
+        icanact_remote::set_transport_lifecycle_recorder(Some(recorder));
+    });
+}
 
 static CRYPTO_INIT: Once = Once::new();
 
@@ -294,6 +342,77 @@ pub async fn create_udp_node(config: GossipConfig) -> Result<TlsHandle, DynError
     }
 }
 
+const CONNECTION_DIAGNOSTICS_PATH: &str = "/tmp/icanact-qa-20260918/r1/connection-diagnostics.log";
+
+static CONNECTION_DIAGNOSTICS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn connection_diagnostics_lock() -> &'static Mutex<()> {
+    CONNECTION_DIAGNOSTICS_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn connected_peer_snapshot(node: &TlsHandle, peer_id: &PeerId) -> String {
+    let connected = node.client().lookup_connected_peer(peer_id);
+    let connection = connected.and_then(|peer| peer.connection_ref());
+    let address = connection.as_ref().map(|conn| conn.addr);
+    let closed = connection.as_ref().map(|conn| conn.is_closed());
+    format!(
+        "connected={} connection_addr={address:?} closed={closed:?} instance_id={:?}",
+        connection.is_some(),
+        node.client().current_peer_connection_instance(peer_id),
+    )
+}
+
+/// Capture only public, read-only state after a connection setup failure.
+///
+/// This deliberately records no payloads or secrets and does not alter the
+/// setup timeout, retry behavior, or test scheduling. The single append is
+/// guarded because the target's default-parallel tests can fail concurrently.
+#[allow(dead_code)]
+pub async fn capture_connection_diagnostics(context: &str, a: &TlsHandle, b: &TlsHandle) {
+    let addr_a = a.registry.bind_addr;
+    let addr_b = b.registry.bind_addr;
+    let peer_id_a = a.registry.peer_id.clone();
+    let peer_id_b = b.registry.peer_id.clone();
+    let stats_a = a.stats().await;
+    let stats_b = b.stats().await;
+    let actors_a = a.snapshot_known_actors();
+    let actors_b = b.snapshot_known_actors();
+    let connection_a_to_b = connected_peer_snapshot(a, &peer_id_b);
+    let connection_b_to_a = connected_peer_snapshot(b, &peer_id_a);
+    let record = format!(
+        "=== connection-diagnostics context={context} captured_at_ms={} ===\n\
+         node_a peer_id={peer_id_a:?} bind_addr={addr_a} dial_addr={addr_b}\n\
+         node_a stats={stats_a:?} active_peers={} failed_peers={}\n\
+         node_a known_actors={actors_a:?}\n\
+         node_a peer_b={peer_id_b:?} {connection_a_to_b}\n\
+         node_b peer_id={peer_id_b:?} bind_addr={addr_b} dial_addr={addr_a}\n\
+         node_b stats={stats_b:?} active_peers={} failed_peers={}\n\
+         node_b known_actors={actors_b:?}\n\
+         node_b peer_a={peer_id_a:?} {connection_b_to_a}\n",
+        icanact_remote::current_timestamp_millis(),
+        stats_a.active_peers,
+        stats_a.failed_peers,
+        stats_b.active_peers,
+        stats_b.failed_peers,
+    );
+
+    let lock = connection_diagnostics_lock()
+        .lock()
+        .expect("connection diagnostics mutex poisoned");
+    let result = (|| -> std::io::Result<()> {
+        std::fs::create_dir_all("/tmp/icanact-qa-20260918/r1")?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(CONNECTION_DIAGNOSTICS_PATH)?;
+        file.write_all(record.as_bytes())
+    })();
+    drop(lock);
+    if let Err(error) = result {
+        eprintln!("failed to write {CONNECTION_DIAGNOSTICS_PATH}: {error}");
+    }
+}
+
 #[allow(dead_code)]
 pub async fn connect_bidirectional(a: &TlsHandle, b: &TlsHandle) -> Result<(), DynError> {
     let addr_a = a.registry.bind_addr;
@@ -317,6 +436,9 @@ pub async fn connect_bidirectional(a: &TlsHandle, b: &TlsHandle) -> Result<(), D
             && b.registry.get_stats().await.active_peers >= 1
     })
     .await;
+    if !connected {
+        capture_connection_diagnostics("common/connect_bidirectional", a, b).await;
+    }
     assert!(connected, "Peers failed to connect in bidirectional setup");
 
     Ok(())

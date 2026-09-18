@@ -6780,29 +6780,42 @@ impl<T: 'static> GossipRegistry<T> {
                 Ok(ConnectOutcome::resolved(conn_route))
             }
             Err(err) => {
-                // Insert-if-absent, not update-only: the first-ever failed
-                // connect to a brand-new required peer must still gain an
-                // entry, or its failure/backoff state silently never
-                // exists at all -- a caller-visible functional regression
-                // from the update-only `get_mut` this replaced. Keyed to
-                // the address this call actually ATTEMPTED
-                // (`attempted_route`, an `AttemptedRoute` -- the SAME
-                // resolution `get_connection_to_required_peer` used for
-                // the dial itself), never to a bare requested/hinted
-                // address a caller merely intended to reach.
-                if let Some(attempted) = attempted_route {
-                    let mut gossip_state = self.gossip_state.lock().await;
-                    let node_id = Some(peer_id.to_node_id());
-                    let peer_info =
-                        gossip_state
-                            .peers
-                            .entry(attempted.addr())
-                            .or_insert_with(|| {
-                                PeerInfo::for_failed_connect_attempt(attempted, node_id)
-                            });
-                    peer_info.failures = self.config.max_peer_failures;
-                    peer_info.last_failure_time = Some(current_timestamp());
-                    peer_info.last_failure_instant = Some(std::time::Instant::now());
+                // `ConnectionExists` is an identity/liveness outcome, not a
+                // failed dial. The same applies to a transient unusable
+                // writer/session result when a current session is present at
+                // mark time. Check the pure current-session slot while
+                // holding the accounting lock so a replacement published
+                // before the write is protected as well.
+                let is_connection_exists = matches!(&err, GossipError::ConnectionExists);
+                if !is_connection_exists {
+                    // Insert-if-absent, not update-only: the first-ever failed
+                    // connect to a brand-new required peer must still gain an
+                    // entry, or its failure/backoff state silently never
+                    // exists at all -- a caller-visible functional regression
+                    // from the update-only `get_mut` this replaced. Keyed to
+                    // the address this call actually ATTEMPTED
+                    // (`attempted_route`, an `AttemptedRoute` -- the SAME
+                    // resolution `get_connection_to_required_peer` used for
+                    // the dial itself), never to a bare requested/hinted
+                    // address a caller merely intended to reach.
+                    if let Some(attempted) = attempted_route {
+                        let mut gossip_state = self.gossip_state.lock().await;
+                        let current_session_exists = pool
+                            .peer_current_connection_snapshot(peer_id)
+                            .is_some();
+                        if !current_session_exists {
+                            let node_id = Some(peer_id.to_node_id());
+                            let peer_info = gossip_state
+                                .peers
+                                .entry(attempted.addr())
+                                .or_insert_with(|| {
+                                    PeerInfo::for_failed_connect_attempt(attempted, node_id)
+                                });
+                            peer_info.failures = self.config.max_peer_failures;
+                            peer_info.last_failure_time = Some(current_timestamp());
+                            peer_info.last_failure_instant = Some(std::time::Instant::now());
+                        }
+                    }
                 }
                 Err(err)
             }
@@ -11560,6 +11573,15 @@ impl<T: 'static> GossipRegistry<T> {
                         // performs a single atomic compare-and-clear against
                         // `current` and declines (a safe no-op) if a
                         // concurrent publish has already superseded it.
+                        #[cfg(feature = "test-helpers")]
+                        crate::lifecycle::record_test_helper_event(|sequence| {
+                            crate::lifecycle::TransportTestHelperEvent::TeardownAttempt {
+                                peer: peer_id.clone(),
+                                addr: current.addr,
+                                instance_id: failed_id,
+                                sequence,
+                            }
+                        });
                         crate::lifecycle::record_transport_event(
                             crate::lifecycle::TransportLifecycleEvent::SocketFailureMatchedInstanceTeardownAttempt {
                                 peer: peer_id.clone(),
@@ -11611,6 +11633,16 @@ impl<T: 'static> GossipRegistry<T> {
                             // accounting; a CAS loss must be structurally
                             // unable to reach it, not merely discouraged by a
                             // flag some later block remembers to check.
+                            #[cfg(feature = "test-helpers")]
+                            crate::lifecycle::record_test_helper_event(|sequence| {
+                                crate::lifecycle::TransportTestHelperEvent::MarkFailed {
+                                    peer: Some(peer_id.clone()),
+                                    addr: failed_peer_addr,
+                                    instance_id: Some(failed_id),
+                                    applied: false,
+                                    sequence,
+                                }
+                            });
                             return Ok(());
                         }
                         info!(
@@ -11754,29 +11786,67 @@ impl<T: 'static> GossipRegistry<T> {
             }
         }
 
-        // IMMEDIATELY mark peer as failed in our local state
+        // Record the accounting attempt before taking the state lock. The
+        // attempt is observational only; the applied/declined outcome below
+        // is captured while holding `gossip_state` and dispatched afterward.
+        #[cfg(feature = "test-helpers")]
+        {
+            let sequence = crate::lifecycle::next_test_helper_sequence();
+            crate::lifecycle::dispatch_test_helper_event(
+                crate::lifecycle::TransportTestHelperEvent::MarkFailedAttempt {
+                    peer: peer_id.clone(),
+                    addr: failed_peer_addr,
+                    instance_id: failed_instance_id,
+                    sequence,
+                },
+            );
+        }
         let mut crossed_threshold = false;
+        let mut applied = false;
         {
             let mut gossip_state = self.gossip_state.lock().await;
-            if let Some(peer_info) = gossip_state.peers.get_mut(&failed_peer_addr) {
-                let was_below = peer_info.failures < self.config.max_peer_failures;
-                peer_info.failures = self.config.max_peer_failures;
-                peer_info.last_failure_time = Some(current_time);
-                // Captured HERE, at the write, not hoisted before the
-                // `clear_discovery_state_if_no_live_connection(...).await`
-                // above -- see `apply_gossip_results`'s matching comment
-                // for why an instant captured before an intervening await
-                // can be stale relative to when this write actually runs.
-                peer_info.last_failure_instant = Some(std::time::Instant::now());
-                peer_info.last_attempt = current_time; // Update last_attempt so retry happens after interval
-                crossed_threshold = was_below;
-                info!(
-                    peer = %failed_peer_addr,
-                    retry_after_secs = self.config.peer_retry_interval.as_secs(),
-                    "marked peer as disconnected in local state, will retry after interval"
-                );
+            let current_instance_id = peer_id.as_ref().and_then(|peer_id| {
+                self.connection_pool
+                    .peer_current_connection_snapshot(peer_id)
+                    .and_then(|connection| {
+                        connection
+                            .stream_handle
+                            .as_ref()
+                            .map(|handle| handle.instance_id())
+                    })
+            });
+            let replacement_is_current = failed_instance_id
+                .zip(current_instance_id)
+                .is_some_and(|(failed, current)| failed != current);
+            if !replacement_is_current {
+                if let Some(peer_info) = gossip_state.peers.get_mut(&failed_peer_addr) {
+                    let was_below = peer_info.failures < self.config.max_peer_failures;
+                    peer_info.failures = self.config.max_peer_failures;
+                    peer_info.last_failure_time = Some(current_time);
+                    // Capture at the actual write, not before the intervening
+                    // teardown awaits.
+                    peer_info.last_failure_instant = Some(std::time::Instant::now());
+                    peer_info.last_attempt = current_time;
+                    crossed_threshold = was_below;
+                    applied = true;
+                    info!(
+                        peer = %failed_peer_addr,
+                        retry_after_secs = self.config.peer_retry_interval.as_secs(),
+                        "marked peer as disconnected in local state, will retry after interval"
+                    );
+                }
             }
         }
+        #[cfg(feature = "test-helpers")]
+        crate::lifecycle::dispatch_test_helper_event(
+            crate::lifecycle::TransportTestHelperEvent::MarkFailed {
+                peer: peer_id.clone(),
+                addr: failed_peer_addr,
+                instance_id: failed_instance_id,
+                applied,
+                sequence: crate::lifecycle::next_test_helper_sequence(),
+            },
+        );
 
         // NOTE: the tie-break reconnect cooldown (`note_tie_break_eviction`)
         // is deliberately *not* armed here. This handler fires for every
@@ -13332,17 +13402,61 @@ impl<T: 'static> GossipRegistry<T> {
     }
 
     async fn mark_peer_connected_inner(&self, addr: SocketAddr, require_live: bool) {
+        #[cfg(feature = "test-helpers")]
+        {
+            let peer = self.connection_pool.get_peer_id_by_addr(&addr);
+            let instance_id = peer.as_ref().and_then(|peer_id| {
+                self.connection_pool
+                    .peer_current_connection_snapshot(peer_id)
+                    .and_then(|connection| {
+                        connection
+                            .stream_handle
+                            .as_ref()
+                            .map(|handle| handle.instance_id())
+                    })
+            });
+            let sequence = crate::lifecycle::next_test_helper_sequence();
+            crate::lifecycle::dispatch_test_helper_event(
+                crate::lifecycle::TransportTestHelperEvent::MarkConnectedAttempt {
+                    peer,
+                    addr,
+                    instance_id,
+                    require_live,
+                    sequence,
+                },
+            );
+        }
         let now = current_timestamp();
-        let did_mark = {
+        #[cfg(feature = "test-helpers")]
+        let decision_event = {
             let mut gossip_state = self.gossip_state.lock().await;
 
+            let peer = self.connection_pool.get_peer_id_by_addr(&addr);
+            let instance_id = peer.as_ref().and_then(|peer_id| {
+                self.connection_pool
+                    .peer_current_connection_snapshot(peer_id)
+                    .and_then(|connection| {
+                        connection
+                            .stream_handle
+                            .as_ref()
+                            .map(|handle| handle.instance_id())
+                    })
+            });
             if require_live && !self.connection_pool.has_connection(&addr) {
                 debug!(
                     addr = %addr,
                     "declining to (re-)mark peer connected; no live pool connection exists \
                      for this address right now"
                 );
-                false
+                Some(
+                    crate::lifecycle::TransportTestHelperEvent::MarkConnectedDeclined {
+                        peer,
+                        addr,
+                        instance_id,
+                        require_live,
+                        sequence: crate::lifecycle::next_test_helper_sequence(),
+                    },
+                )
             } else {
                 // A fresh connection was established and verified by the
                 // caller (post-handshake / first framed message received).
@@ -13382,9 +13496,64 @@ impl<T: 'static> GossipRegistry<T> {
                 self.record_peer_discovery_connected(&mut gossip_state, addr);
 
                 debug!(addr = %addr, "marked peer as connected");
+                Some(crate::lifecycle::TransportTestHelperEvent::MarkConnected {
+                    peer,
+                    addr,
+                    instance_id,
+                    require_live,
+                    sequence: crate::lifecycle::next_test_helper_sequence(),
+                })
+            }
+        };
+        #[cfg(not(feature = "test-helpers"))]
+        let did_mark = {
+            let mut gossip_state = self.gossip_state.lock().await;
+
+            if require_live && !self.connection_pool.has_connection(&addr) {
+                debug!(
+                    addr = %addr,
+                    "declining to (re-)mark peer connected; no live pool connection exists \
+                     for this address right now"
+                );
+                false
+            } else {
+                if let Some(peer_info) = gossip_state.peers.get_mut(&addr) {
+                    peer_info.failures = 0;
+                    peer_info.last_failure_time = None;
+                    peer_info.last_failure_instant = None;
+                    peer_info.last_success = peer_info.last_success.max(now);
+                    peer_info.last_response_received_ms = peer_info
+                        .last_response_received_ms
+                        .max(crate::current_timestamp_millis());
+                }
+                if let Some(peer_info) = gossip_state.known_peers.get_mut(&addr) {
+                    peer_info.failures = 0;
+                    peer_info.last_failure_time = None;
+                    peer_info.last_success = now;
+                    if let Some(node_id) = peer_info.node_id {
+                        let _ = self.peer_capability_addr_to_node.upsert_sync(addr, node_id);
+                        let caps = self
+                            .peer_capabilities_by_node
+                            .read_sync(&node_id, |_, v| *v);
+                        if let Some(caps) = caps {
+                            let _ = self.peer_capabilities.upsert_sync(addr, caps);
+                        }
+                    }
+                }
+                self.record_peer_discovery_connected(&mut gossip_state, addr);
+                debug!(addr = %addr, "marked peer as connected");
                 true
             }
         };
+        #[cfg(feature = "test-helpers")]
+        let did_mark = matches!(
+            &decision_event,
+            Some(crate::lifecycle::TransportTestHelperEvent::MarkConnected { .. })
+        );
+        #[cfg(feature = "test-helpers")]
+        if let Some(event) = decision_event {
+            crate::lifecycle::dispatch_test_helper_event(event);
+        }
 
         if !did_mark {
             return;
@@ -18586,6 +18755,196 @@ mod tests {
             !gossip_state.peers.contains_key(&addr_a),
             "A must not gain gossip_state bookkeeping either -- it was reused, not dialed"
         );
+    }
+
+    /// A required-peer resolution can fail after finding the peer's current
+    /// session but before producing a usable writer handle. That is a live
+    /// session outcome, not evidence that the peer's dial failed: failure
+    /// accounting must leave the existing entry untouched.
+    #[tokio::test]
+    async fn connect_to_peer_live_session_outcome_does_not_poison_failure_accounting() {
+        use crate::connection_pool::{ConnectionDirection, ConnectionState, LockFreeConnection};
+
+        let registry = GossipRegistry::<()>::new(
+            test_addr(20_918),
+            test_config_with_seed("live-session-outcome-accounting"),
+        );
+        let peer_id = test_peer_id("live-session-outcome-accounting-peer");
+        let addr = test_addr(20_919);
+        assert!(
+            registry
+                .registry_owner
+                .set_ordinary_connect_route(peer_id.clone(), addr)
+                .await,
+            "test setup: the required route must be accepted"
+        );
+
+        let previous_failure_time = Some(current_timestamp().saturating_sub(30));
+        let previous_failure_instant = Some(std::time::Instant::now() - Duration::from_secs(30));
+        {
+            let mut state = registry.gossip_state.lock().await;
+            let mut peer_info = PeerInfo::for_failed_connect_attempt(
+                AttemptedRoute::new(addr),
+                Some(peer_id.to_node_id()),
+            );
+            peer_info.failures = 1;
+            peer_info.last_failure_time = previous_failure_time;
+            peer_info.last_failure_instant = previous_failure_instant;
+            state.peers.insert(addr, peer_info);
+        }
+
+        // Keep a current session indexed for the peer, but omit its writer
+        // handle. The required-peer resolver reports this as a connection
+        // outcome, not a genuine dial failure.
+        let mut connection = LockFreeConnection::new(addr, ConnectionDirection::Inbound);
+        connection.embedded_peer_id = Some(peer_id.clone());
+        connection.set_state(ConnectionState::Connected);
+        assert!(registry.connection_pool.add_connection_by_peer_id(
+            peer_id.clone(),
+            addr,
+            Arc::new(connection),
+        ));
+
+        let (attempted, result) = registry.connect_to_peer_with_outcome(&peer_id).await;
+        assert_eq!(attempted.map(|route| route.addr()), Some(addr));
+        assert!(result.is_err(), "the unusable current session must be reported");
+
+        let state = registry.gossip_state.lock().await;
+        let peer_info = state.peers.get(&addr).expect("peer entry must remain");
+        assert_eq!(peer_info.failures, 1, "live-session outcomes are not dial failures");
+        assert_eq!(peer_info.last_failure_time, previous_failure_time);
+        assert_eq!(peer_info.last_failure_instant, previous_failure_instant);
+    }
+
+    /// A rejected outbound candidate reports `ConnectionExists` after a
+    /// preferred rival wins the final compare-and-publish race. That is
+    /// successful peer identity/liveness, not dial failure accounting.
+    #[cfg(feature = "test-helpers")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn connect_to_peer_connection_exists_does_not_poison_failure_accounting() -> Result<()> {
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+
+        crate::tls::ensure_crypto_provider();
+        let first = KeyPair::new_for_testing("connection-exists-accounting-first");
+        let second = KeyPair::new_for_testing("connection-exists-accounting-second");
+        let (local_key_pair, remote_key_pair) = if first.peer_id().to_node_id()
+            > second.peer_id().to_node_id()
+        {
+            (first, second)
+        } else {
+            (second, first)
+        };
+        let remote_peer_id = remote_key_pair.peer_id();
+        let config = GossipConfig {
+            gossip_interval: Duration::from_secs(300),
+            cleanup_interval: Duration::from_secs(300),
+            peer_supervisor_interval: Duration::from_secs(300),
+            connection_timeout: Duration::from_secs(2),
+            response_timeout: Duration::from_secs(2),
+            ..Default::default()
+        };
+        let local = crate::GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:0".parse().expect("valid local bind address"),
+            local_key_pair.to_secret_key(),
+            Some(config.clone()),
+            crate::BuilderTlsBootstrap,
+        )
+        .await?;
+        let remote = crate::GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:0".parse().expect("valid remote bind address"),
+            remote_key_pair.to_secret_key(),
+            Some(config),
+            crate::BuilderTlsBootstrap,
+        )
+        .await?;
+        let remote_addr = remote.registry.bind_addr;
+        // Seed only the required route. `configure_peer` also registers the
+        // route with the configured-peer supervisor, which can race this
+        // focused finalizer test before its lifecycle hook is installed.
+        local
+            .registry
+            .connection_pool
+            .set_configured_peer_addr(&remote_peer_id, remote_addr);
+        {
+            let mut state = local.registry.gossip_state.lock().await;
+            state.peers.insert(
+                remote_addr,
+                PeerInfo::for_failed_connect_attempt(
+                    AttemptedRoute::new(remote_addr),
+                    Some(remote_peer_id.to_node_id()),
+                ),
+            );
+        }
+
+        // Publish a preferred inbound rival exactly in the outbound
+        // finalizer's compare-and-publish window. This is the same
+        // deterministic race shape as the connection-pool reject tests, but
+        // exercises the registry's required-peer accounting caller.
+        let rival_addr = test_addr(20_917);
+        let (rival_io, _rival_peer_io) = tokio::io::duplex(1024);
+        let (rival_stream, _rival_writer, _rival_reader) = LockFreeStreamHandle::new(
+            rival_io,
+            rival_addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut rival = LockFreeConnection::new(rival_addr, ConnectionDirection::Inbound);
+        rival.stream_handle = Some(Arc::new(rival_stream));
+        rival.embedded_peer_id = Some(remote_peer_id.clone());
+        rival.set_state(ConnectionState::Connected);
+        let rival = Arc::new(rival);
+        let hook_fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _recorder_guard = {
+            let pool = local.registry.connection_pool.clone();
+            let peer_id = remote_peer_id.clone();
+            let rival = rival.clone();
+            let hook_fired = hook_fired.clone();
+            crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
+                if let crate::TransportLifecycleEvent::OutboundFinalizePublishAttempt {
+                    peer: event_peer,
+                    ..
+                } = &event
+                    && *event_peer == peer_id
+                {
+                    hook_fired.store(true, std::sync::atomic::Ordering::Release);
+                    crate::set_transport_lifecycle_recorder(None);
+                    pool.publish_current_peer_connection(&peer_id, rival.clone());
+                }
+            }))
+        };
+
+        let (attempted, result) = local
+            .registry
+            .connect_to_peer_with_outcome(&remote_peer_id)
+            .await;
+        assert!(
+            hook_fired.load(std::sync::atomic::Ordering::Acquire),
+            "the outbound finalize hook must fire for this focused race"
+        );
+        assert_eq!(attempted.map(|route| route.addr()), Some(remote_addr));
+        assert!(
+            matches!(result, Err(GossipError::ConnectionExists)),
+            "the preferred rival must surface as ConnectionExists, got {result:?}"
+        );
+
+        let state = local.registry.gossip_state.lock().await;
+        let peer_info = state
+            .peers
+            .get(&remote_addr)
+            .expect("configure_peer must track the attempted route");
+        assert_eq!(peer_info.failures, 0);
+        assert!(peer_info.last_failure_time.is_none());
+        assert!(peer_info.last_failure_instant.is_none());
+        drop(state);
+
+        local.shutdown().await;
+        remote.shutdown().await;
+        Ok(())
     }
 
     /// P1 finding (review round against 6b056ae, `registry.rs:5417`): the
@@ -25721,6 +26080,10 @@ mod tests {
             peer_info.session_restart_confirmed,
             "the old teardown must not retract restart evidence already confirmed on the \
              replacement session"
+        );
+        assert_eq!(
+            peer_info.failures, 0,
+            "a stale teardown must not mark the replacement session's peer entry failed"
         );
     }
 
