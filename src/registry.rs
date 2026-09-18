@@ -2702,6 +2702,74 @@ struct PeerLivenessStatus {
     updated_at: Instant,
 }
 
+/// Upper bound for completed failure IDs that arrived above the contiguous
+/// watermark. IDs are process-global and never reused, so once the watermark
+/// passes an ID it can be rejected forever without retaining that ID.
+const COMPLETED_FAILURE_OUT_OF_ORDER_LIMIT: usize = 1024;
+
+#[derive(Default)]
+struct CompletedFailureInstanceState {
+    watermark: u64,
+    out_of_order: HashSet<u64>,
+}
+
+/// Exactly-once ownership for identified failure callbacks.
+///
+/// Most callbacks arrive in instance-id order and collapse into `watermark`.
+/// Reconnect races can deliver a newer callback before an older one, so a
+/// bounded set retains those out-of-order IDs. When a newer ID is far enough
+/// ahead, the watermark advances and older IDs are permanently treated as
+/// completed; this is monotonic (not time-based) reclamation and therefore
+/// cannot re-admit a late duplicate.
+struct CompletedFailureInstances {
+    state: std::sync::Mutex<CompletedFailureInstanceState>,
+}
+
+impl Default for CompletedFailureInstances {
+    fn default() -> Self {
+        Self {
+            state: std::sync::Mutex::new(CompletedFailureInstanceState::default()),
+        }
+    }
+}
+
+impl CompletedFailureInstances {
+    fn claim(&self, instance_id: u64) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if instance_id <= state.watermark || !state.out_of_order.insert(instance_id) {
+            return false;
+        }
+
+        let cutoff = instance_id.saturating_sub(COMPLETED_FAILURE_OUT_OF_ORDER_LIMIT as u64);
+        if cutoff > state.watermark {
+            state.watermark = cutoff;
+            let watermark = state.watermark;
+            state.out_of_order.retain(|id| *id > watermark);
+        }
+        while state.watermark < u64::MAX {
+            let next = state.watermark + 1;
+            if state.out_of_order.remove(&next) {
+                state.watermark = next;
+            } else {
+                break;
+            }
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn retained_marker_count(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .out_of_order
+            .len()
+    }
+}
+
 pub struct GossipRegistry<T = ()> {
     // Immutable config
     pub bind_addr: SocketAddr,
@@ -2782,7 +2850,7 @@ pub struct GossipRegistry<T = ()> {
     /// an ask-cancellation/recovery path may retire the pool entry before the
     /// IO exit callback runs. A process-global stream instance id makes this
     /// marker stable even after every pool index has forgotten the instance.
-    completed_failure_instances: Arc<SccHashMap<u64, ()>>,
+    completed_failure_instances: Arc<CompletedFailureInstances>,
 
     /// Tracks the currently-running peer discovery dial task (H-004).
     pub discovery_task: Arc<DiscoveryTaskTracker>,
@@ -3232,7 +3300,7 @@ impl<T: 'static> GossipRegistry<T> {
             peer_connect_handler: Arc::new(ArcSwapOption::empty()),
             peer_liveness_handler: Arc::new(ArcSwapOption::empty()),
             peer_liveness_status: Arc::new(SccHashMap::default()),
-            completed_failure_instances: Arc::new(SccHashMap::default()),
+            completed_failure_instances: Arc::new(CompletedFailureInstances::default()),
             discovery_task: Arc::new(DiscoveryTaskTracker::default()),
             peer_gossip_notify: Arc::new(Notify::new()),
             dns_resolver: Arc::new(tokio::sync::RwLock::new(Arc::new(
@@ -11453,12 +11521,11 @@ impl<T: 'static> GossipRegistry<T> {
     /// marker. Stream instance ids are process-global and are never reused;
     /// the marker therefore makes discovery/authentication/accounting and the
     /// user callback exactly-once even when multiple exit/recovery paths race.
+    /// The marker store uses a monotonic watermark and a bounded set for
+    /// out-of-order IDs, so it cannot grow with registry lifetime.
     fn claim_failure_lifecycle(&self, failed_instance_id: Option<u64>) -> bool {
-        failed_instance_id.is_none_or(|instance_id| {
-            self.completed_failure_instances
-                .insert_sync(instance_id, ())
-                .is_ok()
-        })
+        failed_instance_id
+            .is_none_or(|instance_id| self.completed_failure_instances.claim(instance_id))
     }
 
     /// Whether a queued peer-disconnect callback still describes the session
@@ -14281,6 +14348,35 @@ mod tests {
 
     fn test_config() -> GossipConfig {
         test_config_with_seed("registry_tests")
+    }
+
+    #[test]
+    fn completed_failure_markers_are_bounded_and_exactly_once() {
+        let markers = CompletedFailureInstances::default();
+        assert!(markers.claim(1));
+        assert!(
+            !markers.claim(1),
+            "a repeated callback must be deduplicated"
+        );
+
+        // Leave one gap so this exercises the bounded out-of-order set rather
+        // than only the fast contiguous-watermark path.
+        for instance_id in 3..=(COMPLETED_FAILURE_OUT_OF_ORDER_LIMIT as u64 + 3) {
+            assert!(markers.claim(instance_id));
+        }
+        assert!(
+            markers.retained_marker_count() <= COMPLETED_FAILURE_OUT_OF_ORDER_LIMIT,
+            "out-of-order completion markers must remain bounded"
+        );
+        assert!(!markers.claim(1), "reclaimed IDs must not be re-admitted");
+        assert!(
+            !markers.claim(2),
+            "watermark-covered IDs must stay deduplicated"
+        );
+        assert!(
+            !markers.claim(COMPLETED_FAILURE_OUT_OF_ORDER_LIMIT as u64 + 3),
+            "a retained out-of-order marker must still deduplicate"
+        );
     }
 
     #[test]

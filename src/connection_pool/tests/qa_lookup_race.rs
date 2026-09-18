@@ -130,3 +130,50 @@ async fn conditional_clear_does_not_remove_replacement_published_after_check() {
     fresh.abort_tasks();
     stale.abort_tasks();
 }
+
+/// A failed compare-and-clear must not report a removal: the replacement was
+/// already current when the stale instance attempted its cleanup.
+#[tokio::test]
+async fn conditional_clear_failed_cas_does_not_emit_session_removed() {
+    let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
+    let peer_id = crate::KeyPair::new_for_testing("qa-conditional-clear-failed-cas-peer")
+        .peer_id();
+    let stale_addr: SocketAddr = "127.0.0.1:60721".parse().unwrap();
+    let fresh_addr: SocketAddr = "127.0.0.1:60722".parse().unwrap();
+    let stale = make_live_connection(stale_addr, ConnectionDirection::Outbound).await;
+    let fresh = make_live_connection(fresh_addr, ConnectionDirection::Inbound).await;
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), stale_addr, stale.clone()));
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), fresh_addr, fresh.clone()));
+
+    let removals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed_removals = removals.clone();
+    let observed_peer_id = peer_id.clone();
+    let _guard = crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(
+        move |event| {
+            if let crate::TransportLifecycleEvent::SessionRemoved {
+                peer,
+                reason: crate::SessionRemovalReason::CurrentConnectionCleared,
+                ..
+            } = &event
+                && *peer == observed_peer_id
+            {
+                observed_removals.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        },
+    ));
+
+    pool.clear_current_peer_connection_if_matches(&peer_id, &stale);
+
+    assert_eq!(
+        removals.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a failed compare-and-clear must not report a committed removal"
+    );
+    let current = pool
+        .peer_current_connection_snapshot(&peer_id)
+        .expect("replacement must remain current");
+    assert!(Arc::ptr_eq(&current, &fresh));
+
+    fresh.abort_tasks();
+    stale.abort_tasks();
+}

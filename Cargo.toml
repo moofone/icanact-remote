@@ -93,3 +93,4 @@ harness = false
 [[bench]]
 name = "stream_lease"
 harness = false
+required-features = ["test-helpers"]

@@ -1699,24 +1699,20 @@ impl<T> ConnectionPool<T> {
     }
 
     /// Clear the peer's current-connection slot only if it still holds
-    /// `candidate`. The initial snapshot is retained for the lifecycle
-    /// instrumentation seam, but the actual mutation is a single atomic
-    /// compare-and-clear, so a replacement published after that snapshot is
-    /// never clobbered.
+    /// `candidate`. The compare-and-clear is the linearization point: lifecycle
+    /// removal is reported only after that atomic mutation succeeds.
     pub(crate) fn clear_current_peer_connection_if_matches(
         &self,
         peer_id: &crate::PeerId,
         candidate: &Arc<LockFreeConnection>,
     ) {
-        let observed_match = self
+        let cleared = self
             .peer_sessions
             .read_sync(peer_id, |_, session| {
-                session
-                    .current_connection()
-                    .is_some_and(|current| Arc::ptr_eq(&current, candidate))
+                session.compare_and_clear_current_connection(candidate)
             })
             .unwrap_or(false);
-        if !observed_match {
+        if !cleared {
             return;
         }
 
@@ -1747,19 +1743,10 @@ impl<T> ConnectionPool<T> {
                 reason: crate::lifecycle::SessionRemovalReason::CurrentConnectionCleared,
             },
         );
-
-        let cleared = self
-            .peer_sessions
-            .read_sync(peer_id, |_, session| {
-                session.compare_and_clear_current_connection(candidate)
-            })
-            .unwrap_or(false);
-        if cleared {
-            let _ = self
-                .connections_by_peer
-                .remove_if_sync(peer_id, |value| Arc::ptr_eq(value, candidate));
-            self.mark_routing_changed();
-        }
+        let _ = self
+            .connections_by_peer
+            .remove_if_sync(peer_id, |value| Arc::ptr_eq(value, candidate));
+        self.mark_routing_changed();
     }
 
     /// Atomic counterpart to [`Self::clear_current_peer_connection_if_matches`]:
