@@ -2777,6 +2777,12 @@ pub struct GossipRegistry<T = ()> {
     /// edge detection (handler + one-shot recovery log). Dynamic peer IDs age
     /// out after their liveness window so restart churn cannot retain them.
     peer_liveness_status: Arc<SccHashMap<crate::PeerId, PeerLivenessStatus>>,
+    /// Instance-scoped ownership for the registry half of a socket-failure
+    /// lifecycle. Pool retirement and registry cleanup are separate operations:
+    /// an ask-cancellation/recovery path may retire the pool entry before the
+    /// IO exit callback runs. A process-global stream instance id makes this
+    /// marker stable even after every pool index has forgotten the instance.
+    completed_failure_instances: Arc<SccHashMap<u64, ()>>,
 
     /// Tracks the currently-running peer discovery dial task (H-004).
     pub discovery_task: Arc<DiscoveryTaskTracker>,
@@ -2861,6 +2867,7 @@ impl<T> Clone for GossipRegistry<T> {
             peer_connect_handler: self.peer_connect_handler.clone(),
             peer_liveness_handler: self.peer_liveness_handler.clone(),
             peer_liveness_status: self.peer_liveness_status.clone(),
+            completed_failure_instances: self.completed_failure_instances.clone(),
             discovery_task: self.discovery_task.clone(),
             peer_gossip_notify: self.peer_gossip_notify.clone(),
             dns_resolver: self.dns_resolver.clone(),
@@ -3225,6 +3232,7 @@ impl<T: 'static> GossipRegistry<T> {
             peer_connect_handler: Arc::new(ArcSwapOption::empty()),
             peer_liveness_handler: Arc::new(ArcSwapOption::empty()),
             peer_liveness_status: Arc::new(SccHashMap::default()),
+            completed_failure_instances: Arc::new(SccHashMap::default()),
             discovery_task: Arc::new(DiscoveryTaskTracker::default()),
             peer_gossip_notify: Arc::new(Notify::new()),
             dns_resolver: Arc::new(tokio::sync::RwLock::new(Arc::new(
@@ -11439,6 +11447,54 @@ impl<T: 'static> GossipRegistry<T> {
         }
     }
 
+    /// Claim the registry half of an identified socket-failure lifecycle.
+    /// Pool teardown may have already removed every index for this instance,
+    /// so pool-retirement success cannot serve as the lifecycle's ownership
+    /// marker. Stream instance ids are process-global and are never reused;
+    /// the marker therefore makes discovery/authentication/accounting and the
+    /// user callback exactly-once even when multiple exit/recovery paths race.
+    fn claim_failure_lifecycle(&self, failed_instance_id: Option<u64>) -> bool {
+        failed_instance_id.is_none_or(|instance_id| {
+            self.completed_failure_instances
+                .insert_sync(instance_id, ())
+                .is_ok()
+        })
+    }
+
+    /// Whether a queued peer-disconnect callback still describes the session
+    /// whose failure completed accounting. This check intentionally happens
+    /// in the detached task immediately before invoking user code: a
+    /// replacement can publish and arm after failure accounting has finished.
+    async fn disconnect_notification_is_current(
+        &self,
+        failed_peer_addr: SocketAddr,
+        peer_id: Option<&crate::PeerId>,
+        failed_instance_id: Option<u64>,
+        delivery_epoch: u64,
+    ) -> bool {
+        if let Some(peer_id) = peer_id {
+            let current_instance_id = self
+                .connection_pool
+                .peer_current_connection_snapshot(peer_id)
+                .and_then(|connection| {
+                    connection
+                        .stream_handle
+                        .as_ref()
+                        .map(|handle| handle.instance_id())
+                });
+            if current_instance_id.is_some_and(|current| Some(current) != failed_instance_id) {
+                return false;
+            }
+        }
+
+        self.gossip_state
+            .lock()
+            .await
+            .peers
+            .get(&failed_peer_addr)
+            .is_none_or(|peer_info| peer_info.current_session_epoch == delivery_epoch)
+    }
+
     /// Handle peer connection failure - start consensus process
     /// This is called for socket disconnections (not timeouts)
     ///
@@ -11691,19 +11747,31 @@ impl<T: 'static> GossipRegistry<T> {
                     observed_peer_addr,
                     failed_id,
                 );
-                if retired.is_none() {
-                    // The identified instance was already displaced (or
-                    // retired by a racing teardown), so this callback is
-                    // stale and must not run peer-wide failure accounting.
+                if retired.is_none()
+                    && pool
+                        .peer_current_connection_snapshot(peer_id)
+                        .and_then(|connection| {
+                            connection
+                                .stream_handle
+                                .as_ref()
+                                .map(|handle| handle.instance_id())
+                        })
+                        .is_some_and(|current_id| current_id != failed_id)
+                {
+                    // A different current instance proves supersession. An
+                    // empty pool slot does NOT: another teardown path may
+                    // already have retired the failed instance before this
+                    // callback reached the registry lifecycle tail.
                     return Ok(());
                 }
                 // A lookup miss is not evidence of supersession: the IO
                 // exit path marks its own handle exited before spawning this
                 // callback, so `get_connection_by_peer_id` can clear the
-                // failed current session and return None. The identity-aware
-                // retirement above proves this callback did retire that
-                // exact instance; continue through the fenced discovery,
-                // authentication, accounting, and notification tail.
+                // failed current session and return None. Pool retirement
+                // and registry lifecycle completion are separate ownership
+                // decisions; continue through the fenced discovery,
+                // authentication, accounting, and notification tail even
+                // when `retired` is None.
                 instance_teardown_done = true;
             }
         }
@@ -11721,6 +11789,13 @@ impl<T: 'static> GossipRegistry<T> {
                 self.connection_pool
                     .release_displaced_connection_count(failed_id);
             }
+            return Ok(());
+        }
+
+        // Pool retirement is not registry-lifecycle completion. Claim the
+        // latter independently so a cancellation/recovery teardown followed
+        // by the IO exit callback still completes this peer exactly once.
+        if !self.claim_failure_lifecycle(failed_instance_id) {
             return Ok(());
         }
 
@@ -11835,6 +11910,7 @@ impl<T: 'static> GossipRegistry<T> {
         let mut crossed_threshold = false;
         let mut applied = false;
         let replacement_is_current;
+        let delivery_epoch;
         #[cfg(feature = "test-helpers")]
         let mark_failed_event;
         {
@@ -11870,6 +11946,11 @@ impl<T: 'static> GossipRegistry<T> {
                     );
                 }
             }
+            delivery_epoch = gossip_state
+                .peers
+                .get(&failed_peer_addr)
+                .map(|peer_info| peer_info.current_session_epoch)
+                .unwrap_or(0);
             #[cfg(feature = "test-helpers")]
             {
                 // Allocate this sequence while the accounting decision still
@@ -11897,14 +11978,27 @@ impl<T: 'static> GossipRegistry<T> {
                 // and keep the handler alive past shutdown_and_wait.
                 if !self.shutdown.load(Ordering::Acquire) {
                     let handler = cell.handler.clone();
-                    let peer_id = peer_id.clone();
+                    let callback_peer_id = peer_id.clone();
+                    let fence_peer_id = peer_id.clone();
+                    let registry = self.clone();
                     let shutdown = self.shutdown.clone();
                     tokio::spawn(async move {
                         if shutdown.load(Ordering::Acquire) {
                             return;
                         }
+                        if !registry
+                            .disconnect_notification_is_current(
+                                failed_peer_addr,
+                                fence_peer_id.as_ref(),
+                                failed_instance_id,
+                                delivery_epoch,
+                            )
+                            .await
+                        {
+                            return;
+                        }
                         handler
-                            .handle_peer_disconnect(failed_peer_addr, peer_id)
+                            .handle_peer_disconnect(failed_peer_addr, callback_peer_id)
                             .await;
                     });
                 }
@@ -12083,21 +12177,45 @@ impl<T: 'static> GossipRegistry<T> {
         // `pre_teardown_session_epoch`.
         self.invalidate_session_state_on_teardown(failed_peer_addr, pre_teardown_session_epoch)
             .await;
+        let delivery_epoch = self
+            .gossip_state
+            .lock()
+            .await
+            .peers
+            .get(&failed_peer_addr)
+            .map(|peer_info| peer_info.current_session_epoch)
+            .unwrap_or(0);
 
         if let Some(cell) = self.peer_disconnect_handler.load_full() {
             // Skip launching the notifier if we're already shutting
             // down — see the matching branch in
-            // `handle_peer_connection_failure`.
+            // `handle_peer_connection_failure`. The detached task also
+            // revalidates the current generation/instance immediately before
+            // entering user code, so a replacement committed after teardown
+            // cannot receive a stale peer-wide disconnect.
             if !self.shutdown.load(Ordering::Acquire) {
                 let handler = cell.handler.clone();
-                let peer_id = Some(failed_peer_id.clone());
+                let callback_peer_id = Some(failed_peer_id.clone());
+                let fence_peer_id = failed_peer_id.clone();
+                let registry = self.clone();
                 let shutdown = self.shutdown.clone();
                 tokio::spawn(async move {
                     if shutdown.load(Ordering::Acquire) {
                         return;
                     }
+                    if !registry
+                        .disconnect_notification_is_current(
+                            failed_peer_addr,
+                            Some(&fence_peer_id),
+                            None,
+                            delivery_epoch,
+                        )
+                        .await
+                    {
+                        return;
+                    }
                     handler
-                        .handle_peer_disconnect(failed_peer_addr, peer_id)
+                        .handle_peer_disconnect(failed_peer_addr, callback_peer_id)
                         .await;
                 });
             }

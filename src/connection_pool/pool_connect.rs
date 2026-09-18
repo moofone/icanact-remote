@@ -1698,66 +1698,67 @@ impl<T> ConnectionPool<T> {
         }
     }
 
-    /// Check-then-unconditional-clear: reads `current_connection`,
-    /// `ptr_eq`-compares it to `candidate`, and — ONLY afterward, past a log
-    /// line and a lifecycle-event construction, a real gap — unconditionally
-    /// clears the slot. A concurrent `publish_current_peer_connection`
-    /// landing in that gap (e.g. a fresh preferred inbound for this exact
-    /// peer) is silently clobbered.
-    ///
-    /// `get_connection_by_peer_id`'s own internal self-heal no longer uses
-    /// this (see [`Self::compare_and_clear_current_peer_connection`]) —
-    /// this remains in use only by callers that are themselves already
-    /// acting on a connection they just pulled out of an index as part of
-    /// tearing it down (`remove_connection`'s per-alias peer cleanup,
-    /// `GossipRegistry`'s DNS-refresh dead-connection cleanup), where the
-    /// `candidate` was obtained from the SAME removal/observation this call
-    /// is reacting to rather than from an earlier decision snapshot. Prefer
-    /// [`Self::compare_and_clear_current_peer_connection`] for any new
-    /// caller.
+    /// Clear the peer's current-connection slot only if it still holds
+    /// `candidate`. The initial snapshot is retained for the lifecycle
+    /// instrumentation seam, but the actual mutation is a single atomic
+    /// compare-and-clear, so a replacement published after that snapshot is
+    /// never clobbered.
     pub(crate) fn clear_current_peer_connection_if_matches(
         &self,
         peer_id: &crate::PeerId,
         candidate: &Arc<LockFreeConnection>,
     ) {
-        let should_clear = self
+        let observed_match = self
             .peer_sessions
             .read_sync(peer_id, |_, session| {
                 session
                     .current_connection()
-                    .map(|current| Arc::ptr_eq(&current, candidate))
-                    .unwrap_or(false)
+                    .is_some_and(|current| Arc::ptr_eq(&current, candidate))
             })
             .unwrap_or(false);
-        if should_clear {
-            let stream_instance_id = candidate
-                .stream_handle
-                .as_ref()
-                .map(|handle| handle.instance_id());
-            info!(
-                peer_id = %peer_id,
-                addr = %candidate.addr,
-                direction = ?candidate.direction,
-                stream_instance_id = ?stream_instance_id,
-                reason = "current_connection_cleared",
-                "transport_session_removed"
-            );
-            crate::lifecycle::record_transport_event(
-                crate::lifecycle::TransportLifecycleEvent::SessionRemoved {
-                    peer: peer_id.clone(),
-                    addr: candidate.addr,
-                    direction: match candidate.direction {
-                        ConnectionDirection::Inbound => {
-                            crate::lifecycle::TransportDirection::Inbound
-                        }
-                        ConnectionDirection::Outbound => {
-                            crate::lifecycle::TransportDirection::Outbound
-                        }
-                    },
-                    reason: crate::lifecycle::SessionRemovalReason::CurrentConnectionCleared,
+        if !observed_match {
+            return;
+        }
+
+        let stream_instance_id = candidate
+            .stream_handle
+            .as_ref()
+            .map(|handle| handle.instance_id());
+        info!(
+            peer_id = %peer_id,
+            addr = %candidate.addr,
+            direction = ?candidate.direction,
+            stream_instance_id = ?stream_instance_id,
+            reason = "current_connection_cleared",
+            "transport_session_removed"
+        );
+        crate::lifecycle::record_transport_event(
+            crate::lifecycle::TransportLifecycleEvent::SessionRemoved {
+                peer: peer_id.clone(),
+                addr: candidate.addr,
+                direction: match candidate.direction {
+                    ConnectionDirection::Inbound => {
+                        crate::lifecycle::TransportDirection::Inbound
+                    }
+                    ConnectionDirection::Outbound => {
+                        crate::lifecycle::TransportDirection::Outbound
+                    }
                 },
-            );
-            self.clear_current_peer_connection(peer_id);
+                reason: crate::lifecycle::SessionRemovalReason::CurrentConnectionCleared,
+            },
+        );
+
+        let cleared = self
+            .peer_sessions
+            .read_sync(peer_id, |_, session| {
+                session.compare_and_clear_current_connection(candidate)
+            })
+            .unwrap_or(false);
+        if cleared {
+            let _ = self
+                .connections_by_peer
+                .remove_if_sync(peer_id, |value| Arc::ptr_eq(value, candidate));
+            self.mark_routing_changed();
         }
     }
 

@@ -82,3 +82,51 @@ async fn fallback_capture_then_replacement_cannot_be_overwritten_on_resume() {
     replacement.abort_tasks();
     fallback.abort_tasks();
 }
+
+/// The conditional current-session cleanup must revalidate ownership at the
+/// clear itself. A replacement published after the first identity check must
+/// remain in both current-session indices.
+#[tokio::test]
+async fn conditional_clear_does_not_remove_replacement_published_after_check() {
+    let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
+    let peer_id = crate::KeyPair::new_for_testing("qa-conditional-clear-race-peer").peer_id();
+    let stale_addr: SocketAddr = "127.0.0.1:60711".parse().unwrap();
+    let fresh_addr: SocketAddr = "127.0.0.1:60712".parse().unwrap();
+    let stale = make_live_connection(stale_addr, ConnectionDirection::Outbound).await;
+    let fresh = make_live_connection(fresh_addr, ConnectionDirection::Inbound).await;
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), stale_addr, stale.clone()));
+
+    let _guard = {
+        let pool = pool.clone();
+        let peer_id = peer_id.clone();
+        let fresh = fresh.clone();
+        crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
+            if let crate::TransportLifecycleEvent::SessionRemoved {
+                peer,
+                reason: crate::SessionRemovalReason::CurrentConnectionCleared,
+                ..
+            } = &event
+                && *peer == peer_id
+            {
+                crate::set_transport_lifecycle_recorder(None);
+                pool.publish_current_peer_connection(&peer_id, fresh.clone());
+            }
+        }))
+    };
+
+    pool.clear_current_peer_connection_if_matches(&peer_id, &stale);
+
+    let current = pool
+        .peer_current_connection_snapshot(&peer_id)
+        .expect("replacement must remain current");
+    assert!(Arc::ptr_eq(&current, &fresh));
+    assert!(
+        pool.connections_by_peer
+            .read_sync(&peer_id, |_, value| Arc::ptr_eq(value, &fresh))
+            .unwrap_or(false),
+        "the peer mirror must remain on the replacement"
+    );
+
+    fresh.abort_tasks();
+    stale.abort_tasks();
+}

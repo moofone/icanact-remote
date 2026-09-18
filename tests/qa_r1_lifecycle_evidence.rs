@@ -417,7 +417,7 @@ async fn ordered_lifecycle_evidence_proves_publication_and_stale_teardown_fencin
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn successful_cas_tail_does_not_fence_replacement() -> Result<(), DynError> {
+async fn late_replacement_before_disconnect_callback_is_fenced() -> Result<(), DynError> {
     let config = GossipConfig {
         connection_timeout: EVIDENCE_TIMEOUT,
         response_timeout: EVIDENCE_TIMEOUT,
@@ -432,42 +432,41 @@ async fn successful_cas_tail_does_not_fence_replacement() -> Result<(), DynError
 
     let (event_sender, mut events) = unbounded_channel::<TransportTestHelperEvent>();
     let recorded = Arc::new(Mutex::new(Vec::<TransportTestHelperEvent>::new()));
-    let teardown_gate = Gate::new();
-    let teardown_entered = Arc::new(AtomicBool::new(false));
-    let teardown_once = Arc::new(AtomicBool::new(true));
-    let failure_started = Arc::new(AtomicBool::new(false));
+    let accounting_gate = Gate::new();
+    let accounting_entered = Arc::new(AtomicBool::new(false));
+    let accounting_once = Arc::new(AtomicBool::new(true));
     let recorder_events = Arc::clone(&recorded);
     let recorder_sender = event_sender.clone();
-    let recorder_gate = teardown_gate.clone();
-    let recorder_entered = Arc::clone(&teardown_entered);
-    let recorder_once = Arc::clone(&teardown_once);
-    let recorder_failure_started = Arc::clone(&failure_started);
+    let recorder_gate = accounting_gate.clone();
+    let recorder_entered = Arc::clone(&accounting_entered);
+    let recorder_once = Arc::clone(&accounting_once);
     let recorder_peer_b = peer_b.clone();
-    let _guard = TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
-        if let TransportLifecycleEvent::SocketFailurePoolTeardownComplete {
-            peer: Some(peer),
-            addr,
-        } = &event
-            && *peer == recorder_peer_b
-            && *addr == addr_b
-            && recorder_failure_started.load(Ordering::Acquire)
-            && recorder_once.swap(false, Ordering::AcqRel)
-        {
-            // CAS retirement has succeeded before this event. The old
-            // handler is now held before discovery/accounting, allowing a
-            // replacement to publish and commit its own connected mark.
-            recorder_entered.store(true, Ordering::Release);
-            recorder_gate.wait();
-        }
-    }));
+    let _guard = TransportLifecycleRecorderGuard::install(Arc::new(|_event| {}));
     _guard.install_test_helper_recorder(Arc::new(move |event| {
         recorder_events
             .lock()
             .expect("event log mutex poisoned")
             .push(event.clone());
         recorder_sender
-            .send(event)
+            .send(event.clone())
             .expect("lifecycle recorder channel closed");
+        if let TransportTestHelperEvent::MarkFailed {
+            peer: Some(peer),
+            addr,
+            applied: true,
+            ..
+        } = &event
+            && *peer == recorder_peer_b
+            && *addr == addr_b
+            && recorder_once.swap(false, Ordering::AcqRel)
+        {
+            // Failure accounting has committed, but notification delivery
+            // has not started. Hold this window while a replacement publishes
+            // and commits, then require delivery-time fencing to suppress the
+            // stale callback.
+            recorder_entered.store(true, Ordering::Release);
+            recorder_gate.wait();
+        }
     }));
 
     let disconnect_invocations = Arc::new(AtomicUsize::new(0));
@@ -500,7 +499,6 @@ async fn successful_cas_tail_does_not_fence_replacement() -> Result<(), DynError
         .client()
         .current_peer_connection_instance(&peer_b)
         .expect("initial current B instance");
-    failure_started.store(true, Ordering::Release);
     let failure_registry = node_a.registry.clone();
     let failure_task = tokio::spawn(async move {
         failure_registry
@@ -509,18 +507,19 @@ async fn successful_cas_tail_does_not_fence_replacement() -> Result<(), DynError
     });
     assert!(
         common::wait_for_condition(EVIDENCE_TIMEOUT, || async {
-            teardown_entered.load(Ordering::Acquire)
+            accounting_entered.load(Ordering::Acquire)
         })
         .await,
-        "successful-CAS teardown-complete gate did not open"
+        "applied-accounting delivery gate did not open"
     );
-    let _successful_cas_teardown = next_event(&mut events, |event| {
+    let old_failure = next_event(&mut events, |event| {
         matches!(
             event,
-            TransportTestHelperEvent::TeardownAttempt {
-                peer,
+            TransportTestHelperEvent::MarkFailed {
+                peer: Some(peer),
                 addr,
-                instance_id,
+                instance_id: Some(instance_id),
+                applied: true,
                 ..
             } if *peer == peer_b && *addr == addr_b && *instance_id == old_instance
         )
@@ -560,33 +559,21 @@ async fn successful_cas_tail_does_not_fence_replacement() -> Result<(), DynError
         }))
         .await;
 
-    teardown_gate.open();
+    accounting_gate.open();
     failure_task
         .await
-        .expect("stale failure task panicked")
-        .expect("stale failure task failed");
-    let old_failure = next_event(&mut events, |event| {
-        matches!(
-            event,
-            TransportTestHelperEvent::MarkFailed {
-                peer: Some(peer),
-                addr,
-                instance_id: Some(instance_id),
-                ..
-            } if *peer == peer_b && *addr == addr_b && *instance_id == old_instance
-        )
-    })
-    .await;
+        .expect("late-replacement failure task panicked")
+        .expect("late-replacement failure task failed");
     assert!(
-        event_sequence(&old_failure).unwrap() > event_sequence(&replacement_mark).unwrap(),
-        "old accounting decision must be observed after replacement commit"
+        event_sequence(&old_failure).unwrap() < event_sequence(&replacement_mark).unwrap(),
+        "replacement must commit after old failure accounting but before callback delivery"
     );
     assert!(
         matches!(
             old_failure,
-            TransportTestHelperEvent::MarkFailed { applied: false, .. }
+            TransportTestHelperEvent::MarkFailed { applied: true, .. }
         ),
-        "old successful-CAS cleanup must decline accounting after replacement commit"
+        "the original failure must account before the replacement races callback delivery"
     );
     assert_eq!(
         peer_failures(&node_a, addr_b).await,
@@ -597,12 +584,12 @@ async fn successful_cas_tail_does_not_fence_replacement() -> Result<(), DynError
     assert_eq!(
         disconnect_invocations.load(Ordering::SeqCst),
         0,
-        "stale successful-CAS cleanup must not notify the peer-disconnect handler"
+        "a replacement committed before callback execution must suppress the stale peer-disconnect handler"
     );
     assert_eq!(
         node_a.client().current_peer_connection_instance(&peer_b),
         Some(replacement_instance),
-        "replacement remains current after old cleanup release"
+        "replacement remains current after delivery-time fencing"
     );
 
     replacement_b.shutdown().await;
@@ -637,10 +624,29 @@ async fn genuine_eof_lookup_miss_runs_fenced_failure_lifecycle() -> Result<(), D
     let addr_b = node_b.registry.bind_addr;
     let peer_b = node_b.registry.peer_id.clone();
     let (event_sender, mut events) = unbounded_channel::<TransportTestHelperEvent>();
+    let retire_before_registry = Arc::new(AtomicBool::new(true));
     let _guard = TransportLifecycleRecorderGuard::install(Arc::new(|_event| {}));
     _guard.install_test_helper_recorder(Arc::new({
         let event_sender = event_sender.clone();
+        let retire_before_registry = retire_before_registry.clone();
+        let pool = node_a.registry.connection_pool.clone();
+        let peer_b = peer_b.clone();
         move |event| {
+            if let TransportTestHelperEvent::TeardownAttempt {
+                peer,
+                addr,
+                instance_id: _,
+                ..
+            } = &event
+                && *peer == peer_b
+                && *addr == addr_b
+                && retire_before_registry.swap(false, Ordering::AcqRel)
+            {
+                // Model ask cancellation/recovery retiring the pool instance
+                // before the IO-exit failure callback reaches registry
+                // lifecycle completion. No replacement is present.
+                assert!(pool.remove_connection(addr_b).is_some());
+            }
             event_sender
                 .send(event)
                 .expect("lifecycle recorder channel closed");
