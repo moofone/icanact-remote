@@ -808,6 +808,13 @@ async fn run_forward_worker(
     let mut rx_closed = false;
 
     loop {
+        // Register before checking `closed`: shutdown can race this loop
+        // between the check and select. Keeping this same enabled future for
+        // the select closes that registration gap for every worker.
+        let shutdown_notified = control.shutdown_wake.notified();
+        tokio::pin!(shutdown_notified);
+        shutdown_notified.as_mut().enable();
+
         if control.closed.load(Ordering::Acquire) && !rx_closed {
             // Admission is serialized with shutdown, so this final try_recv
             // sweep sees every task whose sender returned Ok(()). Only after
@@ -877,7 +884,7 @@ async fn run_forward_worker(
                 }
             }
             _ = sleep_until_deadline(earliest), if earliest.is_some() => {}
-            _ = control.shutdown_wake.notified() => {}
+            _ = &mut shutdown_notified => {}
         }
     }
 }
@@ -1072,7 +1079,10 @@ async fn deliver_result_reply(
 async fn deliver_forwarded_reply_outcome(responder: AskResponder, reply: Bytes) -> bool {
     match responder.reply_bytes_guaranteed(reply).await {
         Ok(()) => true,
-        Err(err) if is_duplicate_reply_claim(&err) => true,
+        // A duplicate claim only proves that a sibling owns the one-shot
+        // responder guard. It does not prove that sibling delivered its
+        // reply, so account this return path as undeliverable.
+        Err(err) if is_duplicate_reply_claim(&err) => false,
         Err(err) => {
             tracing::warn!(error = %err, "forwarded ask reply delivery failed");
             false

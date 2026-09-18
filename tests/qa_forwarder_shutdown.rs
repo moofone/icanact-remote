@@ -10,6 +10,8 @@ use icanact_remote::registry::{
 use icanact_remote::{
     AskContext, AskForwardObserver, AskForwarder, GossipConfig, RemoteConnection, Result,
 };
+#[cfg(feature = "test-helpers")]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -263,6 +265,19 @@ async fn shutdown_wakes_idle_worker_promptly() {
     assert!(result.is_ok());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_wakes_all_idle_workers_without_forced_timeout() {
+    let forwarder = AskForwarder::new(2, 128);
+    tokio::task::yield_now().await;
+    let result = tokio::time::timeout(
+        Duration::from_millis(200),
+        forwarder.shutdown(Duration::from_secs(5)),
+    )
+    .await
+    .expect("idle shutdown must not consume grace");
+    assert!(result.is_ok(), "both idle workers must observe shutdown");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn shutdown_abandons_inflight_and_repeated_observers_see_timeout() {
     let (caller, gateway) = pair().await;
@@ -452,6 +467,101 @@ async fn no_timeout_return_delivery_failure_is_accounted_as_error() {
     success_writer.shutdown();
     success_writer_task.await.expect("success writer must exit");
 
+    source.shutdown().await;
+    sink.shutdown().await;
+}
+
+#[cfg(feature = "test-helpers")]
+async fn duplicate_claim_accounting_case(
+    destination: RemoteConnection,
+    timeout: Option<Duration>,
+    writer_address: &str,
+) -> Arc<Counts> {
+    let observer = Arc::new(Counts::default());
+    let forwarder = AskForwarder::new_with_observer(1, 128, Some(observer.clone()));
+    let (io, _peer) = tokio::io::duplex(4096);
+    let (writer, writer_task, _reader_task) = LockFreeStreamHandle::new(
+        io,
+        writer_address.parse().expect("test address"),
+        ChannelId::TellAsk,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let writer = Arc::new(writer);
+    writer.shutdown();
+    writer_task.await.expect("failed writer must exit");
+
+    let used = Arc::new(AtomicBool::new(false));
+    let sibling = icanact_remote::AskResponder::from_stream_handle_for_test(
+        102,
+        writer.clone(),
+        used.clone(),
+    );
+    let responder = icanact_remote::AskResponder::from_stream_handle_for_test(102, writer, used);
+    let rejected = sibling.try_reply_bytes_with_fallback(Bytes::from_static(b"rejected-sibling"));
+    let _sibling_fallback = match rejected {
+        Err(icanact_remote::TryReplyError::Enqueue(fallback)) => fallback,
+        Ok(()) => panic!("the closed return path must reject the sibling enqueue"),
+        Err(icanact_remote::TryReplyError::ClaimUnavailable(error)) => {
+            panic!("the sibling must own the initial claim: {error:?}")
+        }
+    };
+
+    if let Some(timeout) = timeout {
+        forwarder
+            .try_forward_actor_ask_combined_timeout(
+                destination,
+                ACTOR,
+                TYPE,
+                Bytes::from_static(b"timed-duplicate-claim"),
+                timeout,
+                responder,
+                Bytes::from_static(b"f5-timeout"),
+                Bytes::from_static(b"f5-error"),
+            )
+            .expect("timed duplicate-claim task must be admitted");
+    } else {
+        forwarder
+            .try_forward_actor_ask_no_timeout(
+                destination,
+                ACTOR,
+                TYPE,
+                Bytes::from_static(b"nonblocking-duplicate-claim"),
+                responder,
+            )
+            .expect("nonblocking duplicate-claim task must be admitted");
+    }
+    forwarder
+        .shutdown(Duration::from_secs(1))
+        .await
+        .expect("duplicate-claim task must drain");
+    observer
+}
+
+#[cfg(feature = "test-helpers")]
+#[tokio::test(flavor = "current_thread")]
+async fn duplicate_claim_return_failure_is_error_for_timed_and_nonblocking() {
+    let (source, sink) = pair().await;
+    sink.registry
+        .set_actor_message_handler(Arc::new(ReplyAfter(Duration::ZERO)))
+        .await;
+    connect_nodes(&source, &sink).await;
+    let destination = connection(&source, &sink).await;
+
+    let nonblocking =
+        duplicate_claim_accounting_case(destination.clone(), None, "127.0.0.1:40575").await;
+    let timed = duplicate_claim_accounting_case(
+        destination,
+        Some(Duration::from_secs(2)),
+        "127.0.0.1:40576",
+    )
+    .await;
+
+    assert_eq!(nonblocking.success.load(Ordering::SeqCst), 0);
+    assert_eq!(nonblocking.error.load(Ordering::SeqCst), 1);
+    assert_eq!(timed.success.load(Ordering::SeqCst), 0);
+    assert_eq!(timed.error.load(Ordering::SeqCst), 1);
     source.shutdown().await;
     sink.shutdown().await;
 }
