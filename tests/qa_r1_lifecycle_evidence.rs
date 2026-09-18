@@ -9,11 +9,24 @@ use icanact_remote::{
     TransportLifecycleEvent, TransportLifecycleRecorderGuard,
 };
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 const EVIDENCE_TIMEOUT: Duration = Duration::from_secs(10);
+
+// The lifecycle recorder is process-global, while these tests deliberately
+// block inside recorder callbacks to pin races. Serialize the test bodies
+// asynchronously so a blocked callback cannot strand another test's runtime
+// worker while it waits for the recorder-install mutex.
+static LIFECYCLE_TEST_SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+async fn lifecycle_test_serial() -> tokio::sync::MutexGuard<'static, ()> {
+    LIFECYCLE_TEST_SERIAL
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await
+}
 
 #[derive(Clone)]
 struct Gate {
@@ -162,6 +175,7 @@ async fn peer_failures(node: &TlsHandle, addr: std::net::SocketAddr) -> usize {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ordered_lifecycle_evidence_proves_publication_and_stale_teardown_fencing()
 -> Result<(), DynError> {
+    let _test_serial = lifecycle_test_serial().await;
     // Keep the real setup's normal 10-second bound and default retry/parallel
     // behavior. The gates below replace arbitrary sleeps; they do not change
     // transport policy or serialize the target binary.
@@ -418,6 +432,7 @@ async fn ordered_lifecycle_evidence_proves_publication_and_stale_teardown_fencin
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn late_replacement_before_disconnect_callback_is_fenced() -> Result<(), DynError> {
+    let _test_serial = lifecycle_test_serial().await;
     let config = GossipConfig {
         connection_timeout: EVIDENCE_TIMEOUT,
         response_timeout: EVIDENCE_TIMEOUT,
@@ -600,6 +615,7 @@ async fn late_replacement_before_disconnect_callback_is_fenced() -> Result<(), D
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn genuine_eof_lookup_miss_runs_fenced_failure_lifecycle() -> Result<(), DynError> {
+    let _test_serial = lifecycle_test_serial().await;
     let config = GossipConfig {
         connection_timeout: EVIDENCE_TIMEOUT,
         response_timeout: EVIDENCE_TIMEOUT,
@@ -766,6 +782,7 @@ async fn genuine_eof_lookup_miss_runs_fenced_failure_lifecycle() -> Result<(), D
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn identified_failure_lookup_miss_preserves_replacement() -> Result<(), DynError> {
+    let _test_serial = lifecycle_test_serial().await;
     let config = GossipConfig {
         connection_timeout: EVIDENCE_TIMEOUT,
         response_timeout: EVIDENCE_TIMEOUT,

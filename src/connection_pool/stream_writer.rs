@@ -2412,6 +2412,10 @@ fn is_streaming_admission_backpressure(error: &crate::GossipError) -> bool {
 pub struct LockFreeStreamHandle {
     /// Unique per-handle id used to ignore disconnect callbacks from stale connections.
     instance_id: u64,
+    /// Lifecycle ownership for exactly-once failure cleanup. Shared by every
+    /// handle clone and the IO task's exit guard, so completed dedup state can
+    /// be reclaimed when this physical stream is truly gone.
+    failure_lifecycle: Arc<crate::registry::FailureLifecycleOwner>,
     addr: SocketAddr,
     channel_id: ChannelId,
     sequence_counter: Arc<AtomicUsize>,
@@ -2645,6 +2649,7 @@ impl LockFreeStreamHandle {
             addr,
             exit_notify.clone(),
         );
+        let failure_lifecycle = crate::registry::FailureLifecycleOwner::new(instance_id);
 
         let max_message_size = read_context
             .as_ref()
@@ -2659,6 +2664,7 @@ impl LockFreeStreamHandle {
             let exit_flag_for_task = exit_flag.clone();
             let exit_notify_for_task = exit_notify.clone();
             let known_superseded_for_task = known_superseded.clone();
+            let failure_lifecycle_for_task = failure_lifecycle.clone();
             let writer_addr = addr;
             let writer_channel_id = channel_id;
             let write_queue = write_queue.clone();
@@ -2691,6 +2697,7 @@ impl LockFreeStreamHandle {
                     exit_flag_for_task,
                     exit_notify_for_task,
                     known_superseded_for_task,
+                    failure_lifecycle_for_task,
                 )
                 .await;
                 // CRITICAL: Log when writer exits - this helps diagnose silent writer deaths
@@ -2705,6 +2712,7 @@ impl LockFreeStreamHandle {
         (
             Self {
                 instance_id,
+                failure_lifecycle,
                 addr,
                 channel_id,
                 sequence_counter: Arc::new(AtomicUsize::new(0)),
@@ -2755,6 +2763,7 @@ impl LockFreeStreamHandle {
         exit_flag: Arc<AtomicBool>,
         exit_notify: Arc<Notify>,
         known_superseded: Arc<AtomicBool>,
+        failure_lifecycle: Arc<crate::registry::FailureLifecycleOwner>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -2849,6 +2858,7 @@ impl LockFreeStreamHandle {
             session_source: Option<SocketAddr>,
             instance_id: u64,
             known_superseded: Arc<AtomicBool>,
+            failure_lifecycle: Arc<crate::registry::FailureLifecycleOwner>,
         }
 
         impl Drop for ExitGuard {
@@ -2999,9 +3009,14 @@ impl LockFreeStreamHandle {
                         if let Some(correlation) = self.response_correlation.as_ref() {
                             correlation.cancel_all();
                         }
+                        let failure_lifecycle = self.failure_lifecycle.clone();
                         tokio::spawn(async move {
                             if let Err(e) = registry
-                                .handle_peer_connection_failure(peer_addr, Some(expected_instance))
+                                .handle_peer_connection_failure_with_owner(
+                                    peer_addr,
+                                    expected_instance,
+                                    failure_lifecycle,
+                                )
                                 .await
                             {
                                 warn!(
@@ -3046,6 +3061,7 @@ impl LockFreeStreamHandle {
             session_source: read_context.as_ref().map(|ctx| ctx.session_source),
             instance_id,
             known_superseded,
+            failure_lifecycle,
         };
 
         let perf = if IoPerfCounters::enabled() {

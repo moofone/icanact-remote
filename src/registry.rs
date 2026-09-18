@@ -2702,31 +2702,170 @@ struct PeerLivenessStatus {
     updated_at: Instant,
 }
 
+/// Ownership token held by the physical stream and its exit guard.
+///
+/// A completed failure marker is retained only while this token is alive: the
+/// token is the ownership proof that another exit callback for the same stream
+/// can still arrive. Once the stream has no owners left, its marker is removed
+/// synchronously, rather than accumulating for the lifetime of the registry.
+pub(crate) struct FailureLifecycleOwner {
+    instance_id: u64,
+    cleanup: std::sync::OnceLock<std::sync::Weak<CompletedFailureInstances>>,
+    self_weak: std::sync::Weak<FailureLifecycleOwner>,
+}
+
+impl FailureLifecycleOwner {
+    pub(crate) fn new(instance_id: u64) -> Arc<Self> {
+        Arc::new_cyclic(|self_weak| Self {
+            instance_id,
+            cleanup: std::sync::OnceLock::new(),
+            self_weak: self_weak.clone(),
+        })
+    }
+
+    fn bind_registry(&self, registry: std::sync::Weak<CompletedFailureInstances>) {
+        let _ = self.cleanup.set(registry);
+    }
+}
+
+impl Drop for FailureLifecycleOwner {
+    fn drop(&mut self) {
+        if let Some(registry) = self.cleanup.get().and_then(std::sync::Weak::upgrade) {
+            registry.release_owner(self.instance_id, &self.self_weak);
+        }
+    }
+}
+
+struct FailureClaimMarker {
+    owner: Option<std::sync::Weak<FailureLifecycleOwner>>,
+}
+
+/// RAII ownership of one identified failure lifecycle.
+///
+/// Dropping an unfinished claim releases it so a later callback can retry
+/// after cancellation. A completed claim remains deduplicated while its
+/// stream owner is alive; an ownerless claim is removed on completion because
+/// no late callback ownership can be proven for it.
+struct FailureLifecycleClaim {
+    registry: Arc<CompletedFailureInstances>,
+    instance_id: u64,
+    marker: Arc<FailureClaimMarker>,
+    finished: bool,
+}
+
+impl FailureLifecycleClaim {
+    fn complete(mut self) {
+        self.finished = true;
+        if self.marker.owner.is_none() {
+            self.registry
+                .remove_if_same(self.instance_id, &self.marker);
+        }
+    }
+}
+
+impl Drop for FailureLifecycleClaim {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.registry
+                .remove_if_same(self.instance_id, &self.marker);
+        }
+    }
+}
+
 /// Exactly-once ownership for identified failure callbacks.
 ///
 /// Instance IDs are globally allocated but callbacks can arrive out of order:
-/// a later connection may fail before an earlier callback is delivered. Keep
-/// the claimed IDs themselves rather than inferring completion from numeric
-/// order. A numeric watermark would classify an unseen sparse ID as already
-/// complete and silently lose its lifecycle cleanup.
+/// a later connection may fail before an earlier callback is delivered. This
+/// keeps explicit per-ID claims (never a numeric watermark), while completed
+/// claims are weakly owned by the physical stream lifecycle. Thus sparse IDs
+/// remain exactly-once and finished instances are reclaimed.
 struct CompletedFailureInstances {
-    claimed: std::sync::Mutex<HashSet<u64>>,
+    claimed: std::sync::Mutex<HashMap<u64, Arc<FailureClaimMarker>>>,
 }
 
 impl Default for CompletedFailureInstances {
     fn default() -> Self {
         Self {
-            claimed: std::sync::Mutex::new(HashSet::new()),
+            claimed: std::sync::Mutex::new(HashMap::new()),
         }
     }
 }
 
 impl CompletedFailureInstances {
-    fn claim(&self, instance_id: u64) -> bool {
+    fn claim(
+        self: &Arc<Self>,
+        instance_id: u64,
+        owner: Option<&Arc<FailureLifecycleOwner>>,
+    ) -> Option<FailureLifecycleClaim> {
+        let registry_weak = Arc::downgrade(self);
+        let mut claimed = self
+            .claimed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = claimed.get(&instance_id) {
+            let owner_gone = existing
+                .owner
+                .as_ref()
+                .is_some_and(|owner| owner.upgrade().is_none());
+            if owner_gone {
+                claimed.remove(&instance_id);
+            } else {
+                return None;
+            }
+        }
+        if let Some(owner) = owner {
+            owner.bind_registry(registry_weak);
+        }
+        let marker = Arc::new(FailureClaimMarker {
+            owner: owner.map(Arc::downgrade),
+        });
+        claimed.insert(instance_id, marker.clone());
+        Some(FailureLifecycleClaim {
+            registry: Arc::clone(self),
+            instance_id,
+            marker,
+            finished: false,
+        })
+    }
+
+    fn remove_if_same(&self, instance_id: u64, marker: &Arc<FailureClaimMarker>) {
+        let mut claimed = self
+            .claimed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if claimed
+            .get(&instance_id)
+            .is_some_and(|current| Arc::ptr_eq(current, marker))
+        {
+            claimed.remove(&instance_id);
+        }
+    }
+
+    fn release_owner(
+        &self,
+        instance_id: u64,
+        owner: &std::sync::Weak<FailureLifecycleOwner>,
+    ) {
+        let mut claimed = self
+            .claimed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if claimed.get(&instance_id).is_some_and(|marker| {
+            marker
+                .owner
+                .as_ref()
+                .is_some_and(|current| std::sync::Weak::ptr_eq(current, owner))
+        }) {
+            claimed.remove(&instance_id);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
         self.claimed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(instance_id)
+            .len()
     }
 }
 
@@ -11482,29 +11621,31 @@ impl<T: 'static> GossipRegistry<T> {
     /// the marker therefore makes discovery/authentication/accounting and the
     /// user callback exactly-once even when multiple exit/recovery paths race.
     /// Do not collapse IDs by numeric order: stream teardown callbacks are
-    /// allowed to arrive sparsely and out of order.
-    fn claim_failure_lifecycle(&self, failed_instance_id: Option<u64>) -> bool {
-        failed_instance_id
-            .is_none_or(|instance_id| self.completed_failure_instances.claim(instance_id))
+    /// allowed to arrive sparsely and out of order. The returned RAII claim
+    /// releases itself if this async handler is cancelled before its tail
+    /// completes, allowing a later callback to retry.
+    fn claim_failure_lifecycle(
+        &self,
+        failed_instance_id: u64,
+        owner: Option<&Arc<FailureLifecycleOwner>>,
+    ) -> Option<FailureLifecycleClaim> {
+        self.completed_failure_instances
+            .claim(failed_instance_id, owner)
     }
 
     /// Whether a queued peer-disconnect callback still describes the session
-    /// whose failure completed accounting. This check intentionally happens
-    /// in the detached task immediately before invoking user code: a
-    /// replacement can publish and arm after failure accounting has finished.
-    async fn disconnect_notification_is_current(
+    /// whose failure completed accounting. The final decision is made while
+    /// holding the same state lock used by session arming, and the production
+    /// notifier invokes the handler directly from that critical section's
+    /// continuation (no await-separated boolean handoff).
+    fn disconnect_notification_is_current_locked(
         &self,
+        gossip_state: &GossipState,
         failed_peer_addr: SocketAddr,
         peer_id: Option<&crate::PeerId>,
         failed_instance_id: Option<u64>,
         delivery_epoch: u64,
     ) -> bool {
-        // Take the same generation lock used by session arming before making
-        // either part of the delivery decision. Publication may complete
-        // while this notifier is waiting for the lock; checking the pool only
-        // after acquiring it makes that replacement visible before the old
-        // epoch is accepted.
-        let gossip_state = self.gossip_state.lock().await;
         if let Some(peer_id) = peer_id {
             let current_instance_id = self
                 .connection_pool
@@ -11526,6 +11667,53 @@ impl<T: 'static> GossipRegistry<T> {
             .is_none_or(|peer_info| peer_info.current_session_epoch == delivery_epoch)
     }
 
+    #[cfg(test)]
+    async fn disconnect_notification_is_current(
+        &self,
+        failed_peer_addr: SocketAddr,
+        peer_id: Option<&crate::PeerId>,
+        failed_instance_id: Option<u64>,
+        delivery_epoch: u64,
+    ) -> bool {
+        let gossip_state = self.gossip_state.lock().await;
+        self.disconnect_notification_is_current_locked(
+            &gossip_state,
+            failed_peer_addr,
+            peer_id,
+            failed_instance_id,
+            delivery_epoch,
+        )
+    }
+
+    /// Check and enter user callback delivery as one await-free continuation
+    /// after the final lock-protected identity/epoch decision. A replacement
+    /// that publishes while the notifier waits for `gossip_state` is therefore
+    /// observed before the stale handler can be entered.
+    async fn notify_disconnect_if_current(
+        &self,
+        failed_peer_addr: SocketAddr,
+        peer_id: Option<&crate::PeerId>,
+        failed_instance_id: Option<u64>,
+        delivery_epoch: u64,
+        handler: Arc<dyn PeerDisconnectHandler>,
+        callback_peer_id: Option<crate::PeerId>,
+    ) {
+        let gossip_state = self.gossip_state.lock().await;
+        if !self.disconnect_notification_is_current_locked(
+            &gossip_state,
+            failed_peer_addr,
+            peer_id,
+            failed_instance_id,
+            delivery_epoch,
+        ) {
+            return;
+        }
+        drop(gossip_state);
+        handler
+            .handle_peer_disconnect(failed_peer_addr, callback_peer_id)
+            .await;
+    }
+
     /// Handle peer connection failure - start consensus process
     /// This is called for socket disconnections (not timeouts)
     ///
@@ -11544,6 +11732,33 @@ impl<T: 'static> GossipRegistry<T> {
         &self,
         observed_peer_addr: SocketAddr,
         failed_instance_id: Option<u64>,
+    ) -> Result<()> {
+        self.handle_peer_connection_failure_inner(observed_peer_addr, failed_instance_id, None)
+            .await
+    }
+
+    /// Internal exit-guard entry point. The physical stream owner keeps
+    /// completed deduplication alive until every callback source for that
+    /// stream has gone away.
+    pub(crate) async fn handle_peer_connection_failure_with_owner(
+        &self,
+        observed_peer_addr: SocketAddr,
+        failed_instance_id: u64,
+        owner: Arc<FailureLifecycleOwner>,
+    ) -> Result<()> {
+        self.handle_peer_connection_failure_inner(
+            observed_peer_addr,
+            Some(failed_instance_id),
+            Some(owner),
+        )
+        .await
+    }
+
+    async fn handle_peer_connection_failure_inner(
+        &self,
+        observed_peer_addr: SocketAddr,
+        failed_instance_id: Option<u64>,
+        failure_lifecycle_owner: Option<Arc<FailureLifecycleOwner>>,
     ) -> Result<()> {
         let (failed_peer_addr, peer_id) = self
             .resolve_failed_peer_state_addr(observed_peer_addr)
@@ -11809,10 +12024,12 @@ impl<T: 'static> GossipRegistry<T> {
 
         if let (None, Some(failed_id)) = (peer_id.as_ref(), failed_instance_id) {
             // Without a resolved peer identity, an identified failure still
-            // cannot authorize address-wide cleanup: the address may already
-            // have been reused by a replacement. Retire only the matching
-            // instance at the observed address and release its count if it
-            // was displaced before this callback arrived.
+            // cannot authorize address-wide pool cleanup: the address may
+            // already have been reused by a replacement. Retire only the
+            // matching instance at the observed address and release its count
+            // if it was displaced before this callback arrived. Unlike the
+            // old early return, continue through the address-scoped discovery,
+            // backoff/accounting, session invalidation, and callback tail.
             let retired = self
                 .connection_pool
                 .remove_connection_instance_by_id(observed_peer_addr, failed_id);
@@ -11820,13 +12037,16 @@ impl<T: 'static> GossipRegistry<T> {
                 self.connection_pool
                     .release_displaced_connection_count(failed_id);
             }
-            return Ok(());
+            instance_teardown_done = true;
         }
 
         // Pool retirement is not registry-lifecycle completion. Claim the
         // latter independently so a cancellation/recovery teardown followed
         // by the IO exit callback still completes this peer exactly once.
-        if !self.claim_failure_lifecycle(failed_instance_id) {
+        let failure_claim = failed_instance_id.and_then(|failed_id| {
+            self.claim_failure_lifecycle(failed_id, failure_lifecycle_owner.as_ref())
+        });
+        if failed_instance_id.is_some() && failure_claim.is_none() {
             return Ok(());
         }
 
@@ -12017,19 +12237,15 @@ impl<T: 'static> GossipRegistry<T> {
                         if shutdown.load(Ordering::Acquire) {
                             return;
                         }
-                        if !registry
-                            .disconnect_notification_is_current(
+                        registry
+                            .notify_disconnect_if_current(
                                 failed_peer_addr,
                                 fence_peer_id.as_ref(),
                                 failed_instance_id,
                                 delivery_epoch,
+                                handler,
+                                callback_peer_id,
                             )
-                            .await
-                        {
-                            return;
-                        }
-                        handler
-                            .handle_peer_disconnect(failed_peer_addr, callback_peer_id)
                             .await;
                     });
                 }
@@ -12061,6 +12277,9 @@ impl<T: 'static> GossipRegistry<T> {
             self.trigger_immediate_peer_gossip();
         }
 
+        if let Some(claim) = failure_claim {
+            claim.complete();
+        }
         Ok(())
     }
 
@@ -12234,19 +12453,15 @@ impl<T: 'static> GossipRegistry<T> {
                     if shutdown.load(Ordering::Acquire) {
                         return;
                     }
-                    if !registry
-                        .disconnect_notification_is_current(
+                    registry
+                        .notify_disconnect_if_current(
                             failed_peer_addr,
                             Some(&fence_peer_id),
                             None,
                             delivery_epoch,
+                            handler,
+                            callback_peer_id,
                         )
-                        .await
-                    {
-                        return;
-                    }
-                    handler
-                        .handle_peer_disconnect(failed_peer_addr, callback_peer_id)
                         .await;
                 });
             }
@@ -14317,19 +14532,129 @@ mod tests {
 
     #[test]
     fn completed_failure_markers_deduplicate_sparse_ids_without_watermarking_gaps() {
-        let markers = CompletedFailureInstances::default();
-        assert!(markers.claim(10));
-        assert!(markers.claim(1), "a lower, unseen instance must still run");
-        assert!(markers.claim(1_000_000));
+        let markers = Arc::new(CompletedFailureInstances::default());
+        let owner_10 = FailureLifecycleOwner::new(10);
+        markers
+            .claim(10, Some(&owner_10))
+            .expect("first sparse instance must claim")
+            .complete();
+        let owner_1 = FailureLifecycleOwner::new(1);
+        markers
+            .claim(1, Some(&owner_1))
+            .expect("a lower, unseen instance must still run")
+            .complete();
+        let owner_large = FailureLifecycleOwner::new(1_000_000);
+        markers
+            .claim(1_000_000, Some(&owner_large))
+            .expect("a sparse high instance must claim")
+            .complete();
+        let owner_2 = FailureLifecycleOwner::new(2);
+        markers
+            .claim(2, Some(&owner_2))
+            .expect("a sparse lower ID must not be inferred complete")
+            .complete();
         assert!(
-            markers.claim(2),
-            "a sparse lower ID must not be inferred complete"
+            markers.claim(10, Some(&owner_10)).is_none(),
+            "a repeated callback must be deduplicated while its stream owner lives"
         );
+        assert!(markers.claim(1_000_000, Some(&owner_large)).is_none());
+
+        let reclaimed_owner = FailureLifecycleOwner::new(77);
+        markers
+            .claim(77, Some(&reclaimed_owner))
+            .expect("reclamation marker must claim")
+            .complete();
+        assert!(markers.len() >= 5);
+        drop(reclaimed_owner);
         assert!(
-            !markers.claim(10),
-            "a repeated callback must be deduplicated"
+            markers.len() < 5,
+            "completed markers must be removed with their physical stream owner"
         );
-        assert!(!markers.claim(1_000_000));
+    }
+
+    #[tokio::test]
+    async fn identified_address_only_failure_runs_full_lifecycle_tail() {
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+        use futures::future::BoxFuture;
+        use tokio::sync::oneshot;
+
+        struct TestHandler {
+            tx: tokio::sync::Mutex<Option<oneshot::Sender<Option<PeerId>>>>,
+        }
+
+        impl PeerDisconnectHandler for TestHandler {
+            fn handle_peer_disconnect(
+                &self,
+                _addr: SocketAddr,
+                peer_id: Option<PeerId>,
+            ) -> BoxFuture<'_, ()> {
+                Box::pin(async move {
+                    if let Some(tx) = self.tx.lock().await.take() {
+                        let _ = tx.send(peer_id);
+                    }
+                })
+            }
+        }
+
+        let mut config = test_config();
+        config.enable_peer_discovery = true;
+        let registry = GossipRegistry::<()>::new(test_addr(18_080), config);
+        let peer_addr = test_addr(9_080);
+        registry.add_peer(peer_addr).await;
+        let (io, _peer_io) = tokio::io::duplex(1024);
+        let (stream_handle, _writer, _reader) = LockFreeStreamHandle::new(
+            io,
+            peer_addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let instance_id = stream_handle.instance_id();
+        let mut connection = LockFreeConnection::new(peer_addr, ConnectionDirection::Inbound);
+        connection.stream_handle = Some(Arc::new(stream_handle));
+        connection.set_state(ConnectionState::Connected);
+        let connection = Arc::new(connection);
+        let _ = registry
+            .connection_pool
+            .connections_by_addr
+            .upsert_sync(peer_addr, connection.clone());
+        registry.mark_peer_connected(peer_addr).await;
+        {
+            let mut state = registry.gossip_state.lock().await;
+            let peer = state.peers.get_mut(&peer_addr).expect("peer state");
+            peer.current_session_source = Some(peer_addr);
+        }
+        let (tx, rx) = oneshot::channel();
+        registry
+            .set_peer_disconnect_handler(Arc::new(TestHandler {
+                tx: tokio::sync::Mutex::new(Some(tx)),
+            }))
+            .await;
+
+        registry
+            .handle_peer_connection_failure(peer_addr, Some(instance_id))
+            .await
+            .expect("address-only failure tail must complete");
+
+        let callback_peer = tokio::time::timeout(Duration::from_secs(1), rx)
+            .await
+            .expect("disconnect callback timed out")
+            .expect("disconnect callback sender dropped");
+        assert_eq!(callback_peer, None);
+        let state = registry.gossip_state.lock().await;
+        let peer = state.peers.get(&peer_addr).expect("peer state retained");
+        assert_eq!(peer.failures, registry.config.max_peer_failures);
+        assert!(peer.last_failure_time.is_some());
+        assert!(peer.current_session_source.is_none());
+        assert_ne!(peer.current_session_epoch, 0);
+        let discovery = state.peer_discovery.as_ref().expect("discovery enabled");
+        assert_eq!(discovery.connected_peer_count(), 0);
+        drop(state);
+        connection.abort_tasks();
     }
 
     #[tokio::test]
