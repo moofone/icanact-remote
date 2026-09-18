@@ -235,6 +235,54 @@ async fn completion_before_first_wait_poll_is_observed() {
         .expect("normal completion");
 }
 
+#[tokio::test]
+async fn completion_recycles_capacity_before_reply_waiter_returns() {
+    let slots = crate::connection_pool::reply_slots::ReplySlots::new(
+        1,
+        "127.0.0.1:40577".parse().expect("test address"),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let jobs = Arc::new(Semaphore::new(1));
+    let bytes = Arc::new(Semaphore::new(32));
+    let record = slots
+        .try_reserve(
+            1,
+            32,
+            Arc::new(ReplyPayload::from_static(b"cancelled")),
+            jobs.clone().try_acquire_owned().expect("job permit"),
+            bytes
+                .clone()
+                .try_acquire_many_owned(32)
+                .expect("byte permit"),
+        )
+        .expect("reserve");
+
+    record.finish();
+    assert_eq!(jobs.available_permits(), 1);
+    assert_eq!(bytes.available_permits(), 32);
+    assert_eq!(
+        slots.free_count(),
+        crate::connection_pool::reply_slots::REPLY_SLOT_CAP
+    );
+
+    let replacement = slots
+        .try_reserve(
+            2,
+            32,
+            Arc::new(ReplyPayload::from_static(b"cancelled")),
+            jobs.try_acquire_owned().expect("recycled job permit"),
+            bytes
+                .try_acquire_many_owned(32)
+                .expect("recycled byte permit"),
+        )
+        .expect("a completed response must not hold the one-job budget");
+    replacement.finish();
+    record
+        .wait_complete()
+        .await
+        .expect("normal completion must be observable");
+}
+
 #[test]
 fn close_before_publication_is_rejected_at_the_close_linearization_point() {
     let slots = crate::connection_pool::reply_slots::ReplySlots::new(

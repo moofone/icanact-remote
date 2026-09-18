@@ -11678,6 +11678,24 @@ impl<T: 'static> GossipRegistry<T> {
             if current_instance_id.is_some_and(|current| Some(current) != failed_instance_id) {
                 return false;
             }
+        } else if let Some(failed_instance_id) = failed_instance_id {
+            // An address-only failure has no peer session slot to consult.
+            // Fence its detached callback against the same address index that
+            // fenced accounting: a different current instance means the
+            // callback describes a superseded link, even if no session epoch
+            // was armed for the replacement.
+            let current_instance_id = self
+                .connection_pool
+                .get_lock_free_connection(failed_peer_addr)
+                .and_then(|connection| {
+                    connection
+                        .stream_handle
+                        .as_ref()
+                        .map(|handle| handle.instance_id())
+                });
+            if current_instance_id.is_some_and(|current| current != failed_instance_id) {
+                return false;
+            }
         }
 
         gossip_state
@@ -11826,6 +11844,37 @@ impl<T: 'static> GossipRegistry<T> {
                 .get(&failed_peer_addr)
                 .map(|peer_info| peer_info.current_session_epoch)
                 .unwrap_or(0)
+        };
+        // When peer identity resolution is unavailable, retain the address
+        // index's instance snapshot as the failure's local session fence. A
+        // same-address replacement can overwrite that index before this
+        // handler reaches accounting; its different instance must then be
+        // treated exactly like the identified-peer supersession path.
+        let pre_teardown_address_instance_id = if peer_id.is_none() {
+            self.connection_pool
+                .get_lock_free_connection(failed_peer_addr)
+                .and_then(|connection| {
+                    connection
+                        .stream_handle
+                        .as_ref()
+                        .map(|handle| handle.instance_id())
+                })
+                .or_else(|| {
+                    if observed_peer_addr != failed_peer_addr {
+                        self.connection_pool
+                            .get_lock_free_connection(observed_peer_addr)
+                            .and_then(|connection| {
+                                connection
+                                    .stream_handle
+                                    .as_ref()
+                                    .map(|handle| handle.instance_id())
+                            })
+                    } else {
+                        None
+                    }
+                })
+        } else {
+            None
         };
 
         // Address-vs-identity guard. The failure is reported for one specific
@@ -12182,8 +12231,12 @@ impl<T: 'static> GossipRegistry<T> {
         // `pre_teardown_session_epoch`, captured before this function did
         // any teardown work at all, so a replacement session armed in the
         // gap above is never the one this clears.
-        self.invalidate_session_state_on_teardown(failed_peer_addr, pre_teardown_session_epoch)
-            .await;
+        self.invalidate_session_state_on_teardown(
+            failed_peer_addr,
+            pre_teardown_session_epoch,
+            failed_instance_id.filter(|_| peer_id.is_none()),
+        )
+        .await;
 
         // Record the accounting attempt before taking the state lock. The
         // attempt is observational only; the applied/declined outcome below
@@ -12218,9 +12271,44 @@ impl<T: 'static> GossipRegistry<T> {
                             .map(|handle| handle.instance_id())
                     })
             });
+            let current_address_instance_id = if peer_id.is_none() {
+                self.connection_pool
+                    .get_lock_free_connection(failed_peer_addr)
+                    .and_then(|connection| {
+                        connection
+                            .stream_handle
+                            .as_ref()
+                            .map(|handle| handle.instance_id())
+                    })
+                    .or_else(|| {
+                        if observed_peer_addr != failed_peer_addr {
+                            self.connection_pool
+                                .get_lock_free_connection(observed_peer_addr)
+                                .and_then(|connection| {
+                                    connection
+                                        .stream_handle
+                                        .as_ref()
+                                        .map(|handle| handle.instance_id())
+                                })
+                        } else {
+                            None
+                        }
+                    })
+            } else {
+                None
+            };
+            let address_replacement_is_current = match failed_instance_id {
+                Some(failed) => {
+                    current_address_instance_id.is_some_and(|current| current != failed)
+                }
+                None => pre_teardown_address_instance_id
+                    .zip(current_address_instance_id)
+                    .is_some_and(|(captured, current)| captured != current),
+            };
             replacement_is_current = failed_instance_id
                 .zip(current_instance_id)
-                .is_some_and(|(failed, current)| failed != current);
+                .is_some_and(|(failed, current)| failed != current)
+                || address_replacement_is_current;
             if !replacement_is_current {
                 if let Some(peer_info) = gossip_state.peers.get_mut(&failed_peer_addr) {
                     let was_below = peer_info.failures < self.config.max_peer_failures;
@@ -12467,8 +12555,12 @@ impl<T: 'static> GossipRegistry<T> {
         // matching call for the full rationale. This path always represents
         // a confirmed, peer-wide teardown, fenced the same way by
         // `pre_teardown_session_epoch`.
-        self.invalidate_session_state_on_teardown(failed_peer_addr, pre_teardown_session_epoch)
-            .await;
+        self.invalidate_session_state_on_teardown(
+            failed_peer_addr,
+            pre_teardown_session_epoch,
+            None,
+        )
+        .await;
         let delivery_epoch = self
             .gossip_state
             .lock()
@@ -14322,8 +14414,33 @@ impl<T: 'static> GossipRegistry<T> {
     /// If a replacement has since armed, `current_session_epoch` has moved
     /// on and no longer matches -- this declines entirely rather than
     /// clearing the replacement's own, unrelated session state.
-    async fn invalidate_session_state_on_teardown(&self, addr: SocketAddr, expected_epoch: u64) {
+    async fn invalidate_session_state_on_teardown(
+        &self,
+        addr: SocketAddr,
+        expected_epoch: u64,
+        failed_instance_id: Option<u64>,
+    ) {
         let mut gossip_state = self.gossip_state.lock().await;
+        if let Some(failed_instance_id) = failed_instance_id {
+            let current_instance_id = self
+                .connection_pool
+                .get_lock_free_connection(addr)
+                .and_then(|connection| {
+                    connection
+                        .stream_handle
+                        .as_ref()
+                        .map(|handle| handle.instance_id())
+                });
+            if current_instance_id.is_some_and(|current| current != failed_instance_id) {
+                debug!(
+                    addr = %addr,
+                    failed_instance_id,
+                    current_instance_id = ?current_instance_id,
+                    "declining to invalidate session state; address-only failure is superseded"
+                );
+                return;
+            }
+        }
         if let Some(peer_info) = gossip_state.peers.get_mut(&addr) {
             if peer_info.current_session_epoch != expected_epoch {
                 debug!(
@@ -14721,6 +14838,135 @@ mod tests {
         assert_eq!(discovery.connected_peer_count(), 0);
         drop(state);
         connection.abort_tasks();
+    }
+
+    #[tokio::test]
+    async fn stale_address_only_failure_does_not_account_same_address_replacement() {
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+        use futures::future::BoxFuture;
+        use tokio::sync::oneshot;
+
+        struct TestHandler {
+            tx: tokio::sync::Mutex<Option<oneshot::Sender<()>>>,
+        }
+
+        impl PeerDisconnectHandler for TestHandler {
+            fn handle_peer_disconnect(
+                &self,
+                _addr: SocketAddr,
+                _peer_id: Option<PeerId>,
+            ) -> BoxFuture<'_, ()> {
+                Box::pin(async move {
+                    if let Some(tx) = self.tx.lock().await.take() {
+                        let _ = tx.send(());
+                    }
+                })
+            }
+        }
+
+        let mut config = test_config();
+        config.enable_peer_discovery = true;
+        let registry = GossipRegistry::<()>::new(test_addr(18_083), config);
+        let peer_addr = test_addr(9_083);
+        registry.add_peer(peer_addr).await;
+
+        let (old_io, _old_peer) = tokio::io::duplex(1024);
+        let (old_handle, _old_writer, _old_reader) = LockFreeStreamHandle::new(
+            old_io,
+            peer_addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let old_instance = old_handle.instance_id();
+        let mut old_connection = LockFreeConnection::new(peer_addr, ConnectionDirection::Inbound);
+        old_connection.stream_handle = Some(Arc::new(old_handle));
+        old_connection.set_state(ConnectionState::Connected);
+        let old_connection = Arc::new(old_connection);
+        registry
+            .connection_pool
+            .connections_by_addr
+            .upsert_sync(peer_addr, old_connection.clone());
+        registry.mark_peer_connected(peer_addr).await;
+
+        let (replacement_io, _replacement_peer) = tokio::io::duplex(1024);
+        let (replacement_handle, _replacement_writer, _replacement_reader) =
+            LockFreeStreamHandle::new(
+                replacement_io,
+                peer_addr,
+                ChannelId::Global,
+                BufferConfig::default(),
+                None,
+                None,
+            );
+        let mut replacement_connection =
+            LockFreeConnection::new(peer_addr, ConnectionDirection::Inbound);
+        replacement_connection.stream_handle = Some(Arc::new(replacement_handle));
+        replacement_connection.set_state(ConnectionState::Connected);
+        let replacement_connection = Arc::new(replacement_connection);
+        registry
+            .connection_pool
+            .connections_by_addr
+            .upsert_sync(peer_addr, replacement_connection.clone());
+
+        let (tx, rx) = oneshot::channel();
+        registry
+            .set_peer_disconnect_handler(Arc::new(TestHandler {
+                tx: tokio::sync::Mutex::new(Some(tx)),
+            }))
+            .await;
+
+        registry
+            .handle_peer_connection_failure(peer_addr, Some(old_instance))
+            .await
+            .expect("stale address-only failure must settle");
+
+        let state = registry.gossip_state.lock().await;
+        let peer = state.peers.get(&peer_addr).expect("peer state retained");
+        assert_eq!(
+            peer.failures,
+            0,
+            "replacement must not inherit stale failure accounting"
+        );
+        assert_eq!(
+            state
+                .peer_discovery
+                .as_ref()
+                .expect("discovery enabled")
+                .connected_peer_count(),
+            1,
+            "replacement must retain its discovery slot"
+        );
+        let delivery_epoch = peer.current_session_epoch;
+        drop(state);
+        let current = registry
+            .connection_pool
+            .get_lock_free_connection(peer_addr)
+            .expect("same-address replacement must remain indexed");
+        assert!(Arc::ptr_eq(&current, &replacement_connection));
+        assert!(
+            !registry
+                .disconnect_notification_is_current(
+                    peer_addr,
+                    None,
+                    Some(old_instance),
+                    delivery_epoch,
+                )
+                .await,
+            "address-only disconnect delivery must fence the replacement too"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), rx)
+                .await
+                .is_err(),
+            "stale address-only failure must not notify the disconnect handler"
+        );
+        old_connection.abort_tasks();
+        replacement_connection.abort_tasks();
     }
 
     #[tokio::test]

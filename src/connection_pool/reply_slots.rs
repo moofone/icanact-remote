@@ -2,7 +2,7 @@ use arc_swap::ArcSwapOption;
 use crossbeam_queue::ArrayQueue;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 use tokio::sync::{Notify, OwnedSemaphorePermit};
 
 use crate::ReplyPayload;
@@ -27,6 +27,11 @@ const RESERVATION_CLOSED: usize = 1usize << (usize::BITS - 1);
 pub(crate) struct StreamKey {
     pub(crate) stream_id: u32,
     pub(crate) generation: u64,
+}
+
+struct ReplySlotResources {
+    job_permit: OwnedSemaphorePermit,
+    byte_permit: OwnedSemaphorePermit,
 }
 
 pub(crate) struct ReplySlotRecord {
@@ -58,11 +63,12 @@ pub(crate) struct ReplySlotRecord {
     #[cfg(test)]
     publication_test_gate: Arc<crate::connection_pool::lease_test_support::PublicationGate>,
     completion: Notify,
-    // The record owns these permits for its entire transport lifetime. Keeping
-    // them as fields avoids a release lock and makes writer-owned retention
-    // part of the same bounded record.
-    _job_permit: Option<OwnedSemaphorePermit>,
-    _byte_permit: Option<OwnedSemaphorePermit>,
+    // The record owns these permits for its entire transport lifetime. They
+    // live behind a small mutex so the writer can recycle capacity before
+    // publishing completion even while a ReplyLease still holds an Arc to the
+    // record. Drop remains a fallback for abandoned/cancelled records.
+    resources: Mutex<Option<ReplySlotResources>>,
+    resources_recycled: AtomicBool,
     #[cfg(any(test, feature = "test-helpers"))]
     stats: Arc<crate::connection_pool::lease_stats::LeaseStats>,
 }
@@ -275,6 +281,7 @@ impl ReplySlotRecord {
     }
 
     pub(crate) fn complete(&self) {
+        self.recycle_resources();
         if self
             .state
             .compare_exchange(
@@ -287,7 +294,6 @@ impl ReplySlotRecord {
         {
             #[cfg(any(test, feature = "test-helpers"))]
             {
-                self.stats.live_slots.fetch_sub(1, Ordering::Relaxed);
                 if self.wire_outcome.load(Ordering::Acquire) == WIRE_OUTCOME_NORMAL {
                     self.stats
                         .normal_completions
@@ -386,6 +392,7 @@ impl ReplySlotRecord {
 
     fn complete_closed(&self) {
         self.close_publication();
+        self.recycle_resources();
         if self
             .state
             .compare_exchange(
@@ -396,8 +403,6 @@ impl ReplySlotRecord {
             )
             .is_ok()
         {
-            #[cfg(any(test, feature = "test-helpers"))]
-            self.stats.live_slots.fetch_sub(1, Ordering::Relaxed);
             self.completion.notify_waiters();
         }
     }
@@ -411,6 +416,7 @@ impl ReplySlotRecord {
     }
 
     fn complete_discarded(&self) {
+        self.recycle_resources();
         if self
             .state
             .compare_exchange(
@@ -422,12 +428,9 @@ impl ReplySlotRecord {
             .is_ok()
         {
             #[cfg(any(test, feature = "test-helpers"))]
-            {
-                self.stats.live_slots.fetch_sub(1, Ordering::Relaxed);
-                self.stats
-                    .discarded_reservations
-                    .fetch_add(1, Ordering::Relaxed);
-            }
+            self.stats
+                .discarded_reservations
+                .fetch_add(1, Ordering::Relaxed);
             self.completion.notify_waiters();
         }
     }
@@ -440,18 +443,39 @@ impl ReplySlotRecord {
     }
 }
 
-impl Drop for ReplySlotRecord {
-    fn drop(&mut self) {
+impl ReplySlotRecord {
+    fn detach_from_table(&self) {
+        let Some(slots) = self.slots.upgrade() else {
+            return;
+        };
+        let Some(record) = self.self_ref.upgrade() else {
+            return;
+        };
+        let _ = slots.table[self.index].compare_and_swap(&record, None);
+    }
+
+    fn recycle_resources(&self) {
+        if self.resources_recycled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.detach_from_table();
         let slots = self.slots.upgrade();
         // Payload references protect the reservation just like their record
         // does. Explicitly remove both transport-owned references first, so a
         // payload owner cannot outlive the permits, accounting, or slot.
         drop(self.normal_payload.swap(None));
         drop(self.terminal_payload.swap(None));
+        let resources = self
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         #[cfg(test)]
         self.stats.permits_released.store(false, Ordering::Release);
-        drop(self._job_permit.take());
-        drop(self._byte_permit.take());
+        if let Some(resources) = resources {
+            drop(resources.job_permit);
+            drop(resources.byte_permit);
+        }
         #[cfg(test)]
         self.stats.permits_released.store(true, Ordering::Release);
         #[cfg(any(test, feature = "test-helpers"))]
@@ -462,6 +486,7 @@ impl Drop for ReplySlotRecord {
                     .accounting_before_permits
                     .store(true, Ordering::Release);
             }
+            self.stats.live_slots.fetch_sub(1, Ordering::Relaxed);
             self.stats.reserved_jobs.fetch_sub(1, Ordering::Release);
             self.stats
                 .reserved_bytes
@@ -475,6 +500,12 @@ impl Drop for ReplySlotRecord {
         if let Some(slots) = slots {
             slots.recycle(self.index, self.generation);
         }
+    }
+}
+
+impl Drop for ReplySlotRecord {
+    fn drop(&mut self) {
+        self.recycle_resources();
     }
 }
 
@@ -592,8 +623,11 @@ impl ReplySlots {
                 crate::connection_pool::lease_test_support::PublicationGate::new(),
             ),
             completion: Notify::new(),
-            _job_permit: Some(job_permit),
-            _byte_permit: Some(byte_permit),
+            resources: Mutex::new(Some(ReplySlotResources {
+                job_permit,
+                byte_permit,
+            })),
+            resources_recycled: AtomicBool::new(false),
             #[cfg(any(test, feature = "test-helpers"))]
             stats: Arc::clone(&self.stats),
         });
