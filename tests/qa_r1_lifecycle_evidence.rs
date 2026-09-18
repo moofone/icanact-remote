@@ -610,3 +610,152 @@ async fn successful_cas_tail_does_not_fence_replacement() -> Result<(), DynError
     drop(event_sender);
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn identified_failure_lookup_miss_preserves_replacement() -> Result<(), DynError> {
+    let config = GossipConfig {
+        connection_timeout: EVIDENCE_TIMEOUT,
+        response_timeout: EVIDENCE_TIMEOUT,
+        ..Default::default()
+    };
+    let key_a = KeyPair::new_for_testing("qa-r1-lookup-miss-a");
+    let key_b = KeyPair::new_for_testing("qa-r1-lookup-miss-b");
+    let node_a = create_tls_node_with_keypair(key_a, config.clone()).await?;
+    let node_b = create_tls_node_with_keypair(key_b.clone(), config.clone()).await?;
+    let addr_b = node_b.registry.bind_addr;
+    let peer_b = node_b.registry.peer_id.clone();
+
+    let (event_sender, mut events) = unbounded_channel::<TransportTestHelperEvent>();
+    let teardown_gate = Gate::new();
+    let teardown_once = Arc::new(AtomicBool::new(true));
+    let recorder_sender = event_sender.clone();
+    let recorder_gate = teardown_gate.clone();
+    let recorder_once = Arc::clone(&teardown_once);
+    let recorder_peer_b = peer_b.clone();
+    let _guard = TransportLifecycleRecorderGuard::install(Arc::new(|_event| {}));
+    _guard.install_test_helper_recorder(Arc::new(move |event| {
+        recorder_sender
+            .send(event.clone())
+            .expect("lifecycle recorder channel closed");
+        if let TransportTestHelperEvent::TeardownAttempt {
+            peer,
+            addr,
+            instance_id: _,
+            ..
+        } = &event
+            && *peer == recorder_peer_b
+            && *addr == addr_b
+            && recorder_once.swap(false, Ordering::AcqRel)
+        {
+            recorder_gate.wait();
+        }
+    }));
+
+    connect_bidirectional(&node_a, &node_b).await?;
+    assert!(
+        common::wait_for_condition(EVIDENCE_TIMEOUT, || async {
+            node_a
+                .client()
+                .current_peer_connection_instance(&peer_b)
+                .is_some()
+        })
+        .await,
+        "initial current B instance did not settle"
+    );
+    let old_instance = node_a
+        .client()
+        .current_peer_connection_instance(&peer_b)
+        .expect("initial current B instance");
+
+    // Remove the old session before invoking its identified failure callback.
+    // This deliberately makes the callback's initial peer lookup miss while
+    // preserving the gossip peer identity used to resolve the failure.
+    assert!(
+        node_a
+            .registry
+            .connection_pool
+            .disconnect_connection_by_peer_id(&peer_b)
+            .is_some(),
+        "test setup must remove the initial session"
+    );
+    assert_eq!(
+        node_a.client().current_peer_connection_instance(&peer_b),
+        None,
+        "the identified failure must begin with no current peer lookup result"
+    );
+    node_b.shutdown().await;
+
+    let failure_registry = node_a.registry.clone();
+    let failure_task = tokio::spawn(async move {
+        failure_registry
+            .handle_peer_connection_failure(addr_b, Some(old_instance))
+            .await
+    });
+    let old_teardown = next_event(&mut events, |event| {
+        matches!(
+            event,
+            TransportTestHelperEvent::TeardownAttempt {
+                peer,
+                addr,
+                instance_id,
+                ..
+            } if *peer == peer_b && *addr == addr_b && *instance_id == old_instance
+        )
+    })
+    .await;
+    let old_teardown_sequence = event_sequence(&old_teardown).unwrap();
+
+    let replacement_b = node_at(addr_b, key_b, config).await?;
+    connect_bidirectional(&node_a, &replacement_b).await?;
+    let replacement_publication = next_event(&mut events, |event| {
+        publication_for(event, &peer_b, addr_b, None)
+            && matches!(
+                event,
+                TransportTestHelperEvent::PublicationCommitted { instance_id, .. }
+                    if *instance_id != old_instance
+            )
+    })
+    .await;
+    let (replacement_instance, replacement_publication_sequence) = match replacement_publication {
+        TransportTestHelperEvent::PublicationCommitted {
+            instance_id,
+            sequence,
+            ..
+        } => (instance_id, sequence),
+        _ => unreachable!(),
+    };
+    assert!(old_teardown_sequence < replacement_publication_sequence);
+    assert_ne!(old_instance, replacement_instance);
+
+    teardown_gate.open();
+    failure_task
+        .await
+        .expect("identified failure task panicked")
+        .expect("identified failure task failed");
+
+    assert_eq!(
+        node_a.client().current_peer_connection_instance(&peer_b),
+        Some(replacement_instance),
+        "the old identified failure tail must not disconnect the replacement"
+    );
+    assert_eq!(
+        peer_failures(&node_a, addr_b).await,
+        0,
+        "the old identified failure tail must not poison replacement accounting"
+    );
+    assert!(
+        common::wait_for_condition(EVIDENCE_TIMEOUT, || async {
+            replacement_b
+                .client()
+                .lookup_connected_peer(&node_a.registry.peer_id)
+                .is_some()
+        })
+        .await,
+        "replacement must remain connected after old failure cleanup"
+    );
+
+    replacement_b.shutdown().await;
+    node_a.shutdown().await;
+    drop(event_sender);
+    Ok(())
+}

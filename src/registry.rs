@@ -11671,7 +11671,44 @@ impl<T: 'static> GossipRegistry<T> {
                         // unchanged.
                     }
                 }
+            } else if let Some(failed_id) = failed_instance_id {
+                // An identified failure whose initial current-session lookup
+                // misses is still instance-scoped. The miss can be the normal
+                // post-disconnect state, or a replacement can publish before
+                // this cleanup runs; neither case authorizes a peer-wide
+                // sweep of whatever session is current later.
+                #[cfg(feature = "test-helpers")]
+                crate::lifecycle::record_test_helper_event(|sequence| {
+                    crate::lifecycle::TransportTestHelperEvent::TeardownAttempt {
+                        peer: peer_id.clone(),
+                        addr: observed_peer_addr,
+                        instance_id: failed_id,
+                        sequence,
+                    }
+                });
+                let _ = pool.remove_connection_instance_for_peer(
+                    peer_id,
+                    observed_peer_addr,
+                    failed_id,
+                );
+                return Ok(());
             }
+        }
+
+        if let (None, Some(failed_id)) = (peer_id.as_ref(), failed_instance_id) {
+            // Without a resolved peer identity, an identified failure still
+            // cannot authorize address-wide cleanup: the address may already
+            // have been reused by a replacement. Retire only the matching
+            // instance at the observed address and release its count if it
+            // was displaced before this callback arrived.
+            let retired = self
+                .connection_pool
+                .remove_connection_instance_by_id(observed_peer_addr, failed_id);
+            if retired.is_none() {
+                self.connection_pool
+                    .release_displaced_connection_count(failed_id);
+            }
+            return Ok(());
         }
 
         let current_time = current_timestamp();
