@@ -23,6 +23,18 @@ use tokio::task::{AbortHandle, JoinHandle};
 use tracing::trace;
 use tracing::{debug, error, info, warn};
 
+/// Serializes connection publication with the final peer-disconnect delivery
+/// decision. Both operations are cold-path lifecycle transitions; keeping one
+/// process-wide gate here avoids an await-separated check-then-enter window
+/// without coupling the pool's lock-free indexes to registry state.
+static DISCONNECT_DELIVERY_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(crate) fn lock_disconnect_delivery() -> std::sync::MutexGuard<'static, ()> {
+    DISCONNECT_DELIVERY_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(any(test, feature = "test-helpers"))]
 use sha2::{Digest, Sha256};
 

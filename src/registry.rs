@@ -2737,15 +2737,31 @@ impl Drop for FailureLifecycleOwner {
 }
 
 struct FailureClaimMarker {
-    owner: Option<std::sync::Weak<FailureLifecycleOwner>>,
+    owner: std::sync::Mutex<Option<std::sync::Weak<FailureLifecycleOwner>>>,
+}
+
+impl FailureClaimMarker {
+    fn owner(&self) -> Option<std::sync::Weak<FailureLifecycleOwner>> {
+        self.owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn attach_owner(&self, owner: &Arc<FailureLifecycleOwner>) {
+        *self
+            .owner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(owner));
+    }
 }
 
 /// RAII ownership of one identified failure lifecycle.
 ///
 /// Dropping an unfinished claim releases it so a later callback can retry
 /// after cancellation. A completed claim remains deduplicated while its
-/// stream owner is alive; an ownerless claim is removed on completion because
-/// no late callback ownership can be proven for it.
+/// stream owner is alive; an ownerless completion remains as a tombstone until
+/// a later owner can be reconciled into it.
 struct FailureLifecycleClaim {
     registry: Arc<CompletedFailureInstances>,
     instance_id: u64,
@@ -2756,10 +2772,6 @@ struct FailureLifecycleClaim {
 impl FailureLifecycleClaim {
     fn complete(mut self) {
         self.finished = true;
-        if self.marker.owner.is_none() {
-            self.registry
-                .remove_if_same(self.instance_id, &self.marker);
-        }
     }
 }
 
@@ -2802,22 +2814,30 @@ impl CompletedFailureInstances {
             .claimed
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(existing) = claimed.get(&instance_id) {
-            let owner_gone = existing
-                .owner
-                .as_ref()
-                .is_some_and(|owner| owner.upgrade().is_none());
-            if owner_gone {
-                claimed.remove(&instance_id);
-            } else {
-                return None;
+        if let Some(existing) = claimed.get(&instance_id).cloned() {
+            match existing.owner() {
+                Some(existing_owner) if existing_owner.upgrade().is_none() => {
+                    claimed.remove(&instance_id);
+                }
+                Some(_) => return None,
+                None => {
+                    // Reconcile an owner that became available after an
+                    // ownerless callback completed. The tombstone still wins
+                    // the duplicate claim, while the physical owner now
+                    // supplies bounded reclamation for this marker.
+                    if let Some(owner) = owner {
+                        owner.bind_registry(registry_weak);
+                        existing.attach_owner(owner);
+                    }
+                    return None;
+                }
             }
         }
         if let Some(owner) = owner {
             owner.bind_registry(registry_weak);
         }
         let marker = Arc::new(FailureClaimMarker {
-            owner: owner.map(Arc::downgrade),
+            owner: std::sync::Mutex::new(owner.map(Arc::downgrade)),
         });
         claimed.insert(instance_id, marker.clone());
         Some(FailureLifecycleClaim {
@@ -2852,9 +2872,8 @@ impl CompletedFailureInstances {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if claimed.get(&instance_id).is_some_and(|marker| {
             marker
-                .owner
-                .as_ref()
-                .is_some_and(|current| std::sync::Weak::ptr_eq(current, owner))
+                .owner()
+                .is_some_and(|current| std::sync::Weak::ptr_eq(&current, owner))
         }) {
             claimed.remove(&instance_id);
         }
@@ -11699,6 +11718,11 @@ impl<T: 'static> GossipRegistry<T> {
         callback_peer_id: Option<crate::PeerId>,
     ) {
         let gossip_state = self.gossip_state.lock().await;
+        // Publication uses this same synchronous gate. Acquire it before the
+        // final snapshot and keep it until the future is entered, so a
+        // replacement cannot publish in an await-free-looking but actually
+        // unsynchronized check -> callback window.
+        let delivery_gate = crate::connection_pool::lock_disconnect_delivery();
         if !self.disconnect_notification_is_current_locked(
             &gossip_state,
             failed_peer_addr,
@@ -11709,9 +11733,18 @@ impl<T: 'static> GossipRegistry<T> {
             return;
         }
         drop(gossip_state);
-        handler
-            .handle_peer_disconnect(failed_peer_addr, callback_peer_id)
-            .await;
+        #[cfg(feature = "test-helpers")]
+        crate::lifecycle::dispatch_test_helper_event(
+            crate::lifecycle::TransportTestHelperEvent::DisconnectNotificationEntered {
+                peer: peer_id.cloned(),
+                addr: failed_peer_addr,
+                instance_id: failed_instance_id,
+                sequence: crate::lifecycle::next_test_helper_sequence(),
+            },
+        );
+        let callback = handler.handle_peer_disconnect(failed_peer_addr, callback_peer_id);
+        drop(delivery_gate);
+        callback.await;
     }
 
     /// Handle peer connection failure - start consensus process
@@ -11733,7 +11766,16 @@ impl<T: 'static> GossipRegistry<T> {
         observed_peer_addr: SocketAddr,
         failed_instance_id: Option<u64>,
     ) -> Result<()> {
-        self.handle_peer_connection_failure_inner(observed_peer_addr, failed_instance_id, None)
+        // Public/manual callers may arrive before pool retirement. Recovering
+        // the physical owner here keeps their completed marker bounded by the
+        // stream lifetime; a callback that arrives after retirement is still
+        // protected by the ownerless tombstone and can reconcile a later
+        // owner-carrying callback.
+        let owner = failed_instance_id.and_then(|instance_id| {
+            self.connection_pool
+                .failure_lifecycle_owner_for_instance(instance_id)
+        });
+        self.handle_peer_connection_failure_inner(observed_peer_addr, failed_instance_id, owner)
             .await
     }
 
@@ -14569,6 +14611,30 @@ mod tests {
         assert!(
             markers.len() < 5,
             "completed markers must be removed with their physical stream owner"
+        );
+    }
+
+    #[test]
+    fn ownerless_failure_tombstone_deduplicates_and_reconciles_owner() {
+        let markers = Arc::new(CompletedFailureInstances::default());
+        markers
+            .claim(7, None)
+            .expect("first ownerless callback must claim")
+            .complete();
+        assert!(
+            markers.claim(7, None).is_none(),
+            "sequential ownerless callbacks for one globally unique instance must deduplicate"
+        );
+
+        let owner = FailureLifecycleOwner::new(7);
+        assert!(
+            markers.claim(7, Some(&owner)).is_none(),
+            "a later owner must reconcile the existing tombstone rather than rerun cleanup"
+        );
+        drop(owner);
+        assert!(
+            markers.claim(7, None).is_some(),
+            "reconciled tombstone must be reclaimable with its physical owner"
         );
     }
 

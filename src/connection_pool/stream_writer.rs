@@ -2507,6 +2507,12 @@ impl LockFreeStreamHandle {
         self.instance_id
     }
 
+    pub(crate) fn failure_lifecycle_owner(
+        &self,
+    ) -> Arc<crate::registry::FailureLifecycleOwner> {
+        self.failure_lifecycle.clone()
+    }
+
     pub(crate) fn reply_slots(&self) -> Arc<crate::connection_pool::reply_slots::ReplySlots> {
         Arc::clone(&self.reply_slots)
     }

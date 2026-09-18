@@ -617,11 +617,36 @@ impl<T> ConnectionPool<T> {
         out
     }
 
+    /// Recover the physical stream owner for an identified failure before its
+    /// address index is retired. The owner lets the registry retain exactly
+    /// one completion marker only for the stream's actual lifetime; callers
+    /// arriving after retirement use the reconciled tombstone fallback.
+    pub(crate) fn failure_lifecycle_owner_for_instance(
+        &self,
+        instance_id: u64,
+    ) -> Option<Arc<crate::registry::FailureLifecycleOwner>> {
+        let mut owner = None;
+        self.connections_by_addr.iter_sync(|_, connection| {
+            if let Some(handle) = connection.stream_handle.as_ref()
+                && handle.instance_id() == instance_id
+            {
+                owner = Some(handle.failure_lifecycle_owner());
+                return false;
+            }
+            true
+        });
+        owner
+    }
+
     pub(crate) fn publish_current_peer_connection(
         &self,
         peer_id: &crate::PeerId,
         connection: Arc<LockFreeConnection>,
     ) {
+        // A disconnect notifier holds this same gate from its final
+        // revalidation through callback entry. Publication therefore cannot
+        // land in that interval and invalidate an already-entered callback.
+        let _delivery_gate = crate::connection_pool::lock_disconnect_delivery();
         let session = self.get_or_create_peer_session(peer_id);
         let stream_instance_id = connection
             .stream_handle
@@ -674,6 +699,10 @@ impl<T> ConnectionPool<T> {
         expected: Option<&Arc<LockFreeConnection>>,
         connection: Arc<LockFreeConnection>,
     ) -> std::result::Result<(), Option<Arc<LockFreeConnection>>> {
+        // Keep compare-and-publish in the same linearization domain as the
+        // final disconnect revalidation. A replacement cannot publish between
+        // that decision and entry into the stale callback.
+        let _delivery_gate = crate::connection_pool::lock_disconnect_delivery();
         let session = self.get_or_create_peer_session(peer_id);
         if let Err(current) =
             session.compare_and_set_current_connection(expected, connection.clone())
