@@ -47,6 +47,9 @@ pub(crate) struct ReplySlotRecord {
     /// Final outcome selected by the writer and committed on the wire. This
     /// deliberately does not infer outcome from payload/cancellation state.
     wire_outcome: AtomicU8,
+    #[cfg(any(test, feature = "test-helpers"))]
+    /// The cancellation/outcome race has one accounting linearization point.
+    too_late_recorded: AtomicBool,
     /// Publication has its own tiny state machine so close and synchronous
     /// publication have one linearization point. `PUBLICATION_WRITING` is
     /// held only while storing the payload in `OnceLock`.
@@ -55,8 +58,8 @@ pub(crate) struct ReplySlotRecord {
     // The record owns these permits for its entire transport lifetime. Keeping
     // them as fields avoids a release lock and makes writer-owned retention
     // part of the same bounded record.
-    _job_permit: OwnedSemaphorePermit,
-    _byte_permit: OwnedSemaphorePermit,
+    _job_permit: Option<OwnedSemaphorePermit>,
+    _byte_permit: Option<OwnedSemaphorePermit>,
     #[cfg(any(test, feature = "test-helpers"))]
     stats: Arc<crate::connection_pool::lease_stats::LeaseStats>,
 }
@@ -173,12 +176,20 @@ impl ReplySlotRecord {
                 // Once the writer has selected and committed a wire outcome,
                 // cancellation can no longer alter delivery, even though the
                 // record remains reserved until its terminal flush.
-                self.stats
-                    .too_late_cancellations
-                    .fetch_add(1, Ordering::Relaxed);
+                self.note_too_late_once();
             }
         }
         self.activate();
+    }
+
+    #[cfg(any(test, feature = "test-helpers"))]
+    #[inline]
+    fn note_too_late_once(&self) {
+        if !self.too_late_recorded.swap(true, Ordering::AcqRel) {
+            self.stats
+                .too_late_cancellations
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn activate(&self) {
@@ -280,8 +291,16 @@ impl ReplySlotRecord {
     #[inline]
     pub(crate) fn note_normal_outcome(&self) {
         #[cfg(any(test, feature = "test-helpers"))]
-        self.wire_outcome
-            .store(WIRE_OUTCOME_NORMAL, Ordering::Release);
+        {
+            self.wire_outcome
+                .store(WIRE_OUTCOME_NORMAL, Ordering::Release);
+            // Cancellation may win the race before the writer resolves the
+            // committed final frame. Account for that path here, exactly once;
+            // `cancel` handles the opposite ordering.
+            if self.cancelled.load(Ordering::Acquire) {
+                self.note_too_late_once();
+            }
+        }
     }
 
     #[inline]
@@ -395,19 +414,25 @@ impl ReplySlotRecord {
 
 impl Drop for ReplySlotRecord {
     fn drop(&mut self) {
+        let slots = self.slots.upgrade();
+        // Release the budget permits before publishing the slot back into the
+        // free set. This makes free-slot observation an actual capacity gate,
+        // rather than a signal that races the record's field destruction.
+        drop(self._job_permit.take());
+        drop(self._byte_permit.take());
         #[cfg(any(test, feature = "test-helpers"))]
         {
-            self.stats.reserved_jobs.fetch_sub(1, Ordering::Relaxed);
+            self.stats.reserved_jobs.fetch_sub(1, Ordering::Release);
             self.stats
                 .reserved_bytes
-                .fetch_sub(self.max_reply_bytes, Ordering::Relaxed);
+                .fetch_sub(self.max_reply_bytes, Ordering::Release);
             if self.normal_payload.get().is_some() {
                 self.stats
                     .retained_payload_owners
-                    .fetch_sub(1, Ordering::Relaxed);
+                    .fetch_sub(1, Ordering::Release);
             }
         }
-        if let Some(slots) = self.slots.upgrade() {
+        if let Some(slots) = slots {
             slots.recycle(self.index, self.generation);
         }
     }
@@ -507,10 +532,12 @@ impl ReplySlots {
             state: AtomicU8::new(STATE_RESERVED),
             #[cfg(any(test, feature = "test-helpers"))]
             wire_outcome: AtomicU8::new(WIRE_OUTCOME_UNSET),
+            #[cfg(any(test, feature = "test-helpers"))]
+            too_late_recorded: AtomicBool::new(false),
             publication_state: AtomicU8::new(PUBLICATION_OPEN),
             completion: Notify::new(),
-            _job_permit: job_permit,
-            _byte_permit: byte_permit,
+            _job_permit: Some(job_permit),
+            _byte_permit: Some(byte_permit),
             #[cfg(any(test, feature = "test-helpers"))]
             stats: Arc::clone(&self.stats),
         });

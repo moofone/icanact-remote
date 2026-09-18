@@ -2049,8 +2049,10 @@ where
             let (written, complete) =
                 write_inline_lease_slice(stream, pending_offset, header, payload.as_ref()).await?;
             response.record.note_frame_progress(written);
-            if complete {
+            if written > 0 || complete {
                 response.record.note_normal_outcome();
+            }
+            if complete {
                 response.stage = LeasedResponseStage::Flushing;
             }
             Ok((written, false, false))
@@ -2081,8 +2083,17 @@ where
             let (written, complete, frame_boundary) =
                 write_bytes_streaming_command_slice(stream, pending_offset, normal).await?;
             response.record.note_frame_progress(written);
-            if complete {
+            // The final frame wins as soon as its first byte is committed.
+            // Cancellation can race the remainder of that frame, so waiting
+            // until the whole response is written would miss the writer's
+            // already-linearized normal outcome.
+            if written > 0 && final_frame {
                 response.record.note_normal_outcome();
+            }
+            if complete {
+                if written == 0 {
+                    response.record.note_normal_outcome();
+                }
                 response.stage = LeasedResponseStage::Flushing;
                 return Ok((written, false, false));
             }

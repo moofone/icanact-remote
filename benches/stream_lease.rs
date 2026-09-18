@@ -64,9 +64,20 @@ impl TransportFixture {
         std::hint::black_box(&self.received[..bytes]);
     }
 
-    async fn drain_and_wait_for_release(&mut self, bytes: usize) {
+    async fn drain_and_wait_for_release(&mut self, bytes: usize, expected_live_slots: usize) {
         self.drain(bytes).await;
-        while lease_stats(&self.handle).live_slots != 0 {
+        loop {
+            let stats = lease_stats(&self.handle);
+            let expected_bytes = expected_live_slots * PAYLOAD_LEN;
+            if stats.live_slots == expected_live_slots
+                && stats.reserved_jobs == expected_live_slots
+                && stats.reserved_bytes == expected_bytes
+                && stats.free_slots
+                    == icanact_remote::lease_test_support::REPLY_SLOT_CAP - expected_live_slots
+                && stats.ready_depth == 0
+            {
+                return;
+            }
             tokio::task::yield_now().await;
         }
     }
@@ -135,7 +146,9 @@ fn cancel_one(mut leases: Vec<ReplyLease>) -> Vec<ReplyLease> {
 
 async fn bench_unleased_inline_end_to_end(fixture: &mut TransportFixture) {
     publish_unleased_inline(unleased_responder(fixture));
-    fixture.drain(16 + PAYLOAD_LEN).await;
+    fixture
+        .drain_and_wait_for_release(16 + PAYLOAD_LEN, 0)
+        .await;
 }
 
 async fn bench_lease_publish_end_to_end(
@@ -143,7 +156,9 @@ async fn bench_lease_publish_end_to_end(
     budget: &ReplyDeliveryBudget,
 ) {
     publish_lease(lease(&fixture.handle, budget, 2));
-    fixture.drain(16 + PAYLOAD_LEN).await;
+    fixture
+        .drain_and_wait_for_release(16 + PAYLOAD_LEN, 0)
+        .await;
 }
 
 async fn bench_shared_fanout_end_to_end(
@@ -152,7 +167,9 @@ async fn bench_shared_fanout_end_to_end(
     fanout: usize,
 ) {
     publish_shared_fanout(prepare_shared_fanout(fixture, budget, fanout));
-    fixture.drain(fanout * (16 + PAYLOAD_LEN)).await;
+    fixture
+        .drain_and_wait_for_release(fanout * (16 + PAYLOAD_LEN), 0)
+        .await;
 }
 
 async fn bench_cancel_end_to_end(
@@ -163,7 +180,10 @@ async fn bench_cancel_end_to_end(
 ) {
     let canceled = leases.pop().expect("occupied cancellation lease");
     drop(canceled);
-    fixture.drain(16 + TERMINAL.len()).await;
+    let survivors = leases.len();
+    fixture
+        .drain_and_wait_for_release(16 + TERMINAL.len(), survivors)
+        .await;
     leases.push(lease(&fixture.handle, budget, *next_correlation));
     *next_correlation = next_correlation.wrapping_add(1);
 }
@@ -189,7 +209,7 @@ fn bench_stream_lease(c: &mut Criterion) {
                 let start = Instant::now();
                 publish_unleased_inline(responder);
                 measured += start.elapsed();
-                runtime.block_on(targeted_unleased.drain_and_wait_for_release(16 + PAYLOAD_LEN));
+                runtime.block_on(targeted_unleased.drain_and_wait_for_release(16 + PAYLOAD_LEN, 0));
             }
             measured
         })
@@ -214,11 +234,11 @@ fn bench_stream_lease(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut measured = Duration::ZERO;
             for _ in 0..iters {
-                let prepared = lease(&targeted_publish.handle, &publish_budget, 2);
                 let start = Instant::now();
+                let prepared = lease(&targeted_publish.handle, &publish_budget, 2);
                 publish_lease(prepared);
                 measured += start.elapsed();
-                runtime.block_on(targeted_publish.drain_and_wait_for_release(16 + PAYLOAD_LEN));
+                runtime.block_on(targeted_publish.drain_and_wait_for_release(16 + PAYLOAD_LEN, 0));
             }
             measured
         })
@@ -255,7 +275,7 @@ fn bench_stream_lease(c: &mut Criterion) {
                     publish_shared_fanout(prepared);
                     measured += start.elapsed();
                     runtime.block_on(
-                        targeted_shared.drain_and_wait_for_release(fanout * (16 + PAYLOAD_LEN)),
+                        targeted_shared.drain_and_wait_for_release(fanout * (16 + PAYLOAD_LEN), 0),
                     );
                 }
                 measured
@@ -310,7 +330,7 @@ fn bench_stream_lease(c: &mut Criterion) {
                     runtime.block_on(async {
                         drop(survivors);
                         targeted_cancel
-                            .drain_and_wait_for_release(terminal_count * (16 + TERMINAL.len()))
+                            .drain_and_wait_for_release(terminal_count * (16 + TERMINAL.len()), 0)
                             .await;
                     });
                 }

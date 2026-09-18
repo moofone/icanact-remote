@@ -102,6 +102,7 @@ pub use reply_lease::{ReplyDeliveryBudget, ReplyLease, ReplyLeaseAdmissionError,
 pub mod lease_test_support {
     pub use crate::connection_pool::lease_stats::LeaseStatsSnapshot;
     pub use crate::connection_pool::{BufferConfig, ChannelId, LockFreeStreamHandle};
+    pub const REPLY_SLOT_CAP: usize = crate::connection_pool::reply_slots::REPLY_SLOT_CAP;
 
     pub fn lease_stats(handle: &LockFreeStreamHandle) -> LeaseStatsSnapshot {
         handle.reply_slots().stats_snapshot()

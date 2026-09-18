@@ -215,6 +215,55 @@ fn publication_close_race_has_no_second_publication() {
     assert_eq!(slots.reserved(), 0);
 }
 
+#[test]
+fn publication_close_controlled_overlap_has_one_linearized_result() {
+    use std::sync::{Arc, Barrier};
+
+    let slots = crate::connection_pool::reply_slots::ReplySlots::new(
+        1,
+        "127.0.0.1:40571".parse().expect("test address"),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let jobs = Arc::new(Semaphore::new(1));
+    let bytes = Arc::new(Semaphore::new(32));
+    let record = slots
+        .try_reserve(
+            1,
+            32,
+            Arc::new(ReplyPayload::from_static(b"cancelled")),
+            jobs.try_acquire_owned().expect("job permit"),
+            bytes.try_acquire_many_owned(32).expect("byte permit"),
+        )
+        .expect("reserve");
+    let gate = Arc::new(Barrier::new(2));
+    let publisher_record = Arc::clone(&record);
+    let publisher_gate = Arc::clone(&gate);
+    let publisher = std::thread::spawn(move || {
+        publisher_gate.wait();
+        publisher_record.publish(ReplyPayload::from_static(b"reply"))
+    });
+    gate.wait();
+    slots.close_and_reclaim();
+    let publication = publisher.join().expect("publisher must not panic");
+    assert!(
+        publication.is_ok() || matches!(publication, Err(crate::GossipError::ConnectionClosed(_))),
+        "close/publication must have one linearized outcome: {publication:?}"
+    );
+    let late = record.publish(ReplyPayload::from_static(b"again"));
+    assert!(
+        matches!(late, Err(crate::GossipError::ConnectionClosed(_)))
+            || matches!(late, Err(crate::GossipError::Network(_))),
+        "a close race must never permit a second publication: {late:?}"
+    );
+    drop(record);
+    let stats = slots.stats_snapshot();
+    assert_eq!(stats.discarded_reservations, 0);
+    assert_eq!(stats.normal_completions, 0);
+    assert_eq!(stats.terminal_completions, 0);
+    assert_eq!(stats.reserved_jobs, 0);
+    assert_eq!(stats.reserved_bytes, 0);
+}
+
 #[tokio::test]
 async fn published_lease_releases_after_terminal_flush() {
     use tokio::io::AsyncReadExt;
