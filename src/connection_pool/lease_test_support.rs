@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use tokio::sync::Notify;
 
@@ -9,6 +9,10 @@ pub(crate) struct LeaseWakeGate {
     armed: AtomicBool,
     observed: Notify,
     release: Notify,
+    registered: Notify,
+    selection_armed: AtomicBool,
+    selected_count: AtomicUsize,
+    selected: Notify,
 }
 
 impl LeaseWakeGate {
@@ -17,11 +21,61 @@ impl LeaseWakeGate {
             armed: AtomicBool::new(false),
             observed: Notify::new(),
             release: Notify::new(),
+            registered: Notify::new(),
+            selection_armed: AtomicBool::new(false),
+            selected_count: AtomicUsize::new(0),
+            selected: Notify::new(),
         }
     }
 
     pub(crate) fn arm(&self) {
         self.armed.store(true, Ordering::Release);
+    }
+
+    pub(crate) async fn wait_registered(&self) {
+        self.registered.notified().await;
+    }
+
+    pub(crate) fn parking_select_registered(&self) {
+        if self.armed.load(Ordering::Acquire) {
+            self.registered.notify_one();
+        }
+    }
+
+    pub(crate) fn maintenance_duration(
+        &self,
+        duration: std::time::Duration,
+    ) -> std::time::Duration {
+        if self.armed.load(Ordering::Acquire) {
+            std::time::Duration::from_secs(3600)
+        } else {
+            duration
+        }
+    }
+
+    pub(crate) fn arm_selection(&self) {
+        self.selected_count.store(0, Ordering::Release);
+        self.selection_armed.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn observe_selection(&self) {
+        if self.selection_armed.load(Ordering::Acquire) {
+            self.selected_count.fetch_add(1, Ordering::AcqRel);
+            self.selected.notify_waiters();
+        }
+    }
+
+    pub(crate) async fn wait_selected(&self, count: usize) {
+        loop {
+            if self.selected_count.load(Ordering::Acquire) >= count {
+                return;
+            }
+            self.selected.notified().await;
+        }
+    }
+
+    pub(crate) fn disarm_selection(&self) {
+        self.selection_armed.store(false, Ordering::Release);
     }
 
     pub(crate) async fn wait_observed(&self) {

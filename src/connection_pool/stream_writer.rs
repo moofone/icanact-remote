@@ -3230,6 +3230,8 @@ impl LockFreeStreamHandle {
                     let pending = match lane {
                         StreamingLane::Resumed => yielded_stream_cmd.pop_front(),
                         StreamingLane::Lease => reply_slots.pop_ready().map(|record| {
+                            #[cfg(test)]
+                            reply_slots.lease_test_gate().observe_selection();
                             PendingStreamingCommand::local(StreamingCommand::LeasedResponse(
                                 Box::new(LeasedResponse {
                                     record,
@@ -4713,6 +4715,13 @@ impl LockFreeStreamHandle {
                     // become ready while an ordinary frame is stalled, and
                     // the next boundary must re-check the ready set.
                     let lease_notify = reply_slots.notify();
+                    let lease_ready = lease_notify.notified();
+                    #[cfg(test)]
+                    let maintenance = reply_slots
+                        .lease_test_gate()
+                        .maintenance_duration(maintenance);
+                    #[cfg(test)]
+                    reply_slots.lease_test_gate().parking_select_registered();
                     tokio::select! {
                         biased;
                         progress = wait_pending_ordinary(&mut stream, pending) => {
@@ -4778,7 +4787,7 @@ impl LockFreeStreamHandle {
                             pending_cmd = write_queue.pop();
                         }
                         _ = streaming_queue.data_notify.notified() => {}
-                        _ = lease_notify.notified() => {
+                        _ = lease_ready => {
                             #[cfg(test)]
                             reply_slots.lease_test_gate().hold_lease_branch().await;
                         }
@@ -4857,6 +4866,8 @@ impl LockFreeStreamHandle {
                         continue;
                     }
                     if let Some(record) = reply_slots.pop_ready() {
+                        #[cfg(test)]
+                        reply_slots.lease_test_gate().observe_selection();
                         pending_stream_cmd = Some(PendingStreamingCommand::local(
                             StreamingCommand::LeasedResponse(Box::new(LeasedResponse {
                                 record,
@@ -5306,6 +5317,8 @@ impl LockFreeStreamHandle {
                 } else {
                     // Pre-park drain; see the read-armed variant above.
                     if let Some(record) = reply_slots.pop_ready() {
+                        #[cfg(test)]
+                        reply_slots.lease_test_gate().observe_selection();
                         pending_stream_cmd = Some(PendingStreamingCommand::local(
                             StreamingCommand::LeasedResponse(Box::new(LeasedResponse {
                                 record,

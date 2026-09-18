@@ -443,8 +443,20 @@ impl Drop for ReplySlotRecord {
         // payload owner cannot outlive the permits, accounting, or slot.
         drop(self.normal_payload.swap(None));
         drop(self.terminal_payload.swap(None));
+        #[cfg(test)]
+        self.stats.permits_released.store(false, Ordering::Release);
+        drop(self._job_permit.take());
+        drop(self._byte_permit.take());
+        #[cfg(test)]
+        self.stats.permits_released.store(true, Ordering::Release);
         #[cfg(any(test, feature = "test-helpers"))]
         {
+            #[cfg(test)]
+            if !self.stats.permits_released.load(Ordering::Acquire) {
+                self.stats
+                    .accounting_before_permits
+                    .store(true, Ordering::Release);
+            }
             self.stats.reserved_jobs.fetch_sub(1, Ordering::Release);
             self.stats
                 .reserved_bytes
@@ -455,8 +467,6 @@ impl Drop for ReplySlotRecord {
                     .fetch_sub(1, Ordering::Release);
             }
         }
-        drop(self._job_permit.take());
-        drop(self._byte_permit.take());
         if let Some(slots) = slots {
             slots.recycle(self.index, self.generation);
         }

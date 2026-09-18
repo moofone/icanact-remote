@@ -4,6 +4,8 @@
 //! Counters are owned by one `ReplySlots` instance; there is no production
 //! global state, lock, or allocator hook on the lease hot path.
 
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[derive(Debug, Default)]
@@ -20,6 +22,10 @@ pub(crate) struct LeaseStats {
     pub(crate) too_late_cancellations: AtomicUsize,
     pub(crate) frame_progress: AtomicUsize,
     pub(crate) flush_progress: AtomicUsize,
+    #[cfg(test)]
+    pub(crate) permits_released: AtomicBool,
+    #[cfg(test)]
+    pub(crate) accounting_before_permits: AtomicBool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

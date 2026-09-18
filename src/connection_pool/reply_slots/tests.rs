@@ -157,6 +157,56 @@ async fn close_before_publish_is_rejected_without_fresh_responder() {
     let _ = writer_task.await;
 }
 
+#[tokio::test]
+async fn publication_close_public_publisher_first_notifies_once() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Observer(AtomicUsize);
+    impl AskReplyObserver for Observer {
+        fn reply_claimed(&self, payload: Bytes) {
+            assert_eq!(payload, Bytes::from_static(b"published"));
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let budget =
+        ReplyDeliveryBudget::new(1, 32, ReplyPayload::from_static(b"duplicate-suppressed"))
+            .expect("valid budget");
+    let (io, _peer) = tokio::io::duplex(4096);
+    let (handle, writer_task, _reader_task) = LockFreeStreamHandle::new(
+        io,
+        "127.0.0.1:40576".parse().expect("test address"),
+        ChannelId::TellAsk,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let handle = Arc::new(handle);
+    let observer = Arc::new(Observer(AtomicUsize::new(0)));
+    let context = crate::AskContext::from_stream_handle_with_request_id(80, &handle, None, None)
+        .with_reply_observer(Arc::clone(&observer) as Arc<dyn AskReplyObserver>);
+    let lease = context
+        .responder()
+        .try_reply_lease(&budget, 32)
+        .expect("lease admission");
+    lease
+        .try_reply_bytes(ReplyPayload::from_static(b"published"))
+        .expect("public publication");
+    assert_eq!(observer.0.load(Ordering::SeqCst), 1);
+    handle.reply_slots().close_and_reclaim();
+    assert_eq!(handle.reply_slots().stats_snapshot().reserved_jobs, 0);
+    assert_eq!(
+        handle
+            .reply_slots()
+            .stats_snapshot()
+            .retained_payload_owners,
+        0
+    );
+    assert_eq!(budget.available_test_permits(), (1, 32));
+    handle.shutdown();
+    let _ = writer_task.await;
+}
+
 #[test]
 fn close_before_publication_is_rejected_at_the_close_linearization_point() {
     let slots = crate::connection_pool::reply_slots::ReplySlots::new(
@@ -269,6 +319,45 @@ fn publication_close_controlled_overlap_has_one_linearized_result() {
 }
 
 #[test]
+fn reservation_accounting_after_permit_release() {
+    let slots = crate::connection_pool::reply_slots::ReplySlots::new(
+        1,
+        "127.0.0.1:40575".parse().expect("test address"),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let jobs = Arc::new(Semaphore::new(1));
+    let bytes = Arc::new(Semaphore::new(32));
+    let record = slots
+        .try_reserve(
+            1,
+            32,
+            Arc::new(ReplyPayload::from_static(b"terminal")),
+            jobs.clone().try_acquire_owned().expect("job permit"),
+            bytes
+                .clone()
+                .try_acquire_many_owned(32)
+                .expect("byte permit"),
+        )
+        .expect("reservation");
+
+    record.finish();
+    drop(record);
+
+    let stats = slots.stats_snapshot();
+    assert_eq!(jobs.available_permits(), 1);
+    assert_eq!(bytes.available_permits(), 32);
+    assert_eq!(stats.reserved_jobs, 0);
+    assert_eq!(stats.reserved_bytes, 0);
+    assert!(
+        !slots
+            .stats
+            .accounting_before_permits
+            .load(std::sync::atomic::Ordering::Acquire),
+        "reservation accounting must follow both permit releases"
+    );
+}
+
+#[test]
 fn payload_destruction_before_capacity_release() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -306,17 +395,18 @@ fn payload_destruction_before_capacity_release() {
     );
     let jobs = Arc::new(Semaphore::new(1));
     let bytes_permits = Arc::new(Semaphore::new(32));
-    let dropped = Arc::new(AtomicBool::new(false));
+    let normal_dropped = Arc::new(AtomicBool::new(false));
+    let terminal_dropped = Arc::new(AtomicBool::new(false));
     let normal_owner = PayloadOwner {
         bytes: vec![7; 8],
-        dropped_before_capacity_release: Arc::clone(&dropped),
+        dropped_before_capacity_release: Arc::clone(&normal_dropped),
         jobs: Arc::clone(&jobs),
         bytes_permits: Arc::clone(&bytes_permits),
         slots: Arc::clone(&slots),
     };
     let terminal_owner = PayloadOwner {
         bytes: b"cancelled".to_vec(),
-        dropped_before_capacity_release: Arc::clone(&dropped),
+        dropped_before_capacity_release: Arc::clone(&terminal_dropped),
         jobs: Arc::clone(&jobs),
         bytes_permits: Arc::clone(&bytes_permits),
         slots: Arc::clone(&slots),
@@ -339,8 +429,12 @@ fn payload_destruction_before_capacity_release() {
     drop(record);
 
     assert!(
-        dropped.load(Ordering::Acquire),
+        normal_dropped.load(Ordering::Acquire),
         "normal payload must be destroyed while permits are held and before slot recycle"
+    );
+    assert!(
+        terminal_dropped.load(Ordering::Acquire),
+        "terminal payload must be destroyed while permits are held and before slot recycle"
     );
     assert_eq!(jobs.available_permits(), 1);
     assert_eq!(bytes_permits.available_permits(), 32);
