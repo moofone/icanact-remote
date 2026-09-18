@@ -1,3 +1,31 @@
+#[cfg(test)]
+type FallbackAdoptionHook =
+    Arc<dyn Fn(&Arc<LockFreeConnection>) + Send + Sync + 'static>;
+
+#[cfg(test)]
+static FALLBACK_ADOPTION_HOOK: OnceLock<std::sync::Mutex<Option<FallbackAdoptionHook>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn set_fallback_adoption_hook(hook: Option<FallbackAdoptionHook>) {
+    *FALLBACK_ADOPTION_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("fallback adoption hook mutex poisoned") = hook;
+}
+
+#[cfg(test)]
+fn record_fallback_adoption_capture(connection: &Arc<LockFreeConnection>) {
+    let hook = FALLBACK_ADOPTION_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("fallback adoption hook mutex poisoned")
+        .clone();
+    if let Some(hook) = hook {
+        hook(connection);
+    }
+}
+
 /// Outcome of a connection keep/drop/dedup conflict for a single peer identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use = "a connection conflict decision must be acted on explicitly by the \
@@ -1799,6 +1827,33 @@ impl<T> ConnectionPool<T> {
         conn.has_live_stream()
     }
 
+    /// Adopt a live address/alias fallback only while the peer session slot
+    /// still matches the empty state observed by the caller. A fallback read
+    /// is necessarily a snapshot: a newer connection may publish before this
+    /// method resumes, and an unconditional publish would overwrite it.
+    fn adopt_fallback_connection(
+        &self,
+        peer_id: &crate::PeerId,
+        connection: Arc<LockFreeConnection>,
+    ) -> Option<Arc<LockFreeConnection>> {
+        #[cfg(test)]
+        record_fallback_adoption_capture(&connection);
+
+        match self.compare_and_publish_peer_connection(peer_id, None, connection.clone()) {
+            Ok(()) => Some(connection),
+            Err(Some(current)) if self.is_usable_connection(&current) => Some(current),
+            Err(Some(_)) => None,
+            Err(None) => {
+                let retry = connection;
+                match self.compare_and_publish_peer_connection(peer_id, None, retry.clone()) {
+                    Ok(()) => Some(retry),
+                    Err(Some(current)) if self.is_usable_connection(&current) => Some(current),
+                    Err(Some(_)) | Err(None) => None,
+                }
+            }
+        }
+    }
+
     /// PURE, non-mutating read of "what connection does this peer currently
     /// have" — the primary session slot, then (as fallbacks, purely as
     /// reads) the secondary `connections_by_peer` mirror, the
@@ -2110,9 +2165,13 @@ impl<T> ConnectionPool<T> {
                         "CONNECTION POOL: Found connection for peer '{}' via address fallback ({})",
                         peer_id, addr
                     );
-                    // Index by peer_id for future lookups
-                    self.publish_current_peer_connection(peer_id, conn.clone());
-                    return Some(conn);
+                    if let Some(conn) = self.adopt_fallback_connection(peer_id, conn) {
+                        debug!(
+                            "CONNECTION POOL: Adopted live configured-address fallback for peer '{}'",
+                            peer_id
+                        );
+                        return Some(conn);
+                    }
                 }
             }
         }
@@ -2125,8 +2184,9 @@ impl<T> ConnectionPool<T> {
                 "CONNECTION POOL: Found connection for peer '{}' via address alias ({})",
                 peer_id, conn.addr
             );
-            self.publish_current_peer_connection(peer_id, conn.clone());
-            return Some(conn);
+            if let Some(conn) = self.adopt_fallback_connection(peer_id, conn) {
+                return Some(conn);
+            }
         }
 
         // `get_connection_by_peer_id` is a pure lookup primitive: a

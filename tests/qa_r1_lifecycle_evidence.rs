@@ -612,6 +612,153 @@ async fn successful_cas_tail_does_not_fence_replacement() -> Result<(), DynError
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn genuine_eof_lookup_miss_runs_fenced_failure_lifecycle() -> Result<(), DynError> {
+    let config = GossipConfig {
+        connection_timeout: EVIDENCE_TIMEOUT,
+        response_timeout: EVIDENCE_TIMEOUT,
+        enable_peer_discovery: true,
+        allow_loopback_discovery: true,
+        max_peers: 1,
+        peer_retry_interval: Duration::from_secs(3_600),
+        gossip_interval: Duration::from_secs(3_600),
+        cleanup_interval: Duration::from_secs(3_600),
+        peer_supervisor_interval: Duration::from_secs(3_600),
+        peer_gossip_interval: None,
+        ..Default::default()
+    };
+    let node_a = create_tls_node_with_keypair(
+        KeyPair::new_for_testing("qa-r1-genuine-eof-a"),
+        config.clone(),
+    )
+    .await?;
+    let node_b =
+        create_tls_node_with_keypair(KeyPair::new_for_testing("qa-r1-genuine-eof-b"), config)
+            .await?;
+    let addr_b = node_b.registry.bind_addr;
+    let peer_b = node_b.registry.peer_id.clone();
+    let (event_sender, mut events) = unbounded_channel::<TransportTestHelperEvent>();
+    let _guard = TransportLifecycleRecorderGuard::install(Arc::new(|_event| {}));
+    _guard.install_test_helper_recorder(Arc::new({
+        let event_sender = event_sender.clone();
+        move |event| {
+            event_sender
+                .send(event)
+                .expect("lifecycle recorder channel closed");
+        }
+    }));
+
+    let disconnect_invocations = Arc::new(AtomicUsize::new(0));
+    struct CountingDisconnectHandler(Arc<AtomicUsize>);
+    impl PeerDisconnectHandler for CountingDisconnectHandler {
+        fn handle_peer_disconnect(
+            &self,
+            _peer_addr: std::net::SocketAddr,
+            _peer_id: Option<PeerId>,
+        ) -> BoxFuture<'_, ()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {})
+        }
+    }
+    node_a
+        .registry
+        .set_peer_disconnect_handler(Arc::new(CountingDisconnectHandler(
+            disconnect_invocations.clone(),
+        )))
+        .await;
+
+    connect_bidirectional(&node_a, &node_b).await?;
+    assert!(
+        common::wait_for_condition(EVIDENCE_TIMEOUT, || async {
+            node_a
+                .client()
+                .current_peer_connection_instance(&peer_b)
+                .is_some()
+        })
+        .await,
+        "initial current B instance did not settle"
+    );
+    let old_instance = node_a
+        .client()
+        .current_peer_connection_instance(&peer_b)
+        .expect("initial current B instance");
+    // Closing B's real transport produces UnexpectedEof in A's IO task. Its
+    // ExitGuard marks the handle exited before invoking failure cleanup, so
+    // the handler's live current-session lookup misses even though this is a
+    // genuine current-session EOF, not a superseded instance.
+    node_b.shutdown().await;
+    let teardown = next_event(&mut events, |event| {
+        matches!(
+            event,
+            TransportTestHelperEvent::TeardownAttempt {
+                peer,
+                addr,
+                instance_id,
+                ..
+            } if *peer == peer_b && *addr == addr_b && *instance_id == old_instance
+        )
+    })
+    .await;
+    let mark_failed = next_event(&mut events, |event| {
+        matches!(
+            event,
+            TransportTestHelperEvent::MarkFailed {
+                peer: Some(peer),
+                addr,
+                instance_id: Some(instance_id),
+                applied: true,
+                ..
+            } if *peer == peer_b && *addr == addr_b && *instance_id == old_instance
+        )
+    })
+    .await;
+    assert!(
+        event_sequence(&teardown).unwrap() < event_sequence(&mark_failed).unwrap(),
+        "instance teardown must precede genuine EOF failure accounting"
+    );
+    assert_eq!(
+        peer_failures(&node_a, addr_b).await,
+        node_a.registry.config.max_peer_failures,
+        "a genuine current-session EOF must still update failure/backoff accounting after lookup miss"
+    );
+    assert!(
+        common::wait_for_condition(EVIDENCE_TIMEOUT, || async {
+            disconnect_invocations.load(Ordering::Acquire) == 1
+        })
+        .await,
+        "a genuine EOF must notify the peer-disconnect handler exactly once"
+    );
+    assert_eq!(
+        node_a.client().current_peer_connection_instance(&peer_b),
+        None,
+        "the genuine EOF must leave no current session"
+    );
+    let state = node_a.registry.gossip_state.lock().await;
+    let peer = state
+        .peers
+        .get(&addr_b)
+        .expect("peer state must remain tracked");
+    assert!(
+        peer.current_session_source.is_none() && peer.current_session_connection.is_none(),
+        "genuine EOF must invalidate the dead session authentication state"
+    );
+    let discovery = state
+        .peer_discovery
+        .as_ref()
+        .expect("peer discovery must be enabled");
+    assert_eq!(
+        discovery.connected_peer_count(),
+        0,
+        "genuine EOF must clear discovery Connected state"
+    );
+    assert_eq!(discovery.remaining_slots(), 1);
+    drop(state);
+
+    node_a.shutdown().await;
+    drop(event_sender);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn identified_failure_lookup_miss_preserves_replacement() -> Result<(), DynError> {
     let config = GossipConfig {
         connection_timeout: EVIDENCE_TIMEOUT,

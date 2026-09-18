@@ -11686,12 +11686,25 @@ impl<T: 'static> GossipRegistry<T> {
                         sequence,
                     }
                 });
-                let _ = pool.remove_connection_instance_for_peer(
+                let retired = pool.remove_connection_instance_for_peer(
                     peer_id,
                     observed_peer_addr,
                     failed_id,
                 );
-                return Ok(());
+                if retired.is_none() {
+                    // The identified instance was already displaced (or
+                    // retired by a racing teardown), so this callback is
+                    // stale and must not run peer-wide failure accounting.
+                    return Ok(());
+                }
+                // A lookup miss is not evidence of supersession: the IO
+                // exit path marks its own handle exited before spawning this
+                // callback, so `get_connection_by_peer_id` can clear the
+                // failed current session and return None. The identity-aware
+                // retirement above proves this callback did retire that
+                // exact instance; continue through the fenced discovery,
+                // authentication, accounting, and notification tail.
+                instance_teardown_done = true;
             }
         }
 
