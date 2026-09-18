@@ -177,3 +177,55 @@ async fn conditional_clear_failed_cas_does_not_emit_session_removed() {
     fresh.abort_tasks();
     stale.abort_tasks();
 }
+
+/// Session publication commits the new current connection while holding the
+/// disconnect-delivery gate, but lifecycle observers run after that gate is
+/// released. A recorder is allowed to publish a replacement synchronously;
+/// this must not self-deadlock on the non-reentrant delivery mutex.
+#[tokio::test]
+async fn publication_lifecycle_recorder_can_reenter_after_gate_release() {
+    let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
+    let peer_id = crate::KeyPair::new_for_testing("qa-publication-recorder-reentry-peer").peer_id();
+    let initial_addr: SocketAddr = "127.0.0.1:60731".parse().unwrap();
+    let replacement_addr: SocketAddr = "127.0.0.1:60732".parse().unwrap();
+    let initial = make_live_connection(initial_addr, ConnectionDirection::Inbound).await;
+    let replacement = make_live_connection(replacement_addr, ConnectionDirection::Inbound).await;
+    let pool_for_recorder = pool.clone();
+    let peer_for_recorder = peer_id.clone();
+    let replacement_for_recorder = replacement.clone();
+    let _guard = crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(
+        move |event| {
+            if matches!(
+                event,
+                crate::TransportLifecycleEvent::SessionPublished { ref peer, .. }
+                    if *peer == peer_for_recorder
+            ) {
+                crate::set_transport_lifecycle_recorder(None);
+                pool_for_recorder.publish_current_peer_connection(
+                    &peer_for_recorder,
+                    replacement_for_recorder.clone(),
+                );
+            }
+        },
+    ));
+
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        tokio::task::spawn_blocking({
+            let pool = pool.clone();
+            let peer_id = peer_id.clone();
+            let initial = initial.clone();
+            move || pool.publish_current_peer_connection(&peer_id, initial)
+        }),
+    )
+    .await
+    .expect("publication recorder re-entry must not deadlock")
+    .expect("publication task must not panic");
+
+    let current = pool
+        .peer_current_connection_snapshot(&peer_id)
+        .expect("recorder must publish the replacement");
+    assert!(Arc::ptr_eq(&current, &replacement));
+    initial.abort_tasks();
+    replacement.abort_tasks();
+}

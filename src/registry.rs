@@ -2708,6 +2708,22 @@ struct PeerLivenessStatus {
 /// token is the ownership proof that another exit callback for the same stream
 /// can still arrive. Once the stream has no owners left, its marker is removed
 /// synchronously, rather than accumulating for the lifetime of the registry.
+static FAILURE_LIFECYCLE_OWNERS: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<u64, std::sync::Weak<FailureLifecycleOwner>>>,
+> = std::sync::OnceLock::new();
+
+fn failure_lifecycle_owners(
+) -> &'static std::sync::Mutex<HashMap<u64, std::sync::Weak<FailureLifecycleOwner>>> {
+    FAILURE_LIFECYCLE_OWNERS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Shared physical-stream ownership for exactly-once failure completion.
+///
+/// The owner is also discoverable by instance ID while the stream/exit guard
+/// is alive. This matters when a recovery path retires the pool index before
+/// the IO exit callback runs: the callback can still reconcile an ownerless
+/// tombstone with the same physical lifecycle, and dropping the final owner
+/// then reclaims the marker without a registry-lifetime leak.
 pub(crate) struct FailureLifecycleOwner {
     instance_id: u64,
     cleanup: std::sync::OnceLock<std::sync::Weak<CompletedFailureInstances>>,
@@ -2716,11 +2732,27 @@ pub(crate) struct FailureLifecycleOwner {
 
 impl FailureLifecycleOwner {
     pub(crate) fn new(instance_id: u64) -> Arc<Self> {
-        Arc::new_cyclic(|self_weak| Self {
+        let owner = Arc::new_cyclic(|self_weak| Self {
             instance_id,
             cleanup: std::sync::OnceLock::new(),
             self_weak: self_weak.clone(),
-        })
+        });
+        failure_lifecycle_owners()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(instance_id, Arc::downgrade(&owner));
+        owner
+    }
+
+    fn lookup(instance_id: u64) -> Option<Arc<Self>> {
+        let mut owners = failure_lifecycle_owners()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let owner = owners.get(&instance_id).and_then(std::sync::Weak::upgrade);
+        if owner.is_none() {
+            owners.remove(&instance_id);
+        }
+        owner
     }
 
     fn bind_registry(&self, registry: std::sync::Weak<CompletedFailureInstances>) {
@@ -2730,6 +2762,19 @@ impl FailureLifecycleOwner {
 
 impl Drop for FailureLifecycleOwner {
     fn drop(&mut self) {
+        // Keep the global-owner -> completion-marker lock order consistent
+        // with `CompletedFailureInstances::claim`: a concurrent late claim
+        // must never deadlock against the final physical-owner drop.
+        let mut owners = failure_lifecycle_owners()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if owners
+            .get(&self.instance_id)
+            .is_some_and(|current| std::sync::Weak::ptr_eq(current, &self.self_weak))
+        {
+            owners.remove(&self.instance_id);
+        }
+        drop(owners);
         if let Some(registry) = self.cleanup.get().and_then(std::sync::Weak::upgrade) {
             registry.release_owner(self.instance_id, &self.self_weak);
         }
@@ -2809,6 +2854,13 @@ impl CompletedFailureInstances {
         instance_id: u64,
         owner: Option<&Arc<FailureLifecycleOwner>>,
     ) -> Option<FailureLifecycleClaim> {
+        // Recover the physical owner even when the address index has already
+        // been retired. An ownerless callback can therefore remain exactly-once
+        // without becoming a permanent registry-lifetime tombstone: the final
+        // stream/exit owner drop releases it.
+        let owner = owner
+            .cloned()
+            .or_else(|| FailureLifecycleOwner::lookup(instance_id));
         let registry_weak = Arc::downgrade(self);
         let mut claimed = self
             .claimed
@@ -2825,7 +2877,7 @@ impl CompletedFailureInstances {
                     // ownerless callback completed. The tombstone still wins
                     // the duplicate claim, while the physical owner now
                     // supplies bounded reclamation for this marker.
-                    if let Some(owner) = owner {
+                    if let Some(owner) = owner.as_ref() {
                         owner.bind_registry(registry_weak);
                         existing.attach_owner(owner);
                     }
@@ -2833,11 +2885,11 @@ impl CompletedFailureInstances {
                 }
             }
         }
-        if let Some(owner) = owner {
+        if let Some(owner) = owner.as_ref() {
             owner.bind_registry(registry_weak);
         }
         let marker = Arc::new(FailureClaimMarker {
-            owner: std::sync::Mutex::new(owner.map(Arc::downgrade)),
+            owner: std::sync::Mutex::new(owner.as_ref().map(Arc::downgrade)),
         });
         claimed.insert(instance_id, marker.clone());
         Some(FailureLifecycleClaim {
@@ -11735,11 +11787,35 @@ impl<T: 'static> GossipRegistry<T> {
         handler: Arc<dyn PeerDisconnectHandler>,
         callback_peer_id: Option<crate::PeerId>,
     ) {
+        // Do an early identity check before invoking the user-supplied handler
+        // method. Handler construction is observable user code (and may have
+        // side effects), so an already-superseded failure must not call it at
+        // all. This check is only a fast rejection: publication may race after
+        // the locks are released, which the final check below handles.
+        let initial_state = self.gossip_state.lock().await;
+        let initial_gate = crate::connection_pool::lock_disconnect_delivery();
+        if !self.disconnect_notification_is_current_locked(
+            &initial_state,
+            failed_peer_addr,
+            peer_id,
+            failed_instance_id,
+            delivery_epoch,
+        ) {
+            return;
+        }
+        drop(initial_gate);
+        drop(initial_state);
+
+        // Construct the callback outside both the state lock and the
+        // non-reentrant publication gate. A replacement can publish during
+        // construction, so repeat the identity check before handing off to
+        // the callback's first poll.
+        let mut callback = handler.handle_peer_disconnect(failed_peer_addr, callback_peer_id);
         let gossip_state = self.gossip_state.lock().await;
-        // Publication uses this same synchronous gate. Acquire it before the
-        // final snapshot and keep it until the future is entered, so a
-        // replacement cannot publish in an await-free-looking but actually
-        // unsynchronized check -> callback window.
+        // Publication uses this same synchronous gate. Keep the gate handed
+        // off until the callback future's first poll: a replacement cannot
+        // publish between final validation and callback entry, while user
+        // callback code still never runs under the non-reentrant mutex.
         let delivery_gate = crate::connection_pool::lock_disconnect_delivery();
         if !self.disconnect_notification_is_current_locked(
             &gossip_state,
@@ -11751,18 +11827,35 @@ impl<T: 'static> GossipRegistry<T> {
             return;
         }
         drop(gossip_state);
-        #[cfg(feature = "test-helpers")]
-        crate::lifecycle::dispatch_test_helper_event(
-            crate::lifecycle::TransportTestHelperEvent::DisconnectNotificationEntered {
-                peer: peer_id.cloned(),
-                addr: failed_peer_addr,
-                instance_id: failed_instance_id,
-                sequence: crate::lifecycle::next_test_helper_sequence(),
-            },
-        );
-        let callback = handler.handle_peer_disconnect(failed_peer_addr, callback_peer_id);
-        drop(delivery_gate);
-        callback.await;
+        let mut delivery_handoff = Some(delivery_gate.handoff());
+        let mut callback_entered = false;
+        futures::future::poll_fn(move |cx| {
+            let first_poll = !callback_entered;
+            if first_poll {
+                callback_entered = true;
+                // Release the publication gate immediately before polling the
+                // user future. There is no await or observer callback between
+                // this handoff and the first user poll.
+                let Some(delivery_handoff) = delivery_handoff.take() else {
+                    return std::task::Poll::Ready(());
+                };
+                delivery_handoff.release();
+            }
+            let result = callback.as_mut().poll(cx);
+            #[cfg(feature = "test-helpers")]
+            if first_poll {
+                crate::lifecycle::dispatch_test_helper_event(
+                    crate::lifecycle::TransportTestHelperEvent::DisconnectNotificationEntered {
+                        peer: peer_id.cloned(),
+                        addr: failed_peer_addr,
+                        instance_id: failed_instance_id,
+                        sequence: crate::lifecycle::next_test_helper_sequence(),
+                    },
+                );
+            }
+            result
+        })
+        .await;
     }
 
     /// Handle peer connection failure - start consensus process
@@ -14691,36 +14784,43 @@ mod tests {
 
     #[test]
     fn completed_failure_markers_deduplicate_sparse_ids_without_watermarking_gaps() {
+        // Use the production allocator so parallel registry tests cannot reuse
+        // these synthetic IDs in the process-global owner table.
+        let low_id = crate::connection_pool::LockFreeStreamHandle::allocate_instance_id();
+        let high_id = crate::connection_pool::LockFreeStreamHandle::allocate_instance_id();
+        let sparse_high_id = crate::connection_pool::LockFreeStreamHandle::allocate_instance_id();
+        let sparse_low_id = crate::connection_pool::LockFreeStreamHandle::allocate_instance_id();
+        let reclaimed_id = crate::connection_pool::LockFreeStreamHandle::allocate_instance_id();
         let markers = Arc::new(CompletedFailureInstances::default());
-        let owner_10 = FailureLifecycleOwner::new(10);
+        let owner_high = FailureLifecycleOwner::new(high_id);
         markers
-            .claim(10, Some(&owner_10))
+            .claim(high_id, Some(&owner_high))
             .expect("first sparse instance must claim")
             .complete();
-        let owner_1 = FailureLifecycleOwner::new(1);
+        let owner_low = FailureLifecycleOwner::new(low_id);
         markers
-            .claim(1, Some(&owner_1))
+            .claim(low_id, Some(&owner_low))
             .expect("a lower, unseen instance must still run")
             .complete();
-        let owner_large = FailureLifecycleOwner::new(1_000_000);
+        let owner_large = FailureLifecycleOwner::new(sparse_high_id);
         markers
-            .claim(1_000_000, Some(&owner_large))
+            .claim(sparse_high_id, Some(&owner_large))
             .expect("a sparse high instance must claim")
             .complete();
-        let owner_2 = FailureLifecycleOwner::new(2);
+        let owner_2 = FailureLifecycleOwner::new(sparse_low_id);
         markers
-            .claim(2, Some(&owner_2))
+            .claim(sparse_low_id, Some(&owner_2))
             .expect("a sparse lower ID must not be inferred complete")
             .complete();
         assert!(
-            markers.claim(10, Some(&owner_10)).is_none(),
+            markers.claim(high_id, Some(&owner_high)).is_none(),
             "a repeated callback must be deduplicated while its stream owner lives"
         );
-        assert!(markers.claim(1_000_000, Some(&owner_large)).is_none());
+        assert!(markers.claim(sparse_high_id, Some(&owner_large)).is_none());
 
-        let reclaimed_owner = FailureLifecycleOwner::new(77);
+        let reclaimed_owner = FailureLifecycleOwner::new(reclaimed_id);
         markers
-            .claim(77, Some(&reclaimed_owner))
+            .claim(reclaimed_id, Some(&reclaimed_owner))
             .expect("reclamation marker must claim")
             .complete();
         assert!(markers.len() >= 5);
@@ -14733,26 +14833,199 @@ mod tests {
 
     #[test]
     fn ownerless_failure_tombstone_deduplicates_and_reconciles_owner() {
+        let tombstone_id = crate::connection_pool::LockFreeStreamHandle::allocate_instance_id();
+        let second_tombstone_id =
+            crate::connection_pool::LockFreeStreamHandle::allocate_instance_id();
         let markers = Arc::new(CompletedFailureInstances::default());
         markers
-            .claim(7, None)
+            .claim(tombstone_id, None)
             .expect("first ownerless callback must claim")
             .complete();
         assert!(
-            markers.claim(7, None).is_none(),
+            markers.claim(tombstone_id, None).is_none(),
             "sequential ownerless callbacks for one globally unique instance must deduplicate"
         );
 
-        let owner = FailureLifecycleOwner::new(7);
+        let owner = FailureLifecycleOwner::new(tombstone_id);
         assert!(
-            markers.claim(7, Some(&owner)).is_none(),
+            markers.claim(tombstone_id, Some(&owner)).is_none(),
             "a later owner must reconcile the existing tombstone rather than rerun cleanup"
         );
         drop(owner);
         assert!(
-            markers.claim(7, None).is_some(),
+            markers.claim(tombstone_id, None).is_some(),
             "reconciled tombstone must be reclaimable with its physical owner"
         );
+
+        let ownerless_callback_owner = FailureLifecycleOwner::new(second_tombstone_id);
+        markers
+            .claim(second_tombstone_id, None)
+            .expect("an ownerless callback must still claim once")
+            .complete();
+        assert!(
+            markers.claim(second_tombstone_id, None).is_none(),
+            "ownerless duplicate must remain suppressed while the physical owner lives"
+        );
+        drop(ownerless_callback_owner);
+        assert_eq!(
+            markers.len(),
+            0,
+            "a tombstone recovered through the global owner must be reclaimed when that owner drops"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnect_delivery_gate_fences_callback_until_first_poll() {
+        use crate::connection_pool::{
+            BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
+            LockFreeStreamHandle,
+        };
+        use futures::future::BoxFuture;
+        use std::sync::atomic::AtomicUsize;
+        use tokio::sync::{Notify, oneshot};
+
+        struct FirstPollHandler {
+            constructed: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+            release_construction: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+            allow_poll: Arc<Notify>,
+            invocations: Arc<AtomicUsize>,
+        }
+
+        impl PeerDisconnectHandler for FirstPollHandler {
+            fn handle_peer_disconnect(
+                &self,
+                _addr: SocketAddr,
+                _peer_id: Option<PeerId>,
+            ) -> BoxFuture<'_, ()> {
+                if let Some(sender) = self
+                    .constructed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    let _ = sender.send(());
+                }
+                let (released, wake) = &*self.release_construction;
+                let mut released = released
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                while !*released {
+                    released = wake
+                        .wait(released)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+                let allow_poll = self.allow_poll.clone();
+                let invocations = self.invocations.clone();
+                Box::pin(async move {
+                    allow_poll.notified().await;
+                    invocations.fetch_add(1, Ordering::SeqCst);
+                })
+            }
+        }
+
+        let registry = GossipRegistry::<()>::new(test_addr(18_084), test_config());
+        let peer_addr = test_addr(9_084);
+        registry.add_peer(peer_addr).await;
+        let peer_id = test_peer_id("first_poll_peer");
+        let (old_io, _old_peer) = tokio::io::duplex(1024);
+        let (old_handle, _old_writer, _old_reader) = LockFreeStreamHandle::new(
+            old_io,
+            peer_addr,
+            ChannelId::Global,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let old_instance = old_handle.instance_id();
+        let mut old_connection = LockFreeConnection::new(peer_addr, ConnectionDirection::Inbound);
+        old_connection.embedded_peer_id = Some(peer_id.clone());
+        old_connection.stream_handle = Some(Arc::new(old_handle));
+        old_connection.set_state(ConnectionState::Connected);
+        let old_connection = Arc::new(old_connection);
+        assert!(registry.connection_pool.add_connection_by_peer_id(
+            peer_id.clone(),
+            peer_addr,
+            old_connection.clone(),
+        ));
+        let (constructed_tx, constructed_rx) = oneshot::channel();
+        let construction_release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let handler = Arc::new(FirstPollHandler {
+            constructed: std::sync::Mutex::new(Some(constructed_tx)),
+            release_construction: construction_release.clone(),
+            allow_poll: Arc::new(Notify::new()),
+            invocations: invocations.clone(),
+        });
+        let registry_task = registry.clone();
+        let handler_task = handler.clone();
+        let notify_peer_id = peer_id.clone();
+        let notify_task = tokio::spawn(async move {
+            registry_task
+                .notify_disconnect_if_current(
+                    peer_addr,
+                    Some(&notify_peer_id),
+                    Some(old_instance),
+                    0,
+                    handler_task,
+                    Some(notify_peer_id.clone()),
+                )
+                .await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), constructed_rx)
+            .await
+            .expect("callback future construction timed out")
+            .expect("callback future must be constructed");
+
+        let (replacement_io, _replacement_peer) = tokio::io::duplex(1024);
+        let (replacement_handle, _replacement_writer, _replacement_reader) =
+            LockFreeStreamHandle::new(
+                replacement_io,
+                peer_addr,
+                ChannelId::Global,
+                BufferConfig::default(),
+                None,
+                None,
+            );
+        let mut replacement_connection =
+            LockFreeConnection::new(peer_addr, ConnectionDirection::Inbound);
+        replacement_connection.embedded_peer_id = Some(peer_id.clone());
+        replacement_connection.stream_handle = Some(Arc::new(replacement_handle));
+        replacement_connection.set_state(ConnectionState::Connected);
+        let replacement_connection = Arc::new(replacement_connection);
+        let replacement_pool = registry.connection_pool.clone();
+        let replacement_peer_id = peer_id.clone();
+        let replacement_for_publish = replacement_connection.clone();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || {
+                replacement_pool.add_connection_by_peer_id(
+                    replacement_peer_id,
+                    peer_addr,
+                    replacement_for_publish,
+                )
+            }),
+        )
+        .await
+        .expect("replacement publication timed out")
+        .expect("replacement publication must not panic");
+        {
+            let (released, wake) = &*construction_release;
+            *released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            wake.notify_all();
+        }
+        tokio::time::timeout(Duration::from_secs(2), notify_task)
+            .await
+            .expect("disconnect notifier timed out")
+            .expect("disconnect notifier must not panic");
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "replacement publication between future construction and first poll must suppress the stale callback"
+        );
+        old_connection.abort_tasks();
+        replacement_connection.abort_tasks();
     }
 
     #[tokio::test]

@@ -27,12 +27,96 @@ use tracing::{debug, error, info, warn};
 /// decision. Both operations are cold-path lifecycle transitions; keeping one
 /// process-wide gate here avoids an await-separated check-then-enter window
 /// without coupling the pool's lock-free indexes to registry state.
-static DISCONNECT_DELIVERY_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+///
+/// A notifier cannot hold a `std::sync::MutexGuard` while polling user code:
+/// the callback future is `Send` and may be polled on another worker, and
+/// application code must never run under this non-reentrant mutex. Instead a
+/// successful final check hands the gate off to a first-poll permit. The
+/// permit keeps publication blocked until the callback future is actually
+/// polled, then releases the gate immediately before entering user code.
+struct DisconnectDeliveryGate {
+    busy: std::sync::Mutex<bool>,
+    wake: std::sync::Condvar,
+}
 
-pub(crate) fn lock_disconnect_delivery() -> std::sync::MutexGuard<'static, ()> {
-    DISCONNECT_DELIVERY_GATE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+impl DisconnectDeliveryGate {
+    const fn new() -> Self {
+        Self {
+            busy: std::sync::Mutex::new(false),
+            wake: std::sync::Condvar::new(),
+        }
+    }
+
+    fn lock(&'static self) -> DisconnectDeliveryGuard {
+        let mut busy = self
+            .busy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *busy {
+            busy = self
+                .wake
+                .wait(busy)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *busy = true;
+        DisconnectDeliveryGuard { gate: self }
+    }
+
+    fn release(&self) {
+        let mut busy = self
+            .busy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *busy = false;
+        self.wake.notify_all();
+    }
+}
+
+static DISCONNECT_DELIVERY_GATE: DisconnectDeliveryGate = DisconnectDeliveryGate::new();
+
+pub(crate) struct DisconnectDeliveryGuard {
+    gate: &'static DisconnectDeliveryGate,
+}
+
+impl DisconnectDeliveryGuard {
+    /// Transfer the publication exclusion to a callback's first-poll permit.
+    /// Dropping the returned permit without polling still releases the gate,
+    /// so cancellation cannot wedge future publication.
+    pub(crate) fn handoff(self) -> DisconnectDeliveryHandoff {
+        let gate = self.gate;
+        std::mem::forget(self);
+        DisconnectDeliveryHandoff { gate: Some(gate) }
+    }
+}
+
+impl Drop for DisconnectDeliveryGuard {
+    fn drop(&mut self) {
+        self.gate.release();
+    }
+}
+
+pub(crate) struct DisconnectDeliveryHandoff {
+    gate: Option<&'static DisconnectDeliveryGate>,
+}
+
+impl DisconnectDeliveryHandoff {
+    pub(crate) fn release(mut self) {
+        if let Some(gate) = self.gate.take() {
+            gate.release();
+        }
+    }
+}
+
+impl Drop for DisconnectDeliveryHandoff {
+    fn drop(&mut self) {
+        if let Some(gate) = self.gate.take() {
+            gate.release();
+        }
+    }
+}
+
+pub(crate) fn lock_disconnect_delivery() -> DisconnectDeliveryGuard {
+    DISCONNECT_DELIVERY_GATE.lock()
 }
 
 #[cfg(any(test, feature = "test-helpers"))]
