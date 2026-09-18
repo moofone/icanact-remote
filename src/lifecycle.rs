@@ -361,9 +361,10 @@ pub enum TransportTestHelperEvent {
         applied: bool,
         sequence: u64,
     },
-    /// The final lock-protected disconnect decision has succeeded and the
-    /// callback method is about to be entered. Publication uses the same
-    /// synchronous gate, so a replacement cannot commit before this event.
+    /// The disconnect callback's first poll has completed its synchronous
+    /// portion. Publication was fenced through that poll; this event is
+    /// dispatched only after the gate is released so recorder re-entry cannot
+    /// deadlock against publication.
     DisconnectNotificationEntered {
         peer: Option<PeerId>,
         addr: SocketAddr,

@@ -11787,35 +11787,12 @@ impl<T: 'static> GossipRegistry<T> {
         handler: Arc<dyn PeerDisconnectHandler>,
         callback_peer_id: Option<crate::PeerId>,
     ) {
-        // Do an early identity check before invoking the user-supplied handler
-        // method. Handler construction is observable user code (and may have
-        // side effects), so an already-superseded failure must not call it at
-        // all. This check is only a fast rejection: publication may race after
-        // the locks are released, which the final check below handles.
-        let initial_state = self.gossip_state.lock().await;
-        let initial_gate = crate::connection_pool::lock_disconnect_delivery();
-        if !self.disconnect_notification_is_current_locked(
-            &initial_state,
-            failed_peer_addr,
-            peer_id,
-            failed_instance_id,
-            delivery_epoch,
-        ) {
-            return;
-        }
-        drop(initial_gate);
-        drop(initial_state);
-
-        // Construct the callback outside both the state lock and the
-        // non-reentrant publication gate. A replacement can publish during
-        // construction, so repeat the identity check before handing off to
-        // the callback's first poll.
-        let mut callback = handler.handle_peer_disconnect(failed_peer_addr, callback_peer_id);
+        // The publication gate is acquired before the final identity/epoch
+        // decision and is held through both observable user entry points:
+        // synchronous callback construction and the future's first poll.
+        // Publication therefore cannot commit in either handoff window and
+        // make a stale disconnect enter user code.
         let gossip_state = self.gossip_state.lock().await;
-        // Publication uses this same synchronous gate. Keep the gate handed
-        // off until the callback future's first poll: a replacement cannot
-        // publish between final validation and callback entry, while user
-        // callback code still never runs under the non-reentrant mutex.
         let delivery_gate = crate::connection_pool::lock_disconnect_delivery();
         if !self.disconnect_notification_is_current_locked(
             &gossip_state,
@@ -11827,23 +11804,19 @@ impl<T: 'static> GossipRegistry<T> {
             return;
         }
         drop(gossip_state);
-        let mut delivery_handoff = Some(delivery_gate.handoff());
+        let mut callback = handler.handle_peer_disconnect(failed_peer_addr, callback_peer_id);
+        let mut delivery_gate = Some(delivery_gate);
         let mut callback_entered = false;
         futures::future::poll_fn(move |cx| {
             let first_poll = !callback_entered;
+            let result = callback.as_mut().poll(cx);
             if first_poll {
                 callback_entered = true;
-                // Release the publication gate immediately before polling the
-                // user future. There is no await or observer callback between
-                // this handoff and the first user poll.
-                let Some(delivery_handoff) = delivery_handoff.take() else {
-                    return std::task::Poll::Ready(());
-                };
-                delivery_handoff.release();
-            }
-            let result = callback.as_mut().poll(cx);
-            #[cfg(feature = "test-helpers")]
-            if first_poll {
+                // The first user poll has now begun and completed its
+                // synchronous portion. Release only after poll returns, so a
+                // replacement cannot commit between gate release and entry.
+                drop(delivery_gate.take());
+                #[cfg(feature = "test-helpers")]
                 crate::lifecycle::dispatch_test_helper_event(
                     crate::lifecycle::TransportTestHelperEvent::DisconnectNotificationEntered {
                         peer: peer_id.cloned(),
@@ -14882,12 +14855,13 @@ mod tests {
         };
         use futures::future::BoxFuture;
         use std::sync::atomic::AtomicUsize;
-        use tokio::sync::{Notify, oneshot};
+        use tokio::sync::oneshot;
 
         struct FirstPollHandler {
             constructed: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+            first_polled: std::sync::Mutex<Option<oneshot::Sender<()>>>,
             release_construction: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
-            allow_poll: Arc<Notify>,
+            release_first_poll: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
             invocations: Arc<AtomicUsize>,
         }
 
@@ -14914,10 +14888,26 @@ mod tests {
                         .wait(released)
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
-                let allow_poll = self.allow_poll.clone();
+                let first_polled = self
+                    .first_polled
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                let release_first_poll = self.release_first_poll.clone();
                 let invocations = self.invocations.clone();
                 Box::pin(async move {
-                    allow_poll.notified().await;
+                    if let Some(sender) = first_polled {
+                        let _ = sender.send(());
+                    }
+                    let (released, wake) = &*release_first_poll;
+                    let mut released = released
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    while !*released {
+                        released = wake
+                            .wait(released)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
                     invocations.fetch_add(1, Ordering::SeqCst);
                 })
             }
@@ -14948,12 +14938,17 @@ mod tests {
             old_connection.clone(),
         ));
         let (constructed_tx, constructed_rx) = oneshot::channel();
-        let construction_release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let (first_polled_tx, first_polled_rx) = oneshot::channel();
+        let construction_release =
+            Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let first_poll_release =
+            Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let invocations = Arc::new(AtomicUsize::new(0));
         let handler = Arc::new(FirstPollHandler {
             constructed: std::sync::Mutex::new(Some(constructed_tx)),
+            first_polled: std::sync::Mutex::new(Some(first_polled_tx)),
             release_construction: construction_release.clone(),
-            allow_poll: Arc::new(Notify::new()),
+            release_first_poll: first_poll_release.clone(),
             invocations: invocations.clone(),
         });
         let registry_task = registry.clone();
@@ -14995,19 +14990,21 @@ mod tests {
         let replacement_pool = registry.connection_pool.clone();
         let replacement_peer_id = peer_id.clone();
         let replacement_for_publish = replacement_connection.clone();
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            tokio::task::spawn_blocking(move || {
-                replacement_pool.add_connection_by_peer_id(
-                    replacement_peer_id,
-                    peer_addr,
-                    replacement_for_publish,
-                )
-            }),
-        )
-        .await
-        .expect("replacement publication timed out")
-        .expect("replacement publication must not panic");
+        let (publication_tx, mut publication_rx) = oneshot::channel();
+        let publication_task = tokio::task::spawn_blocking(move || {
+            let result = replacement_pool.add_connection_by_peer_id(
+                replacement_peer_id,
+                peer_addr,
+                replacement_for_publish,
+            );
+            let _ = publication_tx.send(result);
+        });
+        let mut publication_result =
+            tokio::time::timeout(Duration::from_millis(100), &mut publication_rx)
+                .await
+                .ok()
+                .and_then(|result| result.ok());
+        let publication_during_construction = publication_result.is_some();
         {
             let (released, wake) = &*construction_release;
             *released
@@ -15015,14 +15012,57 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
             wake.notify_all();
         }
+        let first_poll_entered = tokio::time::timeout(Duration::from_secs(2), first_polled_rx)
+            .await
+            .is_ok();
+        let publication_during_first_poll = if first_poll_entered && publication_result.is_none() {
+            publication_result =
+                tokio::time::timeout(Duration::from_millis(100), &mut publication_rx)
+                    .await
+                    .ok()
+                    .and_then(|result| result.ok());
+            publication_result.is_some()
+        } else {
+            false
+        };
+        {
+            let (released, wake) = &*first_poll_release;
+            *released
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            wake.notify_all();
+        }
+        let published = match publication_result {
+            Some(result) => result,
+            None => tokio::time::timeout(Duration::from_secs(2), publication_rx)
+                .await
+                .expect("replacement publication timed out")
+                .expect("replacement publication task must send a result"),
+        };
+        assert!(published, "replacement publication must succeed");
+        publication_task
+            .await
+            .expect("replacement publication task must not panic");
         tokio::time::timeout(Duration::from_secs(2), notify_task)
             .await
             .expect("disconnect notifier timed out")
             .expect("disconnect notifier must not panic");
+        assert!(
+            !publication_during_construction,
+            "publication must remain fenced during synchronous handler construction"
+        );
+        assert!(
+            first_poll_entered,
+            "the callback future's first poll must be entered before publication"
+        );
+        assert!(
+            !publication_during_first_poll,
+            "publication must remain fenced through the callback future's first poll"
+        );
         assert_eq!(
             invocations.load(Ordering::SeqCst),
-            0,
-            "replacement publication between future construction and first poll must suppress the stale callback"
+            1,
+            "the callback's first poll must begin before publication is released"
         );
         old_connection.abort_tasks();
         replacement_connection.abort_tasks();

@@ -29,11 +29,10 @@ use tracing::{debug, error, info, warn};
 /// without coupling the pool's lock-free indexes to registry state.
 ///
 /// A notifier cannot hold a `std::sync::MutexGuard` while polling user code:
-/// the callback future is `Send` and may be polled on another worker, and
-/// application code must never run under this non-reentrant mutex. Instead a
-/// successful final check hands the gate off to a first-poll permit. The
-/// permit keeps publication blocked until the callback future is actually
-/// polled, then releases the gate immediately before entering user code.
+/// the callback future is `Send` and may be polled on another worker. The
+/// custom guard is `Send` and keeps publication blocked through synchronous
+/// handler construction and the complete first poll, then releases the gate;
+/// cancellation before first poll drops it safely.
 struct DisconnectDeliveryGate {
     busy: std::sync::Mutex<bool>,
     wake: std::sync::Condvar,
@@ -78,40 +77,9 @@ pub(crate) struct DisconnectDeliveryGuard {
     gate: &'static DisconnectDeliveryGate,
 }
 
-impl DisconnectDeliveryGuard {
-    /// Transfer the publication exclusion to a callback's first-poll permit.
-    /// Dropping the returned permit without polling still releases the gate,
-    /// so cancellation cannot wedge future publication.
-    pub(crate) fn handoff(self) -> DisconnectDeliveryHandoff {
-        let gate = self.gate;
-        std::mem::forget(self);
-        DisconnectDeliveryHandoff { gate: Some(gate) }
-    }
-}
-
 impl Drop for DisconnectDeliveryGuard {
     fn drop(&mut self) {
         self.gate.release();
-    }
-}
-
-pub(crate) struct DisconnectDeliveryHandoff {
-    gate: Option<&'static DisconnectDeliveryGate>,
-}
-
-impl DisconnectDeliveryHandoff {
-    pub(crate) fn release(mut self) {
-        if let Some(gate) = self.gate.take() {
-            gate.release();
-        }
-    }
-}
-
-impl Drop for DisconnectDeliveryHandoff {
-    fn drop(&mut self) {
-        if let Some(gate) = self.gate.take() {
-            gate.release();
-        }
     }
 }
 
