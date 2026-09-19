@@ -20277,13 +20277,14 @@ mod tests {
         )
         .await?;
         let remote_addr = remote.registry.bind_addr;
-        // Seed only the required route. `configure_peer` also registers the
-        // route with the configured-peer supervisor, which can race this
-        // focused finalizer test before its lifecycle hook is installed.
+        // Seed a normal configured route without enrolling the peer in the
+        // background required-peer supervisor. The supervisor may otherwise
+        // consume the deterministic finalizer hook from its own concurrent
+        // dial before this test's focused call reaches the compare window.
         local
             .registry
             .connection_pool
-            .set_configured_peer_addr(&remote_peer_id, remote_addr);
+            .set_discovered_peer_addr(&remote_peer_id, remote_addr);
         {
             let mut state = local.registry.gossip_state.lock().await;
             state.peers.insert(
