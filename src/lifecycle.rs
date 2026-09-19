@@ -516,11 +516,16 @@ impl Drop for TransportLifecycleRecorderGuard {
     }
 }
 
-struct RecorderDispatchGuard;
+/// Restores the caller's generation after a nested recorder callback returns.
+/// Nested lifecycle events are still dispatched, while a clear issued by the
+/// outer callback remains fenced to the generation that dispatched it.
+struct RecorderDispatchGuard {
+    previous_generation: Option<u64>,
+}
 
 impl Drop for RecorderDispatchGuard {
     fn drop(&mut self) {
-        ACTIVE_RECORDER_GENERATION.with(|active| active.set(None));
+        ACTIVE_RECORDER_GENERATION.with(|active| active.set(self.previous_generation));
     }
 }
 
@@ -534,17 +539,9 @@ pub(crate) fn record_transport_event(event: TransportLifecycleEvent) {
         return;
     };
 
-    let dispatch_guard = ACTIVE_RECORDER_GENERATION.with(|active| {
-        if active.get().is_some() {
-            None
-        } else {
-            active.set(Some(generation));
-            Some(RecorderDispatchGuard)
-        }
+    let _dispatch_guard = ACTIVE_RECORDER_GENERATION.with(|active| RecorderDispatchGuard {
+        previous_generation: active.replace(Some(generation)),
     });
-    let Some(_dispatch_guard) = dispatch_guard else {
-        return;
-    };
     recorder(event);
 }
 
@@ -579,4 +576,36 @@ where
 {
     let sequence = next_test_helper_sequence();
     dispatch_test_helper_event(make_event(sequence));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn recorder_dispatches_lifecycle_events_emitted_by_callback() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let emitted_nested_event = Arc::new(AtomicBool::new(false));
+        let recorder_events = Arc::clone(&events);
+        let emitted_nested_event_for_recorder = Arc::clone(&emitted_nested_event);
+        let _guard = TransportLifecycleRecorderGuard::install(Arc::new(move |event| {
+            recorder_events.lock().unwrap().push(event);
+            if !emitted_nested_event_for_recorder.swap(true, Ordering::SeqCst) {
+                record_transport_event(TransportLifecycleEvent::OutboundStart {
+                    peer: None,
+                    addr: "127.0.0.1:1".parse().unwrap(),
+                    attempt_id: 2,
+                });
+            }
+        }));
+
+        record_transport_event(TransportLifecycleEvent::OutboundStart {
+            peer: None,
+            addr: "127.0.0.1:1".parse().unwrap(),
+            attempt_id: 1,
+        });
+
+        assert_eq!(events.lock().unwrap().len(), 2);
+    }
 }
