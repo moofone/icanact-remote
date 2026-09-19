@@ -210,7 +210,12 @@ pub(crate) mod reply_slots;
 
 #[cfg(test)]
 mod disconnect_delivery_tests {
-    use super::DisconnectDeliveryState;
+    use std::{net::SocketAddr, sync::Arc, time::Duration};
+
+    use super::{
+        ConnectionDirection, ConnectionPool, DisconnectDeliveryState, LockFreeConnection,
+        try_arm_disconnect_delivery,
+    };
 
     #[test]
     fn publication_supersedes_an_armed_callback_without_waiting() {
@@ -222,6 +227,26 @@ mod disconnect_delivery_tests {
         assert!(
             STATE.try_arm().is_some(),
             "publication must leave the state idle"
+        );
+    }
+
+    #[test]
+    fn address_index_publication_supersedes_an_armed_callback() {
+        let pool = ConnectionPool::<()>::new(4, Duration::from_secs(1));
+        let addr: SocketAddr = "127.0.0.1:41001".parse().unwrap();
+        let connection = Arc::new(LockFreeConnection::new(addr, ConnectionDirection::Inbound));
+        let claim = try_arm_disconnect_delivery().expect("test callback must arm");
+
+        pool.publish_connection_by_addr(addr, connection.clone());
+
+        assert!(
+            !claim.enter(),
+            "address-index publication must supersede an armed address-only callback"
+        );
+        assert!(
+            pool.connections_by_addr
+                .read_sync(&addr, |_, current| Arc::ptr_eq(current, &connection))
+                .unwrap_or(false)
         );
     }
 }

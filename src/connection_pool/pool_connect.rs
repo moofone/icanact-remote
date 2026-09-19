@@ -562,7 +562,22 @@ impl<T> ConnectionPool<T> {
                     || current
                         .as_ref()
                         .is_some_and(|current| Arc::ptr_eq(connection, current))
-            });
+        });
+    }
+
+    /// Publish an address-index entry under the same atomic gate used by
+    /// disconnect notification fencing. Address-only failures have no peer
+    /// session slot to compare, so their final replacement fence reads this
+    /// index directly; every replacement write must participate in that
+    /// publication-vs-entry linearization or a stale callback can enter after
+    /// it has observed the old instance but before the new one is visible.
+    pub(crate) fn publish_connection_by_addr(
+        &self,
+        addr: SocketAddr,
+        connection: Arc<LockFreeConnection>,
+    ) {
+        let _publication = crate::connection_pool::begin_disconnect_publication();
+        let _ = self.connections_by_addr.upsert_sync(addr, connection);
     }
 
     /// Evict `evicted_addr`'s `connections_by_addr` alias for `peer_id`,
@@ -1314,9 +1329,7 @@ impl<T> ConnectionPool<T> {
         let _ = self
             .addr_to_peer_id
             .upsert_sync(peer_state_addr, peer_id.clone());
-        let _ = self
-            .connections_by_addr
-            .upsert_sync(peer_state_addr, connection.clone());
+        self.publish_connection_by_addr(peer_state_addr, connection.clone());
 
         // Dedupe: the ephemeral TCP source address and the peer's
         // configured/advertised bind address are frequently identical
@@ -1333,9 +1346,7 @@ impl<T> ConnectionPool<T> {
             let _ = self
                 .addr_to_peer_id
                 .upsert_sync(ephemeral_addr, peer_id.clone());
-            let _ = self
-                .connections_by_addr
-                .upsert_sync(ephemeral_addr, connection.clone());
+            self.publish_connection_by_addr(ephemeral_addr, connection.clone());
         }
 
         // Paired, insert-gated: `count_in_new_instance` only bumps
@@ -2090,9 +2101,7 @@ impl<T> ConnectionPool<T> {
         }
 
         // Insert the connection under the new (advertised) address
-        let _ = self
-            .connections_by_addr
-            .upsert_sync(new_addr, connection.clone());
+        self.publish_connection_by_addr(new_addr, connection.clone());
         // Also update peer_id_to_addr so disconnect uses the correct address
         self.set_discovered_peer_addr(peer_id, new_addr);
 
@@ -2108,7 +2117,7 @@ impl<T> ConnectionPool<T> {
                 .read_sync(&old_addr, |_, owner| owner == peer_id)
                 .unwrap_or(false);
             if old_addr_is_this_peer {
-                let _ = self.connections_by_addr.upsert_sync(old_addr, connection);
+                self.publish_connection_by_addr(old_addr, connection);
                 debug!(
                     old_addr = %old_addr,
                     new_addr = %new_addr,
@@ -2348,7 +2357,7 @@ impl<T> ConnectionPool<T> {
         let instance_id = connection.stream_handle.as_ref().map(|h| h.instance_id());
 
         // Also index by address for direct lookups
-        let _ = self.connections_by_addr.upsert_sync(addr, connection);
+        self.publish_connection_by_addr(addr, connection);
 
         // Paired, insert-gated via `count_in_new_instance` — see its comment.
         // A connection with no stream handle is never counted (nothing to
@@ -2369,7 +2378,7 @@ impl<T> ConnectionPool<T> {
             "CONNECTION POOL: Indexing connection by additional address {}",
             addr
         );
-        let _ = self.connections_by_addr.upsert_sync(addr, connection);
+        self.publish_connection_by_addr(addr, connection);
         self.mark_routing_changed();
     }
 
@@ -2746,7 +2755,7 @@ impl<T> ConnectionPool<T> {
         if removed {
             match existing_before {
                 Some(existing) if existing.addr == addr && existing.has_live_stream() => {
-                    let _ = self.connections_by_addr.upsert_sync(addr, existing.clone());
+                    self.publish_connection_by_addr(addr, existing.clone());
                     let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
                 }
                 _ => {
@@ -3973,9 +3982,7 @@ impl<T> ConnectionPool<T> {
         }
 
         // Insert into lock-free map before spawning.
-        let _ = self
-            .connections_by_addr
-            .upsert_sync(addr, connection_arc.clone());
+        self.publish_connection_by_addr(addr, connection_arc.clone());
         if let Some(peer_id) = peer_id_opt.as_ref() {
             let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
             // Identity-keyed publish gate. This freshly-dialed OUTBOUND must not
