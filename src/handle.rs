@@ -4676,6 +4676,20 @@ where
         // returning and this `.await` acquiring the lock, and an
         // unconditional re-mark would resurrect `Connected` for a session
         // that is already dead, with nothing left to clear it again later.
+        #[cfg(feature = "test-helpers")]
+        crate::lifecycle::record_test_helper_event(|sequence| {
+            crate::lifecycle::TransportTestHelperEvent::PreRemark {
+                peer: peer_id.clone(),
+                addr: peer_state_addr,
+                instance_id: connection_arc
+                    .stream_handle
+                    .as_ref()
+                    .map(|handle| handle.instance_id())
+                    .expect("accepted inbound connection must have an instance id"),
+                direction: crate::lifecycle::TransportDirection::Inbound,
+                sequence,
+            }
+        });
         registry.mark_peer_connected_if_live(peer_state_addr).await;
 
         // R-11: this is a new TLS-authenticated session for `node_id`, which is

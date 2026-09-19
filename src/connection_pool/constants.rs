@@ -48,16 +48,6 @@ struct IoPerfCounters {
     ask_write_ns: AtomicU64,
 }
 
-#[allow(dead_code)]
-fn flush_each_actor_response() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("ICANACT_REMOTE_FLUSH_EACH_RESPONSE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
-}
-
 /// Compact an inline reply onto its visible slice so the retained-byte budget
 /// cannot be defeated by `Bytes::from_owner` / sliced views of a much larger
 /// allocation. Same ownership boundary as streaming-response normalization.

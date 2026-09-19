@@ -1,3 +1,31 @@
+#[cfg(test)]
+type FallbackAdoptionHook =
+    Arc<dyn Fn(&Arc<LockFreeConnection>) + Send + Sync + 'static>;
+
+#[cfg(test)]
+static FALLBACK_ADOPTION_HOOK: OnceLock<std::sync::Mutex<Option<FallbackAdoptionHook>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn set_fallback_adoption_hook(hook: Option<FallbackAdoptionHook>) {
+    *FALLBACK_ADOPTION_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("fallback adoption hook mutex poisoned") = hook;
+}
+
+#[cfg(test)]
+fn record_fallback_adoption_capture(connection: &Arc<LockFreeConnection>) {
+    let hook = FALLBACK_ADOPTION_HOOK
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("fallback adoption hook mutex poisoned")
+        .clone();
+    if let Some(hook) = hook {
+        hook(connection);
+    }
+}
+
 /// Outcome of a connection keep/drop/dedup conflict for a single peer identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use = "a connection conflict decision must be acted on explicitly by the \
@@ -534,7 +562,22 @@ impl<T> ConnectionPool<T> {
                     || current
                         .as_ref()
                         .is_some_and(|current| Arc::ptr_eq(connection, current))
-            });
+        });
+    }
+
+    /// Publish an address-index entry under the same atomic gate used by
+    /// disconnect notification fencing. Address-only failures have no peer
+    /// session slot to compare, so their final replacement fence reads this
+    /// index directly; every replacement write must participate in that
+    /// publication-vs-entry linearization or a stale callback can enter after
+    /// it has observed the old instance but before the new one is visible.
+    pub(crate) fn publish_connection_by_addr(
+        &self,
+        addr: SocketAddr,
+        connection: Arc<LockFreeConnection>,
+    ) {
+        let _publication = crate::connection_pool::begin_disconnect_publication();
+        let _ = self.connections_by_addr.upsert_sync(addr, connection);
     }
 
     /// Evict `evicted_addr`'s `connections_by_addr` alias for `peer_id`,
@@ -589,16 +632,54 @@ impl<T> ConnectionPool<T> {
         out
     }
 
+    /// Recover the physical stream owner for an identified failure before its
+    /// address index is retired. The owner lets the registry retain exactly
+    /// one completion marker only for the stream's actual lifetime; callers
+    /// arriving after retirement use the reconciled tombstone fallback.
+    pub(crate) fn failure_lifecycle_owner_for_instance(
+        &self,
+        instance_id: u64,
+    ) -> Option<Arc<crate::registry::FailureLifecycleOwner>> {
+        let mut owner = None;
+        self.connections_by_addr.iter_sync(|_, connection| {
+            if let Some(handle) = connection.stream_handle.as_ref()
+                && handle.instance_id() == instance_id
+            {
+                owner = Some(handle.failure_lifecycle_owner());
+                return false;
+            }
+            true
+        });
+        owner
+    }
+
     pub(crate) fn publish_current_peer_connection(
         &self,
         peer_id: &crate::PeerId,
         connection: Arc<LockFreeConnection>,
     ) {
+        // Linearize publication against a notifier that has passed its final
+        // identity check. This is an atomic claim, not a mutex: a callback
+        // already entering user code does not block synchronous re-entry.
+        let publication = crate::connection_pool::begin_disconnect_publication();
         let session = self.get_or_create_peer_session(peer_id);
         let stream_instance_id = connection
             .stream_handle
             .as_ref()
             .map(|handle| handle.instance_id());
+        // Publish before releasing the peer's retry reservation. Otherwise a
+        // concurrent caller can observe neither a current connection nor an
+        // active retry floor and start a redundant socket attempt.
+        session.set_current_connection(Some(connection.clone()));
+        session.outbound_dial_retry.record_published_connection();
+        let _ = self
+            .connections_by_peer
+            .upsert_sync(peer_id.clone(), connection.clone());
+        self.mark_routing_changed();
+        // User lifecycle observers are arbitrary application code and run
+        // after the session commit; publication itself never holds a mutex
+        // across observer or callback code.
+        drop(publication);
         info!(
             peer_id = %peer_id,
             addr = %connection.addr,
@@ -616,15 +697,6 @@ impl<T> ConnectionPool<T> {
                 },
             },
         );
-        // Publish before releasing the peer's retry reservation. Otherwise a
-        // concurrent caller can observe neither a current connection nor an
-        // active retry floor and start a redundant socket attempt.
-        session.set_current_connection(Some(connection.clone()));
-        session.outbound_dial_retry.record_published_connection();
-        let _ = self
-            .connections_by_peer
-            .upsert_sync(peer_id.clone(), connection);
-        self.mark_routing_changed();
     }
 
     /// Compare-and-publish counterpart to `publish_current_peer_connection`:
@@ -646,6 +718,10 @@ impl<T> ConnectionPool<T> {
         expected: Option<&Arc<LockFreeConnection>>,
         connection: Arc<LockFreeConnection>,
     ) -> std::result::Result<(), Option<Arc<LockFreeConnection>>> {
+        // Claim the publication-vs-delivery linearization before mutating the
+        // current-session slot. An armed stale callback either wins entry
+        // before this CAS or is suppressed; no mutex is held across user code.
+        let publication = crate::connection_pool::begin_disconnect_publication();
         let session = self.get_or_create_peer_session(peer_id);
         if let Err(current) =
             session.compare_and_set_current_connection(expected, connection.clone())
@@ -681,23 +757,10 @@ impl<T> ConnectionPool<T> {
             .stream_handle
             .as_ref()
             .map(|handle| handle.instance_id());
-        info!(
-            peer_id = %peer_id,
-            addr = %connection.addr,
-            direction = ?connection.direction,
-            stream_instance_id = ?stream_instance_id,
-            "transport_session_published"
-        );
-        crate::lifecycle::record_transport_event(
-            crate::lifecycle::TransportLifecycleEvent::SessionPublished {
-                peer: peer_id.clone(),
-                addr: connection.addr,
-                direction: match connection.direction {
-                    ConnectionDirection::Inbound => crate::lifecycle::TransportDirection::Inbound,
-                    ConnectionDirection::Outbound => crate::lifecycle::TransportDirection::Outbound,
-                },
-            },
-        );
+        let direction = match connection.direction {
+            ConnectionDirection::Inbound => crate::lifecycle::TransportDirection::Inbound,
+            ConnectionDirection::Outbound => crate::lifecycle::TransportDirection::Outbound,
+        };
         let _ = self
             .connections_by_peer
             .upsert_sync(peer_id.clone(), connection.clone());
@@ -728,6 +791,24 @@ impl<T> ConnectionPool<T> {
         if let Some(expected) = expected {
             self.retire_displaced_expected(expected, &connection);
         }
+        // The commit and any displaced-instance cleanup are complete before
+        // invoking the user lifecycle recorder; recorder callbacks may publish
+        // or re-enter the pool because no publication mutex is held.
+        drop(publication);
+        info!(
+            peer_id = %peer_id,
+            addr = %connection.addr,
+            direction = ?connection.direction,
+            stream_instance_id = ?stream_instance_id,
+            "transport_session_published"
+        );
+        crate::lifecycle::record_transport_event(
+            crate::lifecycle::TransportLifecycleEvent::SessionPublished {
+                peer: peer_id.clone(),
+                addr: connection.addr,
+                direction,
+            },
+        );
         Ok(())
     }
 
@@ -1248,9 +1329,7 @@ impl<T> ConnectionPool<T> {
         let _ = self
             .addr_to_peer_id
             .upsert_sync(peer_state_addr, peer_id.clone());
-        let _ = self
-            .connections_by_addr
-            .upsert_sync(peer_state_addr, connection.clone());
+        self.publish_connection_by_addr(peer_state_addr, connection.clone());
 
         // Dedupe: the ephemeral TCP source address and the peer's
         // configured/advertised bind address are frequently identical
@@ -1267,9 +1346,7 @@ impl<T> ConnectionPool<T> {
             let _ = self
                 .addr_to_peer_id
                 .upsert_sync(ephemeral_addr, peer_id.clone());
-            let _ = self
-                .connections_by_addr
-                .upsert_sync(ephemeral_addr, connection.clone());
+            self.publish_connection_by_addr(ephemeral_addr, connection.clone());
         }
 
         // Paired, insert-gated: `count_in_new_instance` only bumps
@@ -1293,6 +1370,18 @@ impl<T> ConnectionPool<T> {
             })
             .unwrap_or(false);
         if still_current {
+            #[cfg(feature = "test-helpers")]
+            if let Some(instance_id) = instance_id {
+                crate::lifecycle::record_test_helper_event(|sequence| {
+                    crate::lifecycle::TransportTestHelperEvent::PublicationCommitted {
+                        peer: peer_id.clone(),
+                        addr: peer_state_addr,
+                        instance_id,
+                        direction: crate::lifecycle::TransportDirection::Inbound,
+                        sequence,
+                    }
+                });
+            }
             return true;
         }
 
@@ -1658,67 +1747,55 @@ impl<T> ConnectionPool<T> {
         }
     }
 
-    /// Check-then-unconditional-clear: reads `current_connection`,
-    /// `ptr_eq`-compares it to `candidate`, and — ONLY afterward, past a log
-    /// line and a lifecycle-event construction, a real gap — unconditionally
-    /// clears the slot. A concurrent `publish_current_peer_connection`
-    /// landing in that gap (e.g. a fresh preferred inbound for this exact
-    /// peer) is silently clobbered.
-    ///
-    /// `get_connection_by_peer_id`'s own internal self-heal no longer uses
-    /// this (see [`Self::compare_and_clear_current_peer_connection`]) —
-    /// this remains in use only by callers that are themselves already
-    /// acting on a connection they just pulled out of an index as part of
-    /// tearing it down (`remove_connection`'s per-alias peer cleanup,
-    /// `GossipRegistry`'s DNS-refresh dead-connection cleanup), where the
-    /// `candidate` was obtained from the SAME removal/observation this call
-    /// is reacting to rather than from an earlier decision snapshot. Prefer
-    /// [`Self::compare_and_clear_current_peer_connection`] for any new
-    /// caller.
+    /// Clear the peer's current-connection slot only if it still holds
+    /// `candidate`. The compare-and-clear is the linearization point: lifecycle
+    /// removal is reported only after that atomic mutation succeeds.
     pub(crate) fn clear_current_peer_connection_if_matches(
         &self,
         peer_id: &crate::PeerId,
         candidate: &Arc<LockFreeConnection>,
     ) {
-        let should_clear = self
+        let cleared = self
             .peer_sessions
             .read_sync(peer_id, |_, session| {
-                session
-                    .current_connection()
-                    .map(|current| Arc::ptr_eq(&current, candidate))
-                    .unwrap_or(false)
+                session.compare_and_clear_current_connection(candidate)
             })
             .unwrap_or(false);
-        if should_clear {
-            let stream_instance_id = candidate
-                .stream_handle
-                .as_ref()
-                .map(|handle| handle.instance_id());
-            info!(
-                peer_id = %peer_id,
-                addr = %candidate.addr,
-                direction = ?candidate.direction,
-                stream_instance_id = ?stream_instance_id,
-                reason = "current_connection_cleared",
-                "transport_session_removed"
-            );
-            crate::lifecycle::record_transport_event(
-                crate::lifecycle::TransportLifecycleEvent::SessionRemoved {
-                    peer: peer_id.clone(),
-                    addr: candidate.addr,
-                    direction: match candidate.direction {
-                        ConnectionDirection::Inbound => {
-                            crate::lifecycle::TransportDirection::Inbound
-                        }
-                        ConnectionDirection::Outbound => {
-                            crate::lifecycle::TransportDirection::Outbound
-                        }
-                    },
-                    reason: crate::lifecycle::SessionRemovalReason::CurrentConnectionCleared,
-                },
-            );
-            self.clear_current_peer_connection(peer_id);
+        if !cleared {
+            return;
         }
+
+        let stream_instance_id = candidate
+            .stream_handle
+            .as_ref()
+            .map(|handle| handle.instance_id());
+        info!(
+            peer_id = %peer_id,
+            addr = %candidate.addr,
+            direction = ?candidate.direction,
+            stream_instance_id = ?stream_instance_id,
+            reason = "current_connection_cleared",
+            "transport_session_removed"
+        );
+        crate::lifecycle::record_transport_event(
+            crate::lifecycle::TransportLifecycleEvent::SessionRemoved {
+                peer: peer_id.clone(),
+                addr: candidate.addr,
+                direction: match candidate.direction {
+                    ConnectionDirection::Inbound => {
+                        crate::lifecycle::TransportDirection::Inbound
+                    }
+                    ConnectionDirection::Outbound => {
+                        crate::lifecycle::TransportDirection::Outbound
+                    }
+                },
+                reason: crate::lifecycle::SessionRemovalReason::CurrentConnectionCleared,
+            },
+        );
+        let _ = self
+            .connections_by_peer
+            .remove_if_sync(peer_id, |value| Arc::ptr_eq(value, candidate));
+        self.mark_routing_changed();
     }
 
     /// Atomic counterpart to [`Self::clear_current_peer_connection_if_matches`]:
@@ -1785,6 +1862,37 @@ impl<T> ConnectionPool<T> {
 
     fn is_usable_connection(&self, conn: &LockFreeConnection) -> bool {
         conn.has_live_stream()
+    }
+
+    /// Adopt a live address/alias fallback only while the peer session slot
+    /// still matches the empty state observed by the caller. A fallback read
+    /// is necessarily a snapshot: a newer connection may publish before this
+    /// method resumes, and an unconditional publish would overwrite it.
+    fn adopt_fallback_connection(
+        &self,
+        peer_id: &crate::PeerId,
+        connection: Arc<LockFreeConnection>,
+    ) -> Option<Arc<LockFreeConnection>> {
+        #[cfg(test)]
+        record_fallback_adoption_capture(&connection);
+
+        // A fallback capture can race a stale session being published into the
+        // primary slot. Do not turn that race into a spurious lookup miss:
+        // an unusable occupant is conditionally cleared by identity, then the
+        // same validated live fallback gets a bounded retry. If a replacement
+        // wins either CAS, the next attempt returns it when usable and never
+        // overwrites it.
+        for _ in 0..3 {
+            match self.compare_and_publish_peer_connection(peer_id, None, connection.clone()) {
+                Ok(()) => return Some(connection),
+                Err(Some(current)) if self.is_usable_connection(&current) => return Some(current),
+                Err(Some(current)) => {
+                    let _ = self.compare_and_clear_current_peer_connection(peer_id, &current);
+                }
+                Err(None) => {}
+            }
+        }
+        None
     }
 
     /// PURE, non-mutating read of "what connection does this peer currently
@@ -1993,9 +2101,7 @@ impl<T> ConnectionPool<T> {
         }
 
         // Insert the connection under the new (advertised) address
-        let _ = self
-            .connections_by_addr
-            .upsert_sync(new_addr, connection.clone());
+        self.publish_connection_by_addr(new_addr, connection.clone());
         // Also update peer_id_to_addr so disconnect uses the correct address
         self.set_discovered_peer_addr(peer_id, new_addr);
 
@@ -2011,7 +2117,7 @@ impl<T> ConnectionPool<T> {
                 .read_sync(&old_addr, |_, owner| owner == peer_id)
                 .unwrap_or(false);
             if old_addr_is_this_peer {
-                let _ = self.connections_by_addr.upsert_sync(old_addr, connection);
+                self.publish_connection_by_addr(old_addr, connection);
                 debug!(
                     old_addr = %old_addr,
                     new_addr = %new_addr,
@@ -2098,9 +2204,13 @@ impl<T> ConnectionPool<T> {
                         "CONNECTION POOL: Found connection for peer '{}' via address fallback ({})",
                         peer_id, addr
                     );
-                    // Index by peer_id for future lookups
-                    self.publish_current_peer_connection(peer_id, conn.clone());
-                    return Some(conn);
+                    if let Some(conn) = self.adopt_fallback_connection(peer_id, conn) {
+                        debug!(
+                            "CONNECTION POOL: Adopted live configured-address fallback for peer '{}'",
+                            peer_id
+                        );
+                        return Some(conn);
+                    }
                 }
             }
         }
@@ -2113,8 +2223,9 @@ impl<T> ConnectionPool<T> {
                 "CONNECTION POOL: Found connection for peer '{}' via address alias ({})",
                 peer_id, conn.addr
             );
-            self.publish_current_peer_connection(peer_id, conn.clone());
-            return Some(conn);
+            if let Some(conn) = self.adopt_fallback_connection(peer_id, conn) {
+                return Some(conn);
+            }
         }
 
         // `get_connection_by_peer_id` is a pure lookup primitive: a
@@ -2246,7 +2357,7 @@ impl<T> ConnectionPool<T> {
         let instance_id = connection.stream_handle.as_ref().map(|h| h.instance_id());
 
         // Also index by address for direct lookups
-        let _ = self.connections_by_addr.upsert_sync(addr, connection);
+        self.publish_connection_by_addr(addr, connection);
 
         // Paired, insert-gated via `count_in_new_instance` — see its comment.
         // A connection with no stream handle is never counted (nothing to
@@ -2267,7 +2378,7 @@ impl<T> ConnectionPool<T> {
             "CONNECTION POOL: Indexing connection by additional address {}",
             addr
         );
-        let _ = self.connections_by_addr.upsert_sync(addr, connection);
+        self.publish_connection_by_addr(addr, connection);
         self.mark_routing_changed();
     }
 
@@ -2644,7 +2755,7 @@ impl<T> ConnectionPool<T> {
         if removed {
             match existing_before {
                 Some(existing) if existing.addr == addr && existing.has_live_stream() => {
-                    let _ = self.connections_by_addr.upsert_sync(addr, existing.clone());
+                    self.publish_connection_by_addr(addr, existing.clone());
                     let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
                 }
                 _ => {
@@ -3871,9 +3982,7 @@ impl<T> ConnectionPool<T> {
         }
 
         // Insert into lock-free map before spawning.
-        let _ = self
-            .connections_by_addr
-            .upsert_sync(addr, connection_arc.clone());
+        self.publish_connection_by_addr(addr, connection_arc.clone());
         if let Some(peer_id) = peer_id_opt.as_ref() {
             let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
             // Identity-keyed publish gate. This freshly-dialed OUTBOUND must not
@@ -4064,6 +4173,18 @@ impl<T> ConnectionPool<T> {
         // connection that the teardown paths later decremented, underflowing
         // `connection_counter`.
         self.count_in_new_instance(stream_handle.instance_id());
+        #[cfg(feature = "test-helpers")]
+        if let Some(peer_id) = peer_id_opt.as_ref() {
+            crate::lifecycle::record_test_helper_event(|sequence| {
+                crate::lifecycle::TransportTestHelperEvent::PublicationCommitted {
+                    peer: peer_id.clone(),
+                    addr,
+                    instance_id: stream_handle.instance_id(),
+                    direction: crate::lifecycle::TransportDirection::Outbound,
+                    sequence,
+                }
+            });
+        }
         debug!(
             "CONNECTION POOL: Added connection via get_connection to {} - pool now has {} connections",
             addr,

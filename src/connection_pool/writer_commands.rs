@@ -29,6 +29,10 @@ enum StreamingCommand {
     /// payload and generates each frame header lazily instead of expanding a
     /// large response into one queue command per frame.
     BytesResponse(Box<BytesStreamingResponse>),
+    /// A bounded, connection-owned response lease. The slot record carries
+    /// cancellation and terminal payload ownership; this command carries only
+    /// the IO owner's frame progress.
+    LeasedResponse(Box<LeasedResponse>),
     /// Abort a partially transmitted stream. This stays on the streaming FIFO
     /// so it cannot overtake data chunks that were already accepted.
     Abort { stream_id: u32, reason: u32 },
@@ -60,6 +64,29 @@ struct PooledStreamingResponse {
 }
 
 /// A lazily framed response backed by an already-owned `Bytes` payload.
+struct LeasedResponse {
+    stage: LeasedResponseStage,
+    record: std::sync::Arc<crate::connection_pool::reply_slots::ReplySlotRecord>,
+}
+
+enum LeasedResponseStage {
+    Reserved,
+    WritingNormal(Box<BytesStreamingResponse>),
+    WritingInline {
+        header: [u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN],
+        payload: crate::ReplyPayload,
+    },
+    WritingAbort {
+        header: [u8; crate::framing::STREAM_DATA_FRAME_HEADER_LEN],
+    },
+    WritingTerminal {
+        header: [u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN],
+        payload: std::sync::Arc<crate::ReplyPayload>,
+    },
+    Flushing,
+    Complete,
+}
+
 struct BytesStreamingResponse {
     stream_id: u32,
     correlation_id: u32,
@@ -108,10 +135,14 @@ impl BytesStreamingResponse {
         if frame_index == 0 {
             return self.payload_len.min(self.chunk_size);
         }
-        let consumed = self
-            .chunk_size
-            .saturating_add(frame_index.saturating_sub(1).saturating_mul(self.chunk_size));
-        self.payload_len.saturating_sub(consumed).min(self.chunk_size)
+        let consumed = self.chunk_size.saturating_add(
+            frame_index
+                .saturating_sub(1)
+                .saturating_mul(self.chunk_size),
+        );
+        self.payload_len
+            .saturating_sub(consumed)
+            .min(self.chunk_size)
     }
 
     fn frame_header(&self, frame_index: usize) -> InlineFrameHeader {
@@ -262,10 +293,14 @@ impl PooledStreamingResponse {
         if frame_index == 0 {
             return self.payload_len.min(self.chunk_size);
         }
-        let consumed = self
-            .chunk_size
-            .saturating_add(frame_index.saturating_sub(1).saturating_mul(self.chunk_size));
-        self.payload_len.saturating_sub(consumed).min(self.chunk_size)
+        let consumed = self.chunk_size.saturating_add(
+            frame_index
+                .saturating_sub(1)
+                .saturating_mul(self.chunk_size),
+        );
+        self.payload_len
+            .saturating_sub(consumed)
+            .min(self.chunk_size)
     }
 
     fn frame_header(&self, frame_index: usize) -> InlineFrameHeader {
@@ -310,6 +345,14 @@ struct LocalStreamingQueue {
     /// another ask; otherwise its handler could produce a response that cannot
     /// be admitted after ownership has already moved here.
     response_in_flight: bool,
+    /// A yielded response is parked in the writer's bounded resumed set. Its
+    /// queue-resident Flush must not be selected until that response resumes.
+    suspended_response: bool,
+    /// The response frame is complete, but its paired Flush still owns the
+    /// retained payload reservation until that Flush completes.
+    flush_pending: bool,
+    /// The currently in-flight response was admitted with a paired Flush.
+    response_expects_flush: bool,
     in_flight_bytes: usize,
     wire_blocked: bool,
     /// Reserve normal queue room for one configured response frame when
@@ -405,6 +448,9 @@ impl LocalStreamingQueue {
             queue: std::collections::VecDeque::new(),
             queued_bytes: 0,
             response_in_flight: false,
+            suspended_response: false,
+            flush_pending: false,
+            response_expects_flush: false,
             in_flight_bytes: 0,
             response_reserve_bytes,
             response_reserve_commands,
@@ -452,10 +498,7 @@ impl LocalStreamingQueue {
 
     /// `extra` counts an already-popped active NACK that still owns the wire.
     fn has_room_for_ask_nack_occupying(&self, extra: usize) -> bool {
-        self.pending_ask_nacks
-            .len()
-            .saturating_add(extra)
-            < PENDING_ASK_NACK_CAP
+        self.pending_ask_nacks.len().saturating_add(extra) < PENDING_ASK_NACK_CAP
     }
 
     /// Pop the oldest queued NACK header for `io_task` to attempt writing.
@@ -481,25 +524,67 @@ impl LocalStreamingQueue {
     }
 
     fn pop_front(&mut self) -> Option<StreamingCommand> {
-        if self.queue.is_empty() && !self.response_in_flight {
+        // A response and its Flush form one retained unit. Once the response
+        // yields at a frame boundary, do not let the Flush (or a later local
+        // response) overtake it; the writer calls `response_finished` only
+        // after the response's final frame has committed.
+        if self.response_in_flight && self.suspended_response {
+            return None;
+        }
+        if self.queue.is_empty() {
             if let Some(deferred) = self.deferred.take() {
                 self.queued_bytes = deferred.iter().map(streaming_command_bytes).sum();
                 self.deferred_bytes = 0;
                 self.queue.extend(deferred);
             }
         }
+        let command = self.queue.front()?;
+        if matches!(command, StreamingCommand::Flush) && self.suspended_response {
+            return None;
+        }
         let command = self.queue.pop_front()?;
         let command_bytes = streaming_command_bytes(&command);
-        self.queued_bytes = self
-            .queued_bytes
-            .saturating_sub(command_bytes);
-        self.response_in_flight = !matches!(&command, StreamingCommand::Flush);
-        self.in_flight_bytes = if self.response_in_flight {
-            command_bytes
+        self.queued_bytes = self.queued_bytes.saturating_sub(command_bytes);
+        if matches!(&command, StreamingCommand::Flush) {
+            // Keep the response's reservation until the actual Flush completes.
+            // `flush_finished` clears it after the writer's flush future returns.
+            if !self.flush_pending {
+                self.in_flight_bytes = 0;
+            }
         } else {
-            0
-        };
+            self.response_in_flight = true;
+            self.response_expects_flush =
+                matches!(self.queue.front(), Some(StreamingCommand::Flush));
+            self.in_flight_bytes = command_bytes;
+        }
         Some(command)
+    }
+
+    fn response_yielded(&mut self) {
+        if self.response_in_flight {
+            self.suspended_response = true;
+        }
+    }
+
+    fn response_finished(&mut self) {
+        if !self.response_in_flight {
+            return;
+        }
+        self.response_in_flight = false;
+        self.suspended_response = false;
+        if self.response_expects_flush {
+            self.flush_pending = true;
+        } else {
+            self.in_flight_bytes = 0;
+        }
+        self.response_expects_flush = false;
+    }
+
+    fn flush_finished(&mut self) {
+        if self.flush_pending {
+            self.flush_pending = false;
+            self.in_flight_bytes = 0;
+        }
     }
 
     fn set_wire_blocked(&mut self, blocked: bool) {
@@ -524,22 +609,18 @@ impl LocalStreamingQueue {
     fn retained_commands(&self) -> usize {
         self.queue
             .len()
-            .saturating_add(usize::from(self.response_in_flight))
+            .saturating_add(usize::from(self.response_in_flight || self.flush_pending))
             .saturating_add(self.deferred.as_ref().map_or(0, Vec::len))
     }
 
     fn can_defer_response(&self, command_count: usize, response_bytes: usize) -> bool {
-        let retained_without_deferred = self
-            .queued_bytes
-            .saturating_add(self.in_flight_bytes);
+        let retained_without_deferred = self.queued_bytes.saturating_add(self.in_flight_bytes);
         let bounded_footprint = response_bytes <= STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP
             && retained_without_deferred.saturating_add(response_bytes)
                 <= STREAMING_RESPONSE_QUEUE_HARD_BYTE_CAP;
         self.deferred.is_none()
             && command_count <= self.response_reserve_commands
-            && self
-                .retained_commands()
-                .saturating_add(command_count)
+            && self.retained_commands().saturating_add(command_count)
                 <= STREAMING_RESPONSE_QUEUE_COMMAND_CAP
             && bounded_footprint
     }
@@ -551,9 +632,7 @@ impl LocalStreamingQueue {
     /// normal queue cap is admitted without deferral only as the sole retained
     /// response.
     fn can_admit_response(&self, command_count: usize, response_bytes: usize) -> bool {
-        let fits_queue = self
-            .retained_commands()
-            .saturating_add(command_count)
+        let fits_queue = self.retained_commands().saturating_add(command_count)
             <= STREAMING_RESPONSE_QUEUE_COMMAND_CAP
             && self.retained_bytes().saturating_add(response_bytes)
                 <= STREAMING_RESPONSE_QUEUE_BYTE_CAP;
@@ -620,9 +699,7 @@ impl LocalStreamingQueue {
     {
         let commands: Vec<_> = commands.into_iter().collect();
         let added_bytes: usize = commands.iter().map(streaming_command_bytes).sum();
-        let fits_queue = self
-            .retained_commands()
-            .saturating_add(commands.len())
+        let fits_queue = self.retained_commands().saturating_add(commands.len())
             <= STREAMING_RESPONSE_QUEUE_COMMAND_CAP
             && self.retained_bytes().saturating_add(added_bytes)
                 <= STREAMING_RESPONSE_QUEUE_BYTE_CAP;
@@ -661,18 +738,69 @@ fn streaming_command_bytes(command: &StreamingCommand) -> usize {
         StreamingCommand::OwnedChunks(chunks) => chunks.iter().map(bytes::Bytes::len).sum(),
         StreamingCommand::PooledResponse(response) => response.retained_len(),
         StreamingCommand::BytesResponse(response) => response.retained_len(),
-        StreamingCommand::Abort { stream_id, reason } => crate::framing::write_stream_abort_header(*stream_id, *reason).len(),
+        StreamingCommand::LeasedResponse(_) => 0,
+        StreamingCommand::Abort { stream_id, reason } => {
+            crate::framing::write_stream_abort_header(*stream_id, *reason).len()
+        }
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StreamingSource {
     Local,
     Shared,
 }
 
+/// Fair source rotation for streaming work. Each selection advances the cursor
+/// by one lane, while the writer keeps the selected command until its current
+/// frame is complete. This makes the quantum one safe frame rather than one
+/// arbitrary socket write.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamingLane {
+    Resumed,
+    Lease,
+    Local,
+    Shared,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StreamingRotation {
+    next: usize,
+}
+
+impl StreamingRotation {
+    fn new() -> Self {
+        Self { next: 0 }
+    }
+
+    fn choose(
+        &mut self,
+        resumed_ready: bool,
+        lease_ready: bool,
+        local_ready: bool,
+        shared_ready: bool,
+    ) -> Option<StreamingLane> {
+        let ready = [resumed_ready, lease_ready, local_ready, shared_ready];
+        for step in 0..ready.len() {
+            let index = (self.next + step) % ready.len();
+            if ready[index] {
+                self.next = (index + 1) % ready.len();
+                return Some(match index {
+                    0 => StreamingLane::Resumed,
+                    1 => StreamingLane::Lease,
+                    2 => StreamingLane::Local,
+                    _ => StreamingLane::Shared,
+                });
+            }
+        }
+        None
+    }
+}
+
 /// Pick the next streaming source without allowing a continuously replenished
 /// local response queue to starve producer-owned shared streams.
+#[cfg(test)]
 fn choose_streaming_source(
     prefer_shared: bool,
     local_ready: bool,
@@ -696,6 +824,9 @@ struct PendingStreamingCommand {
     command: StreamingCommand,
     offset: usize,
     from_shared_queue: bool,
+    /// This command came from the read-pipeline local response queue and may
+    /// therefore complete that queue's response/Flush reservation.
+    from_local_response_queue: bool,
     yield_after_frame: bool,
 }
 
@@ -705,6 +836,7 @@ impl PendingStreamingCommand {
             command,
             offset: 0,
             from_shared_queue: true,
+            from_local_response_queue: false,
             yield_after_frame: false,
         }
     }
@@ -714,6 +846,17 @@ impl PendingStreamingCommand {
             command,
             offset: 0,
             from_shared_queue: false,
+            from_local_response_queue: false,
+            yield_after_frame: false,
+        }
+    }
+
+    fn local_response(command: StreamingCommand) -> Self {
+        Self {
+            command,
+            offset: 0,
+            from_shared_queue: false,
+            from_local_response_queue: true,
             yield_after_frame: false,
         }
     }
@@ -745,6 +888,10 @@ impl std::fmt::Debug for StreamingCommand {
                 .debug_struct("BytesResponse")
                 .field("payload_len", &response.payload_len)
                 .field("chunk_count", &response.chunk_count)
+                .finish(),
+            StreamingCommand::LeasedResponse(response) => f
+                .debug_struct("LeasedResponse")
+                .field("correlation_id", &response.record.correlation_id())
                 .finish(),
             StreamingCommand::Abort { stream_id, reason } => f
                 .debug_struct("Abort")

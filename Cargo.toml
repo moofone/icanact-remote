@@ -51,6 +51,25 @@ tracing-test = "0.2.5"
 name = "interest_advertise_convergence_delivery"
 required-features = ["test-helpers"]
 
+[[test]]
+name = "gossip_dead_peer_actor_cleanup"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "tie_break_reconnect_storm"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "typed_tls_end_to_end"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "remote_actor_ref_self_heal"
+required-features = ["test-helpers"]
+
+[[test]]
+name = "qa_r1_lifecycle_evidence"
+required-features = ["test-helpers"]
 [[bench]]
 name = "archived_access"
 harness = false
@@ -70,3 +89,8 @@ harness = false
 [[bench]]
 name = "pubsub_job_pattern"
 harness = false
+
+[[bench]]
+name = "stream_lease"
+harness = false
+required-features = ["test-helpers"]

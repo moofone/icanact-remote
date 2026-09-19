@@ -305,6 +305,80 @@ pub enum TransportLifecycleEvent {
     },
 }
 
+/// Feature-gated evidence events intentionally live on a separate recorder
+/// type: `TransportLifecycleEvent` is a public exhaustive enum, so adding
+/// variants would break existing downstream/test matches. This side channel
+/// keeps the public lifecycle variants unchanged while still allowing
+/// integration tests built with `test-helpers` to observe exact instances.
+#[cfg(feature = "test-helpers")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportTestHelperEvent {
+    PublicationCommitted {
+        peer: PeerId,
+        addr: SocketAddr,
+        instance_id: u64,
+        direction: TransportDirection,
+        sequence: u64,
+    },
+    PreRemark {
+        peer: PeerId,
+        addr: SocketAddr,
+        instance_id: u64,
+        direction: TransportDirection,
+        sequence: u64,
+    },
+    MarkConnected {
+        peer: Option<PeerId>,
+        addr: SocketAddr,
+        instance_id: Option<u64>,
+        require_live: bool,
+        sequence: u64,
+    },
+    MarkConnectedAttempt {
+        peer: Option<PeerId>,
+        addr: SocketAddr,
+        instance_id: Option<u64>,
+        require_live: bool,
+        sequence: u64,
+    },
+    MarkConnectedDeclined {
+        peer: Option<PeerId>,
+        addr: SocketAddr,
+        instance_id: Option<u64>,
+        require_live: bool,
+        sequence: u64,
+    },
+    MarkFailedAttempt {
+        peer: Option<PeerId>,
+        addr: SocketAddr,
+        instance_id: Option<u64>,
+        sequence: u64,
+    },
+    MarkFailed {
+        peer: Option<PeerId>,
+        addr: SocketAddr,
+        instance_id: Option<u64>,
+        applied: bool,
+        sequence: u64,
+    },
+    /// The disconnect callback's first poll has completed its synchronous
+    /// portion. Publication was fenced through that poll; this event is
+    /// dispatched only after the gate is released so recorder re-entry cannot
+    /// deadlock against publication.
+    DisconnectNotificationEntered {
+        peer: Option<PeerId>,
+        addr: SocketAddr,
+        instance_id: Option<u64>,
+        sequence: u64,
+    },
+    TeardownAttempt {
+        peer: PeerId,
+        addr: SocketAddr,
+        instance_id: u64,
+        sequence: u64,
+    },
+}
+
 pub type TransportLifecycleRecorder = Arc<dyn Fn(TransportLifecycleEvent) + Send + Sync + 'static>;
 
 static RECORDER: OnceLock<RwLock<Option<TransportLifecycleRecorder>>> = OnceLock::new();
@@ -317,6 +391,26 @@ pub fn set_transport_lifecycle_recorder(recorder: Option<TransportLifecycleRecor
     *recorder_cell()
         .write()
         .expect("transport lifecycle recorder lock poisoned") = recorder;
+}
+
+#[cfg(feature = "test-helpers")]
+pub type TransportTestHelperRecorder =
+    Arc<dyn Fn(TransportTestHelperEvent) + Send + Sync + 'static>;
+
+#[cfg(feature = "test-helpers")]
+static TEST_HELPER_RECORDER: OnceLock<RwLock<Option<TransportTestHelperRecorder>>> =
+    OnceLock::new();
+
+#[cfg(feature = "test-helpers")]
+fn test_helper_recorder_cell() -> &'static RwLock<Option<TransportTestHelperRecorder>> {
+    TEST_HELPER_RECORDER.get_or_init(|| RwLock::new(None))
+}
+
+#[cfg(feature = "test-helpers")]
+fn set_test_helper_recorder(recorder: Option<TransportTestHelperRecorder>) {
+    *test_helper_recorder_cell()
+        .write()
+        .expect("transport test-helper recorder lock poisoned") = recorder;
 }
 
 /// Process-wide lock serializing every installation of the global
@@ -352,11 +446,21 @@ impl TransportLifecycleRecorderGuard {
         set_transport_lifecycle_recorder(Some(recorder));
         Self { _lock: lock }
     }
+
+    /// Install the feature-gated evidence side channel while this guard owns
+    /// the process-wide recorder-install lock. The public lifecycle enum stays
+    /// unchanged, preserving exhaustive downstream matches.
+    #[cfg(feature = "test-helpers")]
+    pub fn install_test_helper_recorder(&self, recorder: TransportTestHelperRecorder) {
+        set_test_helper_recorder(Some(recorder));
+    }
 }
 
 impl Drop for TransportLifecycleRecorderGuard {
     fn drop(&mut self) {
         set_transport_lifecycle_recorder(None);
+        #[cfg(feature = "test-helpers")]
+        set_test_helper_recorder(None);
     }
 }
 
@@ -368,4 +472,37 @@ pub(crate) fn record_transport_event(event: TransportLifecycleEvent) {
     if let Some(recorder) = recorder {
         recorder(event);
     }
+}
+
+/// Assign a monotonic order to feature-gated evidence events. This helper is
+/// absent from release builds, so the observation seam adds no hot-path work
+/// unless the explicitly requested `test-helpers` feature is enabled.
+#[cfg(feature = "test-helpers")]
+#[cfg(feature = "test-helpers")]
+static NEXT_TEST_HELPER_SEQUENCE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(feature = "test-helpers")]
+pub(crate) fn next_test_helper_sequence() -> u64 {
+    NEXT_TEST_HELPER_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(feature = "test-helpers")]
+pub(crate) fn dispatch_test_helper_event(event: TransportTestHelperEvent) {
+    let recorder = test_helper_recorder_cell()
+        .read()
+        .expect("transport test-helper recorder lock poisoned")
+        .clone();
+    if let Some(recorder) = recorder {
+        recorder(event);
+    }
+}
+
+#[cfg(feature = "test-helpers")]
+pub(crate) fn record_test_helper_event<F>(make_event: F)
+where
+    F: FnOnce(u64) -> TransportTestHelperEvent,
+{
+    let sequence = next_test_helper_sequence();
+    dispatch_test_helper_event(make_event(sequence));
 }

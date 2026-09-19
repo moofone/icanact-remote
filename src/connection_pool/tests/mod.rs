@@ -14538,6 +14538,7 @@ include!("qa_queue_close.rs");
 include!("qa_deadline.rs");
 include!("qa_response_budget.rs");
 include!("qa_scan_20260907.rs");
+include!("qa_lookup_race.rs");
 mod qa_backpressure_scan;
 mod qa_remaining_deadlines {
     include!("qa_remaining_deadlines.rs");
