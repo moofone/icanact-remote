@@ -6,12 +6,38 @@ impl Drop for FallbackAdoptionHookReset {
     }
 }
 
+/// An unresolved same-address replacement publishes only through the address
+/// index. That publication must supersede a notifier's armed claim before the
+/// claim can enter the detached disconnect callback.
+#[test]
+fn same_address_index_publication_supersedes_armed_disconnect_claim() {
+    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let addr: SocketAddr = "127.0.0.1:60700".parse().unwrap();
+    let old = Arc::new(LockFreeConnection::new(addr, ConnectionDirection::Inbound));
+    let replacement = Arc::new(LockFreeConnection::new(addr, ConnectionDirection::Inbound));
+    pool.index_connection_by_addr(addr, old);
+
+    let claim = try_arm_disconnect_delivery().expect("disconnect claim must arm");
+    pool.index_connection_by_addr(addr, replacement.clone());
+
+    assert!(
+        !claim.enter(),
+        "same-address publication must win before an unresolved disconnect callback enters"
+    );
+    assert!(
+        pool.get_lock_free_connection(addr)
+            .is_some_and(|current| Arc::ptr_eq(&current, &replacement)),
+        "address index must retain the replacement that won the publication race"
+    );
+}
+
 /// The address fallback is a capture-then-adopt path. A replacement may win
 /// the peer session between those two operations, so adoption must use the
 /// observed empty primary slot as a compare-and-publish fence rather than an
 /// unconditional store.
 #[tokio::test]
 async fn fallback_capture_then_replacement_cannot_be_overwritten_on_resume() {
+    let _test_lock = lock_fallback_adoption_test();
     let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
     let peer_id = crate::KeyPair::new_for_testing("qa-fallback-capture-race-peer").peer_id();
     let fallback_addr: SocketAddr = "127.0.0.1:60701".parse().unwrap();
@@ -89,6 +115,7 @@ async fn fallback_capture_then_replacement_cannot_be_overwritten_on_resume() {
 /// instead of returning a spurious lookup miss.
 #[tokio::test]
 async fn fallback_adoption_retries_after_raced_unusable_session() {
+    let _test_lock = lock_fallback_adoption_test();
     let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
     let peer_id = crate::KeyPair::new_for_testing("qa-fallback-unusable-race-peer").peer_id();
     let fallback_addr: SocketAddr = "127.0.0.1:60703".parse().unwrap();
