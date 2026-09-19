@@ -2775,6 +2775,22 @@ impl<T> ConnectionPool<T> {
         }
     }
 
+    /// Reject an outbound candidate that lost a final compare-and-publish
+    /// re-resolution. Keeping the unpublish and `ConnectionExists` error in
+    /// one helper makes every bool-false caller obey the same contract: the
+    /// candidate is removed before the losing finalize can count it, send
+    /// FullSync, or return a successful handle.
+    fn reject_outbound_candidate(
+        &self,
+        addr: SocketAddr,
+        candidate: &Arc<LockFreeConnection>,
+        peer_id: &crate::PeerId,
+        existing_before: Option<&Arc<LockFreeConnection>>,
+    ) -> Result<ConnectionHandle<T>> {
+        self.unpublish_rejected_outbound_candidate(addr, candidate, peer_id, existing_before);
+        Err(crate::GossipError::ConnectionExists)
+    }
+
     /// Disconnect a specific connection instance for `peer_id`, but only if
     /// it is still the instance actually indexed for that peer — matched by
     /// `Arc` identity, never merely by `peer_id`. A concurrent publish that
@@ -4049,13 +4065,12 @@ impl<T> ConnectionPool<T> {
                         existing_before.as_ref(),
                         &registry_weak,
                     ) {
-                        self.unpublish_rejected_outbound_candidate(
+                        return self.reject_outbound_candidate(
                             addr,
                             &connection_arc,
                             peer_id,
                             existing_before.as_ref(),
                         );
-                        return Err(crate::GossipError::ConnectionExists);
                     }
                 }
                 ConnectionConflictDecision::ReplaceExisting => {
@@ -4085,13 +4100,12 @@ impl<T> ConnectionPool<T> {
                         expected.as_ref(),
                         &registry_weak,
                     ) {
-                        self.unpublish_rejected_outbound_candidate(
+                        return self.reject_outbound_candidate(
                             addr,
                             &connection_arc,
                             peer_id,
                             existing_before.as_ref(),
                         );
-                        return Err(crate::GossipError::ConnectionExists);
                     }
                 }
                 ConnectionConflictDecision::RejectIncoming => {
