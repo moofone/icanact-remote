@@ -103,6 +103,13 @@ impl ReplyDeliveryBudget {
             )
             .into());
         }
+        if cancelled_reply.len() > byte_limit {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "reply byte limit is smaller than the cancellation payload",
+            )
+            .into());
+        }
         Ok(Self {
             job_permits: Arc::new(Semaphore::new(job_limit)),
             byte_permits: Arc::new(Semaphore::new(byte_limit)),

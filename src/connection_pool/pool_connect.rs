@@ -1865,19 +1865,23 @@ impl<T> ConnectionPool<T> {
         #[cfg(test)]
         record_fallback_adoption_capture(&connection);
 
-        match self.compare_and_publish_peer_connection(peer_id, None, connection.clone()) {
-            Ok(()) => Some(connection),
-            Err(Some(current)) if self.is_usable_connection(&current) => Some(current),
-            Err(Some(_)) => None,
-            Err(None) => {
-                let retry = connection;
-                match self.compare_and_publish_peer_connection(peer_id, None, retry.clone()) {
-                    Ok(()) => Some(retry),
-                    Err(Some(current)) if self.is_usable_connection(&current) => Some(current),
-                    Err(Some(_)) | Err(None) => None,
+        // A fallback capture can race a stale session being published into the
+        // primary slot. Do not turn that race into a spurious lookup miss:
+        // an unusable occupant is conditionally cleared by identity, then the
+        // same validated live fallback gets a bounded retry. If a replacement
+        // wins either CAS, the next attempt returns it when usable and never
+        // overwrites it.
+        for _ in 0..3 {
+            match self.compare_and_publish_peer_connection(peer_id, None, connection.clone()) {
+                Ok(()) => return Some(connection),
+                Err(Some(current)) if self.is_usable_connection(&current) => return Some(current),
+                Err(Some(current)) => {
+                    let _ = self.compare_and_clear_current_peer_connection(peer_id, &current);
                 }
+                Err(None) => {}
             }
         }
+        None
     }
 
     /// PURE, non-mutating read of "what connection does this peer currently

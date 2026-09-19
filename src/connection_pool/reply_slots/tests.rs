@@ -6,6 +6,15 @@ use bytes::Bytes;
 use crate::connection_pool::{BufferConfig, ChannelId, LockFreeStreamHandle};
 use crate::{AskReplyObserver, AskResponder, ReplyDeliveryBudget, ReplyPayload};
 
+#[test]
+fn budget_rejects_cancellation_payload_larger_than_byte_limit() {
+    let result = ReplyDeliveryBudget::new(1, 3, ReplyPayload::from_static(b"cancelled"));
+    assert!(
+        result.is_err(),
+        "an admitted budget must carry its cancellation payload"
+    );
+}
+
 #[tokio::test]
 async fn slot_exhaustion_does_not_claim_responder() {
     let budget =

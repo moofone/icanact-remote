@@ -83,6 +83,65 @@ async fn fallback_capture_then_replacement_cannot_be_overwritten_on_resume() {
     fallback.abort_tasks();
 }
 
+/// A fallback captured from an address alias must survive a raced unusable
+/// primary-session publication. The compare-and-publish loss is recoverable:
+/// clear that exact unusable occupant and retry the already validated fallback
+/// instead of returning a spurious lookup miss.
+#[tokio::test]
+async fn fallback_adoption_retries_after_raced_unusable_session() {
+    let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
+    let peer_id = crate::KeyPair::new_for_testing("qa-fallback-unusable-race-peer").peer_id();
+    let fallback_addr: SocketAddr = "127.0.0.1:60703".parse().unwrap();
+    let stale_addr: SocketAddr = "127.0.0.1:60704".parse().unwrap();
+    let fallback = make_live_connection(fallback_addr, ConnectionDirection::Inbound).await;
+    let stale = make_live_connection(stale_addr, ConnectionDirection::Outbound).await;
+    let fallback = Arc::new(LockFreeConnection {
+        embedded_peer_id: Some(peer_id.clone()),
+        ..(*fallback).clone()
+    });
+    stale.set_state(ConnectionState::Disconnected);
+
+    pool.set_configured_peer_addr(&peer_id, fallback_addr);
+    pool.index_connection_by_addr(fallback_addr, fallback.clone());
+    pool.add_addr_to_peer_id(fallback_addr, peer_id.clone());
+
+    let captured = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    let hook_captured = captured.clone();
+    let hook_resume = resume.clone();
+    let hook_peer = peer_id.clone();
+    set_fallback_adoption_hook(Some(Arc::new(move |connection| {
+        if connection.embedded_peer_id.as_ref() == Some(&hook_peer) {
+            hook_captured.wait();
+            hook_resume.wait();
+        }
+    })));
+    let _hook_reset = FallbackAdoptionHookReset;
+
+    let lookup_pool = pool.clone();
+    let lookup_peer = peer_id.clone();
+    let lookup = tokio::task::spawn_blocking(move || {
+        lookup_pool
+            .get_connection_by_peer_id(&lookup_peer)
+            .expect("fallback lookup should recover after the unusable race")
+    });
+
+    captured.wait();
+    pool.publish_current_peer_connection(&peer_id, stale.clone());
+    resume.wait();
+
+    let resolved = lookup.await.expect("fallback lookup task must not panic");
+    assert!(Arc::ptr_eq(&resolved, &fallback));
+    let current = pool
+        .peer_current_connection_snapshot(&peer_id)
+        .expect("fallback must be adopted as current");
+    assert!(Arc::ptr_eq(&current, &fallback));
+    assert!(fallback.has_live_stream());
+
+    stale.abort_tasks();
+    fallback.abort_tasks();
+}
+
 /// The conditional current-session cleanup must revalidate ownership at the
 /// clear itself. A replacement published after the first identity check must
 /// remain in both current-session indices.

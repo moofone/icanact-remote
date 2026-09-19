@@ -2844,10 +2844,18 @@ impl Drop for FailureLifecycleClaim {
 /// owner there is no sound event from which to reclaim a completed tombstone,
 /// so admit them only up to a fixed bound rather than allowing registry-life
 /// growth. We never evict/re-admit an older ID: once the bound is reached,
-/// further ownerless claims are conservatively treated as duplicates. Normal
+/// further ownerless claims return an explicit saturation outcome, allowing
+/// the lifecycle caller to take its bounded best-effort path rather than
+/// misclassifying an unseen failure as a completed duplicate. Normal
 /// transport callbacks carry `FailureLifecycleOwner` and are reclaimed by
 /// stream ownership instead.
 const MAX_OWNERLESS_FAILURE_TOMBSTONES: usize = 1024;
+
+enum FailureLifecycleClaimResult {
+    Claimed(FailureLifecycleClaim),
+    Duplicate,
+    Saturated,
+}
 
 struct CompletedFailureInstances {
     claimed: std::sync::Mutex<HashMap<u64, Arc<FailureClaimMarker>>>,
@@ -2868,7 +2876,7 @@ impl CompletedFailureInstances {
         self: &Arc<Self>,
         instance_id: u64,
         owner: Option<&Arc<FailureLifecycleOwner>>,
-    ) -> Option<FailureLifecycleClaim> {
+    ) -> FailureLifecycleClaimResult {
         // Recover the physical owner even when the address index has already
         // been retired. An ownerless callback can therefore remain exactly-once
         // without becoming a permanent registry-lifetime tombstone: the final
@@ -2886,7 +2894,7 @@ impl CompletedFailureInstances {
                 Some(existing_owner) if existing_owner.upgrade().is_none() => {
                     claimed.remove(&instance_id);
                 }
-                Some(_) => return None,
+                Some(_) => return FailureLifecycleClaimResult::Duplicate,
                 None => {
                     // Reconcile an owner that became available after an
                     // ownerless callback completed. The tombstone still wins
@@ -2898,7 +2906,7 @@ impl CompletedFailureInstances {
                             self.ownerless_count.fetch_sub(1, Ordering::Relaxed);
                         }
                     }
-                    return None;
+                    return FailureLifecycleClaimResult::Duplicate;
                 }
             }
         }
@@ -2907,10 +2915,9 @@ impl CompletedFailureInstances {
         {
             // There is no safe watermark or expiry rule for an ownerless ID:
             // retaining fewer entries would permit a later duplicate to run
-            // again. Conservatively suppress new ownerless claims once the
-            // bounded fallback is full; owner-carrying transport callbacks
-            // remain independently reclaimable.
-            return None;
+            // again. Report saturation explicitly; the lifecycle caller must
+            // not mistake this unseen ID for a completed duplicate.
+            return FailureLifecycleClaimResult::Saturated;
         }
         if let Some(owner) = owner.as_ref() {
             owner.bind_registry(registry_weak);
@@ -2922,7 +2929,7 @@ impl CompletedFailureInstances {
             self.ownerless_count.fetch_add(1, Ordering::Relaxed);
         }
         claimed.insert(instance_id, marker.clone());
-        Some(FailureLifecycleClaim {
+        FailureLifecycleClaimResult::Claimed(FailureLifecycleClaim {
             registry: Arc::clone(self),
             instance_id,
             marker,
@@ -11731,7 +11738,7 @@ impl<T: 'static> GossipRegistry<T> {
         &self,
         failed_instance_id: u64,
         owner: Option<&Arc<FailureLifecycleOwner>>,
-    ) -> Option<FailureLifecycleClaim> {
+    ) -> FailureLifecycleClaimResult {
         self.completed_failure_instances
             .claim(failed_instance_id, owner)
     }
@@ -12239,12 +12246,26 @@ impl<T: 'static> GossipRegistry<T> {
         // Pool retirement is not registry-lifecycle completion. Claim the
         // latter independently so a cancellation/recovery teardown followed
         // by the IO exit callback still completes this peer exactly once.
-        let failure_claim = failed_instance_id.and_then(|failed_id| {
-            self.claim_failure_lifecycle(failed_id, failure_lifecycle_owner.as_ref())
-        });
-        if failed_instance_id.is_some() && failure_claim.is_none() {
-            return Ok(());
-        }
+        let failure_claim = match failed_instance_id {
+            Some(failed_id) => {
+                match self.claim_failure_lifecycle(failed_id, failure_lifecycle_owner.as_ref()) {
+                    FailureLifecycleClaimResult::Claimed(claim) => Some(claim),
+                    FailureLifecycleClaimResult::Duplicate => return Ok(()),
+                    FailureLifecycleClaimResult::Saturated => {
+                        // An ownerless marker cannot be safely evicted or
+                        // expired. Saturation is not proof that this unseen
+                        // instance completed: continue the lifecycle once,
+                        // explicitly, without installing an unbounded marker.
+                        warn!(
+                            failed_instance_id = failed_id,
+                            "ownerless failure deduplication is saturated; processing lifecycle without a reclaimable marker"
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
 
         let current_time = current_timestamp();
 
@@ -14805,36 +14826,50 @@ mod tests {
         let reclaimed_id = crate::connection_pool::LockFreeStreamHandle::allocate_instance_id();
         let markers = Arc::new(CompletedFailureInstances::default());
         let owner_high = FailureLifecycleOwner::new(high_id);
-        markers
-            .claim(high_id, Some(&owner_high))
-            .expect("first sparse instance must claim")
-            .complete();
+        let FailureLifecycleClaimResult::Claimed(claim) = markers.claim(high_id, Some(&owner_high))
+        else {
+            panic!("first sparse instance must claim");
+        };
+        claim.complete();
         let owner_low = FailureLifecycleOwner::new(low_id);
-        markers
-            .claim(low_id, Some(&owner_low))
-            .expect("a lower, unseen instance must still run")
-            .complete();
+        let FailureLifecycleClaimResult::Claimed(claim) = markers.claim(low_id, Some(&owner_low))
+        else {
+            panic!("a lower, unseen instance must still run");
+        };
+        claim.complete();
         let owner_large = FailureLifecycleOwner::new(sparse_high_id);
-        markers
-            .claim(sparse_high_id, Some(&owner_large))
-            .expect("a sparse high instance must claim")
-            .complete();
+        let FailureLifecycleClaimResult::Claimed(claim) =
+            markers.claim(sparse_high_id, Some(&owner_large))
+        else {
+            panic!("a sparse high instance must claim");
+        };
+        claim.complete();
         let owner_2 = FailureLifecycleOwner::new(sparse_low_id);
-        markers
-            .claim(sparse_low_id, Some(&owner_2))
-            .expect("a sparse lower ID must not be inferred complete")
-            .complete();
+        let FailureLifecycleClaimResult::Claimed(claim) =
+            markers.claim(sparse_low_id, Some(&owner_2))
+        else {
+            panic!("a sparse lower ID must not be inferred complete");
+        };
+        claim.complete();
         assert!(
-            markers.claim(high_id, Some(&owner_high)).is_none(),
+            matches!(
+                markers.claim(high_id, Some(&owner_high)),
+                FailureLifecycleClaimResult::Duplicate
+            ),
             "a repeated callback must be deduplicated while its stream owner lives"
         );
-        assert!(markers.claim(sparse_high_id, Some(&owner_large)).is_none());
+        assert!(matches!(
+            markers.claim(sparse_high_id, Some(&owner_large)),
+            FailureLifecycleClaimResult::Duplicate
+        ));
 
         let reclaimed_owner = FailureLifecycleOwner::new(reclaimed_id);
-        markers
-            .claim(reclaimed_id, Some(&reclaimed_owner))
-            .expect("reclamation marker must claim")
-            .complete();
+        let FailureLifecycleClaimResult::Claimed(claim) =
+            markers.claim(reclaimed_id, Some(&reclaimed_owner))
+        else {
+            panic!("reclamation marker must claim");
+        };
+        claim.complete();
         assert!(markers.len() >= 5);
         drop(reclaimed_owner);
         assert!(
@@ -14849,33 +14884,46 @@ mod tests {
         let second_tombstone_id =
             crate::connection_pool::LockFreeStreamHandle::allocate_instance_id();
         let markers = Arc::new(CompletedFailureInstances::default());
-        markers
-            .claim(tombstone_id, None)
-            .expect("first ownerless callback must claim")
-            .complete();
+        let FailureLifecycleClaimResult::Claimed(claim) = markers.claim(tombstone_id, None) else {
+            panic!("first ownerless callback must claim");
+        };
+        claim.complete();
         assert!(
-            markers.claim(tombstone_id, None).is_none(),
+            matches!(
+                markers.claim(tombstone_id, None),
+                FailureLifecycleClaimResult::Duplicate
+            ),
             "sequential ownerless callbacks for one globally unique instance must deduplicate"
         );
 
         let owner = FailureLifecycleOwner::new(tombstone_id);
         assert!(
-            markers.claim(tombstone_id, Some(&owner)).is_none(),
+            matches!(
+                markers.claim(tombstone_id, Some(&owner)),
+                FailureLifecycleClaimResult::Duplicate
+            ),
             "a later owner must reconcile the existing tombstone rather than rerun cleanup"
         );
         drop(owner);
         assert!(
-            markers.claim(tombstone_id, None).is_some(),
+            matches!(
+                markers.claim(tombstone_id, None),
+                FailureLifecycleClaimResult::Claimed(_)
+            ),
             "reconciled tombstone must be reclaimable with its physical owner"
         );
 
         let ownerless_callback_owner = FailureLifecycleOwner::new(second_tombstone_id);
-        markers
-            .claim(second_tombstone_id, None)
-            .expect("an ownerless callback must still claim once")
-            .complete();
+        let FailureLifecycleClaimResult::Claimed(claim) = markers.claim(second_tombstone_id, None)
+        else {
+            panic!("an ownerless callback must still claim once");
+        };
+        claim.complete();
         assert!(
-            markers.claim(second_tombstone_id, None).is_none(),
+            matches!(
+                markers.claim(second_tombstone_id, None),
+                FailureLifecycleClaimResult::Duplicate
+            ),
             "ownerless duplicate must remain suppressed while the physical owner lives"
         );
         drop(ownerless_callback_owner);
@@ -14893,22 +14941,27 @@ mod tests {
         for _ in 0..MAX_OWNERLESS_FAILURE_TOMBSTONES {
             let instance_id = crate::connection_pool::LockFreeStreamHandle::allocate_instance_id();
             first_id.get_or_insert(instance_id);
-            markers
-                .claim(instance_id, None)
-                .expect("ownerless tombstone admission below the bound")
-                .complete();
+            let FailureLifecycleClaimResult::Claimed(claim) = markers.claim(instance_id, None)
+            else {
+                panic!("ownerless tombstone admission below the bound");
+            };
+            claim.complete();
         }
         assert_eq!(markers.len(), MAX_OWNERLESS_FAILURE_TOMBSTONES);
         assert!(
-            markers
-                .claim(first_id.expect("one tombstone"), None)
-                .is_none(),
+            matches!(
+                markers.claim(first_id.expect("one tombstone"), None),
+                FailureLifecycleClaimResult::Duplicate
+            ),
             "bounded storage must still suppress sequential ownerless duplicates"
         );
         let overflow_id = crate::connection_pool::LockFreeStreamHandle::allocate_instance_id();
         assert!(
-            markers.claim(overflow_id, None).is_none(),
-            "ownerless admission must stop rather than evict and re-admit IDs"
+            matches!(
+                markers.claim(overflow_id, None),
+                FailureLifecycleClaimResult::Saturated
+            ),
+            "ownerless admission must report saturation rather than a completed duplicate"
         );
         assert_eq!(markers.len(), MAX_OWNERLESS_FAILURE_TOMBSTONES);
     }
