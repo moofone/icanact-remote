@@ -3898,10 +3898,15 @@ impl<T: 'static> GossipRegistry<T> {
             }
             match &projection.addr_connection {
                 Some(connection) => {
-                    let _ = self
-                        .connection_pool
-                        .connections_by_addr
-                        .upsert_sync(projection.addr, connection.clone());
+                    // Restore the address projection through the same
+                    // publication gate as ordinary pool indexing. A
+                    // detached address-only failure callback must not enter
+                    // between its final lookup and this restoration.
+                    self.connection_pool.publish_address_index(
+                        projection.addr,
+                        connection.clone(),
+                        None,
+                    );
                 }
                 None => {
                     let _ = self.connection_pool.connections_by_addr.remove_if_sync(
@@ -6788,7 +6793,9 @@ impl<T: 'static> GossipRegistry<T> {
                 // Update peer_id_to_addr mapping without making DNS-refreshed
                 // discovered routes required supervisor peers.
                 pool.set_discovered_peer_addr(&peer_id, new_addr);
-                // Add new address to addr_to_peer_id mapping
+                // Preserve the route projection even when the old connection
+                // is already dead and therefore has no address-index entry to
+                // publish below.
                 pool.add_addr_to_peer_id(new_addr, peer_id.clone());
 
                 // Migrate connections_by_addr: move connection from old addr to new addr
@@ -6796,9 +6803,7 @@ impl<T: 'static> GossipRegistry<T> {
                 if let Some((_, connection)) = pool.connections_by_addr.remove_sync(&peer_addr) {
                     if connection.is_connected() {
                         // Connection is alive - migrate it to new address
-                        let _ = pool
-                            .connections_by_addr
-                            .upsert_sync(new_addr, connection.clone());
+                        pool.publish_address_index(new_addr, connection.clone(), None);
                         pool.publish_current_peer_connection(&peer_id, connection);
                         debug!(
                             old_addr = %peer_addr,

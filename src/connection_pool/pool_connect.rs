@@ -7,6 +7,17 @@ static FALLBACK_ADOPTION_HOOK: OnceLock<std::sync::Mutex<Option<FallbackAdoption
     OnceLock::new();
 
 #[cfg(test)]
+static FALLBACK_ADOPTION_TEST_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn lock_fallback_adoption_test() -> std::sync::MutexGuard<'static, ()> {
+    FALLBACK_ADOPTION_TEST_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .expect("fallback adoption test mutex poisoned")
+}
+
+#[cfg(test)]
 pub(crate) fn set_fallback_adoption_hook(hook: Option<FallbackAdoptionHook>) {
     *FALLBACK_ADOPTION_HOOK
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -566,18 +577,24 @@ impl<T> ConnectionPool<T> {
     }
 
     /// Publish an address-index entry under the same atomic gate used by
-    /// disconnect notification fencing. Address-only failures have no peer
-    /// session slot to compare, so their final replacement fence reads this
-    /// index directly; every replacement write must participate in that
-    /// publication-vs-entry linearization or a stale callback can enter after
-    /// it has observed the old instance but before the new one is visible.
-    pub(crate) fn publish_connection_by_addr(
+    /// disconnect notification entry. Address-only connections have no peer
+    /// session to fence, so their `connections_by_addr` write is the
+    /// publication linearization point: a notifier that already completed its
+    /// final lookup must either enter first or be superseded before callback
+    /// entry. Keep the optional identity row in this same gate when the
+    /// caller has one; unresolved transports pass `None`.
+    pub(crate) fn publish_address_index(
         &self,
         addr: SocketAddr,
         connection: Arc<LockFreeConnection>,
+        peer_id: Option<&crate::PeerId>,
     ) {
-        let _publication = crate::connection_pool::begin_disconnect_publication();
+        let publication = crate::connection_pool::begin_disconnect_publication();
+        if let Some(peer_id) = peer_id {
+            let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
+        }
         let _ = self.connections_by_addr.upsert_sync(addr, connection);
+        drop(publication);
     }
 
     /// Evict `evicted_addr`'s `connections_by_addr` alias for `peer_id`,
@@ -1326,10 +1343,7 @@ impl<T> ConnectionPool<T> {
             },
         );
         self.set_discovered_peer_addr(peer_id, peer_state_addr);
-        let _ = self
-            .addr_to_peer_id
-            .upsert_sync(peer_state_addr, peer_id.clone());
-        self.publish_connection_by_addr(peer_state_addr, connection.clone());
+        self.publish_address_index(peer_state_addr, connection.clone(), Some(peer_id));
 
         // Dedupe: the ephemeral TCP source address and the peer's
         // configured/advertised bind address are frequently identical
@@ -1343,10 +1357,7 @@ impl<T> ConnectionPool<T> {
                     addr: ephemeral_addr,
                 },
             );
-            let _ = self
-                .addr_to_peer_id
-                .upsert_sync(ephemeral_addr, peer_id.clone());
-            self.publish_connection_by_addr(ephemeral_addr, connection.clone());
+            self.publish_address_index(ephemeral_addr, connection.clone(), Some(peer_id));
         }
 
         // Paired, insert-gated: `count_in_new_instance` only bumps
@@ -2100,8 +2111,10 @@ impl<T> ConnectionPool<T> {
             return;
         }
 
-        // Insert the connection under the new (advertised) address
-        self.publish_connection_by_addr(new_addr, connection.clone());
+        // Insert the connection under the new (advertised) address.  The
+        // address-index publication is fenced against unresolved disconnect
+        // callback entry just like current-session publication.
+        self.publish_address_index(new_addr, connection.clone(), Some(peer_id));
         // Also update peer_id_to_addr so disconnect uses the correct address
         self.set_discovered_peer_addr(peer_id, new_addr);
 
@@ -2117,7 +2130,7 @@ impl<T> ConnectionPool<T> {
                 .read_sync(&old_addr, |_, owner| owner == peer_id)
                 .unwrap_or(false);
             if old_addr_is_this_peer {
-                self.publish_connection_by_addr(old_addr, connection);
+                self.publish_address_index(old_addr, connection, None);
                 debug!(
                     old_addr = %old_addr,
                     new_addr = %new_addr,
@@ -2343,9 +2356,13 @@ impl<T> ConnectionPool<T> {
             let _ = self.get_or_create_peer_session(&peer_id);
         }
 
-        // Update the address mappings
+        // Update the address mappings before publication so lifecycle observers
+        // see the same address-index state they saw before this helper became
+        // atomic.  The address row and connection index share the same
+        // publication gate; this matters when a failure callback has no
+        // resolved peer identity and fences only `connections_by_addr`.
         self.set_discovered_peer_addr(&peer_id, addr);
-        let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
+        self.publish_address_index(addr, connection.clone(), Some(&peer_id));
 
         debug!(
             "CONNECTION POOL: Added connection for peer '{}' (address: {})",
@@ -2355,9 +2372,6 @@ impl<T> ConnectionPool<T> {
         self.publish_current_peer_connection(&peer_id, connection.clone());
 
         let instance_id = connection.stream_handle.as_ref().map(|h| h.instance_id());
-
-        // Also index by address for direct lookups
-        self.publish_connection_by_addr(addr, connection);
 
         // Paired, insert-gated via `count_in_new_instance` — see its comment.
         // A connection with no stream handle is never counted (nothing to
@@ -2378,7 +2392,7 @@ impl<T> ConnectionPool<T> {
             "CONNECTION POOL: Indexing connection by additional address {}",
             addr
         );
-        self.publish_connection_by_addr(addr, connection);
+        self.publish_address_index(addr, connection, None);
         self.mark_routing_changed();
     }
 
@@ -2755,8 +2769,7 @@ impl<T> ConnectionPool<T> {
         if removed {
             match existing_before {
                 Some(existing) if existing.addr == addr && existing.has_live_stream() => {
-                    self.publish_connection_by_addr(addr, existing.clone());
-                    let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
+                    self.publish_address_index(addr, existing.clone(), Some(peer_id));
                 }
                 _ => {
                     let _ = self.addr_to_peer_id.remove_sync(&addr);
@@ -3997,10 +4010,12 @@ impl<T> ConnectionPool<T> {
             );
         }
 
-        // Insert into lock-free map before spawning.
-        self.publish_connection_by_addr(addr, connection_arc.clone());
+        // Insert into the lock-free address index before spawning.  The
+        // optional identity row and address index are one publication event;
+        // in particular, an unresolved candidate must fence address-only
+        // disconnect callback entry at this exact same-address write.
+        self.publish_address_index(addr, connection_arc.clone(), peer_id_opt.as_ref());
         if let Some(peer_id) = peer_id_opt.as_ref() {
-            let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
             // Identity-keyed publish gate. This freshly-dialed OUTBOUND must not
             // displace an existing live session the tie-break says to keep. A
             // higher-NodeId node that fell back to dialing (its preferred-inbound

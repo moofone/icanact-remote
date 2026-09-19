@@ -237,7 +237,7 @@ mod disconnect_delivery_tests {
         let connection = Arc::new(LockFreeConnection::new(addr, ConnectionDirection::Inbound));
         let claim = try_arm_disconnect_delivery().expect("test callback must arm");
 
-        pool.publish_connection_by_addr(addr, connection.clone());
+        pool.publish_address_index(addr, connection.clone(), None);
 
         assert!(
             !claim.enter(),
