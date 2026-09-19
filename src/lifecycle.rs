@@ -1,4 +1,6 @@
+use std::cell::Cell;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
 use crate::PeerId;
@@ -381,16 +383,62 @@ pub enum TransportTestHelperEvent {
 
 pub type TransportLifecycleRecorder = Arc<dyn Fn(TransportLifecycleEvent) + Send + Sync + 'static>;
 
-static RECORDER: OnceLock<RwLock<Option<TransportLifecycleRecorder>>> = OnceLock::new();
+struct RecorderEntry {
+    generation: u64,
+    recorder: TransportLifecycleRecorder,
+}
 
-fn recorder_cell() -> &'static RwLock<Option<TransportLifecycleRecorder>> {
+static RECORDER: OnceLock<RwLock<Option<RecorderEntry>>> = OnceLock::new();
+static NEXT_RECORDER_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    static ACTIVE_RECORDER_GENERATION: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+fn recorder_cell() -> &'static RwLock<Option<RecorderEntry>> {
     RECORDER.get_or_init(|| RwLock::new(None))
 }
 
-pub fn set_transport_lifecycle_recorder(recorder: Option<TransportLifecycleRecorder>) {
+fn install_transport_lifecycle_recorder(recorder: TransportLifecycleRecorder) -> u64 {
+    let generation = NEXT_RECORDER_GENERATION.fetch_add(1, Ordering::Relaxed);
     *recorder_cell()
         .write()
-        .expect("transport lifecycle recorder lock poisoned") = recorder;
+        .expect("transport lifecycle recorder lock poisoned") = Some(RecorderEntry {
+        generation,
+        recorder,
+    });
+    generation
+}
+
+fn clear_transport_lifecycle_recorder(expected_generation: Option<u64>) {
+    let mut current = recorder_cell()
+        .write()
+        .expect("transport lifecycle recorder lock poisoned");
+    if expected_generation.is_none()
+        || current
+            .as_ref()
+            .is_some_and(|entry| Some(entry.generation) == expected_generation)
+    {
+        *current = None;
+    }
+}
+
+/// Install or clear the process-wide test recorder.
+///
+/// Clears issued from inside a recorder callback are scoped to the generation
+/// that dispatched that callback. A callback can already have been cloned by
+/// `record_transport_event` when its guard is dropped; without this check, a
+/// late callback from an older test could clear a newer test's recorder.
+pub fn set_transport_lifecycle_recorder(recorder: Option<TransportLifecycleRecorder>) {
+    match recorder {
+        Some(recorder) => {
+            install_transport_lifecycle_recorder(recorder);
+        }
+        None => {
+            let active_generation = ACTIVE_RECORDER_GENERATION.with(Cell::get);
+            clear_transport_lifecycle_recorder(active_generation);
+        }
+    }
 }
 
 #[cfg(feature = "test-helpers")]
@@ -430,12 +478,13 @@ static RECORDER_INSTALL_LOCK: Mutex<()> = Mutex::new(());
 /// RAII installer for [`set_transport_lifecycle_recorder`]. Acquires the
 /// process-wide recorder-install lock for its entire lifetime and
 /// deregisters the recorder on drop, so concurrently running tests that each
-/// install a recorder are fully serialized against one another and can never
-/// observe or clobber each other's hook — this is the only sanctioned way to
-/// install a recorder in tests.
+/// install a recorder are fully serialized against one another. Its generation
+/// also prevents a late callback from an older test from clearing a newer
+/// recorder — this is the only sanctioned way to install a recorder in tests.
 #[must_use = "the recorder is uninstalled when this guard is dropped"]
 pub struct TransportLifecycleRecorderGuard {
     _lock: MutexGuard<'static, ()>,
+    generation: u64,
 }
 
 impl TransportLifecycleRecorderGuard {
@@ -443,8 +492,11 @@ impl TransportLifecycleRecorderGuard {
         let lock = RECORDER_INSTALL_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        set_transport_lifecycle_recorder(Some(recorder));
-        Self { _lock: lock }
+        let generation = install_transport_lifecycle_recorder(recorder);
+        Self {
+            _lock: lock,
+            generation,
+        }
     }
 
     /// Install the feature-gated evidence side channel while this guard owns
@@ -458,20 +510,42 @@ impl TransportLifecycleRecorderGuard {
 
 impl Drop for TransportLifecycleRecorderGuard {
     fn drop(&mut self) {
-        set_transport_lifecycle_recorder(None);
+        clear_transport_lifecycle_recorder(Some(self.generation));
         #[cfg(feature = "test-helpers")]
         set_test_helper_recorder(None);
     }
 }
 
+struct RecorderDispatchGuard;
+
+impl Drop for RecorderDispatchGuard {
+    fn drop(&mut self) {
+        ACTIVE_RECORDER_GENERATION.with(|active| active.set(None));
+    }
+}
+
 pub(crate) fn record_transport_event(event: TransportLifecycleEvent) {
-    let recorder = recorder_cell()
+    let Some((generation, recorder)) = recorder_cell()
         .read()
         .expect("transport lifecycle recorder lock poisoned")
-        .clone();
-    if let Some(recorder) = recorder {
-        recorder(event);
-    }
+        .as_ref()
+        .map(|entry| (entry.generation, entry.recorder.clone()))
+    else {
+        return;
+    };
+
+    let dispatch_guard = ACTIVE_RECORDER_GENERATION.with(|active| {
+        if active.get().is_some() {
+            None
+        } else {
+            active.set(Some(generation));
+            Some(RecorderDispatchGuard)
+        }
+    });
+    let Some(_dispatch_guard) = dispatch_guard else {
+        return;
+    };
+    recorder(event);
 }
 
 /// Assign a monotonic order to feature-gated evidence events. This helper is
