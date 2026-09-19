@@ -1120,6 +1120,7 @@ fn handle_completed_forward(
 /// (by this future resolving) without the reply having actually been sent or
 /// handed to a completed, guaranteed retry. See
 /// [`AskResponder::reply_bytes_guaranteed`] for the delivery/claim contract.
+#[cfg(test)]
 async fn deliver_forwarded_reply(responder: AskResponder, reply: Bytes) {
     let _ = deliver_forwarded_reply_outcome(responder, reply).await;
 }

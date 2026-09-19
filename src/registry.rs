@@ -6949,97 +6949,89 @@ impl<T: 'static> GossipRegistry<T> {
     ) -> (Option<AttemptedRoute>, Result<ConnectOutcome>) {
         let pool = &self.connection_pool;
         let (attempted_route, dial_result) = pool.get_connection_to_required_peer(peer_id).await;
-        let outcome = match dial_result {
-            Ok(conn) => {
-                // `attempted_route` is guaranteed `Some` here:
-                // `get_connection_to_required_peer` only returns `Ok` after
-                // resolving an address to dial/reuse against.
-                let configured_addr = attempted_route
-                    .expect("get_connection_to_required_peer resolved an address on success")
-                    .addr();
-                // `get_connection_to_required_peer` can resolve to an
-                // EXISTING connection rather than genuinely dialing out --
-                // including one published by an inbound accept. An
-                // inbound connection is exactly the case
-                // `transport_source_keyed` exists to describe, so scoping
-                // the clear to `conn.addr` alone is not sufficient: it
-                // must also be evidence of an actual outbound dial, not
-                // merely "this function happened to resolve a connection
-                // at this address." Use the direction captured by this
-                // resolved handle; the address index may be reassigned to a
-                // different connection before this code runs.
-                let conn_direction = Some(conn.direction());
-                let dialed_outbound =
-                    conn_direction == Some(crate::connection_pool::ConnectionDirection::Outbound);
+        let outcome =
+            match dial_result {
+                Ok(conn) => {
+                    // `attempted_route` is guaranteed `Some` here:
+                    // `get_connection_to_required_peer` only returns `Ok` after
+                    // resolving an address to dial/reuse against.
+                    let configured_addr = attempted_route
+                        .expect("get_connection_to_required_peer resolved an address on success")
+                        .addr();
+                    // `get_connection_to_required_peer` can resolve to an
+                    // EXISTING connection rather than genuinely dialing out --
+                    // including one published by an inbound accept. An
+                    // inbound connection is exactly the case
+                    // `transport_source_keyed` exists to describe, so scoping
+                    // the clear to `conn.addr` alone is not sufficient: it
+                    // must also be evidence of an actual outbound dial, not
+                    // merely "this function happened to resolve a connection
+                    // at this address." Use the direction captured by this
+                    // resolved handle; the address index may be reassigned to a
+                    // different connection before this code runs.
+                    let conn_direction = Some(conn.direction());
+                    let dialed_outbound = conn_direction
+                        == Some(crate::connection_pool::ConnectionDirection::Outbound);
 
-                if !dialed_outbound {
-                    // P1 finding (review round against `f64f3a9`,
-                    // `registry.rs:5465`): this call's own resolution
-                    // reused a connection that is not itself a genuine
-                    // outbound dial -- neither `conn.addr` (often a raw,
-                    // ephemeral inbound transport source) nor
-                    // `configured_addr` (for the `Peer::connect` ORDINARY
-                    // path, whatever the caller most recently asked for
-                    // via `set_ordinary_connect_route`, which only refuses
-                    // on an operator-pin CONFLICT -- never independently
-                    // verified as dialable) was actually reached this
-                    // round. Do NO positive address-level bookkeeping at
-                    // all: no entry created, no failures cleared, nothing
-                    // marked successful, for either address -- and do not
-                    // wrap either in `ResolvedRoute`, whose own contract
-                    // is "valid only once genuinely reached" (see its doc
-                    // comment). `ConnectOutcome::connected_unverified`
-                    // carries `configured_addr` purely as
-                    // diagnostic/liveness-signal information: the peer's
-                    // identity IS reachable via *some* live connection,
-                    // which is worth reporting to a liveness handler,
-                    // never as a claim that any address is dialable. See
-                    // `ConnectOutcome`'s own doc comment for the full
-                    // history (this replaces the previous round's
-                    // `ResolvedRoute::from_configured`, deleted entirely).
-                    debug!(
-                        peer_id = %peer_id,
-                        configured_addr = %configured_addr,
-                        connection_addr = %conn.addr,
-                        "connect_to_peer: reused a connection that is not a genuine outbound \
-                         dial; no address independently corroborated as dialable, so no \
-                         positive bookkeeping was recorded"
-                    );
-                    return (
-                        attempted_route,
-                        Ok(ConnectOutcome::connected_unverified(configured_addr)),
-                    );
-                }
+                    if !dialed_outbound {
+                        // P1 finding (review round against `f64f3a9`,
+                        // `registry.rs:5465`): this call's own resolution
+                        // reused a connection that is not itself a genuine
+                        // outbound dial -- neither `conn.addr` (often a raw,
+                        // ephemeral inbound transport source) nor
+                        // `configured_addr` (for the `Peer::connect` ORDINARY
+                        // path, whatever the caller most recently asked for
+                        // via `set_ordinary_connect_route`, which only refuses
+                        // on an operator-pin CONFLICT -- never independently
+                        // verified as dialable) was actually reached this
+                        // round. Do NO positive address-level bookkeeping at
+                        // all: no entry created, no failures cleared, nothing
+                        // marked successful, for either address -- and do not
+                        // wrap either in `ResolvedRoute`, whose own contract
+                        // is "valid only once genuinely reached" (see its doc
+                        // comment). `ConnectOutcome::connected_unverified`
+                        // carries `configured_addr` purely as
+                        // diagnostic/liveness-signal information: the peer's
+                        // identity IS reachable via *some* live connection,
+                        // which is worth reporting to a liveness handler,
+                        // never as a claim that any address is dialable. See
+                        // `ConnectOutcome`'s own doc comment for the full
+                        // history (this replaces the previous round's
+                        // `ResolvedRoute::from_configured`, deleted entirely).
+                        debug!(
+                            peer_id = %peer_id,
+                            configured_addr = %configured_addr,
+                            connection_addr = %conn.addr,
+                            "connect_to_peer: reused a connection that is not a genuine outbound \
+                             dial; no address independently corroborated as dialable, so no \
+                             positive bookkeeping was recorded"
+                        );
+                        return (
+                            attempted_route,
+                            Ok(ConnectOutcome::connected_unverified(configured_addr)),
+                        );
+                    }
 
-                // From here on, `dialed_outbound` is unconditionally true:
-                // `conn.addr` IS the authoritative, corroborated dialable
-                // address -- we chose to dial exactly it, so there is
-                // nothing to prefer over it (see the `!dialed_outbound`
-                // early return above for the alternative).
-                let conn_route = ResolvedRoute::from_connection(conn.addr, conn_direction);
-                let preferred_addr = conn_route.addr();
+                    // From here on, `dialed_outbound` is unconditionally true:
+                    // `conn.addr` IS the authoritative, corroborated dialable
+                    // address -- we chose to dial exactly it, so there is
+                    // nothing to prefer over it (see the `!dialed_outbound`
+                    // early return above for the alternative).
+                    let conn_route = ResolvedRoute::from_connection(conn.addr, conn_direction);
+                    let preferred_addr = conn_route.addr();
 
-                let mut gossip_state = self.gossip_state.lock().await;
-                let now = current_timestamp();
-                let now_ms = crate::current_timestamp_millis();
-                let node_id = Some(peer_id.to_node_id());
-                // `for_connect_attempt` sets `transport_source_keyed`/
-                // `inbound_observed` directly from
-                // `conn_route.is_dialable()` -- no manual flagging needed
-                // here (see `ResolvedRoute`'s own doc comment).
-                let peer_info = gossip_state
-                    .peers
-                    .entry(preferred_addr)
-                    .or_insert_with(|| PeerInfo::for_connect_attempt(conn_route, node_id));
-                peer_info.failures = 0;
-                peer_info.outbound_dial_success = true;
-                peer_info.mark_dialability_confirmed();
-                peer_info.last_success = now;
-                peer_info.last_response_received_ms = now_ms;
-                peer_info.last_failure_time = None;
-                peer_info.last_failure_instant = None;
-
-                if let Some(peer_info) = gossip_state.known_peers.get_mut(&preferred_addr) {
+                    let mut gossip_state = self.gossip_state.lock().await;
+                    let now = current_timestamp();
+                    let now_ms = crate::current_timestamp_millis();
+                    let node_id = Some(peer_id.to_node_id());
+                    // `for_connect_attempt` sets `transport_source_keyed`/
+                    // `inbound_observed` directly from
+                    // `conn_route.is_dialable()` -- no manual flagging needed
+                    // here (see `ResolvedRoute`'s own doc comment).
+                    let peer_info = gossip_state
+                        .peers
+                        .entry(preferred_addr)
+                        .or_insert_with(|| PeerInfo::for_connect_attempt(conn_route, node_id));
                     peer_info.failures = 0;
                     peer_info.outbound_dial_success = true;
                     peer_info.mark_dialability_confirmed();
@@ -7047,64 +7039,70 @@ impl<T: 'static> GossipRegistry<T> {
                     peer_info.last_response_received_ms = now_ms;
                     peer_info.last_failure_time = None;
                     peer_info.last_failure_instant = None;
+
+                    if let Some(peer_info) = gossip_state.known_peers.get_mut(&preferred_addr) {
+                        peer_info.failures = 0;
+                        peer_info.outbound_dial_success = true;
+                        peer_info.mark_dialability_confirmed();
+                        peer_info.last_success = now;
+                        peer_info.last_response_received_ms = now_ms;
+                        peer_info.last_failure_time = None;
+                        peer_info.last_failure_instant = None;
+                    }
+                    // `preferred_addr` -- the address resolved FOR ROUTING,
+                    // never the bare connection/socket address -- is what
+                    // every `gossip_state` mutation above was keyed to; it
+                    // must also be what this call logs and returns, or a
+                    // caller trusting this function's own contract (see its
+                    // doc comment) would still end up attributing liveness to
+                    // the wrong address. `conn.addr` is included only as
+                    // supplementary diagnostic context, distinctly labeled.
+                    info!(
+                        peer_id = %peer_id,
+                        addr = %preferred_addr,
+                        connection_addr = %conn.addr,
+                        "Connected to peer"
+                    );
+                    Ok(ConnectOutcome::resolved(conn_route))
                 }
-                // `preferred_addr` -- the address resolved FOR ROUTING,
-                // never the bare connection/socket address -- is what
-                // every `gossip_state` mutation above was keyed to; it
-                // must also be what this call logs and returns, or a
-                // caller trusting this function's own contract (see its
-                // doc comment) would still end up attributing liveness to
-                // the wrong address. `conn.addr` is included only as
-                // supplementary diagnostic context, distinctly labeled.
-                info!(
-                    peer_id = %peer_id,
-                    addr = %preferred_addr,
-                    connection_addr = %conn.addr,
-                    "Connected to peer"
-                );
-                Ok(ConnectOutcome::resolved(conn_route))
-            }
-            Err(err) => {
-                // `ConnectionExists` is an identity/liveness outcome, not a
-                // failed dial. The same applies to a transient unusable
-                // writer/session result when a current session is present at
-                // mark time. Check the pure current-session slot while
-                // holding the accounting lock so a replacement published
-                // before the write is protected as well.
-                let is_connection_exists = matches!(&err, GossipError::ConnectionExists);
-                if !is_connection_exists {
-                    // Insert-if-absent, not update-only: the first-ever failed
-                    // connect to a brand-new required peer must still gain an
-                    // entry, or its failure/backoff state silently never
-                    // exists at all -- a caller-visible functional regression
-                    // from the update-only `get_mut` this replaced. Keyed to
-                    // the address this call actually ATTEMPTED
-                    // (`attempted_route`, an `AttemptedRoute` -- the SAME
-                    // resolution `get_connection_to_required_peer` used for
-                    // the dial itself), never to a bare requested/hinted
-                    // address a caller merely intended to reach.
-                    if let Some(attempted) = attempted_route {
-                        let mut gossip_state = self.gossip_state.lock().await;
-                        let current_session_exists = pool
-                            .peer_current_connection_snapshot(peer_id)
-                            .is_some();
-                        if !current_session_exists {
-                            let node_id = Some(peer_id.to_node_id());
-                            let peer_info = gossip_state
-                                .peers
-                                .entry(attempted.addr())
-                                .or_insert_with(|| {
-                                    PeerInfo::for_failed_connect_attempt(attempted, node_id)
-                                });
-                            peer_info.failures = self.config.max_peer_failures;
-                            peer_info.last_failure_time = Some(current_timestamp());
-                            peer_info.last_failure_instant = Some(std::time::Instant::now());
+                Err(err) => {
+                    // `ConnectionExists` is an identity/liveness outcome, not a
+                    // failed dial. The same applies to a transient unusable
+                    // writer/session result when a current session is present at
+                    // mark time. Check the pure current-session slot while
+                    // holding the accounting lock so a replacement published
+                    // before the write is protected as well.
+                    let is_connection_exists = matches!(&err, GossipError::ConnectionExists);
+                    if !is_connection_exists {
+                        // Insert-if-absent, not update-only: the first-ever failed
+                        // connect to a brand-new required peer must still gain an
+                        // entry, or its failure/backoff state silently never
+                        // exists at all -- a caller-visible functional regression
+                        // from the update-only `get_mut` this replaced. Keyed to
+                        // the address this call actually ATTEMPTED
+                        // (`attempted_route`, an `AttemptedRoute` -- the SAME
+                        // resolution `get_connection_to_required_peer` used for
+                        // the dial itself), never to a bare requested/hinted
+                        // address a caller merely intended to reach.
+                        if let Some(attempted) = attempted_route {
+                            let mut gossip_state = self.gossip_state.lock().await;
+                            let current_session_exists =
+                                pool.peer_current_connection_snapshot(peer_id).is_some();
+                            if !current_session_exists {
+                                let node_id = Some(peer_id.to_node_id());
+                                let peer_info =
+                                    gossip_state.peers.entry(attempted.addr()).or_insert_with(
+                                        || PeerInfo::for_failed_connect_attempt(attempted, node_id),
+                                    );
+                                peer_info.failures = self.config.max_peer_failures;
+                                peer_info.last_failure_time = Some(current_timestamp());
+                                peer_info.last_failure_instant = Some(std::time::Instant::now());
+                            }
                         }
                     }
+                    Err(err)
                 }
-                Err(err)
-            }
-        };
+            };
         (attempted_route, outcome)
     }
 
@@ -15376,8 +15374,7 @@ mod tests {
         let state = registry.gossip_state.lock().await;
         let peer = state.peers.get(&peer_addr).expect("peer state retained");
         assert_eq!(
-            peer.failures,
-            0,
+            peer.failures, 0,
             "replacement must not inherit stale failure accounting"
         );
         assert_eq!(
@@ -20221,11 +20218,17 @@ mod tests {
 
         let (attempted, result) = registry.connect_to_peer_with_outcome(&peer_id).await;
         assert_eq!(attempted.map(|route| route.addr()), Some(addr));
-        assert!(result.is_err(), "the unusable current session must be reported");
+        assert!(
+            result.is_err(),
+            "the unusable current session must be reported"
+        );
 
         let state = registry.gossip_state.lock().await;
         let peer_info = state.peers.get(&addr).expect("peer entry must remain");
-        assert_eq!(peer_info.failures, 1, "live-session outcomes are not dial failures");
+        assert_eq!(
+            peer_info.failures, 1,
+            "live-session outcomes are not dial failures"
+        );
         assert_eq!(peer_info.last_failure_time, previous_failure_time);
         assert_eq!(peer_info.last_failure_instant, previous_failure_instant);
     }
@@ -20244,13 +20247,12 @@ mod tests {
         crate::tls::ensure_crypto_provider();
         let first = KeyPair::new_for_testing("connection-exists-accounting-first");
         let second = KeyPair::new_for_testing("connection-exists-accounting-second");
-        let (local_key_pair, remote_key_pair) = if first.peer_id().to_node_id()
-            > second.peer_id().to_node_id()
-        {
-            (first, second)
-        } else {
-            (second, first)
-        };
+        let (local_key_pair, remote_key_pair) =
+            if first.peer_id().to_node_id() > second.peer_id().to_node_id() {
+                (first, second)
+            } else {
+                (second, first)
+            };
         let remote_peer_id = remote_key_pair.peer_id();
         let config = GossipConfig {
             gossip_interval: Duration::from_secs(300),

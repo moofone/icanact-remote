@@ -228,7 +228,7 @@ async fn ordered_lifecycle_evidence_proves_publication_and_stale_teardown_fencin
             && *peer == recorder_peer_b
             && *addr == addr_b
             && recorder_stale_enabled.load(Ordering::Acquire)
-            && recorder_stale_once.swap(true, Ordering::AcqRel) == false
+            && !recorder_stale_once.swap(true, Ordering::AcqRel)
         {
             recorder_stale_gate.wait();
         }
