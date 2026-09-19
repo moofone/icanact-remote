@@ -11,7 +11,7 @@ use futures::future::BoxFuture;
 use lru::LruCache;
 use scc::HashMap as SccHashMap;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::{Mutex, Notify};
 
 use rand::seq::SliceRandom;
@@ -2712,8 +2712,8 @@ static FAILURE_LIFECYCLE_OWNERS: std::sync::OnceLock<
     std::sync::Mutex<HashMap<u64, std::sync::Weak<FailureLifecycleOwner>>>,
 > = std::sync::OnceLock::new();
 
-fn failure_lifecycle_owners(
-) -> &'static std::sync::Mutex<HashMap<u64, std::sync::Weak<FailureLifecycleOwner>>> {
+fn failure_lifecycle_owners()
+-> &'static std::sync::Mutex<HashMap<u64, std::sync::Weak<FailureLifecycleOwner>>> {
     FAILURE_LIFECYCLE_OWNERS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
@@ -2793,11 +2793,16 @@ impl FailureClaimMarker {
             .clone()
     }
 
-    fn attach_owner(&self, owner: &Arc<FailureLifecycleOwner>) {
-        *self
+    fn attach_owner(&self, owner: &Arc<FailureLifecycleOwner>) -> bool {
+        let mut current = self
             .owner
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::downgrade(owner));
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current.is_some() {
+            return false;
+        }
+        *current = Some(Arc::downgrade(owner));
+        true
     }
 }
 
@@ -2823,8 +2828,7 @@ impl FailureLifecycleClaim {
 impl Drop for FailureLifecycleClaim {
     fn drop(&mut self) {
         if !self.finished {
-            self.registry
-                .remove_if_same(self.instance_id, &self.marker);
+            self.registry.remove_if_same(self.instance_id, &self.marker);
         }
     }
 }
@@ -2836,14 +2840,25 @@ impl Drop for FailureLifecycleClaim {
 /// keeps explicit per-ID claims (never a numeric watermark), while completed
 /// claims are weakly owned by the physical stream lifecycle. Thus sparse IDs
 /// remain exactly-once and finished instances are reclaimed.
+/// Ownerless callbacks are a compatibility fallback. Without a physical
+/// owner there is no sound event from which to reclaim a completed tombstone,
+/// so admit them only up to a fixed bound rather than allowing registry-life
+/// growth. We never evict/re-admit an older ID: once the bound is reached,
+/// further ownerless claims are conservatively treated as duplicates. Normal
+/// transport callbacks carry `FailureLifecycleOwner` and are reclaimed by
+/// stream ownership instead.
+const MAX_OWNERLESS_FAILURE_TOMBSTONES: usize = 1024;
+
 struct CompletedFailureInstances {
     claimed: std::sync::Mutex<HashMap<u64, Arc<FailureClaimMarker>>>,
+    ownerless_count: AtomicUsize,
 }
 
 impl Default for CompletedFailureInstances {
     fn default() -> Self {
         Self {
             claimed: std::sync::Mutex::new(HashMap::new()),
+            ownerless_count: AtomicUsize::new(0),
         }
     }
 }
@@ -2879,11 +2894,23 @@ impl CompletedFailureInstances {
                     // supplies bounded reclamation for this marker.
                     if let Some(owner) = owner.as_ref() {
                         owner.bind_registry(registry_weak);
-                        existing.attach_owner(owner);
+                        if existing.attach_owner(owner) {
+                            self.ownerless_count.fetch_sub(1, Ordering::Relaxed);
+                        }
                     }
                     return None;
                 }
             }
+        }
+        if owner.is_none()
+            && self.ownerless_count.load(Ordering::Relaxed) >= MAX_OWNERLESS_FAILURE_TOMBSTONES
+        {
+            // There is no safe watermark or expiry rule for an ownerless ID:
+            // retaining fewer entries would permit a later duplicate to run
+            // again. Conservatively suppress new ownerless claims once the
+            // bounded fallback is full; owner-carrying transport callbacks
+            // remain independently reclaimable.
+            return None;
         }
         if let Some(owner) = owner.as_ref() {
             owner.bind_registry(registry_weak);
@@ -2891,6 +2918,9 @@ impl CompletedFailureInstances {
         let marker = Arc::new(FailureClaimMarker {
             owner: std::sync::Mutex::new(owner.as_ref().map(Arc::downgrade)),
         });
+        if owner.is_none() {
+            self.ownerless_count.fetch_add(1, Ordering::Relaxed);
+        }
         claimed.insert(instance_id, marker.clone());
         Some(FailureLifecycleClaim {
             registry: Arc::clone(self),
@@ -2909,15 +2939,17 @@ impl CompletedFailureInstances {
             .get(&instance_id)
             .is_some_and(|current| Arc::ptr_eq(current, marker))
         {
+            let ownerless = claimed
+                .get(&instance_id)
+                .is_some_and(|current| current.owner().is_none());
             claimed.remove(&instance_id);
+            if ownerless {
+                self.ownerless_count.fetch_sub(1, Ordering::Relaxed);
+            }
         }
     }
 
-    fn release_owner(
-        &self,
-        instance_id: u64,
-        owner: &std::sync::Weak<FailureLifecycleOwner>,
-    ) {
+    fn release_owner(&self, instance_id: u64, owner: &std::sync::Weak<FailureLifecycleOwner>) {
         let mut claimed = self
             .claimed
             .lock()
@@ -11706,9 +11738,8 @@ impl<T: 'static> GossipRegistry<T> {
 
     /// Whether a queued peer-disconnect callback still describes the session
     /// whose failure completed accounting. The final decision is made while
-    /// holding the same state lock used by session arming, and the production
-    /// notifier invokes the handler directly from that critical section's
-    /// continuation (no await-separated boolean handoff).
+    /// holding the same state lock used by session arming; callback entry is
+    /// then claimed by the shared atomic publication-vs-entry state.
     fn disconnect_notification_is_current_locked(
         &self,
         gossip_state: &GossipState,
@@ -11787,35 +11818,43 @@ impl<T: 'static> GossipRegistry<T> {
         handler: Arc<dyn PeerDisconnectHandler>,
         callback_peer_id: Option<crate::PeerId>,
     ) {
-        // The publication gate is acquired before the final identity/epoch
-        // decision and is held through both observable user entry points:
-        // synchronous callback construction and the future's first poll.
-        // Publication therefore cannot commit in either handoff window and
-        // make a stale disconnect enter user code.
-        let gossip_state = self.gossip_state.lock().await;
-        let delivery_gate = crate::connection_pool::lock_disconnect_delivery();
-        if !self.disconnect_notification_is_current_locked(
-            &gossip_state,
-            failed_peer_addr,
-            peer_id,
-            failed_instance_id,
-            delivery_epoch,
-        ) {
-            return;
+        // Make the final identity/epoch decision while holding the same
+        // state lock used by session arming, then arm the shared atomic
+        // publication-vs-entry claim before releasing it. There is no await
+        // between that arm and callback entry. If publication wins the CAS,
+        // retry the identity check so unrelated publications do not suppress
+        // this notification; if entry wins, user code runs without any
+        // publication/delivery mutex held.
+        loop {
+            let claim = {
+                let gossip_state = self.gossip_state.lock().await;
+                if !self.disconnect_notification_is_current_locked(
+                    &gossip_state,
+                    failed_peer_addr,
+                    peer_id,
+                    failed_instance_id,
+                    delivery_epoch,
+                ) {
+                    return;
+                }
+                crate::connection_pool::try_arm_disconnect_delivery()
+            };
+            let Some(claim) = claim else {
+                tokio::task::yield_now().await;
+                continue;
+            };
+            if claim.enter() {
+                break;
+            }
         }
-        drop(gossip_state);
+
         let mut callback = handler.handle_peer_disconnect(failed_peer_addr, callback_peer_id);
-        let mut delivery_gate = Some(delivery_gate);
         let mut callback_entered = false;
         futures::future::poll_fn(move |cx| {
             let first_poll = !callback_entered;
             let result = callback.as_mut().poll(cx);
             if first_poll {
                 callback_entered = true;
-                // The first user poll has now begun and completed its
-                // synchronous portion. Release only after poll returns, so a
-                // replacement cannot commit between gate release and entry.
-                drop(delivery_gate.take());
                 #[cfg(feature = "test-helpers")]
                 crate::lifecycle::dispatch_test_helper_event(
                     crate::lifecycle::TransportTestHelperEvent::DisconnectNotificationEntered {
@@ -14847,8 +14886,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ownerless_failure_tombstones_have_a_fixed_admission_bound() {
+        let markers = Arc::new(CompletedFailureInstances::default());
+        let mut first_id = None;
+        for _ in 0..MAX_OWNERLESS_FAILURE_TOMBSTONES {
+            let instance_id = crate::connection_pool::LockFreeStreamHandle::allocate_instance_id();
+            first_id.get_or_insert(instance_id);
+            markers
+                .claim(instance_id, None)
+                .expect("ownerless tombstone admission below the bound")
+                .complete();
+        }
+        assert_eq!(markers.len(), MAX_OWNERLESS_FAILURE_TOMBSTONES);
+        assert!(
+            markers
+                .claim(first_id.expect("one tombstone"), None)
+                .is_none(),
+            "bounded storage must still suppress sequential ownerless duplicates"
+        );
+        let overflow_id = crate::connection_pool::LockFreeStreamHandle::allocate_instance_id();
+        assert!(
+            markers.claim(overflow_id, None).is_none(),
+            "ownerless admission must stop rather than evict and re-admit IDs"
+        );
+        assert_eq!(markers.len(), MAX_OWNERLESS_FAILURE_TOMBSTONES);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn disconnect_delivery_gate_fences_callback_until_first_poll() {
+    async fn disconnect_delivery_atomic_claim_allows_reentrant_publication() {
         use crate::connection_pool::{
             BufferConfig, ChannelId, ConnectionDirection, ConnectionState, LockFreeConnection,
             LockFreeStreamHandle,
@@ -14862,6 +14928,7 @@ mod tests {
             first_polled: std::sync::Mutex<Option<oneshot::Sender<()>>>,
             release_construction: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
             release_first_poll: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+            first_poll_publication: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
             invocations: Arc<AtomicUsize>,
         }
 
@@ -14894,8 +14961,16 @@ mod tests {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take();
                 let release_first_poll = self.release_first_poll.clone();
+                let first_poll_publication = self
+                    .first_poll_publication
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
                 let invocations = self.invocations.clone();
                 Box::pin(async move {
+                    if let Some(publish) = first_poll_publication {
+                        publish();
+                    }
                     if let Some(sender) = first_polled {
                         let _ = sender.send(());
                     }
@@ -14944,11 +15019,43 @@ mod tests {
         let first_poll_release =
             Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let invocations = Arc::new(AtomicUsize::new(0));
+
+        let (replacement_io, _replacement_peer) = tokio::io::duplex(1024);
+        let (replacement_handle, _replacement_writer, _replacement_reader) =
+            LockFreeStreamHandle::new(
+                replacement_io,
+                peer_addr,
+                ChannelId::Global,
+                BufferConfig::default(),
+                None,
+                None,
+            );
+        let mut replacement_connection =
+            LockFreeConnection::new(peer_addr, ConnectionDirection::Inbound);
+        replacement_connection.embedded_peer_id = Some(peer_id.clone());
+        replacement_connection.stream_handle = Some(Arc::new(replacement_handle));
+        replacement_connection.set_state(ConnectionState::Connected);
+        let replacement_connection = Arc::new(replacement_connection);
+        let first_poll_publication_succeeded = Arc::new(AtomicUsize::new(0));
+        let first_poll_publication_result = first_poll_publication_succeeded.clone();
+        let first_poll_pool = registry.connection_pool.clone();
+        let first_poll_peer_id = peer_id.clone();
+        let first_poll_connection = replacement_connection.clone();
+        let first_poll_publication: Box<dyn FnOnce() + Send> = Box::new(move || {
+            if first_poll_pool.add_connection_by_peer_id(
+                first_poll_peer_id,
+                peer_addr,
+                first_poll_connection,
+            ) {
+                first_poll_publication_result.store(1, Ordering::SeqCst);
+            }
+        });
         let handler = Arc::new(FirstPollHandler {
             constructed: std::sync::Mutex::new(Some(constructed_tx)),
             first_polled: std::sync::Mutex::new(Some(first_polled_tx)),
             release_construction: construction_release.clone(),
             release_first_poll: first_poll_release.clone(),
+            first_poll_publication: std::sync::Mutex::new(Some(first_poll_publication)),
             invocations: invocations.clone(),
         });
         let registry_task = registry.clone();
@@ -14971,22 +15078,6 @@ mod tests {
             .expect("callback future construction timed out")
             .expect("callback future must be constructed");
 
-        let (replacement_io, _replacement_peer) = tokio::io::duplex(1024);
-        let (replacement_handle, _replacement_writer, _replacement_reader) =
-            LockFreeStreamHandle::new(
-                replacement_io,
-                peer_addr,
-                ChannelId::Global,
-                BufferConfig::default(),
-                None,
-                None,
-            );
-        let mut replacement_connection =
-            LockFreeConnection::new(peer_addr, ConnectionDirection::Inbound);
-        replacement_connection.embedded_peer_id = Some(peer_id.clone());
-        replacement_connection.stream_handle = Some(Arc::new(replacement_handle));
-        replacement_connection.set_state(ConnectionState::Connected);
-        let replacement_connection = Arc::new(replacement_connection);
         let replacement_pool = registry.connection_pool.clone();
         let replacement_peer_id = peer_id.clone();
         let replacement_for_publish = replacement_connection.clone();
@@ -14999,7 +15090,7 @@ mod tests {
             );
             let _ = publication_tx.send(result);
         });
-        let mut publication_result =
+        let publication_result =
             tokio::time::timeout(Duration::from_millis(100), &mut publication_rx)
                 .await
                 .ok()
@@ -15015,16 +15106,6 @@ mod tests {
         let first_poll_entered = tokio::time::timeout(Duration::from_secs(2), first_polled_rx)
             .await
             .is_ok();
-        let publication_during_first_poll = if first_poll_entered && publication_result.is_none() {
-            publication_result =
-                tokio::time::timeout(Duration::from_millis(100), &mut publication_rx)
-                    .await
-                    .ok()
-                    .and_then(|result| result.ok());
-            publication_result.is_some()
-        } else {
-            false
-        };
         {
             let (released, wake) = &*first_poll_release;
             *released
@@ -15048,21 +15129,22 @@ mod tests {
             .expect("disconnect notifier timed out")
             .expect("disconnect notifier must not panic");
         assert!(
-            !publication_during_construction,
-            "publication must remain fenced during synchronous handler construction"
+            publication_during_construction,
+            "publication must complete during synchronous handler construction"
         );
         assert!(
             first_poll_entered,
-            "the callback future's first poll must be entered before publication"
+            "the callback future's first poll must be entered"
         );
-        assert!(
-            !publication_during_first_poll,
-            "publication must remain fenced through the callback future's first poll"
+        assert_eq!(
+            first_poll_publication_succeeded.load(Ordering::SeqCst),
+            1,
+            "first-poll publication must re-enter the pool without deadlock"
         );
         assert_eq!(
             invocations.load(Ordering::SeqCst),
             1,
-            "the callback's first poll must begin before publication is released"
+            "the callback must run exactly once"
         );
         old_connection.abort_tasks();
         replacement_connection.abort_tasks();

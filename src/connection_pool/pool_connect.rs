@@ -643,10 +643,10 @@ impl<T> ConnectionPool<T> {
         peer_id: &crate::PeerId,
         connection: Arc<LockFreeConnection>,
     ) {
-        // A disconnect notifier holds this same gate from its final
-        // revalidation through callback entry. Publication therefore cannot
-        // land in that interval and invalidate an already-entered callback.
-        let delivery_gate = crate::connection_pool::lock_disconnect_delivery();
+        // Linearize publication against a notifier that has passed its final
+        // identity check. This is an atomic claim, not a mutex: a callback
+        // already entering user code does not block synchronous re-entry.
+        let publication = crate::connection_pool::begin_disconnect_publication();
         let session = self.get_or_create_peer_session(peer_id);
         let stream_instance_id = connection
             .stream_handle
@@ -661,10 +661,10 @@ impl<T> ConnectionPool<T> {
             .connections_by_peer
             .upsert_sync(peer_id.clone(), connection.clone());
         self.mark_routing_changed();
-        // User lifecycle observers are arbitrary application code and may
-        // re-enter publication. They must run after both the session commit
-        // and the publication/delivery gate have been released.
-        drop(delivery_gate);
+        // User lifecycle observers are arbitrary application code and run
+        // after the session commit; publication itself never holds a mutex
+        // across observer or callback code.
+        drop(publication);
         info!(
             peer_id = %peer_id,
             addr = %connection.addr,
@@ -703,10 +703,10 @@ impl<T> ConnectionPool<T> {
         expected: Option<&Arc<LockFreeConnection>>,
         connection: Arc<LockFreeConnection>,
     ) -> std::result::Result<(), Option<Arc<LockFreeConnection>>> {
-        // Keep compare-and-publish in the same linearization domain as the
-        // final disconnect revalidation. A replacement cannot publish between
-        // that decision and entry into the stale callback.
-        let delivery_gate = crate::connection_pool::lock_disconnect_delivery();
+        // Claim the publication-vs-delivery linearization before mutating the
+        // current-session slot. An armed stale callback either wins entry
+        // before this CAS or is suppressed; no mutex is held across user code.
+        let publication = crate::connection_pool::begin_disconnect_publication();
         let session = self.get_or_create_peer_session(peer_id);
         if let Err(current) =
             session.compare_and_set_current_connection(expected, connection.clone())
@@ -777,9 +777,9 @@ impl<T> ConnectionPool<T> {
             self.retire_displaced_expected(expected, &connection);
         }
         // The commit and any displaced-instance cleanup are complete before
-        // releasing the gate. Only then invoke the user lifecycle recorder;
-        // recorder callbacks are allowed to publish/re-enter the pool.
-        drop(delivery_gate);
+        // invoking the user lifecycle recorder; recorder callbacks may publish
+        // or re-enter the pool because no publication mutex is held.
+        drop(publication);
         info!(
             peer_id = %peer_id,
             addr = %connection.addr,
