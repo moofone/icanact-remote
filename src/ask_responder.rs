@@ -163,6 +163,10 @@ impl<'a> ReplyPayloadRef<'a> {
         self.len
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     /// Copy this borrowed wire view into the owned value used by the original
     /// observer contract.
     pub fn to_bytes(&self) -> Bytes {

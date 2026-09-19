@@ -87,6 +87,7 @@ fn evidence_path(name: &str) -> io::Result<PathBuf> {
     Ok(evidence_directory()?.join(name))
 }
 
+#[allow(dead_code, reason = "installed only by lifecycle evidence binaries")]
 pub fn install_natural_lifecycle_recorder(
     on_event: Arc<dyn Fn(&TransportLifecycleEvent) + Send + Sync + 'static>,
 ) {
