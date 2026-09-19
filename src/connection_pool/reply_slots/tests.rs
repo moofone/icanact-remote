@@ -109,7 +109,7 @@ async fn close_before_publish_is_rejected_without_fresh_responder() {
 
     struct Observer(AtomicUsize);
     impl AskReplyObserver for Observer {
-        fn reply_claimed(&self, _payload: crate::ReplyPayloadRef<'_>) {
+        fn reply_claimed(&self, _payload: Bytes) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
@@ -163,7 +163,11 @@ async fn publication_close_public_publisher_first_notifies_once() {
 
     struct Observer(AtomicUsize);
     impl AskReplyObserver for Observer {
-        fn reply_claimed(&self, payload: crate::ReplyPayloadRef<'_>) {
+        fn reply_claimed(&self, _payload: Bytes) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn reply_claimed_borrowed(&self, payload: crate::ReplyPayloadRef<'_>) {
             assert_eq!(payload.prefix(), None);
             assert_eq!(payload.payload(), b"published");
             assert_eq!(payload.len(), b"published".len());

@@ -132,7 +132,7 @@ impl<'a> TellContext<'a> {
 
 /// A borrowed view of the first reply claimed for one deferred ask.
 ///
-/// The view is valid only for the duration of [`AskReplyObserver::reply_claimed`].
+/// The view is valid only for the duration of [`AskReplyObserver::reply_claimed_borrowed`].
 /// It can describe a typed reply as two segments: an optional type-hash prefix
 /// and the pooled payload body. Observers that need retention must reserve
 /// their own bounded storage and copy while the callback is running.
@@ -162,6 +162,17 @@ impl<'a> ReplyPayloadRef<'a> {
     pub fn len(&self) -> usize {
         self.len
     }
+
+    /// Copy this borrowed wire view into the owned value used by the original
+    /// observer contract.
+    pub fn to_bytes(&self) -> Bytes {
+        let mut owned = Vec::with_capacity(self.len);
+        if let Some(prefix) = self.prefix {
+            owned.extend_from_slice(prefix);
+        }
+        owned.extend_from_slice(self.payload);
+        Bytes::from(owned)
+    }
 }
 
 /// Observes the first reply claimed for one deferred ask.
@@ -171,7 +182,16 @@ impl<'a> ReplyPayloadRef<'a> {
 /// must remain nonblocking: it runs on the responder's reply path, including
 /// the synchronous `try_reply_*` paths.
 pub trait AskReplyObserver: Send + Sync {
-    fn reply_claimed(&self, payload: ReplyPayloadRef<'_>);
+    /// The original owned-value callback. Keep this required method stable so
+    /// observers implemented against the public API before borrowed views were
+    /// added remain source-compatible.
+    fn reply_claimed(&self, payload: Bytes);
+
+    /// Borrowed observation for callers that can copy or consume the payload
+    /// synchronously. The default bridge preserves the owned callback contract.
+    fn reply_claimed_borrowed(&self, payload: ReplyPayloadRef<'_>) {
+        self.reply_claimed(payload.to_bytes());
+    }
 }
 
 #[derive(Clone)]
@@ -698,7 +718,7 @@ impl AskResponder {
             && !self.observer_notified
             && let Some(observer) = &self.reply_observer
         {
-            observer.reply_claimed(ReplyPayloadRef::new(prefix, payload, len));
+            observer.reply_claimed_borrowed(ReplyPayloadRef::new(prefix, payload, len));
             self.observer_notified = true;
         }
     }
@@ -806,16 +826,11 @@ mod tests {
     }
 
     impl AskReplyObserver for RecordingReplyObserver {
-        fn reply_claimed(&self, payload: ReplyPayloadRef<'_>) {
-            let mut owned = Vec::with_capacity(payload.len());
-            if let Some(prefix) = payload.prefix() {
-                owned.extend_from_slice(prefix);
-            }
-            owned.extend_from_slice(payload.payload());
+        fn reply_claimed(&self, payload: Bytes) {
             self.payloads
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(Bytes::from(owned));
+                .push(payload);
         }
     }
 
@@ -845,7 +860,7 @@ mod tests {
     }
 
     #[test]
-    fn reply_observer_is_one_shot_and_receives_owned_bytes_before_enqueue() {
+    fn legacy_owned_reply_observer_remains_source_compatible_and_one_shot() {
         let writer = Arc::new(ResponseWriter::new("127.0.0.1:12349".parse().unwrap()));
         let observer = Arc::new(RecordingReplyObserver::default());
         let context = AskContext::from_writer(14, &writer, None)

@@ -1,19 +1,91 @@
 use icanact_remote::{
     GossipConfig, GossipRegistryHandle, KeyPair, PeerId, SecretKey, TransportLifecycleEvent,
 };
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::future::Future;
-use std::io::Write;
+use std::io::{self, Write};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::time::sleep;
 
 pub type DynError = Box<dyn std::error::Error + Send + Sync>;
 pub type TlsHandle = GossipRegistryHandle<icanact_remote::BuilderTlsBootstrap>;
 
-const NATURAL_LIFECYCLE_EVIDENCE_PATH: &str =
-    "/tmp/icanact-qa-20260918/r1/committed-accounting-evidence.log";
+static EVIDENCE_DIRECTORY: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+static EVIDENCE_NAME_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn private_evidence_directory() -> io::Result<PathBuf> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let process_id = std::process::id();
+    for _ in 0..64 {
+        let sequence = EVIDENCE_NAME_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "icanact-qa-20260918-r1-{process_id}-{timestamp}-{sequence}"
+        ));
+        match std::fs::create_dir(&path) {
+            Ok(()) => {
+                #[cfg(unix)]
+                std::fs::set_permissions(
+                    &path,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o700),
+                )?;
+                return Ok(path);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique lifecycle evidence directory",
+    ))
+}
+
+fn evidence_directory() -> io::Result<&'static Path> {
+    match EVIDENCE_DIRECTORY
+        .get_or_init(|| private_evidence_directory().map_err(|error| error.to_string()))
+    {
+        Ok(path) => Ok(path.as_path()),
+        Err(error) => Err(io::Error::other(error.clone())),
+    }
+}
+
+fn open_exclusive_evidence_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
+fn open_append_evidence_file(path: &Path, ready: &OnceLock<()>) -> io::Result<File> {
+    if ready.get().is_none() {
+        let file = open_exclusive_evidence_file(path)?;
+        let _ = ready.set(());
+        return Ok(file);
+    }
+    let mut options = OpenOptions::new();
+    options.append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
+fn evidence_path(name: &str) -> io::Result<PathBuf> {
+    Ok(evidence_directory()?.join(name))
+}
 
 pub fn install_natural_lifecycle_recorder(
     on_event: Arc<dyn Fn(&TransportLifecycleEvent) + Send + Sync + 'static>,
@@ -24,12 +96,10 @@ pub fn install_natural_lifecycle_recorder(
         let _ = std::thread::Builder::new()
             .name("icanact-r1-lifecycle-log".into())
             .spawn(move || {
-                let _ = std::fs::create_dir_all("/tmp/icanact-qa-20260918/r1");
-                let Ok(mut file) = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(NATURAL_LIFECYCLE_EVIDENCE_PATH)
-                else {
+                let Ok(path) = evidence_path("committed-accounting-evidence.log") else {
+                    return;
+                };
+                let Ok(mut file) = open_exclusive_evidence_file(&path) else {
                     return;
                 };
                 let command = std::env::args().collect::<Vec<_>>().join(" ");
@@ -342,9 +412,8 @@ pub async fn create_udp_node(config: GossipConfig) -> Result<TlsHandle, DynError
     }
 }
 
-const CONNECTION_DIAGNOSTICS_PATH: &str = "/tmp/icanact-qa-20260918/r1/connection-diagnostics.log";
-
 static CONNECTION_DIAGNOSTICS_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static CONNECTION_DIAGNOSTICS_EVIDENCE_READY: OnceLock<()> = OnceLock::new();
 
 fn connection_diagnostics_lock() -> &'static Mutex<()> {
     CONNECTION_DIAGNOSTICS_LOCK.get_or_init(|| Mutex::new(()))
@@ -399,17 +468,14 @@ pub async fn capture_connection_diagnostics(context: &str, a: &TlsHandle, b: &Tl
     let lock = connection_diagnostics_lock()
         .lock()
         .expect("connection diagnostics mutex poisoned");
-    let result = (|| -> std::io::Result<()> {
-        std::fs::create_dir_all("/tmp/icanact-qa-20260918/r1")?;
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(CONNECTION_DIAGNOSTICS_PATH)?;
+    let result = (|| -> io::Result<()> {
+        let path = evidence_path("connection-diagnostics.log")?;
+        let mut file = open_append_evidence_file(&path, &CONNECTION_DIAGNOSTICS_EVIDENCE_READY)?;
         file.write_all(record.as_bytes())
     })();
     drop(lock);
     if let Err(error) = result {
-        eprintln!("failed to write {CONNECTION_DIAGNOSTICS_PATH}: {error}");
+        eprintln!("failed to write connection diagnostics evidence: {error}");
     }
 }
 
@@ -504,4 +570,39 @@ pub async fn wait_for_active_peers(node: &TlsHandle, min_peers: usize, timeout: 
 #[allow(dead_code)]
 pub fn parse_addr(addr: &str) -> SocketAddr {
     addr.parse().expect("valid socket addr")
+}
+
+#[cfg(test)]
+mod evidence_path_tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_evidence_uses_a_unique_private_directory() {
+        let path = evidence_directory().expect("private evidence directory");
+        assert!(!path.ends_with("r1"));
+        assert!(path.starts_with(std::env::temp_dir()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path)
+                .expect("evidence directory metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o077, 0, "evidence directory must not be shared");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exclusive_evidence_creation_rejects_a_symlink() {
+        let path = evidence_directory()
+            .expect("private evidence directory")
+            .join(format!(
+                "symlink-check-{}",
+                EVIDENCE_NAME_COUNTER.fetch_add(1, Ordering::Relaxed)
+            ));
+        std::os::unix::fs::symlink("/dev/null", &path).expect("create test symlink");
+        assert!(open_exclusive_evidence_file(&path).is_err());
+        let _ = std::fs::remove_file(path);
+    }
 }

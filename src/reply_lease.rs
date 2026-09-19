@@ -262,7 +262,7 @@ impl ReplyLease {
             return;
         }
         if let Some(observer) = &self.reply_observer {
-            observer.reply_claimed(crate::ReplyPayloadRef::new(
+            observer.reply_claimed_borrowed(crate::ReplyPayloadRef::new(
                 None,
                 payload.as_ref(),
                 payload.len(),
