@@ -185,8 +185,8 @@ pub fn retained_byte_pool_bytes() -> usize {
     byte_payload_pool().retained_bytes()
 }
 
-/// Count of payload encodes that exceeded the pool's retention bound and were
-/// served by an unpooled allocation. Nonzero is legal — it marks frames the
+/// Count of payload encodes that exceeded the pool's retention bound and
+/// attempted an unpooled allocation. Nonzero is legal — it marks frames the
 /// old admission-as-pool design would have dropped silently — but a steadily
 /// climbing value means a hot path is serializing payloads larger than the
 /// pool is tuned for.
@@ -236,10 +236,14 @@ fn try_acquire_byte_buffer(min_capacity: usize) -> Option<Vec<u8>> {
         // is not acceptable is returning `None` and letting the caller drop
         // the frame with no signal at any layer.
         None => {
+            // Count the request before allocation so even fallible requests
+            // that would previously have panicked remain visible in metrics.
             byte_payload_pool()
                 .oversize_checkouts
                 .fetch_add(1, Ordering::Relaxed);
-            Some(Vec::with_capacity(min_capacity))
+            let mut buffer = Vec::new();
+            buffer.try_reserve(min_capacity).ok()?;
+            Some(buffer)
         }
     }
 }
@@ -364,6 +368,16 @@ mod qa_pool_review {
         })
         .expect("oversize payload encodes on an unpooled buffer");
         assert_eq!(payload.len(), size);
+    }
+
+    #[test]
+    fn oversized_capacity_request_returns_none_without_running_fill() {
+        let mut fill_called = false;
+        let payload = PooledPayload::try_from_pooled_bytes(usize::MAX, |_| {
+            fill_called = true;
+        });
+        assert!(payload.is_none());
+        assert!(!fill_called);
     }
 
     #[test]
