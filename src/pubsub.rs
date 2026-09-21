@@ -2688,6 +2688,33 @@ mod tests {
         );
     }
 
+    /// Payloads above the byte-pool retention bound (1 MiB) must still encode
+    /// and send: the pool bound is a pooling decision, not a message bound.
+    /// Returning `None` here is what dropped a multi-MiB dashboard keyframe
+    /// between a healthy publisher and its subscriber with no error anywhere.
+    #[tokio::test]
+    async fn oversize_pubsub_payload_encodes_above_pool_retention_bound() {
+        let pubsub = test_pubsub("pubsub-oversize-encode");
+        let topic = topic_key("oversize-encode");
+        let destination = crate::KeyPair::new_for_testing("pubsub-oversize-dest").peer_id();
+        let payload = vec![0xABu8; 2 * 1024 * 1024];
+        let (frame, _prefix, payload_len) = encode_fast_frame_pooled(
+            topic,
+            7,
+            7,
+            &pubsub.local_peer_id,
+            &pubsub.local_peer_id,
+            2,
+            PubSubDeliveryMode::AtMostOnce,
+            PubSubFrameMetadata::default(),
+            std::slice::from_ref(&destination),
+            &payload,
+        )
+        .expect("oversize pubsub frame must still encode on an unpooled buffer");
+        assert_eq!(payload_len, fast_frame_len(std::slice::from_ref(&destination), &payload));
+        assert_eq!(frame.remaining(), payload_len);
+    }
+
     #[tokio::test]
     async fn oversized_pubsub_payload_skips_datagram_but_encodes_stream_frame() {
         let pubsub = test_pubsub("pubsub-oversize-stream-fallback");

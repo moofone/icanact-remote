@@ -57,6 +57,11 @@ thread_local! {
 struct BytePayloadPool {
     queue: ArrayQueue<Vec<u8>>,
     retained_bytes: AtomicUsize,
+    /// Encodes that exceeded the pooled retention bound and were served by a
+    /// fresh unpooled allocation. Exposed for diagnostics: an oversize encode
+    /// used to fail outright (the frame was silently dropped), so the count
+    /// marks a path that previously lost data.
+    oversize_checkouts: AtomicUsize,
     budget: usize,
 }
 
@@ -65,6 +70,7 @@ impl BytePayloadPool {
         Self {
             queue: ArrayQueue::new(slots),
             retained_bytes: AtomicUsize::new(0),
+            oversize_checkouts: AtomicUsize::new(0),
             budget,
         }
     }
@@ -179,6 +185,17 @@ pub fn retained_byte_pool_bytes() -> usize {
     byte_payload_pool().retained_bytes()
 }
 
+/// Count of payload encodes that exceeded the pool's retention bound and
+/// attempted an unpooled allocation. Nonzero is legal — it marks frames the
+/// old admission-as-pool design would have dropped silently — but a steadily
+/// climbing value means a hot path is serializing payloads larger than the
+/// pool is tuned for.
+pub fn oversize_byte_pool_checkouts() -> usize {
+    byte_payload_pool()
+        .oversize_checkouts
+        .load(Ordering::Acquire)
+}
+
 fn acquire_ctx() -> Box<SerializerCtx> {
     SERIALIZER_POOL.with(|pool| {
         pool.borrow_mut()
@@ -207,7 +224,28 @@ fn release_ctx(mut ctx: Box<SerializerCtx>) {
 }
 
 fn try_acquire_byte_buffer(min_capacity: usize) -> Option<Vec<u8>> {
-    byte_payload_pool().acquire(min_capacity)
+    match byte_payload_pool().acquire(min_capacity) {
+        Some(buffer) => Some(buffer),
+        // `acquire` refuses only requests above the *retention* bound
+        // (`MAX_POOLED_BYTE_CAPACITY`) — the largest idle buffer the pool will
+        // hold. That is a pooling decision, not a message bound: the encode
+        // still needs the bytes, so serve it from a fresh allocation that
+        // `release` will not retain (its early return already drops buffers
+        // above the cap). One allocation per oversized encode is identical
+        // cost to the pooled path's own first-use `Vec::with_capacity`; what
+        // is not acceptable is returning `None` and letting the caller drop
+        // the frame with no signal at any layer.
+        None => {
+            // Count the request before allocation so even fallible requests
+            // that would previously have panicked remain visible in metrics.
+            byte_payload_pool()
+                .oversize_checkouts
+                .fetch_add(1, Ordering::Relaxed);
+            let mut buffer = Vec::new();
+            buffer.try_reserve(min_capacity).ok()?;
+            Some(buffer)
+        }
+    }
 }
 
 fn release_byte_buffer(buffer: Vec<u8>) {
@@ -315,6 +353,31 @@ mod qa_pool_review {
         assert_eq!(pool.retained_bytes(), 0);
         assert_eq!(pool.queue.len(), 0);
         assert!(pool.acquire(MAX_POOLED_BYTE_CAPACITY + 1).is_none());
+    }
+
+    #[test]
+    fn oversize_payload_encodes_on_an_unpooled_buffer() {
+        // The pool bound is a *retention* bound: it caps the size of idle
+        // buffer the pool will hold, not the size of payload the codec may
+        // encode. An oversized encode must still succeed on a fresh
+        // allocation — silently dropping the frame is how a >1 MiB pubsub
+        // message vanished between a healthy publisher and its subscriber.
+        let size = MAX_POOLED_BYTE_CAPACITY + 128;
+        let payload = PooledPayload::try_from_pooled_bytes(size, |out| {
+            out.extend(std::iter::repeat_n(7u8, size));
+        })
+        .expect("oversize payload encodes on an unpooled buffer");
+        assert_eq!(payload.len(), size);
+    }
+
+    #[test]
+    fn oversized_capacity_request_returns_none_without_running_fill() {
+        let mut fill_called = false;
+        let payload = PooledPayload::try_from_pooled_bytes(usize::MAX, |_| {
+            fill_called = true;
+        });
+        assert!(payload.is_none());
+        assert!(!fill_called);
     }
 
     #[test]
@@ -698,8 +761,11 @@ mod tests {
         .expect("bounded on-demand byte payload");
         assert_eq!(payload.len(), 65_507);
 
+        // Above the retention bound the encode still succeeds — on an
+        // unpooled buffer. The bound caps what the pool *keeps*, never what
+        // callers may send.
         assert!(
-            PooledPayload::try_from_pooled_bytes(MAX_POOLED_BYTE_CAPACITY + 1, |_| {}).is_none()
+            PooledPayload::try_from_pooled_bytes(MAX_POOLED_BYTE_CAPACITY + 1, |_| {}).is_some()
         );
     }
 
