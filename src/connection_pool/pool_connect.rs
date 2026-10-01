@@ -3882,6 +3882,13 @@ impl<T> ConnectionPool<T> {
             .map(|registry| {
                 let response_writer = Arc::new(crate::ask_responder::ResponseWriter::new(addr));
                 let read_context = ReadContext {
+                    // Only the identity this exact TLS session's own peer
+                    // certificate proved. `peer_id_opt` may come from an
+                    // addr -> peer cache and is not evidence of who answers.
+                    authenticated_peer_id: fresh_session_node_id
+                        .as_ref()
+                        .map(crate::PeerId::from_public_key)
+                        .map(Arc::new),
                     streaming_state_handoff: None,
                     registry_weak: Arc::downgrade(&registry),
                     peer_addr: addr,

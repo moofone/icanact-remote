@@ -7966,6 +7966,7 @@ mod write_payload_size_gate_tests {
 
     fn small_message_read_context(port: u16, max_message_size: usize) -> ReadContext {
         ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: std::sync::Weak::new(),
             peer_addr: format!("127.0.0.1:{port}").parse().unwrap(),
@@ -8835,6 +8836,7 @@ mod header_inline_family_bounds_tests {
 
     fn small_message_read_context(port: u16, max_message_size: usize) -> ReadContext {
         ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: std::sync::Weak::new(),
             peer_addr: format!("127.0.0.1:{port}").parse().unwrap(),
@@ -9063,6 +9065,7 @@ mod buf_write_payload_closure_tests {
 
     fn small_message_read_context(port: u16, max_message_size: usize) -> ReadContext {
         ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: std::sync::Weak::new(),
             peer_addr: format!("127.0.0.1:{port}").parse().unwrap(),
@@ -9176,6 +9179,7 @@ mod write_buf_control_single_arg_tests {
 
     fn small_message_read_context(port: u16, max_message_size: usize) -> ReadContext {
         ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: std::sync::Weak::new(),
             peer_addr: format!("127.0.0.1:{port}").parse().unwrap(),
@@ -9317,6 +9321,7 @@ mod write_chunked_nonblocking_tests {
 
     fn small_message_read_context(port: u16, max_message_size: usize) -> ReadContext {
         ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: std::sync::Weak::new(),
             peer_addr: format!("127.0.0.1:{port}").parse().unwrap(),

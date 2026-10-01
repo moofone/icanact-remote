@@ -575,6 +575,7 @@ async fn registered_lease_notification() {
 
     let addr = "127.0.0.1:41015".parse().expect("test address");
     let read_context = ReadContext {
+        authenticated_peer_id: None,
         streaming_state_handoff: None,
         registry_weak: std::sync::Weak::new(),
         peer_addr: addr,
@@ -1123,6 +1124,7 @@ async fn production_abort_terminal_settles_correlation() {
 
     let addr = "127.0.0.1:41019".parse().expect("test address");
     let context = ReadContext {
+        authenticated_peer_id: None,
         streaming_state_handoff: None,
         registry_weak: std::sync::Weak::new(),
         peer_addr: addr,

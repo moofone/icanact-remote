@@ -306,6 +306,38 @@ async fn server_tells_and_asks_client_actor_over_client_initiated_session() -> R
     Ok(())
 }
 
+/// An attributed ask over the client-initiated (inbound-for-the-server)
+/// session reports the client's certificate-verified identity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn attributed_ask_over_client_initiated_session_reports_client_identity()
+-> Result<(), DynError> {
+    let server = node_on(SecretKey::generate(), loopback(), cfg(false)).await;
+    let client = node_on(SecretKey::generate(), loopback(), cfg(true)).await;
+    let client_id = client.registry.peer_id.clone();
+    let _tells = serve_echo(&client, "client").await;
+
+    dial(&client, &server).await;
+    assert!(server_sees(&server, &client_id).await);
+
+    let conn = server
+        .lookup_peer(&client_id)
+        .await?
+        .connection_ref()
+        .expect("server holds the client's session");
+
+    let (answered_by, reply) = conn
+        .ask_actor_frame_aligned_attributed(
+            ACTOR_ID,
+            TYPE_HASH,
+            Bytes::from_static(b"ping"),
+            Duration::from_secs(3),
+        )
+        .await?;
+    assert_eq!(answered_by, client_id);
+    assert_eq!(reply.as_ref(), b"client:ping");
+    Ok(())
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Event {
     Connected,
