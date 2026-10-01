@@ -152,6 +152,35 @@ impl<T> ConnectionPool<T> {
             }
         }
 
+        // Guard 3 (client-only chokepoint): a peer that declared itself
+        // client-only in an authenticated Hello can only reach us, never be
+        // reached. Refuse any fresh dial toward its identity, whichever path
+        // (supervisor, gossip, discovery, lookup) got here. A live session is
+        // not a dial and is reused below as usual. REMOTE-3: decided on
+        // identity (resolved, or learned for this address), not on address.
+        if let Some(registry_arc) = registry_weak.upgrade() {
+            let target_peer_id = resolved_node_id
+                .as_ref()
+                .map(crate::PeerId::from)
+                .or_else(|| {
+                    self.addr_to_peer_id
+                        .read_sync(&addr, |_, peer| peer.clone())
+                });
+            if let Some(target_peer_id) = target_peer_id
+                && registry_arc.is_client_only_peer(&target_peer_id)
+                && !self.has_connection_by_peer_id(&target_peer_id)
+            {
+                debug!(
+                    target: "icanact_remote_lifecycle",
+                    attempt_id,
+                    addr = %addr,
+                    peer_id = %target_peer_id,
+                    "outbound_connect_refused_client_only_peer"
+                );
+                return Err(GossipError::ClientOnlyPeer(target_peer_id));
+            }
+        }
+
         // Make room if necessary - evict the least-recently-used connection
         // that is safe to drop. Configured/required peers are never chosen, so
         // a new (often transient/discovered) dial cannot disconnect a live
@@ -406,6 +435,8 @@ impl<T> ConnectionPool<T> {
                 match tokio::time::timeout(connection_timeout, async {
                     debug!("CONNECTION POOL: Attempting to connect to {}", addr);
                     let tcp_started = Instant::now();
+                    self.outbound_tcp_dial_attempts
+                        .fetch_add(1, Ordering::Relaxed);
                     let stream = match TcpStream::connect(addr).await {
                         Ok(stream) => {
                             info!(
@@ -617,12 +648,13 @@ impl<T> ConnectionPool<T> {
 
                     let negotiated_alpn = tls_stream.get_ref().1.alpn_protocol().map(|proto| proto.to_vec());
                     let hello_started = Instant::now();
-                    let peer_caps = match crate::handshake::perform_hello_handshake(
+                    let peer_caps = match crate::handshake::perform_hello_handshake_with_role(
                         &mut tls_stream,
                         negotiated_alpn.as_deref(),
                         registry_arc.config.enable_peer_discovery,
                         registry_arc.config.schema_hash,
                         registry_arc.boot_id,
+                        registry_arc.config.client_only,
                     )
                     .await
                     {
@@ -649,6 +681,11 @@ impl<T> ConnectionPool<T> {
                         }
                     };
                     registry_arc.set_peer_capabilities(addr, peer_caps);
+                    if let Some(node_id) = discovered_node_id.as_ref() {
+                        // REMOTE-3: role bound to the TLS-authenticated identity.
+                        let _ = registry_arc
+                            .note_remote_role(&crate::PeerId::from(node_id), peer_caps.remote_client_only);
+                    }
 
                     let associated_node_id = match discovered_node_id {
                         Some(node_id) => Some(node_id),

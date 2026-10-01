@@ -21,6 +21,7 @@ pub mod addr_ownership;
 pub mod aligned;
 mod ask_forwarder;
 mod ask_responder;
+mod client_only;
 pub mod config;
 pub(crate) mod connection_pool;
 pub mod dns;
@@ -1380,6 +1381,9 @@ pub enum GossipError {
 
     #[error("connection already exists")]
     ConnectionExists,
+
+    #[error("peer {0} is client-only and is never dialed")]
+    ClientOnlyPeer(PeerId),
 
     #[error("actor '{0}' already exists")]
     ActorAlreadyExists(String),

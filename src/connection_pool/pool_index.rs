@@ -54,6 +54,8 @@ pub struct ConnectionPool<T = ()> {
     /// only cares about "at or over the cap", never "did we dip below zero".
     connection_counter: AtomicIsize,
     routing_revision: AtomicU64,
+    /// Count of real outbound `TcpStream::connect` attempts (diagnostic).
+    outbound_tcp_dial_attempts: AtomicU64,
     routing_change_notify: Arc<Notify>,
     #[cfg(test)]
     preferred_connection_checks: AtomicU64,

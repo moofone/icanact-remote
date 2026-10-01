@@ -58,6 +58,12 @@ pub enum Feature {
     PeerListGossip = 0,
     /// Optional pairwise clock calibration piggybacked on normal gossip frames.
     ClockCalibration = 1,
+    /// The sender is a client-only node (`GossipConfig::client_only`): it
+    /// never accepts dial-backs, so the receiver must not dial, supervise,
+    /// retry, or gossip it onward as a dial target. Only advertised when the
+    /// opt-in role is configured; a peer that predates this variant rejects
+    /// the Hello, so enable it only against upgraded servers.
+    ClientOnly = 2,
 }
 
 impl Feature {
@@ -65,6 +71,7 @@ impl Feature {
         match self {
             Feature::PeerListGossip => 1u64 << 0,
             Feature::ClockCalibration => 1u64 << 1,
+            Feature::ClientOnly => 1u64 << 2,
         }
     }
 }
@@ -156,10 +163,14 @@ fn hello_for_config(
     enable_peer_discovery: bool,
     schema_hash: Option<u64>,
     boot_id: RemoteBootId,
+    client_only: bool,
 ) -> Hello {
     let mut features = vec![Feature::ClockCalibration];
     if enable_peer_discovery {
         features.push(Feature::PeerListGossip);
+    }
+    if client_only {
+        features.push(Feature::ClientOnly);
     }
     let mut hello = Hello::with_features(features);
     hello.schema_hash = schema_hash;
@@ -176,6 +187,10 @@ pub struct PeerCapabilities {
     pub features: u64,
     /// Authenticated process incarnation advertised by the remote peer.
     pub remote_boot_id: RemoteBootId,
+    /// The remote declared itself client-only in its authenticated Hello.
+    /// Kept apart from `features` (an intersection) because this is a fact
+    /// about the *remote's* role, independent of our own.
+    pub remote_client_only: bool,
 }
 
 impl PeerCapabilities {
@@ -196,6 +211,7 @@ impl PeerCapabilities {
             version: PROTOCOL_VERSION_V6,
             features,
             remote_boot_id: remote.boot_id,
+            remote_client_only: remote.features.contains(&Feature::ClientOnly),
         }
     }
 
@@ -293,6 +309,30 @@ pub async fn perform_hello_handshake<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    perform_hello_handshake_with_role(
+        stream,
+        negotiated_alpn,
+        enable_peer_discovery,
+        schema_hash,
+        local_boot_id,
+        false,
+    )
+    .await
+}
+
+/// [`perform_hello_handshake`] that also declares this node's role:
+/// `client_only` advertises [`Feature::ClientOnly`] to the remote.
+pub async fn perform_hello_handshake_with_role<S>(
+    stream: &mut S,
+    negotiated_alpn: Option<&[u8]>,
+    enable_peer_discovery: bool,
+    schema_hash: Option<u64>,
+    local_boot_id: RemoteBootId,
+    client_only: bool,
+) -> Result<PeerCapabilities>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let alpn = negotiated_alpn.ok_or_else(|| {
         GossipError::TlsHandshakeFailed("missing ALPN negotiation result".to_string())
     })?;
@@ -304,7 +344,12 @@ where
         )));
     }
 
-    let local_hello = hello_for_config(enable_peer_discovery, schema_hash, local_boot_id);
+    let local_hello = hello_for_config(
+        enable_peer_discovery,
+        schema_hash,
+        local_boot_id,
+        client_only,
+    );
     send_hello_message(stream, &local_hello).await?;
     let remote_hello = read_hello_message(stream).await?;
     if remote_hello.protocol_version != CURRENT_PROTOCOL_VERSION {
@@ -386,6 +431,7 @@ mod tests {
             version: PROTOCOL_VERSION_V6,
             features: 0,
             remote_boot_id: RemoteBootId::from_bytes([0; 16]),
+            remote_client_only: false,
         };
         assert!(
             gated_but_unsupported.supports_wire_kind(crate::framing::WireKind::Gossip),
@@ -434,13 +480,30 @@ mod tests {
 
     #[test]
     fn test_clock_calibration_negotiates_when_peer_discovery_disabled() {
-        let local = hello_for_config(false, None, RemoteBootId::from_bytes([1; 16]));
-        let remote = hello_for_config(false, None, RemoteBootId::from_bytes([2; 16]));
+        let local = hello_for_config(false, None, RemoteBootId::from_bytes([1; 16]), false);
+        let remote = hello_for_config(false, None, RemoteBootId::from_bytes([2; 16]), false);
 
         let caps = PeerCapabilities::from_hello_exchange(&local, &remote);
 
         assert!(!caps.can_send_peer_list());
         assert!(caps.can_calibrate_clock());
+    }
+
+    /// The remote's role is a fact about the remote, reported even when the
+    /// local side does not share it (the feature intersection would hide it).
+    #[test]
+    fn client_only_role_is_reported_from_the_remote_hello_only() {
+        let regular = hello_for_config(false, None, RemoteBootId::from_bytes([1; 16]), false);
+        let client = hello_for_config(false, None, RemoteBootId::from_bytes([2; 16]), true);
+        assert!(client.features.contains(&Feature::ClientOnly));
+        assert!(!regular.features.contains(&Feature::ClientOnly));
+
+        let seen_by_server = PeerCapabilities::from_hello_exchange(&regular, &client);
+        assert!(seen_by_server.remote_client_only);
+        let seen_by_client = PeerCapabilities::from_hello_exchange(&client, &regular);
+        assert!(!seen_by_client.remote_client_only);
+        // Default hellos never advertise the role.
+        assert!(!Hello::new().features.contains(&Feature::ClientOnly));
     }
 
     #[test]

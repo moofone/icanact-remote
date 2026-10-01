@@ -3054,6 +3054,10 @@ pub struct GossipRegistry<T = ()> {
     /// edge detection (handler + one-shot recovery log). Dynamic peer IDs age
     /// out after their liveness window so restart churn cannot retain them.
     peer_liveness_status: Arc<SccHashMap<crate::PeerId, PeerLivenessStatus>>,
+    /// Identities that declared themselves client-only in an authenticated
+    /// Hello (REMOTE-3: identity-keyed). Never dialed, supervised, or gossiped
+    /// as a dial target.
+    pub(crate) client_only_peers: Arc<crate::client_only::ClientOnlyPeers>,
     /// Instance-scoped ownership for the registry half of a socket-failure
     /// lifecycle. Pool retirement and registry cleanup are separate operations:
     /// an ask-cancellation/recovery path may retire the pool entry before the
@@ -3144,6 +3148,7 @@ impl<T> Clone for GossipRegistry<T> {
             peer_connect_handler: self.peer_connect_handler.clone(),
             peer_liveness_handler: self.peer_liveness_handler.clone(),
             peer_liveness_status: self.peer_liveness_status.clone(),
+            client_only_peers: self.client_only_peers.clone(),
             completed_failure_instances: self.completed_failure_instances.clone(),
             discovery_task: self.discovery_task.clone(),
             peer_gossip_notify: self.peer_gossip_notify.clone(),
@@ -3509,6 +3514,7 @@ impl<T: 'static> GossipRegistry<T> {
             peer_connect_handler: Arc::new(ArcSwapOption::empty()),
             peer_liveness_handler: Arc::new(ArcSwapOption::empty()),
             peer_liveness_status: Arc::new(SccHashMap::default()),
+            client_only_peers: Arc::new(crate::client_only::ClientOnlyPeers::default()),
             completed_failure_instances: Arc::new(CompletedFailureInstances::default()),
             discovery_task: Arc::new(DiscoveryTaskTracker::default()),
             peer_gossip_notify: Arc::new(Notify::new()),
@@ -3527,9 +3533,10 @@ impl<T: 'static> GossipRegistry<T> {
     /// Enable TLS for secure connections
     /// This must be called before starting the registry to enable TLS
     pub fn enable_tls(&mut self, secret_key: crate::SecretKey) -> Result<()> {
-        self.tls_config = Some(Arc::new(crate::tls::TlsConfig::with_peer_discovery(
+        self.tls_config = Some(Arc::new(crate::tls::TlsConfig::with_options(
             secret_key,
             self.config.enable_peer_discovery,
+            self.config.inbound_peer_allowlist.clone(),
         )?));
         Ok(())
     }
@@ -6284,6 +6291,10 @@ impl<T: 'static> GossipRegistry<T> {
                 );
                 continue;
             }
+            // A client-only peer is never dialed: it can only reach us.
+            if self.is_client_only_peer(&peer_id) {
+                continue;
+            }
             // No connection -> actively *establish* one now. This is what makes a
             // freshly-started peer connect immediately (rather than waiting for a
             // lazy gossip round) and what reconnects after a connection is lost.
@@ -8206,7 +8217,7 @@ impl<T: 'static> GossipRegistry<T> {
             local_actors: local_pairs,
             known_actors: known_pairs,
             sender_peer_id: self.peer_id.clone(), // Use peer ID
-            sender_bind_addr: Some(self.advertised_addr().to_string()), // reachable advertised address (NAT-aware), not the raw bind
+            sender_bind_addr: self.advertised_bind_addr_for_wire(), // reachable advertised address (NAT-aware); None for client-only
             sequence,
             wall_clock_time: current_timestamp(),
             extensions: None,
@@ -8237,7 +8248,7 @@ impl<T: 'static> GossipRegistry<T> {
             local_actors: local_pairs,
             known_actors: known_pairs,
             sender_peer_id: self.peer_id.clone(), // Use peer ID
-            sender_bind_addr: Some(self.advertised_addr().to_string()), // reachable advertised address (NAT-aware), not the raw bind
+            sender_bind_addr: self.advertised_bind_addr_for_wire(), // reachable advertised address (NAT-aware); None for client-only
             sequence,
             wall_clock_time: current_timestamp(),
             extensions: None,
@@ -8994,6 +9005,10 @@ impl<T: 'static> GossipRegistry<T> {
     /// the owner pin check is evaluated at selection time.
     #[inline]
     fn is_effectively_dialable(&self, addr: SocketAddr, peer: &PeerInfo) -> bool {
+        // A client-only peer has no dialable address, whatever its record says.
+        if self.peer_is_client_only(peer) {
+            return false;
+        }
         if !peer.transport_source_keyed {
             return true;
         }
@@ -9047,6 +9062,11 @@ impl<T: 'static> GossipRegistry<T> {
 
     #[inline]
     fn should_suppress_outbound_retry_for_peer(&self, peer: &PeerInfo) -> bool {
+        // Client-only peers are never redialed, independent of the opt-in NAT
+        // heuristics below (which are address-based and off by default).
+        if self.peer_is_client_only(peer) {
+            return !self.peer_has_live_connection(peer);
+        }
         if !self.config.nat_role_reconnect_enabled {
             return false;
         }
@@ -9057,6 +9077,83 @@ impl<T: 'static> GossipRegistry<T> {
             return false;
         }
         !self.is_practically_dialable_from_here(peer.address)
+    }
+
+    /// Whether `peer`'s authenticated identity declared itself client-only.
+    #[inline]
+    fn peer_is_client_only(&self, peer: &PeerInfo) -> bool {
+        peer.node_id
+            .is_some_and(|node_id| self.client_only_peers.contains(&node_id.to_peer_id()))
+    }
+
+    /// Whether `peer` declared itself client-only in an authenticated Hello.
+    pub(crate) fn is_client_only_peer(&self, peer: &crate::PeerId) -> bool {
+        self.client_only_peers.contains(peer)
+    }
+
+    /// Bind address to advertise in FullSync-style messages: a client-only
+    /// node advertises nothing dialable.
+    pub(crate) fn advertised_bind_addr_for_wire(&self) -> Option<String> {
+        (!self.config.client_only).then(|| self.advertised_addr().to_string())
+    }
+
+    /// Record the role `peer` declared in its authenticated Hello. Returns the
+    /// session receipt for a client-only declaration.
+    pub(crate) fn note_remote_role(
+        &self,
+        peer: &crate::PeerId,
+        client_only: bool,
+    ) -> Option<crate::client_only::ClientOnlySession> {
+        self.client_only_peers.note_declared_role(peer, client_only)
+    }
+
+    /// A client-only session ended: drop the per-peer dial state we kept for
+    /// it so nothing can try to reach it afterwards. Fenced by the session
+    /// receipt (REMOTE-4): if the peer has since declared a newer session, or
+    /// has a live connection, this is a no-op. Operator-pinned routes are
+    /// left to the operator (the supervisor still skips them).
+    pub(crate) async fn release_client_only_session(
+        &self,
+        peer: &crate::PeerId,
+        session: crate::client_only::ClientOnlySession,
+    ) {
+        if !self.client_only_peers.is_current(peer, session) {
+            return;
+        }
+        let node_id = peer.to_node_id();
+        let mut gossip_state = self.gossip_state.lock().await;
+        // Re-check under the lock, after the await gap.
+        if !self.client_only_peers.is_current(peer, session)
+            || self.connection_pool.has_connection_by_peer_id(peer)
+        {
+            return;
+        }
+        let addrs: Vec<SocketAddr> = gossip_state
+            .peers
+            .iter()
+            .filter(|(addr, info)| {
+                info.node_id == Some(node_id) && !self.registry_owner.pin_is_current(addr, peer)
+            })
+            .map(|(addr, _)| *addr)
+            .collect();
+        for addr in &addrs {
+            gossip_state.peers.remove(addr);
+            gossip_state.known_peers.pop(addr);
+            if let Some(ref mut discovery) = gossip_state.peer_discovery {
+                discovery.on_peer_disconnected(*addr);
+            }
+        }
+        let stale_known: Vec<SocketAddr> = gossip_state
+            .known_peers
+            .iter()
+            .filter(|(addr, info)| {
+                info.node_id == Some(node_id) && !self.registry_owner.pin_is_current(addr, peer)
+            })
+            .map(|(addr, _)| *addr)
+            .collect();
+        for addr in stale_known {
+            gossip_state.known_peers.pop(&addr);
+        }
     }
 
     /// Snapshot the currently-known actor directory as owned `(name, location)` pairs.
@@ -13556,6 +13653,7 @@ impl<T: 'static> GossipRegistry<T> {
                 .known_peers
                 .iter()
                 .map(|(_, info)| info)
+                .filter(|p| !self.peer_is_client_only(p))
                 .filter(|p| {
                     crate::net_security::is_safe_to_dial(
                         &p.address,
@@ -13589,8 +13687,8 @@ impl<T: 'static> GossipRegistry<T> {
     }
 
     async fn gossip_peer_list_inner(&self, force: bool) -> Vec<GossipTask> {
-        // Check if peer discovery is enabled
-        if !self.config.enable_peer_discovery {
+        // A client-only node has no dialable address to advertise.
+        if !self.config.enable_peer_discovery || self.config.client_only {
             return Vec::new();
         }
 
@@ -19337,6 +19435,70 @@ mod tests {
             selected.contains(&addr),
             "a current operator pin must be eligible for gossip target selection"
         );
+    }
+
+    /// REMOTE-3: a peer that declared itself client-only is undialable
+    /// whatever its record says -- not a gossip/retry target, not
+    /// advertised to third parties, and not redialed even with the opt-in
+    /// NAT heuristics off -- and a regular declaration restores it.
+    #[tokio::test]
+    async fn client_only_identity_is_never_dialable_or_advertised() {
+        let registry = GossipRegistry::<()>::new(
+            test_addr(20_290),
+            GossipConfig {
+                allow_loopback_discovery: true,
+                ..test_config()
+            },
+        );
+        let addr = test_addr(20_291);
+        let node_id = test_peer_id("client-only-undialable").to_node_id();
+        let peer_id = node_id.to_peer_id();
+        {
+            let mut state = registry.gossip_state.lock().await;
+            state
+                .peers
+                .insert(addr, peer_info_with_node_id(addr, node_id));
+        }
+        assert!(!registry.config.nat_role_reconnect_enabled);
+        assert!(registry.should_attempt_outbound_dial(addr).await);
+        let advertised = |snap: &[PeerInfoGossip]| {
+            snap.iter().any(|p| p.address == addr.to_string())
+        };
+        assert!(advertised(&registry.peers_snapshot().await));
+
+        let session = registry
+            .note_remote_role(&peer_id, true)
+            .expect("client-only declaration yields a session receipt");
+        {
+            let state = registry.gossip_state.lock().await;
+            assert!(!registry.is_effectively_dialable(addr, &state.peers[&addr]));
+        }
+        assert!(!registry.should_attempt_outbound_dial(addr).await);
+        assert!(!advertised(&registry.peers_snapshot().await));
+        assert!(
+            !registry
+                .select_immediate_gossip_peers_for_test()
+                .await
+                .contains(&addr),
+            "client-only peers are not gossip dial targets"
+        );
+
+        // Session end drops the per-peer state, fenced by the receipt.
+        let newer = registry.note_remote_role(&peer_id, true).expect("newer");
+        registry.release_client_only_session(&peer_id, session).await;
+        assert!(
+            registry.gossip_state.lock().await.peers.contains_key(&addr),
+            "a stale receipt must not drop state of the successor session"
+        );
+        registry.release_client_only_session(&peer_id, newer).await;
+        assert!(
+            !registry.gossip_state.lock().await.peers.contains_key(&addr),
+            "ending the current client-only session drops its peer state"
+        );
+        assert!(registry.is_client_only_peer(&peer_id));
+
+        assert!(registry.note_remote_role(&peer_id, false).is_none());
+        assert!(!registry.is_client_only_peer(&peer_id));
     }
 
     /// A successful outbound dial is definitive, independent proof that
