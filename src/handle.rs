@@ -3598,6 +3598,17 @@ async fn handle_connection(
                 "TLS accept timed out"
             );
         }
+        Ok(Err(err)) if crate::tls::allowlist::peer_not_allowed(&err).is_some() => {
+            // Typed allowlist rejection: the verifier already emitted one
+            // rate-limited line for this identity; stay quiet here so
+            // repeated attempts cannot storm the log.
+            debug!(
+                target: "icanact_remote_lifecycle",
+                peer = %peer_addr,
+                error = %err,
+                "inbound TLS handshake rejected by peer allowlist"
+            );
+        }
         Ok(Err(err)) => {
             // `UnexpectedEof` here means the peer closed the raw TCP socket
             // before completing (often before *starting*) the TLS record

@@ -3527,9 +3527,10 @@ impl<T: 'static> GossipRegistry<T> {
     /// Enable TLS for secure connections
     /// This must be called before starting the registry to enable TLS
     pub fn enable_tls(&mut self, secret_key: crate::SecretKey) -> Result<()> {
-        self.tls_config = Some(Arc::new(crate::tls::TlsConfig::with_peer_discovery(
+        self.tls_config = Some(Arc::new(crate::tls::TlsConfig::with_options(
             secret_key,
             self.config.enable_peer_discovery,
+            self.config.inbound_peer_allowlist.clone(),
         )?));
         Ok(())
     }
