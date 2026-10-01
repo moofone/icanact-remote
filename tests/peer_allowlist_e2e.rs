@@ -54,10 +54,10 @@ async fn handshake(server: &TlsConfig, client: &TlsConfig) -> Handshake {
             let _ = tls.write_all(&[7]).await;
             let _ = tls.flush().await;
             let mut b = [0u8; 1];
-            match tokio::time::timeout(Duration::from_secs(5), tls.read_exact(&mut b)).await {
-                Ok(Ok(_)) => false,
-                _ => true,
-            }
+            !matches!(
+                tokio::time::timeout(Duration::from_secs(5), tls.read_exact(&mut b)).await,
+                Ok(Ok(_))
+            )
         }
     };
     let (server, server_err_peer) = server_task.await.unwrap();
