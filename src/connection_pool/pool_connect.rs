@@ -379,6 +379,7 @@ impl<T> ConnectionPool<T> {
             )),
             connection_counter: AtomicIsize::new(0),
             routing_revision: AtomicU64::new(0),
+            outbound_tcp_dial_attempts: AtomicU64::new(0),
             routing_change_notify: Arc::new(Notify::new()),
             #[cfg(test)]
             preferred_connection_checks: AtomicU64::new(0),
@@ -394,6 +395,12 @@ impl<T> ConnectionPool<T> {
     }
 
     #[inline]
+    /// Number of real outbound TCP dials this pool has started. Monotonic;
+    /// a diagnostic for proving that a peer is (not) being dialed.
+    pub fn outbound_tcp_dial_attempts(&self) -> u64 {
+        self.outbound_tcp_dial_attempts.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn routing_revision(&self) -> u64 {
         self.routing_revision.load(Ordering::Acquire)
     }
@@ -4281,7 +4288,7 @@ impl<T> ConnectionPool<T> {
                         local_actors,
                         known_actors,
                         gossip_state.gossip_sequence,
-                        Some(registry_arc.advertised_addr().to_string()),
+                        registry_arc.advertised_bind_addr_for_wire(),
                         crate::current_timestamp(),
                     )
                 };
@@ -5265,7 +5272,7 @@ pub(crate) fn handle_incoming_message_with_instance(
                         local_actors: our_local_actors,
                         known_actors: our_known_actors,
                         sender_peer_id: registry.peer_id.clone(), // Use peer ID
-                        sender_bind_addr: Some(registry.advertised_addr().to_string()), // reachable advertised address (NAT-aware)
+                        sender_bind_addr: registry.advertised_bind_addr_for_wire(), // reachable advertised address (NAT-aware); None for client-only
                         sequence: our_sequence,
                         wall_clock_time: crate::current_timestamp(),
                         extensions: registry

@@ -1,14 +1,17 @@
+pub mod allowlist;
 pub mod name;
 pub mod resolver;
 
 use crate::{GossipNodeId, Result, SecretKey};
+use rustls::OtherError;
 use rustls::client::Resumption;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::version::TLS13;
 use rustls::{
-    ClientConfig, DigitallySignedStruct, DistinguishedName, Error, ServerConfig, SignatureScheme,
+    CertificateError, ClientConfig, DigitallySignedStruct, DistinguishedName, Error, ServerConfig,
+    SignatureScheme,
 };
 use std::sync::Arc;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -33,10 +36,22 @@ impl TlsConfig {
     }
 
     pub fn with_peer_discovery(secret_key: SecretKey, enable_peer_discovery: bool) -> Result<Self> {
+        Self::with_options(secret_key, enable_peer_discovery, None)
+    }
+
+    /// Like [`Self::with_peer_discovery`], additionally enforcing an optional
+    /// inbound [`allowlist::PeerAllowlist`] during client-certificate
+    /// verification.
+    pub fn with_options(
+        secret_key: SecretKey,
+        enable_peer_discovery: bool,
+        inbound_allowlist: Option<allowlist::PeerAllowlist>,
+    ) -> Result<Self> {
         ensure_crypto_provider();
         let node_id = secret_key.public();
         let client_config = make_client_config(&secret_key, enable_peer_discovery)?;
-        let server_config = make_server_config(&secret_key, enable_peer_discovery)?;
+        let server_config =
+            make_server_config(&secret_key, enable_peer_discovery, inbound_allowlist)?;
         Ok(Self {
             secret_key,
             node_id,
@@ -76,9 +91,10 @@ fn make_client_config(
 fn make_server_config(
     secret_key: &SecretKey,
     _enable_peer_discovery: bool,
+    inbound_allowlist: Option<allowlist::PeerAllowlist>,
 ) -> Result<ServerConfig> {
     let mut config = ServerConfig::builder_with_protocol_versions(&[&TLS13])
-        .with_client_cert_verifier(Arc::new(NodeIdClientVerifier::new()))
+        .with_client_cert_verifier(Arc::new(NodeIdClientVerifier::new(inbound_allowlist)))
         .with_cert_resolver(Arc::new(resolver::AlwaysResolvesCert::new(secret_key)?));
     config.alpn_protocols = vec![ALPN_ICANACT_V6.to_vec()];
     config.send_tls13_tickets = 0;
@@ -154,11 +170,27 @@ impl ServerCertVerifier for NodeIdServerVerifier {
 }
 
 #[derive(Debug)]
-struct NodeIdClientVerifier;
+struct NodeIdClientVerifier {
+    allowlist: Option<allowlist::PeerAllowlist>,
+    reject_log: RejectLogLimiterCell,
+}
+
+/// `Debug` shim: the limiter holds only log-dedupe bookkeeping.
+#[derive(Default)]
+struct RejectLogLimiterCell(allowlist::RejectLogLimiter);
+
+impl std::fmt::Debug for RejectLogLimiterCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RejectLogLimiter")
+    }
+}
 
 impl NodeIdClientVerifier {
-    fn new() -> Self {
-        Self
+    fn new(allowlist: Option<allowlist::PeerAllowlist>) -> Self {
+        Self {
+            allowlist,
+            reject_log: RejectLogLimiterCell::default(),
+        }
     }
 }
 
@@ -169,7 +201,24 @@ impl ClientCertVerifier for NodeIdClientVerifier {
         _intermediates: &[CertificateDer<'_>],
         _now: UnixTime,
     ) -> std::result::Result<ClientCertVerified, Error> {
-        let _node_id = extract_node_id_from_cert(end_entity)?;
+        let node_id = extract_node_id_from_cert(end_entity)?;
+        if let Some(allowlist) = &self.allowlist {
+            // REMOTE-3: decided on the certificate's Ed25519 identity only;
+            // the TLS signature check proves key possession afterwards.
+            let peer_id = crate::PeerId::from_public_key(&node_id);
+            if !allowlist.contains(&peer_id) {
+                if self.reject_log.0.should_log(&peer_id) {
+                    tracing::warn!(
+                        target: "icanact_remote_lifecycle",
+                        peer_id = %peer_id,
+                        "inbound_peer_not_allowlisted (handshake rejected; further attempts by this identity are not logged for 60s)"
+                    );
+                }
+                return Err(Error::InvalidCertificate(CertificateError::Other(
+                    OtherError(Arc::new(allowlist::PeerNotAllowed { peer_id })),
+                )));
+            }
+        }
         Ok(ClientCertVerified::assertion())
     }
 
@@ -247,7 +296,7 @@ mod tests {
 
     #[test]
     fn client_cert_verifier_requires_authenticated_clients() {
-        let verifier = NodeIdClientVerifier::new();
+        let verifier = NodeIdClientVerifier::new(None);
 
         assert!(verifier.client_auth_mandatory());
     }

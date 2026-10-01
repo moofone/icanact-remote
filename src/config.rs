@@ -306,6 +306,20 @@ pub struct GossipConfig {
     /// Default: 250 ms. Set very small (e.g., 20 ms) in tests for
     /// determinism.
     pub tie_break_reconnect_cooldown: Duration,
+    /// Opt-in client-only role (default `false`).
+    ///
+    /// A client-only node only ever makes outbound connections: it never
+    /// advertises a dialable address, and it tells every peer (via the Hello
+    /// handshake, authenticated by mTLS) that it must never be dialed back.
+    /// A peer that learns this refuses to dial, gossip-dial, supervise, or
+    /// retry this identity, and never gossips it onward as a dial target.
+    /// Messages still flow both ways over the client-initiated session.
+    pub client_only: bool,
+    /// Opt-in inbound peer allowlist (default `None` = accept any peer that
+    /// proves key ownership). When set, a client whose authenticated
+    /// [`crate::PeerId`] is not in the set is rejected during the TLS
+    /// handshake. Keep a clone to swap the set at runtime.
+    pub inbound_peer_allowlist: Option<crate::tls::allowlist::PeerAllowlist>,
 }
 
 impl Default for GossipConfig {
@@ -388,6 +402,8 @@ impl Default for GossipConfig {
             tie_break_reconnect_cooldown: Duration::from_millis(
                 DEFAULT_TIE_BREAK_RECONNECT_COOLDOWN_MS,
             ),
+            client_only: false,
+            inbound_peer_allowlist: None,
         }
     }
 }

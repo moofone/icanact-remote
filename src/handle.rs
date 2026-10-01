@@ -3598,6 +3598,17 @@ async fn handle_connection(
                 "TLS accept timed out"
             );
         }
+        Ok(Err(err)) if crate::tls::allowlist::peer_not_allowed(&err).is_some() => {
+            // Typed allowlist rejection: the verifier already emitted one
+            // rate-limited line for this identity; stay quiet here so
+            // repeated attempts cannot storm the log.
+            debug!(
+                target: "icanact_remote_lifecycle",
+                peer = %peer_addr,
+                error = %err,
+                "inbound TLS handshake rejected by peer allowlist"
+            );
+        }
         Ok(Err(err)) => {
             // `UnexpectedEof` here means the peer closed the raw TCP socket
             // before completing (often before *starting*) the TLS record
@@ -3653,12 +3664,13 @@ async fn handle_connection(
             let hello_started = Instant::now();
             let capabilities = match tokio::time::timeout(
                 registry.config.connection_timeout,
-                crate::handshake::perform_hello_handshake(
+                crate::handshake::perform_hello_handshake_with_role(
                     &mut tls_stream,
                     negotiated_alpn.as_deref(),
                     registry.config.enable_peer_discovery,
                     registry.config.schema_hash,
                     registry.boot_id,
+                    registry.config.client_only,
                 ),
             )
             .await
@@ -3699,6 +3711,10 @@ async fn handle_connection(
             };
 
             registry.set_peer_capabilities(peer_addr, capabilities);
+            // REMOTE-3: the role is bound to the TLS-authenticated identity.
+            let client_only_session = peer_node_id.and_then(|node_id| {
+                registry.note_remote_role(&node_id.to_peer_id(), capabilities.remote_client_only)
+            });
             if let Some(node_id) = registry.lookup_node_id(&peer_addr).await {
                 registry
                     .associate_peer_capabilities_with_node(peer_addr, node_id)
@@ -3706,6 +3722,7 @@ async fn handle_connection(
             }
 
             let registry_weak = Arc::downgrade(&registry);
+            let registry_for_release = client_only_session.map(|_| Arc::clone(&registry));
             match handle_incoming_connection_tls(
                 tls_stream,
                 peer_addr,
@@ -3722,6 +3739,15 @@ async fn handle_connection(
                 ConnectionCloseOutcome::DroppedByTieBreaker => {
                     debug!(peer = %peer_addr, "stream connection dropped by tie-breaker");
                 }
+            }
+            // Session over: drop the client-only peer's dial state, fenced by
+            // this exact session's receipt (REMOTE-4).
+            if let (Some(registry), Some(session), Some(node_id)) =
+                (registry_for_release, client_only_session, peer_node_id)
+            {
+                registry
+                    .release_client_only_session(&node_id.to_peer_id(), session)
+                    .await;
             }
         }
     }
