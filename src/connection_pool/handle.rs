@@ -872,6 +872,35 @@ impl<T> ConnectionHandle<T> {
         .await
     }
 
+    /// Ask an actor and return, together with the aligned reply, the
+    /// certificate-authenticated identity of the connection whose read
+    /// context completed THIS reply.
+    ///
+    /// The identity is snapshotted into the correlation slot in the same
+    /// write as the payload -- it is not looked up afterwards from address or
+    /// peer indexes, which can change under a reconnect. If the answering
+    /// connection has no authenticated identity (plaintext, no usable
+    /// certificate, or a completion path that does not carry one) this
+    /// returns `GossipError::AuthenticationFailed`, never a placeholder; a
+    /// peer NACK is still reported as `GossipError::AskNacked`.
+    ///
+    /// Callers that required a specific peer must compare the returned
+    /// identity themselves: an address-keyed connection reuse can hand back a
+    /// connection authenticated as a different peer than the one requested.
+    pub async fn ask_actor_frame_aligned_attributed(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+        timeout: Duration,
+    ) -> Result<(crate::PeerId, crate::AlignedBytes)> {
+        self.ask_actor_frame_outcome_with_optional_request_id(
+            actor_id, type_hash, payload, timeout, None,
+        )
+        .await
+        .and_then(CorrelationOutcome::into_attributed_result)
+    }
+
     async fn ask_actor_frame_aligned_with_optional_request_id(
         &self,
         actor_id: u64,
@@ -880,6 +909,23 @@ impl<T> ConnectionHandle<T> {
         timeout: Duration,
         request_id: Option<u64>,
     ) -> Result<crate::AlignedBytes> {
+        self.ask_actor_frame_outcome_with_optional_request_id(
+            actor_id, type_hash, payload, timeout, request_id,
+        )
+        .await
+        .and_then(CorrelationOutcome::into_result)
+    }
+
+    /// Shared ask engine: returns the raw completed slot outcome so the
+    /// plain and attributed asks differ only in how they interpret it.
+    async fn ask_actor_frame_outcome_with_optional_request_id(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+        timeout: Duration,
+        request_id: Option<u64>,
+    ) -> Result<CorrelationOutcome> {
         require_positive_timeout(timeout)?;
         let started_at = Instant::now();
         let slot = self.correlation.allocate()?;
@@ -920,7 +966,7 @@ impl<T> ConnectionHandle<T> {
                 return Err(e);
             }
             self.correlation
-                .wait_for_response_no_timeout(correlation_id)
+                .wait_for_response_no_timeout_outcome(correlation_id)
                 .await
         })
         .await;
@@ -2275,6 +2321,7 @@ mod oversized_inline_send_gate_tests {
     ) {
         let (client, peer) = tokio::io::duplex(4 * 1024 * 1024);
         let read_context = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: std::sync::Weak::new(),
             peer_addr: test_addr(),

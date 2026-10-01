@@ -29,6 +29,15 @@ pub struct ReadContext {
     /// This is used to avoid mis-attributing disconnects from stale/duplicate
     /// connections (for example tie-breaker drops during simultaneous dial).
     pub(crate) peer_id: Option<crate::PeerId>,
+    /// Identity this exact physical connection cryptographically proved
+    /// (derived from its own TLS peer certificate), or `None` when the
+    /// session proved none (plaintext, or no usable certificate).
+    ///
+    /// Unlike `peer_id` this is never filled from address caches or
+    /// configuration, so it is safe to attribute replies to. Replies completed
+    /// by this connection's read pipeline snapshot it into the correlation slot
+    /// (`CorrelationTracker::complete_attributed`).
+    pub(crate) authenticated_peer_id: Option<Arc<crate::PeerId>>,
     pub(crate) max_message_size: usize,
     pub(crate) expected_schema_hash: Option<u64>,
     pub(crate) aligned_pool: Arc<crate::AlignedBytesPool>,
@@ -77,6 +86,7 @@ mod read_pipeline_tests {
         writer.write_all(&0u32.to_be_bytes()).await.unwrap();
 
         let ctx = super::ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: std::sync::Weak::new(),
             peer_addr: "127.0.0.1:9000".parse().unwrap(),
@@ -114,6 +124,7 @@ mod read_pipeline_tests {
         let (mut writer, mut reader) = tokio::io::duplex(frame.len());
         writer.write_all(&frame).await.unwrap();
         let ctx = super::ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: std::sync::Weak::new(),
             peer_addr: "127.0.0.1:9001".parse().unwrap(),
@@ -205,6 +216,7 @@ mod read_pipeline_tests {
 
     fn test_read_context(port: u16) -> super::ReadContext {
         super::ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: std::sync::Weak::new(),
             peer_addr: format!("127.0.0.1:{port}").parse().unwrap(),
@@ -2183,6 +2195,7 @@ where
                 };
                 if let Some(disposition) = disposition {
                     let temp_ctx = ReadContext {
+                        authenticated_peer_id: None,
                         streaming_state_handoff: None,
                         registry_weak: Arc::downgrade(registry),
                         peer_addr,
@@ -2657,7 +2670,11 @@ where
         }) => {
             let mut payload = Some(payload);
             if let Some(correlation) = ctx.response_correlation.as_deref()
-                && correlation.complete(correlation_id, &mut payload)
+                && correlation.complete_attributed(
+                    correlation_id,
+                    &mut payload,
+                    ctx.authenticated_peer_id.as_ref(),
+                )
             {
                 return Ok(None);
             }
@@ -2672,7 +2689,11 @@ where
         }) => {
             let mut payload = Some(payload);
             if let Some(correlation) = ctx.response_correlation.as_deref()
-                && correlation.complete(correlation_id, &mut payload)
+                && correlation.complete_attributed(
+                    correlation_id,
+                    &mut payload,
+                    ctx.authenticated_peer_id.as_ref(),
+                )
             {
                 return Ok(None);
             }

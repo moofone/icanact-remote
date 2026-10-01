@@ -117,6 +117,28 @@ impl RemoteConnection {
             .await
     }
 
+    /// Ask an actor and also return the certificate-authenticated identity of
+    /// the connection that produced the reply.
+    ///
+    /// The identity is captured atomically with the reply by the connection
+    /// whose read pipeline completed it (not via a separate address lookup),
+    /// so a caller that expects a specific peer can refuse a reply whose
+    /// returned [`crate::PeerId`] differs -- including when an address-keyed
+    /// connection was reused for a peer with a different identity. A
+    /// connection with no authenticated identity yields
+    /// [`crate::GossipError::AuthenticationFailed`], never a placeholder.
+    pub async fn ask_actor_frame_aligned_attributed(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+        timeout: Duration,
+    ) -> crate::Result<(crate::PeerId, crate::AlignedBytes)> {
+        self.inner
+            .ask_actor_frame_aligned_attributed(actor_id, type_hash, payload, timeout)
+            .await
+    }
+
     /// Ask an actor with a caller-controlled out-of-band request id. The
     /// identity is carried in the uncompact ActorAsk header and is available
     /// through the receiver's [`crate::AskContext::request_id`].

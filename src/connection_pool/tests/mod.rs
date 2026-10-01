@@ -229,6 +229,7 @@ fn simultaneous_multi_mib_asks_complete_over_constrained_duplex() {
         let (io_a, io_b) = tokio::io::duplex(DUPLEX_CAPACITY);
 
         let read_ctx_a = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&registry_a),
             peer_addr: addr_b,
@@ -247,6 +248,7 @@ fn simultaneous_multi_mib_asks_complete_over_constrained_duplex() {
             sync_actor_handler: registry_a.actor_message_handler_sync.load_full(),
         };
         let read_ctx_b = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&registry_b),
             peer_addr: addr_a,
@@ -423,6 +425,7 @@ fn wedged_streaming_write_does_not_stop_the_io_task_from_processing_a_buffered_r
         let wedged_stream = WriteWedgedStream { inner: io_wedged };
 
         let read_ctx_wedged = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&registry_wedged),
             peer_addr: addr_peer,
@@ -615,6 +618,7 @@ fn wedged_automatic_flush_does_not_stop_the_io_task_from_processing_a_buffered_r
         let wedged_stream = FlushWedgedStream { inner: io_wedged };
 
         let read_ctx_wedged = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&registry_wedged),
             peer_addr: addr_peer,
@@ -766,6 +770,7 @@ fn local_streaming_queue_full_does_not_stop_the_io_task_from_processing_a_later_
         let wedged_stream = WriteWedgedStream { inner: io_wedged };
 
         let read_ctx_wedged = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&registry_wedged),
             peer_addr: addr_peer,
@@ -939,6 +944,7 @@ fn ask_dispatch_is_skipped_not_consumed_when_streaming_queue_has_no_room() {
         let wedged_stream = WriteWedgedStream { inner: io_wedged };
 
         let read_ctx_wedged = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&registry_wedged),
             peer_addr: addr_peer,
@@ -1217,6 +1223,7 @@ fn ask_backpressure_nack_never_splices_into_an_in_flight_streaming_frame() {
         };
 
         let read_ctx_wedged = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&registry_wedged),
             peer_addr: addr_peer,
@@ -1266,6 +1273,7 @@ fn ask_backpressure_nack_never_splices_into_an_in_flight_streaming_frame() {
         ));
         let correlation_peer = CorrelationTracker::new();
         let read_ctx_peer = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&registry_peer),
             peer_addr: addr_wedged,
@@ -2125,6 +2133,7 @@ fn deferred_actor_ask_sync_replies_via_responder() {
         let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
 
         let client_read_ctx = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&client_registry),
             peer_addr: server_addr,
@@ -2160,6 +2169,7 @@ fn deferred_actor_ask_sync_replies_via_responder() {
 
         let response_writer = Arc::new(crate::ask_responder::ResponseWriter::new(client_addr));
         let server_read_ctx = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&server_registry),
             peer_addr: client_addr,
@@ -2244,6 +2254,7 @@ fn ask_immediate_handler_sync_error_nacks_instead_of_letting_the_asker_time_out(
         let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
 
         let client_read_ctx = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&client_registry),
             peer_addr: server_addr,
@@ -2279,6 +2290,7 @@ fn ask_immediate_handler_sync_error_nacks_instead_of_letting_the_asker_time_out(
 
         let response_writer = Arc::new(crate::ask_responder::ResponseWriter::new(client_addr));
         let server_read_ctx = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&server_registry),
             peer_addr: client_addr,
@@ -2371,6 +2383,7 @@ fn ask_handler_sync_error_nacks_instead_of_letting_the_asker_time_out() {
         let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
 
         let client_read_ctx = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&client_registry),
             peer_addr: server_addr,
@@ -2408,6 +2421,7 @@ fn ask_handler_sync_error_nacks_instead_of_letting_the_asker_time_out() {
         // `ask_context_from_context`), same as the deferred-reply test above.
         let response_writer = Arc::new(crate::ask_responder::ResponseWriter::new(client_addr));
         let server_read_ctx = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&server_registry),
             peer_addr: client_addr,
@@ -2495,6 +2509,7 @@ fn deferred_actor_ask_pending_wait_replies_repeatedly() {
         let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
 
         let client_read_ctx = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&client_registry),
             peer_addr: server_addr,
@@ -2530,6 +2545,7 @@ fn deferred_actor_ask_pending_wait_replies_repeatedly() {
 
         let response_writer = Arc::new(crate::ask_responder::ResponseWriter::new(client_addr));
         let server_read_ctx = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&server_registry),
             peer_addr: client_addr,
@@ -2614,6 +2630,7 @@ fn deferred_actor_ask_still_dispatches_when_immediate_handler_declines() {
         let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
 
         let client_read_ctx = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&client_registry),
             peer_addr: server_addr,
@@ -2649,6 +2666,7 @@ fn deferred_actor_ask_still_dispatches_when_immediate_handler_declines() {
 
         let response_writer = Arc::new(crate::ask_responder::ResponseWriter::new(client_addr));
         let server_read_ctx = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&server_registry),
             peer_addr: client_addr,
@@ -2733,6 +2751,7 @@ fn get_connection_to_peer_reuses_existing_connection_correlation_tracker() {
         );
 
         let client_read_ctx = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&client_registry),
             peer_addr: server_addr,
@@ -2773,6 +2792,7 @@ fn get_connection_to_peer_reuses_existing_connection_correlation_tracker() {
 
         let response_writer = Arc::new(crate::ask_responder::ResponseWriter::new(client_addr));
         let server_read_ctx = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&server_registry),
             peer_addr: client_addr,
@@ -3417,6 +3437,7 @@ fn nine_queued_ask_nacks_all_reach_the_wire_without_further_traffic() {
 
         let (server_io, mut peer_io) = tokio::io::duplex(1024 * 1024);
         let server_read_ctx = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&server_registry),
             peer_addr,
@@ -3533,6 +3554,7 @@ fn ninety_six_queued_ask_nacks_all_reach_the_wire_none_evicted() {
 
         let (server_io, mut peer_io) = tokio::io::duplex(1024 * 1024);
         let server_read_ctx = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&server_registry),
             peer_addr,
@@ -5176,6 +5198,7 @@ fn stream_direct_ask_throughput_bench() {
 
         let (client_io, mut server_io) = tokio::io::duplex(1024 * 1024);
         let client_read_ctx = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&registry),
             peer_addr: server_addr,
@@ -5640,6 +5663,7 @@ fn stream_protocol_ask_throughput_bench() {
         let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
 
         let client_read_ctx = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&client_registry),
             peer_addr: server_addr,
@@ -5677,6 +5701,7 @@ fn stream_protocol_ask_throughput_bench() {
         );
 
         let server_read_ctx = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&server_registry),
             peer_addr: client_addr,
@@ -5972,6 +5997,7 @@ fn stream_protocol_direct_ask_inflight64_bench() {
 
         let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
         let client_read_ctx = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&client_registry),
             peer_addr: server_addr,
@@ -6009,6 +6035,7 @@ fn stream_protocol_direct_ask_inflight64_bench() {
         );
 
         let server_read_ctx = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&server_registry),
             peer_addr: client_addr,
@@ -6125,6 +6152,7 @@ fn stream_protocol_actor_ask_inflight64_bench() {
 
         let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
         let client_read_ctx = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&client_registry),
             peer_addr: server_addr,
@@ -6162,6 +6190,7 @@ fn stream_protocol_actor_ask_inflight64_bench() {
         );
 
         let server_read_ctx = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&server_registry),
             peer_addr: client_addr,
@@ -6289,6 +6318,7 @@ fn stream_protocol_tell_throughput_bench() {
         let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
 
         let client_read_ctx = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&client_registry),
             peer_addr: server_addr,
@@ -6326,6 +6356,7 @@ fn stream_protocol_tell_throughput_bench() {
         );
 
         let server_read_ctx = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: Arc::downgrade(&server_registry),
             peer_addr: client_addr,
@@ -6539,6 +6570,7 @@ fn accept_path_streaming_state_handoff_completes_a_stream_split_across_the_first
         let (mut client_io, server_io) = tokio::io::duplex(1024 * 1024);
 
         let server_read_ctx = ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: Some(Arc::clone(&handoff)),
             registry_weak: Arc::downgrade(&server_registry),
             peer_addr: client_addr,
@@ -13531,6 +13563,7 @@ async fn retire_displaced_expected_exit_guard_must_not_cancel_via_task_abort_whe
     // `ExitGuard` captured NO peer_id at spawn time.
     let (io, _keep) = tokio::io::duplex(1024);
     let read_ctx = ReadContext {
+        authenticated_peer_id: None,
         streaming_state_handoff: None,
         registry_weak: Arc::downgrade(&registry),
         peer_addr: addr,

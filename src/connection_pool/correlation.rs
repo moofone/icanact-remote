@@ -11,15 +11,35 @@ const SLOT_READY: u8 = 3;
 /// it costs nothing beyond what `Response` already pays to publish a payload.
 pub(crate) enum CorrelationOutcome {
     Response(crate::AlignedBytes),
+    /// A real payload completed by a connection whose read context carried a
+    /// certificate-authenticated identity. The identity is published in the
+    /// same slot write as the payload, so the two can never be torn apart.
+    /// (`Arc` keeps the slot ring small: the identity is shared with the
+    /// completing connection's `ReadContext`, not copied per reply.)
+    Attributed(crate::AlignedBytes, Arc<crate::PeerId>),
     Nack(crate::framing::AskNackReason),
 }
 
 impl CorrelationOutcome {
     /// Convert to the `Result` a waiter actually receives: a NACK becomes an
     /// immediate typed error rather than a payload the caller must inspect.
-    fn into_result(self) -> Result<crate::AlignedBytes> {
+    pub(crate) fn into_result(self) -> Result<crate::AlignedBytes> {
         match self {
-            Self::Response(bytes) => Ok(bytes),
+            Self::Response(bytes) | Self::Attributed(bytes, _) => Ok(bytes),
+            Self::Nack(reason) => Err(crate::GossipError::AskNacked(reason)),
+        }
+    }
+
+    /// Like [`Self::into_result`], but also yields the authenticated identity
+    /// of the connection that completed the reply. A reply completed without
+    /// an authenticated identity is an error, never a placeholder.
+    pub(crate) fn into_attributed_result(self) -> Result<(crate::PeerId, crate::AlignedBytes)> {
+        match self {
+            Self::Attributed(bytes, peer) => Ok(((*peer).clone(), bytes)),
+            Self::Response(_) => Err(crate::GossipError::AuthenticationFailed(
+                "reply was not completed by a connection with an authenticated peer identity"
+                    .to_string(),
+            )),
             Self::Nack(reason) => Err(crate::GossipError::AskNacked(reason)),
         }
     }
@@ -297,6 +317,19 @@ impl CorrelationTracker {
         correlation_id: u32,
         response: &mut Option<crate::AlignedBytes>,
     ) -> bool {
+        self.complete_attributed(correlation_id, response, None)
+    }
+
+    /// [`Self::complete`], additionally snapshotting `completed_by` -- the
+    /// authenticated identity of the connection whose read context is
+    /// completing this reply -- into the slot together with the payload.
+    /// `None` publishes a plain, unattributed response.
+    pub(crate) fn complete_attributed(
+        &self,
+        correlation_id: u32,
+        response: &mut Option<crate::AlignedBytes>,
+        completed_by: Option<&Arc<crate::PeerId>>,
+    ) -> bool {
         let Some(slot_ref) = self.claim_slot_for_completion(correlation_id) else {
             return false;
         };
@@ -305,7 +338,11 @@ impl CorrelationTracker {
             slot_ref.waker.wake();
             return false;
         };
-        Self::publish_outcome(slot_ref, CorrelationOutcome::Response(response));
+        let outcome = match completed_by {
+            Some(peer) => CorrelationOutcome::Attributed(response, Arc::clone(peer)),
+            None => CorrelationOutcome::Response(response),
+        };
+        Self::publish_outcome(slot_ref, outcome);
         true
     }
 
@@ -539,13 +576,24 @@ impl CorrelationTracker {
         &self,
         correlation_id: u32,
     ) -> Result<crate::AlignedBytes> {
+        self.wait_for_response_no_timeout_outcome(correlation_id)
+            .await
+            .and_then(CorrelationOutcome::into_result)
+    }
+
+    /// Wait for the slot's raw outcome (payload, attributed payload, or NACK)
+    /// without converting it, so callers can choose how to interpret it.
+    async fn wait_for_response_no_timeout_outcome(
+        &self,
+        correlation_id: u32,
+    ) -> Result<CorrelationOutcome> {
         let slot = Self::slot_index(correlation_id);
         let slot_ref = &self.pending[slot];
 
         futures::future::poll_fn(|cx| {
             match Self::try_take_ready(slot_ref, correlation_id) {
                 ReadyTake::Taken(outcome) => {
-                    return std::task::Poll::Ready(outcome.into_result());
+                    return std::task::Poll::Ready(Ok(outcome));
                 }
                 ReadyTake::ForeignReady => {
                     return std::task::Poll::Ready(Err(crate::GossipError::ConnectionDropped));
@@ -565,7 +613,7 @@ impl CorrelationTracker {
             }
             match Self::try_take_ready(slot_ref, correlation_id) {
                 ReadyTake::Taken(outcome) => {
-                    return std::task::Poll::Ready(outcome.into_result());
+                    return std::task::Poll::Ready(Ok(outcome));
                 }
                 ReadyTake::ForeignReady => {
                     return std::task::Poll::Ready(Err(crate::GossipError::ConnectionDropped));
@@ -662,7 +710,8 @@ mod correlation_tests {
     /// otherwise (test helper).
     fn expect_taken(take: ReadyTake, msg: &str) -> crate::AlignedBytes {
         match take {
-            ReadyTake::Taken(CorrelationOutcome::Response(response)) => response,
+            ReadyTake::Taken(CorrelationOutcome::Response(response))
+            | ReadyTake::Taken(CorrelationOutcome::Attributed(response, _)) => response,
             ReadyTake::Taken(CorrelationOutcome::Nack(reason)) => {
                 panic!("{msg}: slot held a NACK ({reason}), not a response")
             }

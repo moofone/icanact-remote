@@ -4222,6 +4222,9 @@ where
             .get_or_create_correlation_tracker(&peer_id);
         let response_writer = Arc::new(crate::ask_responder::ResponseWriter::new(peer_addr));
         let read_context = crate::connection_pool::ReadContext {
+            // `peer_id` was verified above to equal the TLS client
+            // certificate's GossipNodeId (`inbound_tls_sender_is_authenticated`).
+            authenticated_peer_id: Some(Arc::new(peer_id.clone())),
             streaming_state_handoff: Some(streaming_state_handoff.clone()),
             registry_weak: Arc::downgrade(&registry),
             peer_addr,

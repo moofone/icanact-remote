@@ -1230,6 +1230,7 @@ mod size_gate_tests {
     ) {
         let (client, peer) = tokio::io::duplex(8 * 1024);
         let read_context = crate::connection_pool::ReadContext {
+            authenticated_peer_id: None,
             streaming_state_handoff: None,
             registry_weak: std::sync::Weak::new(),
             peer_addr: format!("127.0.0.1:{port}").parse().unwrap(),

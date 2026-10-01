@@ -53,6 +53,7 @@ fn response_budget_read_context(
     addr: std::net::SocketAddr,
 ) -> ReadContext {
     ReadContext {
+        authenticated_peer_id: None,
         streaming_state_handoff: None,
         registry_weak: Arc::downgrade(registry),
         peer_addr: addr,
