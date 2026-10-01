@@ -65,6 +65,37 @@ use icanact_remote::{DnsResolver, GossipRegistryHandle, TokioDnsResolver};
 
 You can also associate a DNS name with a peer address through `handle.set_peer_dns_name(...)`.
 
+## Client-only peers (push to NAT/VPN clients)
+
+Both features below are opt-in; defaults are unchanged.
+
+**Client-only role.** A laptop/CLI that only makes outbound connections sets
+`GossipConfig { client_only: true, .. }`. It advertises no dialable address and
+declares the role in its mTLS-authenticated Hello (`Feature::ClientOnly`). A
+peer that learns this never dials, supervises, retries, or gossips that
+identity as a dial target (any fresh dial toward it fails with
+`GossipError::ClientOnlyPeer`), so a LAN server does not dial back toward
+laptops or log "required peer unreachable" for them. While the client is
+connected the server can still `tell`/`ask` its actors and send replies over
+the client-initiated session (`client().lookup_connected_peer(&peer_id)`). When
+the session ends the server drops the peer's dial state, fenced by that exact
+session. The client keeps its configured-peer supervisor (and DNS refresh) and
+re-subscribes from the existing `PeerConnectHandler` / `PeerDisconnectHandler`
+callbacks. The role is bound to the authenticated `PeerId`, never an address.
+`Feature::ClientOnly` is a new Hello variant: enable `client_only` only against
+servers that have this version.
+
+**Inbound allowlist.** `GossipConfig { inbound_peer_allowlist: Some(list), .. }`
+rejects, during the TLS handshake, any client whose authenticated `PeerId` is
+not in the `PeerAllowlist` (typed `tls::allowlist::PeerNotAllowed`, recoverable
+from the accept error with `tls::allowlist::peer_not_allowed`). Rejections log
+one line per identity per 60 s. Keep a clone of the list and call
+`list.replace(new_peer_ids)` to swap the whole set atomically at runtime; it
+applies to new handshakes. Existing sessions are not torn down by a swap.
+
+See `examples/client_only_push_{server,client}.rs` (run the server first), and
+the `tests/client_only_peer_e2e.rs` / `tests/peer_allowlist_e2e.rs` suites.
+
 ## Key types
 
 - `SecretKey` is the private Ed25519 signing key used for TLS identity.
