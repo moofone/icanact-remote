@@ -400,6 +400,49 @@ mod qa_queue_retention_review {
 /// work rather than folded into this fix.
 const STREAM_WRITE_SLICE_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// Log the end of the read side. A peer close between frames (TLS
+/// `close_notify`) is expected and marks the exit orderly; everything else
+/// (truncation, TLS errors, protocol violations) stays a warning.
+fn log_read_exit(error: &GossipError, orderly_exit: &AtomicBool, peer: SocketAddr) {
+    if is_orderly_peer_close(error) {
+        orderly_exit.store(true, Ordering::Release);
+        debug!(%peer, "peer closed the connection cleanly between frames");
+    } else {
+        warn!(%peer, error = %error, "IO task read error");
+    }
+}
+
+/// Upper bound on the graceful TLS close performed when the IO task is asked to
+/// shut down at a frame boundary: it covers flushing already-written bytes and
+/// emitting the `close_notify` alert. The peer's reciprocal alert is never
+/// awaited, so a non-reading or half-open peer costs at most this long.
+pub(crate) const GRACEFUL_CLOSE_TIMEOUT: Duration = Duration::from_millis(1000);
+
+/// Flush and shut down the write half (for TLS: emit `close_notify`), bounded
+/// by [`GRACEFUL_CLOSE_TIMEOUT`]. Returns whether the close completed.
+///
+/// Only call this when no frame is partially written: the bound can cancel the
+/// shutdown mid-flight, after which the stream must be dropped, never reused.
+pub(crate) async fn close_stream_gracefully<S>(stream: &mut S) -> bool
+where
+    S: AsyncWrite + Unpin,
+{
+    match tokio::time::timeout(GRACEFUL_CLOSE_TIMEOUT, stream.shutdown()).await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            debug!(%error, "graceful close failed; dropping the stream");
+            false
+        }
+        Err(_elapsed) => {
+            warn!(
+                timeout = ?GRACEFUL_CLOSE_TIMEOUT,
+                "graceful close timed out (peer not reading?); dropping the stream"
+            );
+            false
+        }
+    }
+}
+
 /// See `STREAM_WRITE_SLICE_TIMEOUT`.
 const STREAM_WRITE_STUCK_TEARDOWN: Duration = Duration::from_secs(30);
 
@@ -2640,6 +2683,10 @@ impl LockFreeStreamHandle {
         let exit_flag = Arc::new(AtomicBool::new(false));
         let exit_notify = Arc::new(Notify::new());
         let known_superseded = Arc::new(AtomicBool::new(false));
+        // Set by the IO task when it ends for an expected reason (the peer
+        // closed between frames, or a local graceful shutdown completed), so
+        // exit logging can tell it from a fault.
+        let orderly_exit = Arc::new(AtomicBool::new(false));
 
         // Create shared counter for actual TCP bytes written
         let bytes_written = Arc::new(AtomicUsize::new(0));
@@ -2670,6 +2717,7 @@ impl LockFreeStreamHandle {
             let exit_flag_for_task = exit_flag.clone();
             let exit_notify_for_task = exit_notify.clone();
             let known_superseded_for_task = known_superseded.clone();
+            let orderly_exit_for_task = orderly_exit.clone();
             let failure_lifecycle_for_task = failure_lifecycle.clone();
             let writer_addr = addr;
             let writer_channel_id = channel_id;
@@ -2703,15 +2751,24 @@ impl LockFreeStreamHandle {
                     exit_flag_for_task,
                     exit_notify_for_task,
                     known_superseded_for_task,
+                    orderly_exit_for_task.clone(),
                     failure_lifecycle_for_task,
                 )
                 .await;
-                // CRITICAL: Log when writer exits - this helps diagnose silent writer deaths
-                warn!(
-                    addr = %writer_addr,
-                    channel_id = ?writer_channel_id,
-                    "⚠️ Background writer task EXITED - no more writes possible on this connection!"
-                );
+                if orderly_exit_for_task.load(Ordering::Acquire) {
+                    debug!(
+                        addr = %writer_addr,
+                        channel_id = ?writer_channel_id,
+                        "background writer task exited after an orderly close"
+                    );
+                } else {
+                    // CRITICAL: Log when writer exits - this helps diagnose silent writer deaths
+                    warn!(
+                        addr = %writer_addr,
+                        channel_id = ?writer_channel_id,
+                        "⚠️ Background writer task EXITED - no more writes possible on this connection!"
+                    );
+                }
             })
         };
 
@@ -2769,6 +2826,7 @@ impl LockFreeStreamHandle {
         exit_flag: Arc<AtomicBool>,
         exit_notify: Arc<Notify>,
         known_superseded: Arc<AtomicBool>,
+        orderly_exit: Arc<AtomicBool>,
         failure_lifecycle: Arc<crate::registry::FailureLifecycleOwner>,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -2864,6 +2922,8 @@ impl LockFreeStreamHandle {
             session_source: Option<SocketAddr>,
             instance_id: u64,
             known_superseded: Arc<AtomicBool>,
+            /// Shared with the spawn wrapper; true for an expected exit.
+            orderly_exit: Arc<AtomicBool>,
             failure_lifecycle: Arc<crate::registry::FailureLifecycleOwner>,
         }
 
@@ -3006,12 +3066,23 @@ impl LockFreeStreamHandle {
                     }
 
                     if should_cancel_pending {
-                        warn!(
-                            peer = %peer_addr,
-                            peer_id = ?peer_id,
-                            stream_instance_id = expected_instance,
-                            "transport_io_task_exit_current_connection"
-                        );
+                        // Teardown below is identical either way; only the
+                        // severity differs for an expected close.
+                        if self.orderly_exit.load(Ordering::Acquire) {
+                            info!(
+                                peer = %peer_addr,
+                                peer_id = ?peer_id,
+                                stream_instance_id = expected_instance,
+                                "transport_io_task_exit_orderly_close"
+                            );
+                        } else {
+                            warn!(
+                                peer = %peer_addr,
+                                peer_id = ?peer_id,
+                                stream_instance_id = expected_instance,
+                                "transport_io_task_exit_current_connection"
+                            );
+                        }
                         if let Some(correlation) = self.response_correlation.as_ref() {
                             correlation.cancel_all();
                         }
@@ -3067,6 +3138,7 @@ impl LockFreeStreamHandle {
             session_source: read_context.as_ref().map(|ctx| ctx.session_source),
             instance_id,
             known_superseded,
+            orderly_exit: orderly_exit.clone(),
             failure_lifecycle,
         };
 
@@ -4467,11 +4539,7 @@ impl LockFreeStreamHandle {
                             {
                                 Ok(result) => result,
                                 Err(e) => {
-                                    warn!(
-                                        peer = %ctx.peer_addr,
-                                        error = %e,
-                                        "IO task read error"
-                                    );
+                                    log_read_exit(&e, &orderly_exit, ctx.peer_addr);
                                     return;
                                 }
                             };
@@ -4909,11 +4977,7 @@ impl LockFreeStreamHandle {
                             let read_result = match read_result {
                                 Ok(result) => result,
                                 Err(e) => {
-                                    warn!(
-                                        peer = %ctx.peer_addr,
-                                        error = %e,
-                                        "IO task read error"
-                                    );
+                                    log_read_exit(&e, &orderly_exit, ctx.peer_addr);
                                     return;
                                 }
                             };
@@ -5129,11 +5193,7 @@ impl LockFreeStreamHandle {
                                 let next = match read_message_step_nonblocking(&mut stream, state, ctx, streaming_state).await {
                                     Ok(r) => r,
                                     Err(e) => {
-                                        warn!(
-                                            peer = %ctx.peer_addr,
-                                            error = %e,
-                                            "IO task read error"
-                                        );
+                                        log_read_exit(&e, &orderly_exit, ctx.peer_addr);
                                         return;
                                     }
                                 };
@@ -5416,6 +5476,22 @@ impl LockFreeStreamHandle {
                     perf_last = Instant::now();
                 }
             }
+        }
+
+        // The loop only ends here when `shutdown_signal` was set (every fault
+        // path above `return`s, and forced teardown aborts the task before it
+        // gets here). Close the TLS session with `close_notify` so the peer sees
+        // an orderly close instead of truncation -- but only at a frame
+        // boundary: a started streaming frame or any parked ordinary write may
+        // be partially on the wire, and the stream is never reused or finished
+        // after that, so it is dropped abruptly and the peer's parser reports
+        // the truncated frame. Never wait for the peer's reciprocal alert.
+        let partial_frame_possible = pending_ordinary_write.is_some()
+            || pending_stream_cmd
+                .as_ref()
+                .is_some_and(|pending| pending.offset > 0);
+        if !partial_frame_possible && close_stream_gracefully(&mut stream).await {
+            orderly_exit.store(true, Ordering::Release);
         }
     }
 

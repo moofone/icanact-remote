@@ -491,6 +491,278 @@ mod read_pipeline_tests {
              reserved (not a fresh StreamData frame) before the reap happened"
         );
     }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ReadMode {
+        PollBlocking,
+        PollNonBlocking,
+        Nonblocking,
+    }
+
+    const READ_MODES: [ReadMode; 3] = [
+        ReadMode::PollBlocking,
+        ReadMode::PollNonBlocking,
+        ReadMode::Nonblocking,
+    ];
+
+    async fn step_in_mode<S>(
+        mode: ReadMode,
+        stream: &mut S,
+        state: &mut super::ReadState,
+        ctx: &super::ReadContext,
+        streams: &mut crate::protocol::StreamingState,
+    ) -> crate::Result<super::ReadPollResult>
+    where
+        S: tokio::io::AsyncRead + Unpin,
+    {
+        match mode {
+            ReadMode::PollBlocking => {
+                super::read_message_step_poll(stream, state, ctx, streams, true).await
+            }
+            ReadMode::PollNonBlocking => {
+                super::read_message_step_poll(stream, state, ctx, streams, false).await
+            }
+            ReadMode::Nonblocking => {
+                super::read_message_step_nonblocking(stream, state, ctx, streams).await
+            }
+        }
+    }
+
+    /// Drives the parser until it errors, returning how many complete frames
+    /// were parsed first. The peer side is already closed, so every read is
+    /// immediately ready.
+    async fn drain_until_error<S>(
+        mode: ReadMode,
+        stream: &mut S,
+        state: &mut super::ReadState,
+        ctx: &super::ReadContext,
+        streams: &mut crate::protocol::StreamingState,
+    ) -> (usize, crate::GossipError)
+    where
+        S: tokio::io::AsyncRead + Unpin,
+    {
+        let mut frames = 0;
+        for _ in 0..64 {
+            match step_in_mode(mode, stream, state, ctx, streams).await {
+                Ok(step) => frames += usize::from(step.result.is_some()),
+                Err(error) => return (frames, error),
+            }
+        }
+        panic!("parser never reported the closed stream ({mode:?})");
+    }
+
+    async fn closed_after(bytes: &[u8]) -> tokio::io::DuplexStream {
+        let (mut writer, reader) = tokio::io::duplex(8192);
+        writer.write_all(bytes).await.unwrap();
+        drop(writer);
+        reader
+    }
+
+    fn assert_truncation(error: &crate::GossipError, what: &str) {
+        assert!(
+            !super::is_orderly_peer_close(error),
+            "EOF during {what} must stay a diagnosable truncation, got {error:?}"
+        );
+        assert!(
+            matches!(error, crate::GossipError::Network(io) if io.kind() == std::io::ErrorKind::UnexpectedEof),
+            "EOF during {what} must remain UnexpectedEof, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn eof_between_frames_is_an_orderly_peer_close_in_every_read_mode() {
+        let frame = crate::framing::write_stream_abort_header(7, 9);
+        for mode in READ_MODES {
+            let mut reader = closed_after(&frame).await;
+            let ctx = test_read_context(9200);
+            let (frames, error) = drain_until_error(
+                mode,
+                &mut reader,
+                &mut super::ReadState::new(),
+                &ctx,
+                &mut crate::protocol::StreamingState::new(),
+            )
+            .await;
+            assert_eq!(frames, 1, "the complete frame is delivered first ({mode:?})");
+            assert!(
+                super::is_orderly_peer_close(&error),
+                "EOF with zero prefix bytes consumed is an orderly close ({mode:?}): {error:?}"
+            );
+            assert!(
+                matches!(&error, crate::GossipError::Network(io) if io.kind() == std::io::ErrorKind::UnexpectedEof),
+                "orderly close keeps the EOF kind for existing callers ({mode:?})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn eof_with_no_bytes_at_all_is_an_orderly_peer_close() {
+        for mode in READ_MODES {
+            let mut reader = closed_after(&[]).await;
+            let (frames, error) = drain_until_error(
+                mode,
+                &mut reader,
+                &mut super::ReadState::new(),
+                &test_read_context(9201),
+                &mut crate::protocol::StreamingState::new(),
+            )
+            .await;
+            assert_eq!(frames, 0);
+            assert!(super::is_orderly_peer_close(&error), "{mode:?}: {error:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn eof_after_partial_length_prefix_is_truncation_in_every_read_mode() {
+        let frame = crate::framing::write_stream_abort_header(7, 9);
+        for mode in READ_MODES {
+            let mut reader = closed_after(&frame[..2]).await;
+            let (_, error) = drain_until_error(
+                mode,
+                &mut reader,
+                &mut super::ReadState::new(),
+                &test_read_context(9202),
+                &mut crate::protocol::StreamingState::new(),
+            )
+            .await;
+            assert_truncation(&error, &format!("the length prefix ({mode:?})"));
+        }
+    }
+
+    #[tokio::test]
+    async fn eof_after_partial_frame_body_is_truncation_in_every_read_mode() {
+        let frame = crate::framing::write_stream_abort_header(7, 9);
+        assert!(frame.len() > crate::framing::LENGTH_PREFIX_LEN);
+        for mode in READ_MODES {
+            let mut reader = closed_after(&frame[..frame.len() - 1]).await;
+            let (frames, error) = drain_until_error(
+                mode,
+                &mut reader,
+                &mut super::ReadState::new(),
+                &test_read_context(9203),
+                &mut crate::protocol::StreamingState::new(),
+            )
+            .await;
+            assert_eq!(frames, 0);
+            assert_truncation(&error, &format!("the frame body ({mode:?})"));
+        }
+    }
+
+    #[tokio::test]
+    async fn eof_during_stream_metadata_is_truncation_in_every_read_mode() {
+        let header =
+            crate::framing::try_write_stream_request_start_header(41, 0, 8, 7, 3, 8).unwrap();
+        for mode in READ_MODES {
+            let mut reader = closed_after(&header[..header.len() - 1]).await;
+            let (_, error) = drain_until_error(
+                mode,
+                &mut reader,
+                &mut super::ReadState::new(),
+                &test_read_context(9204),
+                &mut crate::protocol::StreamingState::new(),
+            )
+            .await;
+            assert_truncation(&error, &format!("stream metadata ({mode:?})"));
+        }
+    }
+
+    #[tokio::test]
+    async fn eof_during_stream_payload_is_truncation_in_every_read_mode() {
+        let header =
+            crate::framing::try_write_stream_request_start_header(41, 0, 8, 7, 3, 8).unwrap();
+        for mode in READ_MODES {
+            let mut bytes = header.to_vec();
+            bytes.extend_from_slice(&[0xAB; 3]);
+            let mut reader = closed_after(&bytes).await;
+            let (_, error) = drain_until_error(
+                mode,
+                &mut reader,
+                &mut super::ReadState::new(),
+                &test_read_context(9205),
+                &mut crate::protocol::StreamingState::new(),
+            )
+            .await;
+            assert_truncation(&error, &format!("stream payload ({mode:?})"));
+        }
+    }
+
+    #[tokio::test]
+    async fn eof_while_discarding_rejected_stream_payload_is_truncation() {
+        let ctx = test_read_context(9206);
+        let mut state = super::ReadState::new();
+        let mut streams = crate::protocol::StreamingState::new();
+        let (mut writer, mut reader) = tokio::io::duplex(4096);
+        let header =
+            crate::framing::try_write_stream_request_start_header(51, 0, 16, 1, 2, 16).unwrap();
+        writer.write_all(&header).await.unwrap();
+        writer.write_all(&[0xEE; 4]).await.unwrap();
+        for _ in 0..3 {
+            assert!(
+                super::read_message_step(&mut reader, &mut state, &ctx, &mut streams)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let _ = streams.cleanup_stale_with(
+            std::time::Duration::from_millis(0),
+            std::time::Duration::from_secs(3600),
+            1,
+        );
+        writer.write_all(&[0xEE; 4]).await.unwrap();
+        drop(writer);
+        let (_, error) = drain_until_error(
+            ReadMode::PollBlocking,
+            &mut reader,
+            &mut state,
+            &ctx,
+            &mut streams,
+        )
+        .await;
+        assert!(matches!(state, super::ReadState::DiscardStreamPayload { .. }));
+        assert_truncation(&error, "the discard of a rejected stream payload");
+    }
+}
+
+/// Marker payload of the `io::Error` produced when the peer's orderly close
+/// (a TLS `close_notify`, surfaced by the stream as `Ok(0)`) is observed
+/// exactly between frames. Truncation at any other point keeps a plain
+/// `UnexpectedEof`, so callers can tell an expected close from a failure with
+/// [`is_orderly_peer_close`].
+#[derive(Debug)]
+pub(crate) struct OrderlyPeerClose;
+
+impl std::fmt::Display for OrderlyPeerClose {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("peer closed the connection between frames")
+    }
+}
+
+impl std::error::Error for OrderlyPeerClose {}
+
+/// True only for the between-frames orderly close (see [`OrderlyPeerClose`]).
+pub(crate) fn is_orderly_peer_close(error: &GossipError) -> bool {
+    matches!(
+        error,
+        GossipError::Network(io)
+            if io.get_ref().is_some_and(|inner| inner.is::<OrderlyPeerClose>())
+    )
+}
+
+/// EOF seen while waiting for a frame's length prefix. Only zero consumed
+/// prefix bytes is an orderly close; a partial prefix is a truncated frame.
+fn eof_in_length_prefix(prefix_bytes_read: usize) -> GossipError {
+    if prefix_bytes_read == 0 {
+        GossipError::Network(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            OrderlyPeerClose,
+        ))
+    } else {
+        GossipError::Network(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "connection closed",
+        ))
+    }
 }
 
 enum ReadState {
@@ -855,10 +1127,7 @@ where
                         }))
                     }
                 }
-                Poll::Ready(Ok(0)) => Poll::Ready(Err(GossipError::Network(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "connection closed",
-                )))),
+                Poll::Ready(Ok(0)) => Poll::Ready(Err(eof_in_length_prefix(*read))),
                 Poll::Ready(Ok(n)) => {
                     *read += n;
                     if *read < crate::framing::LENGTH_PREFIX_LEN {
@@ -1153,10 +1422,7 @@ where
                     result: None,
                     progressed: false,
                 })),
-                Poll::Ready(Ok(0)) => Poll::Ready(Err(GossipError::Network(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "connection closed",
-                )))),
+                Poll::Ready(Ok(0)) => Poll::Ready(Err(eof_in_length_prefix(*read))),
                 Poll::Ready(Ok(n)) => {
                     *read += n;
                     if *read < crate::framing::LENGTH_PREFIX_LEN {

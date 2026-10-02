@@ -4559,6 +4559,38 @@ impl<T> ConnectionPool<T> {
         }
     }
 
+    /// Orderly variant of [`Self::close_all_connections`] for explicit
+    /// shutdown: ask every live IO task to close its TLS session with
+    /// `close_notify` and wait for them (at most `bound` overall, never for the
+    /// peers' reciprocal alerts), then run the forced teardown, which aborts
+    /// whatever has not exited and releases all pool state.
+    pub async fn close_all_connections_gracefully(&self, bound: std::time::Duration) {
+        let mut handles: Vec<Arc<LockFreeStreamHandle>> = Vec::new();
+        self.connections_by_addr.iter_sync(|_, connection| {
+            handles.extend(connection.stream_handle.clone());
+            true
+        });
+        for peer_id in self.session_peer_ids() {
+            if let Some(connection) = self.get_connection_by_peer_id(&peer_id) {
+                handles.extend(connection.stream_handle.clone());
+            }
+        }
+        handles.sort_by_key(|handle| handle.instance_id());
+        handles.dedup_by_key(|handle| handle.instance_id());
+        for handle in &handles {
+            handle.shutdown();
+        }
+        let exited = futures::future::join_all(handles.iter().map(|handle| handle.wait_for_exit()));
+        if tokio::time::timeout(bound, exited).await.is_err() {
+            warn!(
+                connections = handles.len(),
+                ?bound,
+                "graceful connection close timed out; aborting the remaining IO tasks"
+            );
+        }
+        self.close_all_connections();
+    }
+
     /// Close all connections (for shutdown)
     pub fn close_all_connections(&self) {
         // Use peer-id-based removal to properly clean up all address aliases

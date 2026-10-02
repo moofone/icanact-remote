@@ -14577,3 +14577,4 @@ mod qa_backpressure_scan;
 mod qa_remaining_deadlines {
     include!("qa_remaining_deadlines.rs");
 }
+mod tls_graceful_close;

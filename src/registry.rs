@@ -11736,11 +11736,14 @@ impl<T: 'static> GossipRegistry<T> {
         // connection teardown can emit any terminal disconnect notifications.
         self.clear_runtime_handlers();
 
-        // Close all connections in the pool
-        {
-            let connection_pool = &self.connection_pool;
-            connection_pool.close_all_connections();
-        }
+        // Close all connections in the pool: orderly TLS close first (bounded),
+        // forced teardown for whatever has not exited by then.
+        self.connection_pool
+            .close_all_connections_gracefully(
+                crate::connection_pool::GRACEFUL_CLOSE_TIMEOUT
+                    + std::time::Duration::from_millis(500),
+            )
+            .await;
 
         // Clear actor state
         {

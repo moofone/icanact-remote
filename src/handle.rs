@@ -641,7 +641,12 @@ impl<T> GossipRegistryHandle<T> {
         );
     }
 
-    /// Shutdown the registry
+    /// Shutdown the registry.
+    ///
+    /// Live TLS sessions are closed with `close_notify` (bounded to about
+    /// 1.5s in total, without waiting for peers' replies); sessions that cannot
+    /// close in time, or have a frame partially written, are dropped abruptly.
+    /// Dropping the handle without calling this always drops them abruptly.
     pub async fn shutdown(&self) {
         // Signal shutdown first, then abort background tasks so we don't get stuck
         // waiting on locks held by long-running timer/server work.
