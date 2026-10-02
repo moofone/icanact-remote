@@ -545,23 +545,48 @@ async fn late_replacement_before_disconnect_callback_is_fenced() -> Result<(), D
     let replacement_b = node_at(addr_b, key_b, config).await?;
     connect_bidirectional(&node_a, &replacement_b).await?;
 
-    let replacement_publication = next_event(&mut events, |event| {
-        publication_for(event, &peer_b, addr_b, None)
-            && matches!(
-                event,
-                TransportTestHelperEvent::PublicationCommitted { instance_id, .. }
-                    if *instance_id != old_instance
-            )
-    })
-    .await;
-    let replacement_instance = match replacement_publication {
-        TransportTestHelperEvent::PublicationCommitted { instance_id, .. } => instance_id,
-        _ => unreachable!(),
-    };
-    let replacement_mark = next_event(&mut events, |event| {
-        mark_connected_for(event, &peer_b, addr_b, replacement_instance)
-    })
-    .await;
+    // `connect_bidirectional` makes both nodes dial, so duplicate sessions race
+    // and the tie-break retires the loser (observed: the first-published
+    // replacement, instance 4, torn down and instance 6 becoming current;
+    // that teardown legitimately records a failure and could invoke the
+    // disconnect handler). The fencing oracle below is about the SURVIVING
+    // replacement, so let the lifecycle stream go quiet first (churn emits
+    // events within milliseconds; the old failure is still parked at the
+    // gate) and only then identify the replacement as the settled current
+    // instance, taking its publication/mark evidence from the recorded log.
+    loop {
+        match tokio::time::timeout(Duration::from_millis(750), events.recv()).await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("lifecycle recorder channel closed"),
+            Err(_quiet) => break,
+        }
+    }
+    let replacement_instance = node_a
+        .client()
+        .current_peer_connection_instance(&peer_b)
+        .expect("settled replacement instance");
+    assert_ne!(
+        replacement_instance, old_instance,
+        "the settled current instance must be a replacement"
+    );
+    let settled_events = evidence_events(&recorded);
+    let replacement_publication = settled_events
+        .iter()
+        .find(|event| {
+            publication_for(event, &peer_b, addr_b, None)
+                && matches!(
+                    event,
+                    TransportTestHelperEvent::PublicationCommitted { instance_id, .. }
+                        if *instance_id == replacement_instance
+                )
+        })
+        .expect("settled replacement publication evidence")
+        .clone();
+    let replacement_mark = settled_events
+        .iter()
+        .find(|event| mark_connected_for(event, &peer_b, addr_b, replacement_instance))
+        .expect("settled replacement committed mark evidence")
+        .clone();
     assert!(
         event_sequence(&replacement_mark).unwrap()
             > event_sequence(&replacement_publication).unwrap(),

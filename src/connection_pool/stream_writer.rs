@@ -2476,6 +2476,9 @@ pub struct LockFreeStreamHandle {
     /// inference, which can otherwise lag the caller's already-published
     /// decision by a check-then-act window.
     known_superseded: Arc<AtomicBool>,
+    /// True once the IO task ended for an expected reason (peer close between
+    /// frames, or a completed local graceful close).
+    orderly_exit: Arc<AtomicBool>,
     flush_pending: Arc<AtomicBool>,
     /// Atomic flag for coordinating streaming mode. Read by the IO task and
     /// `is_streaming_active` as a cheap observability signal; the actual mutual
@@ -2561,7 +2564,7 @@ impl LockFreeStreamHandle {
     }
 
     /// Arm the identify gate: `write_routed_actor_ask` on this handle will
-    /// park in [`Self::wait_until_identified`] until [`Self::mark_identified`]
+    /// park in `Self::wait_until_identified` until [`Self::mark_identified`]
     /// is called. Only ever called by `finalize_new_outbound_connection`,
     /// immediately after construction and before this handle is shared with
     /// anything that could enqueue onto it -- so there is no window in
@@ -2573,7 +2576,7 @@ impl LockFreeStreamHandle {
 
     /// Signal that this connection's identifying frame has been enqueued.
     /// Wakes any `write_routed_actor_ask` parked in
-    /// [`Self::wait_until_identified`] so it can now enqueue behind it.
+    /// `Self::wait_until_identified` so it can now enqueue behind it.
     pub(crate) fn mark_identified(&self) {
         self.identify_ready.store(true, Ordering::Release);
         self.exit_notify.notify_waiters();
@@ -2786,6 +2789,7 @@ impl LockFreeStreamHandle {
                 exit_flag,
                 exit_notify,
                 known_superseded,
+                orderly_exit,
                 streaming_active,
                 stream_gate,
                 outbound_routes,
@@ -6440,7 +6444,7 @@ impl LockFreeStreamHandle {
     }
 
     /// Write DirectAsk header + payload inline (fast path for direct ask)
-    /// Wire format: [length:4][type:1][correlation_id:4][payload_len:4][payload:N]
+    /// Wire format: `[length:4][type:1][correlation_id:4][payload_len:4][payload:N]`
     pub async fn write_direct_ask_inline(
         &self,
         header: [u8; 16], // DIRECT_ASK_FRAME_HEADER_LEN
@@ -6451,7 +6455,7 @@ impl LockFreeStreamHandle {
     }
 
     /// Write DirectResponse inline (same format as DirectAsk)
-    /// Wire format: [length:4][type:1][correlation_id:4][payload_len:4][payload:N]
+    /// Wire format: `[length:4][type:1][correlation_id:4][payload_len:4][payload:N]`
     pub async fn write_direct_response_inline(
         &self,
         header: [u8; 16], // DIRECT_RESPONSE_FRAME_HEADER_LEN
@@ -6817,8 +6821,13 @@ impl LockFreeStreamHandle {
         self.signal_shutdown();
     }
 
+    /// Whether the IO task exited for an expected reason (see field docs).
+    pub(crate) fn exited_orderly(&self) -> bool {
+        self.orderly_exit.load(Ordering::Acquire)
+    }
+
     /// Wait until the IO task exits. Same subscribe-before-check shape as
-    /// [`Self::wait_until_identified`]: checking `exit_flag` and only then
+    /// `Self::wait_until_identified`: checking `exit_flag` and only then
     /// awaiting `notified()` leaves a window in which a `notify_waiters()`
     /// landing between the check and the await is missed, hanging this
     /// call forever. Subscribing first means any notification from that

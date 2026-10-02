@@ -37,7 +37,7 @@ fn same_address_index_publication_supersedes_armed_disconnect_claim() {
 /// unconditional store.
 #[tokio::test]
 async fn fallback_capture_then_replacement_cannot_be_overwritten_on_resume() {
-    let _test_lock = lock_fallback_adoption_test();
+    let _test_lock = lock_fallback_adoption_test().await;
     let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
     let peer_id = crate::KeyPair::new_for_testing("qa-fallback-capture-race-peer").peer_id();
     let fallback_addr: SocketAddr = "127.0.0.1:60701".parse().unwrap();
@@ -115,7 +115,7 @@ async fn fallback_capture_then_replacement_cannot_be_overwritten_on_resume() {
 /// instead of returning a spurious lookup miss.
 #[tokio::test]
 async fn fallback_adoption_retries_after_raced_unusable_session() {
-    let _test_lock = lock_fallback_adoption_test();
+    let _test_lock = lock_fallback_adoption_test().await;
     let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
     let peer_id = crate::KeyPair::new_for_testing("qa-fallback-unusable-race-peer").peer_id();
     let fallback_addr: SocketAddr = "127.0.0.1:60703".parse().unwrap();

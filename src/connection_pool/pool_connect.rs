@@ -7,14 +7,13 @@ static FALLBACK_ADOPTION_HOOK: OnceLock<std::sync::Mutex<Option<FallbackAdoption
     OnceLock::new();
 
 #[cfg(test)]
-static FALLBACK_ADOPTION_TEST_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+static FALLBACK_ADOPTION_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
-pub(crate) fn lock_fallback_adoption_test() -> std::sync::MutexGuard<'static, ()> {
-    FALLBACK_ADOPTION_TEST_LOCK
-        .get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .expect("fallback adoption test mutex poisoned")
+/// Serializes tests that share the process-global adoption hook. The guard is
+/// held across `.await`s, so it is an async mutex (never poisoned).
+pub(crate) async fn lock_fallback_adoption_test() -> tokio::sync::MutexGuard<'static, ()> {
+    FALLBACK_ADOPTION_TEST_LOCK.lock().await
 }
 
 #[cfg(test)]
@@ -4571,7 +4570,7 @@ impl<T> ConnectionPool<T> {
             true
         });
         for peer_id in self.session_peer_ids() {
-            if let Some(connection) = self.get_connection_by_peer_id(&peer_id) {
+            if let Some(connection) = self.peer_current_connection_snapshot(&peer_id) {
                 handles.extend(connection.stream_handle.clone());
             }
         }

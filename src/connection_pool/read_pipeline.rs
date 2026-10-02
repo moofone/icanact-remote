@@ -751,7 +751,7 @@ pub(crate) fn is_orderly_peer_close(error: &GossipError) -> bool {
 
 /// EOF seen while waiting for a frame's length prefix. Only zero consumed
 /// prefix bytes is an orderly close; a partial prefix is a truncated frame.
-fn eof_in_length_prefix(prefix_bytes_read: usize) -> GossipError {
+pub(crate) fn eof_in_length_prefix(prefix_bytes_read: usize) -> GossipError {
     if prefix_bytes_read == 0 {
         GossipError::Network(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,

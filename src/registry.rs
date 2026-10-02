@@ -19464,9 +19464,8 @@ mod tests {
         }
         assert!(!registry.config.nat_role_reconnect_enabled);
         assert!(registry.should_attempt_outbound_dial(addr).await);
-        let advertised = |snap: &[PeerInfoGossip]| {
-            snap.iter().any(|p| p.address == addr.to_string())
-        };
+        let advertised =
+            |snap: &[PeerInfoGossip]| snap.iter().any(|p| p.address == addr.to_string());
         assert!(advertised(&registry.peers_snapshot().await));
 
         let session = registry
@@ -19488,7 +19487,9 @@ mod tests {
 
         // Session end drops the per-peer state, fenced by the receipt.
         let newer = registry.note_remote_role(&peer_id, true).expect("newer");
-        registry.release_client_only_session(&peer_id, session).await;
+        registry
+            .release_client_only_session(&peer_id, session)
+            .await;
         assert!(
             registry.gossip_state.lock().await.peers.contains_key(&addr),
             "a stale receipt must not drop state of the successor session"

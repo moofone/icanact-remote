@@ -232,3 +232,118 @@ async fn graceful_close_completes_promptly_when_the_peer_is_reading() {
     peer.read_to_end(&mut got).await.unwrap();
     assert_eq!(got, b"x");
 }
+
+/// Wait (bounded) until the handle has stopped making write progress because
+/// the peer is not reading, i.e. the IO task is parked inside a frame.
+async fn wait_until_write_stalled(handle: &LockFreeStreamHandle) {
+    let mut last = handle.bytes_written();
+    let mut stable_since = Instant::now();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        let now = handle.bytes_written();
+        if now != last {
+            last = now;
+            stable_since = Instant::now();
+        } else if last > 0 && stable_since.elapsed() >= Duration::from_millis(400) {
+            return;
+        }
+        assert!(Instant::now() < deadline, "write never stalled");
+    }
+}
+
+/// Peer reads everything the closed connection delivered and must observe
+/// truncation (no `close_notify`), never an orderly end of stream.
+async fn assert_peer_sees_truncation(mut peer: client::TlsStream<TcpStream>) {
+    let mut sink = Vec::new();
+    let error = tokio::time::timeout(Duration::from_secs(15), peer.read_to_end(&mut sink))
+        .await
+        .expect("peer read must not hang")
+        .expect_err("a mid-frame shutdown must not look like an orderly TLS close");
+    assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+    assert!(!sink.is_empty(), "the partial frame bytes were delivered");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_with_parked_ordinary_write_stays_abrupt() {
+    let (peer, server) = tls_pair().await; // peer never reads until after shutdown
+    let (handle, task, _) = LockFreeStreamHandle::new(
+        server,
+        ADDR.parse().unwrap(),
+        ChannelId::TellAsk,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let payload = bytes::Bytes::from(vec![7u8; 16 * 1024]);
+    let header = crate::framing::try_write_ask_response_header(
+        crate::MessageType::Response,
+        1,
+        payload.len(),
+    )
+    .unwrap();
+    let mut frame = Vec::from(&header[..16]);
+    frame.extend_from_slice(&payload);
+    let frame = bytes::Bytes::from(frame);
+    for _ in 0..8192 {
+        if handle.write_bytes_nonblocking(frame.clone()).is_err() {
+            break;
+        }
+    }
+    wait_until_write_stalled(&handle).await;
+
+    handle.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), handle.wait_for_exit())
+        .await
+        .expect("teardown bounded");
+    assert!(
+        !handle.exited_orderly(),
+        "a parked partial write must not be reported as an orderly exit"
+    );
+    let _ = task.await;
+    assert_peer_sees_truncation(peer).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_mid_stream_frame_stays_abrupt() {
+    let (peer, server) = tls_pair().await;
+    let (handle, task, _) = LockFreeStreamHandle::new(
+        server,
+        ADDR.parse().unwrap(),
+        ChannelId::TellAsk,
+        BufferConfig::default(),
+        None,
+        None,
+    );
+    let handle = Arc::new(handle);
+    let streamer = {
+        let handle = Arc::clone(&handle);
+        tokio::spawn(async move {
+            let _ = handle
+                .stream_large_message_bytes(bytes::Bytes::from(vec![9u8; 8 * 1024 * 1024]), 1, 2)
+                .await;
+        })
+    };
+    wait_until_write_stalled(&handle).await;
+
+    handle.shutdown();
+    tokio::time::timeout(Duration::from_secs(10), handle.wait_for_exit())
+        .await
+        .expect("teardown bounded");
+    assert!(
+        !handle.exited_orderly(),
+        "a mid-frame stream must not be reported as an orderly exit"
+    );
+    let _ = task.await;
+    streamer.abort();
+    assert_peer_sees_truncation(peer).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn orderly_local_shutdown_is_flagged_orderly() {
+    let (handle, task, _client) = idle_handle_with_delivered_frame().await;
+    handle.shutdown();
+    handle.wait_for_exit().await;
+    let _ = task.await;
+    assert!(handle.exited_orderly());
+}

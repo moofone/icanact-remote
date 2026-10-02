@@ -3964,7 +3964,11 @@ where
             }
         }
         Err(e) => {
-            warn!(error = %e, peer_addr = %peer_addr, "⚠️ Failed to read initial message from TLS stream - early exit");
+            if crate::connection_pool::is_orderly_peer_close(&e) {
+                debug!(peer_addr = %peer_addr, "peer closed the TLS stream cleanly before its first frame");
+            } else {
+                warn!(error = %e, peer_addr = %peer_addr, "⚠️ Failed to read initial message from TLS stream - early exit");
+            }
             return ConnectionCloseOutcome::Normal { node_id: None };
         }
     };
@@ -4833,8 +4837,17 @@ where
         handle.wait_for_exit().await;
     }
 
-    warn!(peer_addr = %peer_addr, sender_node_id = %sender_node_id,
-        "📤 Incoming TLS connection handler loop exited - peer may need reconnection");
+    if response_connection
+        .stream_handle
+        .as_ref()
+        .is_some_and(|handle| handle.exited_orderly())
+    {
+        debug!(peer_addr = %peer_addr, sender_node_id = %sender_node_id,
+            "incoming TLS connection handler loop exited after an orderly close");
+    } else {
+        warn!(peer_addr = %peer_addr, sender_node_id = %sender_node_id,
+            "📤 Incoming TLS connection handler loop exited - peer may need reconnection");
+    }
     ConnectionCloseOutcome::Normal {
         node_id: Some(sender_node_id),
     }
@@ -5588,7 +5601,16 @@ where
     R: AsyncReadExt + Unpin,
 {
     let mut control = [0u8; crate::framing::LENGTH_PREFIX_LEN];
-    reader.read_exact(&mut control).await?;
+    // Read the prefix by hand so EOF with zero bytes consumed (the peer's
+    // orderly close before its first frame) stays distinguishable from a
+    // truncated prefix.
+    let mut filled = 0;
+    while filled < control.len() {
+        match reader.read(&mut control[filled..]).await? {
+            0 => return Err(crate::connection_pool::eof_in_length_prefix(filled)),
+            n => filled += n,
+        }
+    }
     let decoded = crate::framing::decode_control(control)
         .ok_or_else(|| invalid_v5_frame("unknown wire kind"))?;
     if decoded.body_len == 0 || decoded.body_len > max_message_size {
