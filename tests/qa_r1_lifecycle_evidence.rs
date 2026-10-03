@@ -438,6 +438,7 @@ async fn late_replacement_before_disconnect_callback_is_fenced() -> Result<(), D
         response_timeout: EVIDENCE_TIMEOUT,
         ..Default::default()
     };
+    let tie_break_window = config.preferred_inbound_wait;
     let key_a = KeyPair::new_for_testing("qa-r1-committed-accounting-a");
     let key_b = KeyPair::new_for_testing("qa-r1-committed-accounting-b");
     let node_a = create_tls_node_with_keypair(key_a, config.clone()).await?;
@@ -449,7 +450,9 @@ async fn late_replacement_before_disconnect_callback_is_fenced() -> Result<(), D
     let recorded = Arc::new(Mutex::new(Vec::<TransportTestHelperEvent>::new()));
     let accounting_gate = Gate::new();
     let accounting_entered = Arc::new(AtomicBool::new(false));
-    let accounting_once = Arc::new(AtomicBool::new(true));
+    // Armed (set true) only once setup has settled, so duplicate-session
+    // tie-break churn during setup can never trip the gate in the recorder.
+    let accounting_once = Arc::new(AtomicBool::new(false));
     let recorder_events = Arc::clone(&recorded);
     let recorder_sender = event_sender.clone();
     let recorder_gate = accounting_gate.clone();
@@ -500,6 +503,17 @@ async fn late_replacement_before_disconnect_callback_is_fenced() -> Result<(), D
     }
 
     connect_bidirectional(&node_a, &node_b).await?;
+    // Same duplicate-session tie-break churn as for the replacement below: the
+    // current instance can be momentarily absent while the loser is retired.
+    // Wait for the protocol-bounded quiet window before sampling it.
+    let initial_quiet_window = tie_break_window + Duration::from_millis(250);
+    loop {
+        match tokio::time::timeout(initial_quiet_window, events.recv()).await {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("lifecycle recorder channel closed"),
+            Err(_quiet) => break,
+        }
+    }
     assert!(
         common::wait_for_condition(EVIDENCE_TIMEOUT, || async {
             node_a
@@ -514,6 +528,7 @@ async fn late_replacement_before_disconnect_callback_is_fenced() -> Result<(), D
         .client()
         .current_peer_connection_instance(&peer_b)
         .expect("initial current B instance");
+    accounting_once.store(true, Ordering::Release);
     let failure_registry = node_a.registry.clone();
     let failure_task = tokio::spawn(async move {
         failure_registry
@@ -554,13 +569,31 @@ async fn late_replacement_before_disconnect_callback_is_fenced() -> Result<(), D
     // events within milliseconds; the old failure is still parked at the
     // gate) and only then identify the replacement as the settled current
     // instance, taking its publication/mark evidence from the recorded log.
+    //
+    // The quiet window is the protocol's own bound, not an arbitrary delay: a
+    // pending duplicate-session resolution can only be waiting on the
+    // preferred-inbound timer (`preferred_inbound_wait`), so a window longer
+    // than it with no lifecycle events proves the tie-break concluded.
+    let quiet_window = tie_break_window + Duration::from_millis(250);
     loop {
-        match tokio::time::timeout(Duration::from_millis(750), events.recv()).await {
+        match tokio::time::timeout(quiet_window, events.recv()).await {
             Ok(Some(_)) => {}
             Ok(None) => panic!("lifecycle recorder channel closed"),
             Err(_quiet) => break,
         }
     }
+    // Session convergence: both sides hold the surviving session.
+    assert!(
+        common::wait_for_condition(EVIDENCE_TIMEOUT, || async {
+            node_a.registry.has_connection_to_peer(&peer_b).await
+                && replacement_b
+                    .registry
+                    .has_connection_to_peer(&node_a.registry.peer_id)
+                    .await
+        })
+        .await,
+        "both nodes must hold the converged replacement session"
+    );
     let replacement_instance = node_a
         .client()
         .current_peer_connection_instance(&peer_b)
