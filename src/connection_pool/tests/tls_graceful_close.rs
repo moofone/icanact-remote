@@ -347,3 +347,154 @@ async fn orderly_local_shutdown_is_flagged_orderly() {
     let _ = task.await;
     assert!(handle.exited_orderly());
 }
+
+fn read_ctx() -> super::ReadContext {
+    super::ReadContext {
+        authenticated_peer_id: None,
+        streaming_state_handoff: None,
+        registry_weak: std::sync::Weak::new(),
+        peer_addr: ADDR.parse().unwrap(),
+        session_source: ADDR.parse().unwrap(),
+        peer_id: None,
+        max_message_size: 1024 * 1024,
+        expected_schema_hash: None,
+        aligned_pool: Arc::new(crate::AlignedBytesPool::default()),
+        inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
+        response_correlation: None,
+        response_writer: None,
+        tell_handler_sync: None,
+        tell_handler_sync_context: None,
+        ask_immediate_handler_sync: None,
+        ask_handler_sync: None,
+        sync_actor_handler: None,
+    }
+}
+
+/// The peer initiates the close (`close_notify`) and then waits for the
+/// reciprocal alert: it must get an orderly end of stream, not truncation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_initiated_close_notify_gets_a_reciprocal_close_notify() {
+    let (mut initiator, server) = tls_pair().await;
+    let (handle, task, _) = LockFreeStreamHandle::new(
+        server,
+        ADDR.parse().unwrap(),
+        ChannelId::TellAsk,
+        BufferConfig::default(),
+        None,
+        Some(read_ctx()),
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), initiator.shutdown())
+        .await
+        .expect("initiator close_notify must not hang")
+        .unwrap();
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), initiator.read_to_end(&mut rest))
+        .await
+        .expect("awaiting the reciprocal close must not hang")
+        .expect("the responder must reply with close_notify, not a raw EOF");
+    assert!(rest.is_empty());
+    tokio::time::timeout(Duration::from_secs(5), handle.wait_for_exit())
+        .await
+        .expect("writer must exit");
+    task.await.unwrap();
+    assert!(handle.exited_orderly());
+}
+
+/// Reads EOF immediately (orderly peer close) but its write half never
+/// finishes shutting down.
+struct EofThenStuckShutdown {
+    shutdown_polled: Arc<AtomicBool>,
+}
+
+impl AsyncRead for EofThenStuckShutdown {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        _: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for EofThenStuckShutdown {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _: &mut Context<'_>,
+        b: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Poll::Ready(Ok(b.len()))
+    }
+    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.shutdown_polled.store(true, Ordering::SeqCst);
+        Poll::Pending
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reciprocal_close_after_peer_close_is_bounded_when_shutdown_stalls() {
+    let polled = Arc::new(AtomicBool::new(false));
+    let (handle, task, _) = LockFreeStreamHandle::new(
+        EofThenStuckShutdown {
+            shutdown_polled: polled.clone(),
+        },
+        ADDR.parse().unwrap(),
+        ChannelId::TellAsk,
+        BufferConfig::default(),
+        None,
+        Some(read_ctx()),
+    );
+    tokio::time::timeout(GRACEFUL_CLOSE_TIMEOUT + Duration::from_secs(3), task)
+        .await
+        .expect("the reciprocal close must be bounded")
+        .unwrap();
+    assert!(
+        polled.load(Ordering::SeqCst),
+        "the orderly read exit must attempt the reciprocal shutdown"
+    );
+    handle.shutdown();
+}
+
+/// A peer `close_notify` arriving while an ordinary write is parked mid-frame
+/// must not turn the truncated frame into a clean close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_close_notify_with_parked_ordinary_write_stays_abrupt() {
+    let (mut peer, server) = tls_pair().await;
+    let (handle, task, _) = LockFreeStreamHandle::new(
+        server,
+        ADDR.parse().unwrap(),
+        ChannelId::TellAsk,
+        BufferConfig::default(),
+        None,
+        Some(read_ctx()),
+    );
+    let payload = bytes::Bytes::from(vec![7u8; 16 * 1024]);
+    let header = crate::framing::try_write_ask_response_header(
+        crate::MessageType::Response,
+        1,
+        payload.len(),
+    )
+    .unwrap();
+    let mut frame = Vec::from(&header[..16]);
+    frame.extend_from_slice(&payload);
+    let frame = bytes::Bytes::from(frame);
+    for _ in 0..8192 {
+        if handle.write_bytes_nonblocking(frame.clone()).is_err() {
+            break;
+        }
+    }
+    wait_until_write_stalled(&handle).await;
+
+    // Send close_notify without reading anything back.
+    tokio::time::timeout(Duration::from_secs(5), peer.shutdown())
+        .await
+        .expect("peer close_notify must not hang")
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(40), task)
+        .await
+        .expect("teardown bounded");
+    assert_peer_sees_truncation(peer).await;
+}

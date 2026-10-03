@@ -412,6 +412,37 @@ fn log_read_exit(error: &GossipError, orderly_exit: &AtomicBool, peer: SocketAdd
     }
 }
 
+/// A started streaming frame or any parked ordinary write may be partially on
+/// the wire; the stream must then be dropped abruptly, never closed cleanly.
+fn partial_frame_possible(
+    pending_ordinary_write: &Option<PendingOrdinaryWrite>,
+    pending_stream_cmd: &Option<PendingStreamingCommand>,
+) -> bool {
+    pending_ordinary_write.is_some()
+        || pending_stream_cmd
+            .as_ref()
+            .is_some_and(|pending| pending.offset > 0)
+}
+
+/// Handle the end of the read side. After the peer's `close_notify` between
+/// frames, reply with our own bounded `close_notify` (TLS half-close
+/// reciprocity) unless a frame may be partially written; any other read error
+/// is only logged and the stream is dropped abruptly.
+async fn finish_after_read_exit<S>(
+    stream: &mut S,
+    error: &GossipError,
+    orderly_exit: &AtomicBool,
+    peer: SocketAddr,
+    partial_frame_possible: bool,
+) where
+    S: AsyncWrite + Unpin,
+{
+    log_read_exit(error, orderly_exit, peer);
+    if is_orderly_peer_close(error) && !partial_frame_possible {
+        close_stream_gracefully(stream).await;
+    }
+}
+
 /// Upper bound on the graceful TLS close performed when the IO task is asked to
 /// shut down at a frame boundary: it covers flushing already-written bytes and
 /// emitting the `close_notify` alert. The peer's reciprocal alert is never
@@ -4542,7 +4573,13 @@ impl LockFreeStreamHandle {
                             {
                                 Ok(result) => result,
                                 Err(e) => {
-                                    log_read_exit(&e, &orderly_exit, ctx.peer_addr);
+                                    finish_after_read_exit(
+                                        &mut stream,
+                                        &e,
+                                        &orderly_exit,
+                                        ctx.peer_addr,
+                                        partial_frame_possible(&pending_ordinary_write, &pending_stream_cmd),
+                                    ).await;
                                     return;
                                 }
                             };
@@ -4980,7 +5017,13 @@ impl LockFreeStreamHandle {
                             let read_result = match read_result {
                                 Ok(result) => result,
                                 Err(e) => {
-                                    log_read_exit(&e, &orderly_exit, ctx.peer_addr);
+                                    finish_after_read_exit(
+                                        &mut stream,
+                                        &e,
+                                        &orderly_exit,
+                                        ctx.peer_addr,
+                                        partial_frame_possible(&pending_ordinary_write, &pending_stream_cmd),
+                                    ).await;
                                     return;
                                 }
                             };
@@ -5196,7 +5239,13 @@ impl LockFreeStreamHandle {
                                 let next = match read_message_step_nonblocking(&mut stream, state, ctx, streaming_state).await {
                                     Ok(r) => r,
                                     Err(e) => {
-                                        log_read_exit(&e, &orderly_exit, ctx.peer_addr);
+                                        finish_after_read_exit(
+                                            &mut stream,
+                                            &e,
+                                            &orderly_exit,
+                                            ctx.peer_addr,
+                                            partial_frame_possible(&pending_ordinary_write, &pending_stream_cmd),
+                                        ).await;
                                         return;
                                     }
                                 };
@@ -5489,10 +5538,8 @@ impl LockFreeStreamHandle {
         // be partially on the wire, and the stream is never reused or finished
         // after that, so it is dropped abruptly and the peer's parser reports
         // the truncated frame. Never wait for the peer's reciprocal alert.
-        let partial_frame_possible = pending_ordinary_write.is_some()
-            || pending_stream_cmd
-                .as_ref()
-                .is_some_and(|pending| pending.offset > 0);
+        let partial_frame_possible =
+            partial_frame_possible(&pending_ordinary_write, &pending_stream_cmd);
         if !partial_frame_possible && close_stream_gracefully(&mut stream).await {
             orderly_exit.store(true, Ordering::Release);
         }
