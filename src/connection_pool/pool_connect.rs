@@ -2176,6 +2176,27 @@ impl<T> ConnectionPool<T> {
         &self,
         peer_id: &crate::PeerId,
     ) -> Option<Arc<LockFreeConnection>> {
+        self.get_connection_by_peer_id_inner(peer_id, true)
+    }
+
+    /// Identical to [`Self::get_connection_by_peer_id`] (same self-heal, same
+    /// events) except that it does not warn about an unusable primary slot.
+    /// For the connection-failure handler only: there, the slot being unusable
+    /// is the very event being handled (the IO task exited and marked its
+    /// handle), already reported with its own cause-specific log, so a second
+    /// "not usable" warning is redundant noise rather than a new fault.
+    pub(crate) fn get_connection_by_peer_id_for_failure_handling(
+        &self,
+        peer_id: &crate::PeerId,
+    ) -> Option<Arc<LockFreeConnection>> {
+        self.get_connection_by_peer_id_inner(peer_id, false)
+    }
+
+    fn get_connection_by_peer_id_inner(
+        &self,
+        peer_id: &crate::PeerId,
+        warn_unusable: bool,
+    ) -> Option<Arc<LockFreeConnection>> {
         // PRIMARY: Look up live connection through the peer session.
         if let Some(conn) = self
             .peer_sessions
@@ -2186,10 +2207,12 @@ impl<T> ConnectionPool<T> {
                 debug!("CONNECTION POOL: Found connection for peer '{}'", peer_id);
                 return Some(conn);
             }
-            warn!(
-                "CONNECTION POOL: Connection for peer '{}' is not usable",
-                peer_id
-            );
+            if warn_unusable {
+                warn!(
+                    "CONNECTION POOL: Connection for peer '{}' is not usable",
+                    peer_id
+                );
+            }
             // Self-heal the stale slot, but atomically at the source: a
             // check-then-unconditional-clear (the old
             // `clear_current_peer_connection_if_matches` shape) has a real

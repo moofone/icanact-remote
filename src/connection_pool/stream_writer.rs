@@ -2553,9 +2553,7 @@ impl LockFreeStreamHandle {
         self.instance_id
     }
 
-    pub(crate) fn failure_lifecycle_owner(
-        &self,
-    ) -> Arc<crate::registry::FailureLifecycleOwner> {
+    pub(crate) fn failure_lifecycle_owner(&self) -> Arc<crate::registry::FailureLifecycleOwner> {
         self.failure_lifecycle.clone()
     }
 
@@ -2988,7 +2986,8 @@ impl LockFreeStreamHandle {
                     // authoritative "yes" back to "no".
                     if !superseded
                         && let Some(peer_id) = peer_id.as_ref()
-                        && let Some(current) = pool.get_connection_by_peer_id(peer_id)
+                        && let Some(current) =
+                            pool.get_connection_by_peer_id_for_failure_handling(peer_id)
                         && let Some(handle) = current.stream_handle.as_ref()
                         && handle.instance_id() != expected_instance
                     {

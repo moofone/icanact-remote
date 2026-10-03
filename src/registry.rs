@@ -12115,7 +12115,7 @@ impl<T: 'static> GossipRegistry<T> {
 
         if let Some(peer_id) = peer_id.as_ref() {
             let pool = &self.connection_pool;
-            if let Some(current) = pool.get_connection_by_peer_id(peer_id) {
+            if let Some(current) = pool.get_connection_by_peer_id_for_failure_handling(peer_id) {
                 // Compare INSTANCE IDENTITY directly against the current
                 // session's own stream handle. This deliberately does not
                 // re-resolve `observed_peer_addr` through
@@ -12389,7 +12389,8 @@ impl<T: 'static> GossipRegistry<T> {
             let pool = &self.connection_pool;
             // Try to find peer_id for proper cleanup of all aliases
             if let Some(peer_id) = peer_id.clone() {
-                if let Some(current) = pool.get_connection_by_peer_id(&peer_id) {
+                if let Some(current) = pool.get_connection_by_peer_id_for_failure_handling(&peer_id)
+                {
                     info!(
                         addr = %failed_peer_addr,
                         peer_id = %peer_id,

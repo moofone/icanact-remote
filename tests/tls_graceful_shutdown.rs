@@ -33,17 +33,19 @@ const READ_ERROR: &str = "IO task read error";
 const CURRENT_EXIT: &str = "transport_io_task_exit_current_connection";
 const WRITER_EXIT: &str = "Background writer task EXITED";
 const HANDLER_EXIT: &str = "Incoming TLS connection handler loop exited";
+const NOT_USABLE: &str = "is not usable";
 const FIRST_FRAME: &str = "Failed to read initial message";
 const PRE_HANDSHAKE: &str = "inbound_pre_handshake_eof";
 const WRITER_ORDERLY: &str = "background writer task exited after an orderly close";
 const HANDLER_ORDERLY: &str = "incoming TLS connection handler loop exited after an orderly close";
 const FIRST_FRAME_CLEAN: &str = "peer closed the TLS stream cleanly before its first frame";
-const FAILURE_WARNINGS: [&str; 5] = [
+const FAILURE_WARNINGS: [&str; 6] = [
     READ_ERROR,
     CURRENT_EXIT,
     WRITER_EXIT,
     HANDLER_EXIT,
     FIRST_FRAME,
+    NOT_USABLE,
 ];
 
 fn captured() -> &'static Mutex<Vec<(Level, String)>> {
