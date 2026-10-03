@@ -7,14 +7,13 @@ static FALLBACK_ADOPTION_HOOK: OnceLock<std::sync::Mutex<Option<FallbackAdoption
     OnceLock::new();
 
 #[cfg(test)]
-static FALLBACK_ADOPTION_TEST_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+static FALLBACK_ADOPTION_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
-pub(crate) fn lock_fallback_adoption_test() -> std::sync::MutexGuard<'static, ()> {
-    FALLBACK_ADOPTION_TEST_LOCK
-        .get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .expect("fallback adoption test mutex poisoned")
+/// Serializes tests that share the process-global adoption hook. The guard is
+/// held across `.await`s, so it is an async mutex (never poisoned).
+pub(crate) async fn lock_fallback_adoption_test() -> tokio::sync::MutexGuard<'static, ()> {
+    FALLBACK_ADOPTION_TEST_LOCK.lock().await
 }
 
 #[cfg(test)]
@@ -2177,6 +2176,27 @@ impl<T> ConnectionPool<T> {
         &self,
         peer_id: &crate::PeerId,
     ) -> Option<Arc<LockFreeConnection>> {
+        self.get_connection_by_peer_id_inner(peer_id, true)
+    }
+
+    /// Identical to [`Self::get_connection_by_peer_id`] (same self-heal, same
+    /// events) except that it does not warn about an unusable primary slot.
+    /// For the connection-failure handler only: there, the slot being unusable
+    /// is the very event being handled (the IO task exited and marked its
+    /// handle), already reported with its own cause-specific log, so a second
+    /// "not usable" warning is redundant noise rather than a new fault.
+    pub(crate) fn get_connection_by_peer_id_for_failure_handling(
+        &self,
+        peer_id: &crate::PeerId,
+    ) -> Option<Arc<LockFreeConnection>> {
+        self.get_connection_by_peer_id_inner(peer_id, false)
+    }
+
+    fn get_connection_by_peer_id_inner(
+        &self,
+        peer_id: &crate::PeerId,
+        warn_unusable: bool,
+    ) -> Option<Arc<LockFreeConnection>> {
         // PRIMARY: Look up live connection through the peer session.
         if let Some(conn) = self
             .peer_sessions
@@ -2187,10 +2207,12 @@ impl<T> ConnectionPool<T> {
                 debug!("CONNECTION POOL: Found connection for peer '{}'", peer_id);
                 return Some(conn);
             }
-            warn!(
-                "CONNECTION POOL: Connection for peer '{}' is not usable",
-                peer_id
-            );
+            if warn_unusable {
+                warn!(
+                    "CONNECTION POOL: Connection for peer '{}' is not usable",
+                    peer_id
+                );
+            }
             // Self-heal the stale slot, but atomically at the source: a
             // check-then-unconditional-clear (the old
             // `clear_current_peer_connection_if_matches` shape) has a real
@@ -4557,6 +4579,38 @@ impl<T> ConnectionPool<T> {
                     .remove_if_sync(&peer_id, |cur| *cur == addr);
             }
         }
+    }
+
+    /// Orderly variant of [`Self::close_all_connections`] for explicit
+    /// shutdown: ask every live IO task to close its TLS session with
+    /// `close_notify` and wait for them (at most `bound` overall, never for the
+    /// peers' reciprocal alerts), then run the forced teardown, which aborts
+    /// whatever has not exited and releases all pool state.
+    pub async fn close_all_connections_gracefully(&self, bound: std::time::Duration) {
+        let mut handles: Vec<Arc<LockFreeStreamHandle>> = Vec::new();
+        self.connections_by_addr.iter_sync(|_, connection| {
+            handles.extend(connection.stream_handle.clone());
+            true
+        });
+        for peer_id in self.session_peer_ids() {
+            if let Some(connection) = self.peer_current_connection_snapshot(&peer_id) {
+                handles.extend(connection.stream_handle.clone());
+            }
+        }
+        handles.sort_by_key(|handle| handle.instance_id());
+        handles.dedup_by_key(|handle| handle.instance_id());
+        for handle in &handles {
+            handle.shutdown();
+        }
+        let exited = futures::future::join_all(handles.iter().map(|handle| handle.wait_for_exit()));
+        if tokio::time::timeout(bound, exited).await.is_err() {
+            warn!(
+                connections = handles.len(),
+                ?bound,
+                "graceful connection close timed out; aborting the remaining IO tasks"
+            );
+        }
+        self.close_all_connections();
     }
 
     /// Close all connections (for shutdown)

@@ -2711,7 +2711,10 @@ mod tests {
             &payload,
         )
         .expect("oversize pubsub frame must still encode on an unpooled buffer");
-        assert_eq!(payload_len, fast_frame_len(std::slice::from_ref(&destination), &payload));
+        assert_eq!(
+            payload_len,
+            fast_frame_len(std::slice::from_ref(&destination), &payload)
+        );
         assert_eq!(frame.remaining(), payload_len);
     }
 

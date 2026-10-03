@@ -181,6 +181,19 @@ fn lifecycle_event_peer(event: &TransportLifecycleEvent) -> Option<&PeerId> {
 static PEER_OUTBOUND_DIAL_RESOLUTION_COUNTS: OnceLock<Mutex<HashMap<PeerId, u64>>> =
     OnceLock::new();
 
+/// Per-peer count of outbound dial ATTEMPTS (`OutboundStart`), keyed by the
+/// dialed peer. `connect_bidirectional` awaits both `connect` calls, and a
+/// `connect` toward a peer this node already holds a live session with (the
+/// reciprocal dial's inbound session won the race) returns without dialing at
+/// all, so that direction legitimately produces NO outbound events. Counting
+/// attempts lets the precondition tell "dial entered resolution" apart from
+/// "no dial was ever attempted, so nothing can still be pending".
+static PEER_OUTBOUND_START_COUNTS: OnceLock<Mutex<HashMap<PeerId, u64>>> = OnceLock::new();
+
+fn peer_outbound_start_counts() -> &'static Mutex<HashMap<PeerId, u64>> {
+    PEER_OUTBOUND_START_COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn peer_outbound_dial_resolution_counts() -> &'static Mutex<HashMap<PeerId, u64>> {
     PEER_OUTBOUND_DIAL_RESOLUTION_COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -216,6 +229,16 @@ fn lifecycle_outbound_dial_resolution_peer(event: &TransportLifecycleEvent) -> O
 /// process-wide recorder-install guard.
 fn ensure_lifecycle_quiescence_recorder_installed() {
     install_natural_lifecycle_recorder(Arc::new(|event: &TransportLifecycleEvent| {
+        if let TransportLifecycleEvent::OutboundStart {
+            peer: Some(peer), ..
+        } = event
+        {
+            *peer_outbound_start_counts()
+                .lock()
+                .expect("peer outbound start counts mutex poisoned")
+                .entry(peer.clone())
+                .or_insert(0) += 1;
+        }
         if let Some(peer) = lifecycle_outbound_dial_resolution_peer(event) {
             let mut counts = peer_outbound_dial_resolution_counts()
                 .lock()
@@ -278,19 +301,34 @@ fn snapshot_outbound_dial_resolution_counts(peer_ids: &[PeerId]) -> Vec<u64> {
 /// two physically distinct dials (A to B, and B to A) have individually
 /// entered resolution converts "nothing happened" from being the entire
 /// proof into a secondary confirmation layered on top of an affirmative one.
+///
+/// A direction whose `connect` never attempted a dial (`start_baseline`
+/// unchanged: the reciprocal dial's inbound session had already won, so
+/// `connect` returned on the existing live session) has no resolution that
+/// could still be pending, so it counts as settled without outbound events.
+/// This is only sound because the caller invokes this AFTER
+/// `connect_bidirectional` has awaited both `connect` calls: an attempt that
+/// was going to happen has already recorded `OutboundStart` by then.
 async fn wait_for_dial_resolution_entered(
     peer_ids: &[PeerId],
     baseline: &[u64],
+    start_baseline: &[u64],
     deadline: Duration,
 ) -> bool {
     wait_for_condition(deadline, || async {
         let counts = peer_outbound_dial_resolution_counts()
             .lock()
             .expect("peer outbound dial resolution counts mutex poisoned");
+        let starts = peer_outbound_start_counts()
+            .lock()
+            .expect("peer outbound start counts mutex poisoned");
         peer_ids
             .iter()
-            .zip(baseline)
-            .all(|(id, &base)| counts.get(id).copied().unwrap_or(0) > base)
+            .zip(baseline.iter().zip(start_baseline))
+            .all(|(id, (&base, &start_base))| {
+                counts.get(id).copied().unwrap_or(0) > base
+                    || starts.get(id).copied().unwrap_or(0) == start_base
+            })
     })
     .await
 }
@@ -404,13 +442,26 @@ async fn connect_bidirectional_bounded(a: &TlsHandle, b: &TlsHandle) -> Result<(
         .expect("NODE_SETUP_ADMISSION is never closed");
     let peer_ids = [a.registry.peer_id.clone(), b.registry.peer_id.clone()];
     let outbound_baseline = snapshot_outbound_dial_resolution_counts(&peer_ids);
+    let start_baseline: Vec<u64> = {
+        let starts = peer_outbound_start_counts()
+            .lock()
+            .expect("peer outbound start counts mutex poisoned");
+        peer_ids
+            .iter()
+            .map(|id| starts.get(id).copied().unwrap_or(0))
+            .collect()
+    };
     let result = connect_bidirectional(a, b).await;
     if result.is_err() {
         capture_connection_diagnostics("chaos/connect_bidirectional", a, b).await;
     }
-    let resolution_entered =
-        wait_for_dial_resolution_entered(&peer_ids, &outbound_baseline, Duration::from_secs(3))
-            .await;
+    let resolution_entered = wait_for_dial_resolution_entered(
+        &peer_ids,
+        &outbound_baseline,
+        &start_baseline,
+        Duration::from_secs(3),
+    )
+    .await;
     if !resolution_entered {
         capture_connection_diagnostics("chaos/dial-resolution", a, b).await;
     }
