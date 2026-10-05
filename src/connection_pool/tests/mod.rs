@@ -4694,37 +4694,95 @@ async fn stale_outbound_completion_cannot_replace_a_newer_reservation() {
 async fn connection_published_after_retry_claim_is_reused_before_dial() {
     use crate::{GossipConfig, registry::GossipRegistry};
 
-    let registry = Arc::new(GossipRegistry::<()>::new(
+    let mut keys = [
+        crate::KeyPair::new_for_testing("retry-claim-local"),
+        crate::KeyPair::new_for_testing("retry_claim_publish_race"),
+    ];
+    keys.sort_by_key(|key| *key.peer_id().to_node_id().as_bytes());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let peer = keys[1].peer_id();
+    let mut registry = GossipRegistry::<()>::new(
         "127.0.0.1:0".parse().unwrap(),
         GossipConfig {
-            key_pair: Some(crate::KeyPair::new_for_testing("retry-claim-local")),
+            key_pair: Some(keys[0].clone()),
             ..Default::default()
         },
-    ));
+    );
+    registry.enable_tls(keys[0].to_secret_key()).unwrap();
+    let registry = Arc::new(registry);
+    let mut remote = GossipRegistry::<()>::new(
+        addr,
+        GossipConfig {
+            key_pair: Some(keys[1].clone()),
+            ..Default::default()
+        },
+    );
+    remote.enable_tls(keys[1].to_secret_key()).unwrap();
+    let acceptor = remote.tls_config.as_ref().unwrap().acceptor();
+    let schema_hash = remote.config.schema_hash;
+    assert_eq!(
+        schema_hash, registry.config.schema_hash,
+        "fixture Hello schemas must match"
+    );
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("fixture TCP accept");
+        let mut tls = acceptor.accept(stream).await.expect("fixture TLS accept");
+        let alpn = tls.get_ref().1.alpn_protocol().map(|value| value.to_vec());
+        crate::handshake::perform_hello_handshake(
+            &mut tls,
+            alpn.as_deref(),
+            false,
+            schema_hash,
+            crate::handshake::RemoteBootId::from_bytes([53; 16]),
+        )
+        .await
+        .expect("fixture authenticated Hello");
+        std::future::pending::<()>().await;
+        drop(tls);
+    });
     let pool = registry.connection_pool.clone();
-    let peer = crate::KeyPair::new_for_testing("retry_claim_publish_race").peer_id();
-    let addr: SocketAddr = "127.0.0.1:7314".parse().unwrap();
-    pool.add_addr_to_peer_id(addr, peer.clone());
     let session = pool.get_or_create_peer_session(&peer);
+    assert!(session.current_connection().is_none());
     let attempt = session
         .outbound_dial_retry
         .try_claim_attempt()
         .expect("retry attempt must be claimed before publication");
+    assert!(
+        session.outbound_dial_retry.try_claim_attempt().is_none(),
+        "the real retry reservation must be active before TLS publication"
+    );
 
-    let (io, _keep) = tokio::io::duplex(1024);
-    pool.finalize_new_outbound_connection(addr, io, Arc::downgrade(&registry), None, addr, None)
+    let handle = pool
+        .connect_via_stream(
+            addr,
+            None,
+            8,
+            Duration::from_secs(5),
+            Arc::downgrade(&registry),
+        )
         .await
-        .expect("publish outbound connection");
+        .expect("fixture production TLS connection published after retry claim");
+    let connection = pool.get_connection_by_addr(&addr).expect("fixture published stream");
+    assert_eq!(connection.embedded_peer_id.as_ref(), Some(&peer));
+    assert_eq!(connection.direction, ConnectionDirection::Outbound);
+    assert!(connection.remote_boot_id.is_some());
+    assert!(connection.has_live_stream());
+    assert!(session.current_connection().is_some_and(|current| {
+        Arc::ptr_eq(&current, &connection)
+    }));
 
     assert!(
-        pool.reuse_published_connection(&session).is_some(),
+        pool.reuse_published_connection(&session, &peer).is_some(),
         "a connection published while the retry floor is active must be reused before WouldBlock"
     );
     assert!(
-        pool.reuse_published_connection_after_retry_claim(&session, attempt)
+        pool.reuse_published_connection_after_retry_claim(&session, &peer, attempt)
             .is_some(),
         "a connection published after the initial lookup must be reused before dialing"
     );
+    server.abort();
+    drop(handle);
 }
 
 #[test]
