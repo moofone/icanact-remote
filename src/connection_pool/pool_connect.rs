@@ -472,8 +472,12 @@ impl<T> ConnectionPool<T> {
     fn reuse_published_connection(
         &self,
         session: &Arc<PeerSession>,
+        peer_id: &crate::PeerId,
     ) -> Option<ConnectionHandle<T>> {
         let connection = session.current_connection()?;
+        if !self.connection_identity_matches_peer(&connection, peer_id) {
+            return None;
+        }
         connection.update_last_used();
         self.make_connection_handle(connection.addr, &connection)
     }
@@ -481,9 +485,10 @@ impl<T> ConnectionPool<T> {
     fn reuse_published_connection_after_retry_claim(
         &self,
         session: &Arc<PeerSession>,
+        peer_id: &crate::PeerId,
         attempt: OutboundDialAttempt,
     ) -> Option<ConnectionHandle<T>> {
-        let handle = self.reuse_published_connection(session)?;
+        let handle = self.reuse_published_connection(session, peer_id)?;
         session.outbound_dial_retry.record_success(attempt);
         Some(handle)
     }
@@ -1890,6 +1895,9 @@ impl<T> ConnectionPool<T> {
         peer_id: &crate::PeerId,
         connection: Arc<LockFreeConnection>,
     ) -> Option<Arc<LockFreeConnection>> {
+        if !self.connection_identity_matches_peer(&connection, peer_id) {
+            return None;
+        }
         #[cfg(test)]
         record_fallback_adoption_capture(&connection);
 
@@ -1902,6 +1910,9 @@ impl<T> ConnectionPool<T> {
         for _ in 0..3 {
             match self.compare_and_publish_peer_connection(peer_id, None, connection.clone()) {
                 Ok(()) => return Some(connection),
+                Err(Some(current)) if !self.connection_identity_matches_peer(&current, peer_id) => {
+                    return None;
+                }
                 Err(Some(current)) if self.is_usable_connection(&current) => return Some(current),
                 Err(Some(current)) => {
                     let _ = self.compare_and_clear_current_peer_connection(peer_id, &current);
@@ -2203,6 +2214,9 @@ impl<T> ConnectionPool<T> {
             .read_sync(peer_id, |_, session| session.current_connection())
             .flatten()
         {
+            if !self.connection_identity_matches_peer(&conn, peer_id) {
+                return None;
+            }
             if self.is_usable_connection(&conn) {
                 debug!("CONNECTION POOL: Found connection for peer '{}'", peer_id);
                 return Some(conn);
@@ -3625,6 +3639,12 @@ impl<T> ConnectionPool<T> {
 
         // After successful connection, ensure it's indexed by node ID
         if let Some(conn) = self.connections_by_addr.read_sync(&addr, |_, v| v.clone()) {
+            if !self.connection_identity_matches_peer(&conn, peer_id) {
+                return Err(crate::GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Connection identity does not match requested peer",
+                )));
+            }
             self.publish_current_peer_connection(peer_id, conn);
             let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
             debug!(
@@ -3683,6 +3703,14 @@ impl<T> ConnectionPool<T> {
 
             if let Some(conn) = self.connections_by_addr.read_sync(&addr, |_, v| v.clone()) {
                 if conn.is_connected() {
+                    if let Some(node_id) = resolved_node_id.as_ref()
+                        && !self.connection_identity_matches_peer(&conn, &crate::PeerId::from(node_id))
+                    {
+                        return Err(crate::GossipError::Network(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "Connection identity does not match requested peer",
+                        )));
+                    }
                     if let Some(stream_handle) = conn.stream_handle.as_ref() {
                         if stream_handle.exit_flag.load(Ordering::Acquire) {
                             debug!(addr = %addr, "found closed stream handle, removing stale connection");
@@ -3726,9 +3754,10 @@ impl<T> ConnectionPool<T> {
                 OutboundDialLease::Leader(gate) => {
                     let mut gate_completion =
                         OutboundDialGateCompletion::new(self, addr, gate.clone());
-                    let retry_session = resolved_node_id.as_ref().map(|node_id| {
-                        self.get_or_create_peer_session(&crate::PeerId::from(node_id))
-                    });
+                    let retry_peer_id = resolved_node_id.as_ref().map(crate::PeerId::from);
+                    let retry_session = retry_peer_id
+                        .as_ref()
+                        .map(|peer_id| self.get_or_create_peer_session(peer_id));
                     let retry_attempt = retry_session
                         .as_ref()
                         .map(|session| session.outbound_dial_retry.try_claim_attempt());
@@ -3736,7 +3765,10 @@ impl<T> ConnectionPool<T> {
                     if retry_attempt.as_ref().is_some_and(Option::is_none) {
                         if let Some(handle) = retry_session
                             .as_ref()
-                            .and_then(|session| self.reuse_published_connection(session))
+                            .zip(retry_peer_id.as_ref())
+                            .and_then(|(session, peer_id)| {
+                                self.reuse_published_connection(session, peer_id)
+                            })
                         {
                             gate_completion.finish(true);
                             return Ok(handle);
@@ -3750,11 +3782,13 @@ impl<T> ConnectionPool<T> {
                             "outbound retry floor active",
                         )));
                     }
-                    if let (Some(session), Some(attempt)) =
-                        (retry_session.as_ref(), claimed_attempt)
+                    if let (Some(session), Some(peer_id), Some(attempt)) =
+                        (retry_session.as_ref(), retry_peer_id.as_ref(), claimed_attempt)
                     {
                         if let Some(handle) =
-                            self.reuse_published_connection_after_retry_claim(session, attempt)
+                            self.reuse_published_connection_after_retry_claim(
+                                session, peer_id, attempt,
+                            )
                         {
                             gate_completion.finish(true);
                             return Ok(handle);

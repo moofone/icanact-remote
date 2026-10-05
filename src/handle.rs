@@ -5379,7 +5379,7 @@ pub(crate) async fn send_pooled_response(
 
 pub(crate) async fn handle_response_message(
     registry: &Arc<GossipRegistry>,
-    peer_addr: SocketAddr,
+    _peer_addr: SocketAddr,
     correlation_id: u32,
     payload: crate::AlignedBytes,
     response_correlation: Option<&crate::connection_pool::CorrelationTracker>,
@@ -5392,40 +5392,21 @@ pub(crate) async fn handle_response_message(
         }
     }
 
-    let pool = &registry.connection_pool;
+    // The reader captured its native tracker when the stream was created.
+    // Re-resolving its address here could complete a different peer's ask
+    // after address reuse. Same-peer reconnects retain the per-peer tracker.
+    // A missing or unclaimed slot is late or spurious traffic, not a reason
+    // to try the address's current owner.
 
-    // First, try to deliver via connection's embedded correlation tracker
-    if let Some(conn) = pool.get_connection_by_addr(&peer_addr) {
-        if let Some(ref correlation) = conn.correlation {
-            if correlation.complete(correlation_id, &mut payload) {
-                return;
-            }
-        }
-    }
-
-    // FALLBACK: Use shared correlation tracker by peer_id.
-    if let Some(peer_id) = pool.get_peer_id_by_addr(&peer_addr) {
-        if let Some(correlation) = pool.get_shared_correlation_tracker(&peer_id) {
-            if correlation.complete(correlation_id, &mut payload) {
-                return;
-            }
-        }
-    }
-
-    // No tier claimed this correlation_id -- the ask it was meant for has
-    // already timed out and been evicted, or this is spurious traffic.
     registry.note_unmatched_response();
 }
 
-/// Deliver an ask NACK to whichever correlation tracker is waiting on
-/// `correlation_id`. Mirrors `handle_response_message`'s three-tier lookup
-/// (connection-scoped tracker, then the connection's embedded tracker, then
-/// the shared-by-peer-id fallback) exactly, but completes the slot with
-/// `complete_nack` so the waiter resolves to `Err(GossipError::AskNacked)`
-/// immediately instead of the response payload path.
+/// Deliver an ask NACK only through the reader's captured native tracker,
+/// just like `handle_response_message`, completing the slot with
+/// `Err(GossipError::AskNacked)` instead of a response payload.
 pub(crate) async fn handle_response_nack_message(
     registry: &Arc<GossipRegistry>,
-    peer_addr: SocketAddr,
+    _peer_addr: SocketAddr,
     correlation_id: u32,
     reason: crate::framing::AskNackReason,
     response_correlation: Option<&crate::connection_pool::CorrelationTracker>,
@@ -5436,26 +5417,8 @@ pub(crate) async fn handle_response_nack_message(
         }
     }
 
-    let pool = &registry.connection_pool;
-
-    if let Some(conn) = pool.get_connection_by_addr(&peer_addr) {
-        if let Some(ref correlation) = conn.correlation {
-            if correlation.complete_nack(correlation_id, reason) {
-                return;
-            }
-        }
-    }
-
-    if let Some(peer_id) = pool.get_peer_id_by_addr(&peer_addr) {
-        if let Some(correlation) = pool.get_shared_correlation_tracker(&peer_id) {
-            if correlation.complete_nack(correlation_id, reason) {
-                return;
-            }
-        }
-    }
-
-    // No tier claimed this correlation_id -- the ask it was meant for has
-    // already timed out and been evicted, or this is spurious traffic.
+    // Never redirect an old reader's NACK through a rekeyed address.
+    // The captured tracker owns completion, cancellation and deadline slots.
     registry.note_unmatched_response();
 }
 

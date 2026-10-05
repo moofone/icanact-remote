@@ -1908,31 +1908,71 @@ async fn disconnect_by_peer_id_removes_configured_addr_connection_without_alias_
 
 #[tokio::test]
 async fn get_connection_by_peer_id_uses_session_current_connection() {
-    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
-    let peer_id = crate::KeyPair::new_for_testing("session_current_connection").peer_id();
-    let addr: SocketAddr = "127.0.0.1:40556".parse().unwrap();
-
-    let (io, _peer_io) = tokio::io::duplex(1024);
-    let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
-        io,
-        addr,
-        ChannelId::Global,
-        BufferConfig::default(),
-        None,
-        None,
+    let mut keys = [
+        crate::KeyPair::new_for_testing("session_current_connection_local"),
+        crate::KeyPair::new_for_testing("session_current_connection_remote"),
+    ];
+    keys.sort_by_key(|key| *key.peer_id().to_node_id().as_bytes());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let peer_id = keys[1].peer_id();
+    let mut local = crate::registry::GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        crate::GossipConfig {
+            key_pair: Some(keys[0].clone()),
+            ..crate::GossipConfig::default()
+        },
     );
-    let mut connection = LockFreeConnection::new(addr, ConnectionDirection::Outbound);
-    connection.stream_handle = Some(Arc::new(stream_handle));
-    connection.set_state(ConnectionState::Connected);
-    let connection = Arc::new(connection);
+    local.enable_tls(keys[0].to_secret_key()).unwrap();
+    let local = Arc::new(local);
+    let mut remote = crate::registry::GossipRegistry::<()>::new(
+        addr,
+        crate::GossipConfig {
+            key_pair: Some(keys[1].clone()),
+            ..crate::GossipConfig::default()
+        },
+    );
+    remote.enable_tls(keys[1].to_secret_key()).unwrap();
+    let acceptor = remote.tls_config.as_ref().unwrap().acceptor();
+    let schema_hash = remote.config.schema_hash;
+    assert_eq!(schema_hash, local.config.schema_hash, "fixture Hello schemas must match");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("fixture TCP accept");
+        let mut tls = acceptor.accept(stream).await.expect("fixture TLS accept");
+        let alpn = tls.get_ref().1.alpn_protocol().map(|value| value.to_vec());
+        crate::handshake::perform_hello_handshake(
+            &mut tls,
+            alpn.as_deref(),
+            false,
+            schema_hash,
+            crate::handshake::RemoteBootId::from_bytes([51; 16]),
+        )
+        .await
+        .expect("fixture authenticated Hello");
+        std::future::pending::<()>().await;
+        drop(tls);
+    });
+    let pool = &local.connection_pool;
+    let handle = pool.connect_via_stream(
+        addr, None, 8, Duration::from_secs(5), Arc::downgrade(&local),
+    ).await.expect("fixture production TLS connection");
+    let connection = pool.get_connection_by_addr(&addr).expect("fixture published stream");
+    assert_eq!(connection.embedded_peer_id.as_ref(), Some(&peer_id));
+    assert!(connection.has_live_stream());
+    assert!(pool.get_connected_connection_to_peer(&peer_id).is_some());
     assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, connection.clone()));
+    assert!(pool.connections_by_peer.read_sync(&peer_id, |_, current| {
+        Arc::ptr_eq(current, &connection)
+    }).unwrap_or(false));
 
-    let _ = pool.connections_by_peer.remove_sync(&peer_id);
-
+    assert!(pool.connections_by_peer.remove_sync(&peer_id).is_some());
+    assert!(!pool.connections_by_peer.contains_sync(&peer_id));
     let resolved = pool
         .get_connection_by_peer_id(&peer_id)
         .expect("session should retain current connection");
     assert!(Arc::ptr_eq(&resolved, &connection));
+    server.abort();
+    drop(handle);
 }
 
 #[tokio::test]
@@ -13404,26 +13444,64 @@ async fn make_live_connection_with_correlation(
 /// (post-fix): the slot survives, still `SLOT_WAITING`.
 #[tokio::test]
 async fn retire_displaced_expected_must_not_cancel_winners_shared_correlation() {
-    let peer_id = crate::KeyPair::new_for_testing("shared-correlation-peer").peer_id();
-    let addr: SocketAddr = "127.0.0.1:7496".parse().unwrap();
-
-    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
-
-    // The peer session's shared, SESSION-level tracker — created up front,
-    // exactly like the real outbound/inbound connect paths do via
-    // `get_or_create_correlation_tracker` BEFORE installing it onto a raw
-    // `conn.correlation` (production `LockFreeConnection::new` always seeds
-    // a fresh PRIVATE tracker; only this explicit overwrite makes it
-    // session-shared — see `pool_connect.rs` outbound ~3216-3219 / inbound
-    // ~3634).
+    let mut keys = [
+        crate::KeyPair::new_for_testing("shared-correlation-local"),
+        crate::KeyPair::new_for_testing("shared-correlation-peer"),
+    ];
+    keys.sort_by_key(|key| *key.peer_id().to_node_id().as_bytes());
+    let peer_id = keys[1].peer_id();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut local = crate::registry::GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        crate::GossipConfig {
+            key_pair: Some(keys[0].clone()),
+            ..crate::GossipConfig::default()
+        },
+    );
+    local.enable_tls(keys[0].to_secret_key()).unwrap();
+    let local = Arc::new(local);
+    let mut remote = crate::registry::GossipRegistry::<()>::new(
+        addr,
+        crate::GossipConfig {
+            key_pair: Some(keys[1].clone()),
+            ..crate::GossipConfig::default()
+        },
+    );
+    remote.enable_tls(keys[1].to_secret_key()).unwrap();
+    let acceptor = remote.tls_config.as_ref().unwrap().acceptor();
+    let schema_hash = remote.config.schema_hash;
+    assert_eq!(schema_hash, local.config.schema_hash, "fixture Hello schemas must match");
+    let server = tokio::spawn(async move {
+        let mut streams = Vec::new();
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().await.expect("fixture TCP accept");
+            let mut tls = acceptor.accept(stream).await.expect("fixture TLS accept");
+            let alpn = tls.get_ref().1.alpn_protocol().map(|value| value.to_vec());
+            crate::handshake::perform_hello_handshake(
+                &mut tls,
+                alpn.as_deref(),
+                false,
+                schema_hash,
+                // Both physical sessions belong to the SAME authenticated boot.
+                crate::handshake::RemoteBootId::from_bytes([52; 16]),
+            )
+            .await
+            .expect("fixture authenticated Hello");
+            streams.push(tls);
+        }
+        // Retain both independently authenticated sockets through retirement.
+        std::future::pending::<()>().await;
+        drop(streams);
+    });
+    let pool = &local.connection_pool;
     let tracker = pool.get_or_create_correlation_tracker(&peer_id);
-
-    // `expected`: the losing/displaced instance, indexed+counted exactly
-    // like a real, previously accepted/finalized connection for this peer,
-    // using the shared tracker.
-    let expected =
-        make_live_connection_with_correlation(addr, ConnectionDirection::Outbound, tracker.clone())
-            .await;
+    let expected_handle = pool.connect_via_stream(
+        addr, None, 8, Duration::from_secs(5), Arc::downgrade(&local),
+    ).await.expect("fixture first production TLS connection");
+    let expected = pool.get_connection_by_addr(&addr).expect("fixture first published stream");
+    assert_eq!(expected.embedded_peer_id.as_ref(), Some(&peer_id));
+    assert!(expected.has_live_stream());
     assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, expected.clone()));
     assert!(
         expected
@@ -13433,12 +13511,30 @@ async fn retire_displaced_expected_must_not_cancel_winners_shared_correlation() 
         "test precondition: `expected` must use the peer session's shared tracker"
     );
 
-    // `winner`: the fresh instance the tie-break selects, installed with the
-    // IDENTICAL shared tracker Arc — exactly what a real reconnect for this
-    // peer gets from `handle_correlation`/`add_connection_by_peer_id`.
-    let winner =
-        make_live_connection_with_correlation(addr, ConnectionDirection::Inbound, tracker.clone())
-            .await;
+    // Remove only routing/session projections, not the old stream or tracker.
+    // A fresh production dial must authenticate a second physical TLS session,
+    // rather than reusing `expected` or constructing an identity-less proxy.
+    pool.clear_current_peer_connection_if_matches(&peer_id, &expected);
+    pool.evict_pin_alias(&peer_id, addr);
+    assert!(expected.has_live_stream());
+    let winner_handle = pool.connect_via_stream(
+        addr, Some(peer_id.to_node_id()), 8, Duration::from_secs(5), Arc::downgrade(&local),
+    ).await.expect("fixture second production TLS connection");
+    let winner = pool.get_connection_by_addr(&addr).expect("fixture second published stream");
+    assert_eq!(winner.embedded_peer_id.as_ref(), Some(&peer_id));
+    assert!(winner.has_live_stream());
+    assert!(expected.has_live_stream());
+    assert!(!Arc::ptr_eq(&expected, &winner));
+    assert_ne!(
+        expected.stream_handle.as_ref().unwrap().instance_id(),
+        winner.stream_handle.as_ref().unwrap().instance_id(),
+    );
+    assert!(expected.remote_boot_id.is_some(), "fixture Hello must authenticate the remote boot");
+    assert_eq!(expected.remote_boot_id, winner.remote_boot_id);
+    assert!(winner.correlation.as_ref().is_some_and(|c| Arc::ptr_eq(c, &tracker)));
+    // Restore the real incumbent for the precise CAS/retirement primitive under
+    // test; no authenticated identity or correlation field is assigned here.
+    assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, expected.clone()));
 
     // An in-flight ask slot on the WINNER's tracker, exactly as if a real ask
     // were awaiting a reply on the connection that is about to become
@@ -13477,7 +13573,10 @@ async fn retire_displaced_expected_must_not_cancel_winners_shared_correlation() 
          in-flight slot — this kills the WINNER's in-flight asks (QA finding R-C)"
     );
 
+    assert!(winner.has_live_stream(), "retirement must preserve the winner's live TLS stream");
     guard.disarm();
+    server.abort();
+    drop((expected_handle, winner_handle));
 }
 
 /// Control for the fix above: a GENUINELY FINAL teardown (no surviving
