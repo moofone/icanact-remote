@@ -14567,6 +14567,164 @@ async fn full_sync_response_claim_displaced_during_merge_records_no_stale_projec
     run_full_sync_displaced_during_merge_is_dropped(true).await;
 }
 
+/// A real certificate-authenticated stream must not be reused for a different
+/// requested peer merely because that peer is configured at its address.
+#[tokio::test]
+async fn peer_binding_reused_address_identity() {
+    let first = crate::KeyPair::new_for_testing("peer_binding_reuse_local");
+    let second = crate::KeyPair::new_for_testing("peer_binding_reuse_remote");
+    let (local_key, remote_key) = if first.peer_id().to_node_id().as_bytes()
+        < second.peer_id().to_node_id().as_bytes()
+    {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote_addr = listener.local_addr().unwrap();
+    let local_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let mut local = crate::registry::GossipRegistry::<()>::new(
+        local_addr,
+        crate::GossipConfig {
+            key_pair: Some(local_key.clone()),
+            ..crate::GossipConfig::default()
+        },
+    );
+    local.enable_tls(local_key.to_secret_key()).unwrap();
+    let local = Arc::new(local);
+    let mut remote = crate::registry::GossipRegistry::<()>::new(
+        remote_addr,
+        crate::GossipConfig {
+            key_pair: Some(remote_key.clone()),
+            ..crate::GossipConfig::default()
+        },
+    );
+    remote.enable_tls(remote_key.to_secret_key()).unwrap();
+    let acceptor = remote.tls_config.as_ref().unwrap().acceptor();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut tls = acceptor.accept(stream).await.unwrap();
+        let alpn = tls.get_ref().1.alpn_protocol().map(|value| value.to_vec());
+        crate::handshake::perform_hello_handshake(
+            &mut tls,
+            alpn.as_deref(),
+            false,
+            None,
+            crate::handshake::RemoteBootId::from_bytes([41; 16]),
+        )
+        .await
+        .unwrap();
+        // Keep the authenticated socket alive while the production pool lookup
+        // attempts address reuse. No synthetic connection or identity is used.
+        std::future::pending::<()>().await;
+        drop(tls);
+    });
+    let pool = &local.connection_pool;
+    let handle = pool
+        .connect_via_stream(
+            remote_addr,
+            None,
+            8,
+            Duration::from_secs(5),
+            Arc::downgrade(&local),
+        )
+        .await
+        .unwrap();
+    let authenticated = pool.get_connection_by_addr(&remote_addr).unwrap();
+    assert_eq!(authenticated.embedded_peer_id.as_ref(), Some(&remote_key.peer_id()));
+    assert!(authenticated.has_live_stream());
+    assert!(pool.get_connected_connection_to_peer(&remote_key.peer_id()).is_some());
+
+    let requested = crate::KeyPair::new_for_testing("peer_binding_reuse_other").peer_id();
+    pool.set_configured_peer_addr(&requested, remote_addr);
+    let reused = pool.get_connected_connection_to_peer(&requested);
+    server.abort();
+    drop(handle);
+    assert!(reused.is_none(), "a peer-qualified lookup reused another peer's TLS stream");
+}
+
+/// Lose adoption's empty-slot CAS to a genuinely authenticated stream of a
+/// different peer; returning that live winner would violate the requested identity.
+#[tokio::test]
+async fn peer_binding_adoption_cas_winner() {
+    let _serial = lock_fallback_adoption_test().await;
+    let mut keys = [
+        crate::KeyPair::new_for_testing("peer_binding_cas_a"),
+        crate::KeyPair::new_for_testing("peer_binding_cas_b"),
+        crate::KeyPair::new_for_testing("peer_binding_cas_c"),
+    ];
+    keys.sort_by_key(|key| *key.peer_id().to_node_id().as_bytes());
+    let local_key = &keys[0];
+    let mut local = crate::registry::GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        crate::GossipConfig {
+            key_pair: Some(local_key.clone()),
+            ..crate::GossipConfig::default()
+        },
+    );
+    local.enable_tls(local_key.to_secret_key()).unwrap();
+    let local = Arc::new(local);
+    let mut servers = Vec::new();
+    let mut handles = Vec::new();
+    let mut connections = Vec::new();
+    for (index, key) in keys[1..].iter().enumerate() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut remote = crate::registry::GossipRegistry::<()>::new(
+            addr,
+            crate::GossipConfig {
+                key_pair: Some(key.clone()),
+                ..crate::GossipConfig::default()
+            },
+        );
+        remote.enable_tls(key.to_secret_key()).unwrap();
+        let acceptor = remote.tls_config.as_ref().unwrap().acceptor();
+        servers.push(tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(stream).await.unwrap();
+            let alpn = tls.get_ref().1.alpn_protocol().map(|value| value.to_vec());
+            crate::handshake::perform_hello_handshake(
+                &mut tls,
+                alpn.as_deref(),
+                false,
+                None,
+                crate::handshake::RemoteBootId::from_bytes([42 + index as u8; 16]),
+            )
+            .await
+            .unwrap();
+            std::future::pending::<()>().await;
+            drop(tls);
+        }));
+        handles.push(local.connection_pool.connect_via_stream(
+            addr, None, 8, Duration::from_secs(5), Arc::downgrade(&local),
+        ).await.unwrap());
+        let connection = local.connection_pool.get_connection_by_addr(&addr).unwrap();
+        assert_eq!(connection.embedded_peer_id.as_ref(), Some(&key.peer_id()));
+        assert!(connection.has_live_stream());
+        connections.push(connection);
+    }
+    let requested = keys[1].peer_id();
+    let fallback = &connections[0];
+    let winner = connections[1].clone();
+    let pool = &local.connection_pool;
+    pool.set_configured_peer_addr(&requested, fallback.addr);
+    pool.clear_current_peer_connection_if_matches(&requested, fallback);
+    let hook_registry = local.clone();
+    let hook_peer = requested.clone();
+    let captured = fallback.clone();
+    set_fallback_adoption_hook(Some(Arc::new(move |candidate| {
+        assert!(Arc::ptr_eq(candidate, &captured));
+        hook_registry.connection_pool.publish_current_peer_connection(&hook_peer, winner.clone());
+    })));
+    let adopted = pool.get_connected_connection_to_peer(&requested);
+    set_fallback_adoption_hook(None);
+    for server in servers {
+        server.abort();
+    }
+    drop(handles);
+    assert!(adopted.is_none(), "adoption returned a CAS winner authenticated as another peer");
+}
+
 include!("qa_queue_close.rs");
 include!("qa_deadline.rs");
 include!("qa_response_budget.rs");

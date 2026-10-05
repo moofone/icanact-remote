@@ -870,6 +870,177 @@ mod tests {
     use std::net::SocketAddr;
     use std::time::Duration;
 
+    // Controlled native replies over real TLS: observe the production request's
+    // correlation, then release the response without injecting any wire identity.
+    struct PeerBindingReply {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        correlation: Arc<std::sync::atomic::AtomicU32>,
+    }
+
+    impl crate::registry::ActorMessageHandler for PeerBindingReply {
+        fn handle_actor_message(
+            &self,
+            _actor_id: u64,
+            _type_hash: u32,
+            payload: crate::AlignedBytes,
+            correlation_id: Option<u32>,
+        ) -> crate::registry::ActorMessageFuture<'_> {
+            Box::pin(async move {
+                self.correlation.store(correlation_id.expect("native ask correlation"), Ordering::Release);
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(Some(crate::registry::ActorResponse::Aligned(payload)))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_binding_unmatched_response_rekey() -> crate::Result<()> {
+        let mut keys = ["binding_rekey_caller", "binding_rekey_old", "binding_rekey_new"]
+            .map(KeyPair::new_for_testing);
+        keys.sort_by_key(|key| *key.peer_id().to_node_id().as_bytes());
+        let mut nodes = Vec::new();
+        for key in keys {
+            let mut config = test_cfg();
+            config.key_pair = Some(key.clone());
+            config.gossip_interval = Duration::from_secs(3_600);
+            nodes.push(GossipRegistryHandle::new_with_transport_stack(
+                "127.0.0.1:0".parse().unwrap(), key.to_secret_key(), Some(config), TestTlsBootstrap,
+            ).await?);
+        }
+        let caller = &nodes[0];
+        let mut controls = Vec::new();
+        let mut connections = Vec::new();
+        for remote in &nodes[1..] {
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let release = Arc::new(tokio::sync::Notify::new());
+            let correlation = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            remote.registry.set_actor_message_handler(Arc::new(PeerBindingReply {
+                entered: entered.clone(), release: release.clone(), correlation: correlation.clone(),
+            })).await;
+            if caller.registry.should_keep_connection(&remote.registry.peer_id, true) {
+                caller.add_peer(&remote.registry.peer_id).await.connect(&remote.registry.bind_addr).await?;
+            } else {
+                remote.add_peer(&caller.registry.peer_id).await.connect(&caller.registry.bind_addr).await?;
+            }
+            let connection = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    if let Ok(peer) = caller.lookup_peer(&remote.registry.peer_id).await
+                        && let Some(connection) = peer.connection_ref()
+                    {
+                        break connection;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            }).await.expect("real TLS connection lookup");
+            controls.push((entered, release, correlation));
+            connections.push(connection);
+        }
+        let old = connections[0].ask_actor_frame_deferred(
+            7, 11, Bytes::from_static(b"native request"), Duration::from_secs(5),
+        ).await?;
+        tokio::time::timeout(Duration::from_secs(3), controls[0].0.notified()).await.unwrap();
+        drop(old);
+        let new = connections[1].ask_actor_frame_deferred(
+            7, 11, Bytes::from_static(b"native request"), Duration::from_secs(5),
+        ).await?;
+        tokio::time::timeout(Duration::from_secs(3), controls[1].0.notified()).await.unwrap();
+        assert_eq!(controls[0].2.load(Ordering::Acquire), controls[1].2.load(Ordering::Acquire),
+            "fixture must exercise the same native correlation on distinct peers");
+        let pool = &caller.registry.connection_pool;
+        let old_connection = pool.get_connection_by_peer_id(&nodes[1].registry.peer_id).unwrap();
+        let new_connection = pool.get_connection_by_peer_id(&nodes[2].registry.peer_id).unwrap();
+        assert_eq!(old_connection.embedded_peer_id.as_ref(), Some(&nodes[1].registry.peer_id));
+        assert_eq!(new_connection.embedded_peer_id.as_ref(), Some(&nodes[2].registry.peer_id));
+        assert_eq!(old_connection.addr, nodes[1].registry.bind_addr);
+        assert_eq!(old_connection.direction, crate::connection_pool::ConnectionDirection::Outbound);
+        // Apply the production address-index publication seam. The old reader
+        // retains its original authenticated ReadContext and captured tracker.
+        pool.publish_address_index(old_connection.addr, new_connection, Some(&nodes[2].registry.peer_id));
+        assert_eq!(pool.get_peer_id_by_addr(&old_connection.addr), Some(nodes[2].registry.peer_id.clone()));
+        let before = caller.registry.unmatched_responses.load(Ordering::Acquire);
+        controls[0].1.notify_one();
+        let read = tokio::time::timeout(Duration::from_secs(3), async {
+            while caller.registry.unmatched_responses.load(Ordering::Acquire) == before {
+                tokio::task::yield_now().await;
+            }
+        }).await;
+        // This is a positive reader barrier, not a sleep-based assertion that
+        // an attacker response probably arrived before checking the waiter.
+        controls[1].1.notify_one();
+        let result = new.wait().await;
+        for node in nodes {
+            node.shutdown_and_wait().await;
+        }
+        assert!(read.is_ok(), "old unmatched TLS response was rerouted instead of counted");
+        assert_eq!(result?, Bytes::from_static(b"native request"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn peer_binding_native_cancelled_late_response() -> crate::Result<()> {
+        let mut keys = ["binding_cancel_caller", "binding_cancel_remote"]
+            .map(KeyPair::new_for_testing);
+        keys.sort_by_key(|key| *key.peer_id().to_node_id().as_bytes());
+        let mut nodes = Vec::new();
+        for key in keys {
+            let mut config = test_cfg();
+            config.key_pair = Some(key.clone());
+            config.gossip_interval = Duration::from_secs(3_600);
+            nodes.push(GossipRegistryHandle::new_with_transport_stack(
+                "127.0.0.1:0".parse().unwrap(), key.to_secret_key(), Some(config), TestTlsBootstrap,
+            ).await?);
+        }
+        let caller = &nodes[0];
+        let remote = &nodes[1];
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let correlation = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        remote.registry.set_actor_message_handler(Arc::new(PeerBindingReply {
+            entered: entered.clone(), release: release.clone(), correlation,
+        })).await;
+        if caller.registry.should_keep_connection(&remote.registry.peer_id, true) {
+            caller.add_peer(&remote.registry.peer_id).await.connect(&remote.registry.bind_addr).await?;
+        } else {
+            remote.add_peer(&caller.registry.peer_id).await.connect(&caller.registry.bind_addr).await?;
+        }
+        let connection = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(peer) = caller.lookup_peer(&remote.registry.peer_id).await
+                    && let Some(connection) = peer.connection_ref()
+                {
+                    break connection;
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("real TLS connection lookup");
+        let cancelled = connection.ask_actor_frame_deferred(
+            7, 11, Bytes::from_static(b"native request"), Duration::from_secs(5),
+        ).await?;
+        tokio::time::timeout(Duration::from_secs(3), entered.notified()).await.unwrap();
+        let before = caller.registry.unmatched_responses.load(Ordering::Acquire);
+        drop(cancelled);
+        release.notify_one();
+        let late = tokio::time::timeout(Duration::from_secs(3), async {
+            while caller.registry.unmatched_responses.load(Ordering::Acquire) == before {
+                tokio::task::yield_now().await;
+            }
+        }).await;
+        let next = connection.ask_actor_frame_deferred(
+            7, 11, Bytes::from_static(b"native request"), Duration::from_secs(5),
+        ).await?;
+        tokio::time::timeout(Duration::from_secs(3), entered.notified()).await.unwrap();
+        release.notify_one();
+        let result = next.wait().await;
+        for node in nodes {
+            node.shutdown_and_wait().await;
+        }
+        assert!(late.is_ok(), "cancelled native ask's late TLS response must be unmatched");
+        assert_eq!(result?, Bytes::from_static(b"native request"));
+        Ok(())
+    }
+
     #[derive(Debug, Clone, Copy, Default)]
     struct TestTlsBootstrap;
     struct TestNoopBootstrap;
