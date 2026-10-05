@@ -14601,6 +14601,8 @@ async fn peer_binding_reused_address_identity() {
     );
     remote.enable_tls(remote_key.to_secret_key()).unwrap();
     let acceptor = remote.tls_config.as_ref().unwrap().acceptor();
+    let schema_hash = remote.config.schema_hash;
+    assert_eq!(schema_hash, local.config.schema_hash, "fixture Hello schemas must match");
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut tls = acceptor.accept(stream).await.unwrap();
@@ -14609,7 +14611,7 @@ async fn peer_binding_reused_address_identity() {
             &mut tls,
             alpn.as_deref(),
             false,
-            None,
+            schema_hash,
             crate::handshake::RemoteBootId::from_bytes([41; 16]),
         )
         .await
@@ -14679,6 +14681,8 @@ async fn peer_binding_adoption_cas_winner() {
         );
         remote.enable_tls(key.to_secret_key()).unwrap();
         let acceptor = remote.tls_config.as_ref().unwrap().acceptor();
+        let schema_hash = remote.config.schema_hash;
+        assert_eq!(schema_hash, local.config.schema_hash, "fixture Hello schemas must match");
         servers.push(tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut tls = acceptor.accept(stream).await.unwrap();
@@ -14687,7 +14691,7 @@ async fn peer_binding_adoption_cas_winner() {
                 &mut tls,
                 alpn.as_deref(),
                 false,
-                None,
+                schema_hash,
                 crate::handshake::RemoteBootId::from_bytes([42 + index as u8; 16]),
             )
             .await

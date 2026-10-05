@@ -937,13 +937,17 @@ mod tests {
             controls.push((entered, release, correlation));
             connections.push(connection);
         }
+        // Diagnostic bytes distinguish test replies only. Peer authorization
+        // still comes exclusively from real TLS sessions and native trackers.
+        let old_reply = Bytes::from_static(b"old authenticated reader reply");
+        let legitimate_reply = Bytes::from_static(b"other peer legitimate reply");
         let old = connections[0].ask_actor_frame_deferred(
-            7, 11, Bytes::from_static(b"native request"), Duration::from_secs(5),
+            7, 11, old_reply.clone(), Duration::from_secs(5),
         ).await?;
         tokio::time::timeout(Duration::from_secs(3), controls[0].0.notified()).await.unwrap();
         drop(old);
         let new = connections[1].ask_actor_frame_deferred(
-            7, 11, Bytes::from_static(b"native request"), Duration::from_secs(5),
+            7, 11, legitimate_reply.clone(), Duration::from_secs(5),
         ).await?;
         tokio::time::timeout(Duration::from_secs(3), controls[1].0.notified()).await.unwrap();
         assert_eq!(controls[0].2.load(Ordering::Acquire), controls[1].2.load(Ordering::Acquire),
@@ -960,21 +964,43 @@ mod tests {
         pool.publish_address_index(old_connection.addr, new_connection, Some(&nodes[2].registry.peer_id));
         assert_eq!(pool.get_peer_id_by_addr(&old_connection.addr), Some(nodes[2].registry.peer_id.clone()));
         let before = caller.registry.unmatched_responses.load(Ordering::Acquire);
+        let pending = new.wait();
+        tokio::pin!(pending);
         controls[0].1.notify_one();
-        let read = tokio::time::timeout(Duration::from_secs(3), async {
-            while caller.registry.unmatched_responses.load(Ordering::Acquire) == before {
-                tokio::task::yield_now().await;
+        let mut early_reply = None;
+        let reader_processed = tokio::select! {
+            // Poll the native waiter first even if the counter barrier also
+            // becomes ready. The other peer's legitimate reply remains gated.
+            biased;
+            reply = &mut pending => {
+                early_reply = Some(reply);
+                false
             }
-        }).await;
-        // This is a positive reader barrier, not a sleep-based assertion that
-        // an attacker response probably arrived before checking the waiter.
+            _ = async {
+                while caller.registry.unmatched_responses.load(Ordering::Acquire) == before {
+                    tokio::task::yield_now().await;
+                }
+            } => true,
+            _ = tokio::time::sleep(Duration::from_secs(3)) => false,
+        };
+        let completed_before_release = early_reply.is_some();
         controls[1].1.notify_one();
-        let result = new.wait().await;
+        let result = match early_reply {
+            Some(reply) => reply,
+            None => pending.await,
+        };
         for node in nodes {
             node.shutdown_and_wait().await;
         }
-        assert!(read.is_ok(), "old unmatched TLS response was rerouted instead of counted");
-        assert_eq!(result?, Bytes::from_static(b"native request"));
+        assert!(
+            !completed_before_release,
+            "other peer's native pending ask completed before its legitimate reply was released: \
+             {result:?}; old-reader diagnostic bytes: {old_reply:?}"
+        );
+        // Timeout alone is a fixture/processing-barrier failure, NOT proof
+        // that the old reader delivered to the wrong peer's native waiter.
+        assert!(reader_processed, "fixture: old TLS reader processing was not observed within 3s");
+        assert_eq!(result?, legitimate_reply);
         Ok(())
     }
 
