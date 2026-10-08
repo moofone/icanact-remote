@@ -3354,16 +3354,23 @@ fn drain_pending_ask_nacks_requeues_on_zero_byte_write_miss() {
 #[test]
 fn park_deferred_ask_does_not_grow_nack_queue_past_cap() {
     let pool = Arc::new(crate::AlignedBytesPool::default());
-    let ask = |id: u32| ReadIoResult::ActorAsk {
-        correlation_id: id,
-        actor_id: 1,
-        type_hash: 1,
-        payload: crate::AlignedBytes::from_pooled_slice(&[], pool.clone()),
+    let ask = |id: u32| {
+        let header = crate::framing::write_actor_ask_header(id, 1, 1, 0);
+        let buffer = crate::PooledAlignedBuffer::from_slice(&header, pool.clone());
+        let result = crate::handle::parse_message_from_pooled_buffer(
+            buffer,
+            header.len() - crate::framing::LENGTH_PREFIX_LEN,
+        )
+        .expect("deferred fixture must be a real parsed actor ask");
+        assert!(matches!(result, crate::handle::MessageReadResult::Actor {
+            correlation_id, ..
+        } if correlation_id == id));
+        result
     };
 
     let mut deferred = std::collections::VecDeque::new();
     let mut queue = LocalStreamingQueue::new();
-    for i in 0..DEFERRED_ASK_CAP as u32 {
+    for i in 1..=DEFERRED_ASK_CAP as u32 {
         park_deferred_ask(&mut deferred, ask(i), &mut queue, 0);
     }
     assert_eq!(deferred.len(), DEFERRED_ASK_CAP);
