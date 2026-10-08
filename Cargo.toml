@@ -29,7 +29,7 @@ rkyv = { version = "0.8", features = ["bytecheck"] }
 serde = { version = "1.0", features = ["derive"] }
 socket2 = { version = "0.5", features = ["all"] }
 thiserror = "2.0.12"
-tokio = { version = "1.52.1", default-features = false, features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.52.1", default-features = false, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1.41"
 
 # TLS and cryptographic dependencies
@@ -41,11 +41,11 @@ x509-parser = "0.16"  # For parsing X.509 certificates
 sha2 = "0.10"  # For deterministic NodeId generation fallback
 
 [dev-dependencies]
-bytes = "1.0"
 criterion = { version = "0.7", features = ["async_tokio"] }
-tokio-test = "0.4"
+# Examples use signals; paused-clock tests need test-util explicitly rather
+# than inheriting it accidentally through the unused tokio-test dependency.
+tokio = { version = "1.52.1", default-features = false, features = ["signal", "test-util"] }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
-tracing-test = "0.2.5"
 
 [[test]]
 name = "interest_advertise_convergence_delivery"

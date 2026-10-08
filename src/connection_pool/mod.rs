@@ -254,6 +254,9 @@ mod disconnect_delivery_tests {
 #[cfg(test)]
 mod lease_test_support;
 
+#[cfg(test)]
+mod pending_write_cleanup_tests;
+
 #[cfg(any(test, feature = "test-helpers"))]
 pub(crate) mod lease_stats;
 

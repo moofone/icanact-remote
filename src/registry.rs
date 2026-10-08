@@ -12484,6 +12484,7 @@ impl<T: 'static> GossipRegistry<T> {
             );
         }
         let mut crossed_threshold = false;
+        #[cfg(feature = "test-helpers")]
         let mut applied = false;
         let replacement_is_current;
         let delivery_epoch;
@@ -12549,7 +12550,10 @@ impl<T: 'static> GossipRegistry<T> {
                     peer_info.last_failure_instant = Some(std::time::Instant::now());
                     peer_info.last_attempt = current_time;
                     crossed_threshold = was_below;
-                    applied = true;
+                    #[cfg(feature = "test-helpers")]
+                    {
+                        applied = true;
+                    }
                     info!(
                         peer = %failed_peer_addr,
                         retry_after_secs = self.config.peer_retry_interval.as_secs(),

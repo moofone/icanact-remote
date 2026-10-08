@@ -20,17 +20,17 @@ This directory contains repository validation helpers. The current scripts are c
 ./scripts/full_validation.sh
 ```
 
-The script currently:
+The script runs default and all-features workspace test lanes once each, followed by both copy guards and optional coverage gates. It uses the existing local lockfile and offline dependencies. Resolve/fetch dependencies separately before running it. No broad retries or substring skips are used; socket failures block validation rather than becoming clean passes.
 
-1. Runs `cargo test --test ask_reply_end_to_end -j 1 -- --test-threads=1` first.
-2. Runs the broader workspace test suite with retries.
-3. Runs `check_no_rkyv_from_bytes.sh`.
-4. Runs `check_forbidden_copy_patterns.sh`.
-5. Runs focused pointer-identity tests.
-6. Runs focused streaming tests from `tests/streaming_tests.rs`.
-7. Optionally runs coverage gates if a plan path is supplied.
+Native test output is not piped because of macOS socket/output constraints. Command identities and exit statuses are logged under `logs/`; preserve the terminal transcript when diagnosing failures. This is not a complete test-output log.
 
-It also creates `baselines/`, `reports/`, and `logs/` if they do not exist, and writes a log to `logs/validation_<timestamp>.txt`.
+For troubleshooting only, `./scripts/full_validation.sh --focus FILTER` verifies a nonzero test selection and runs it with all features. Focused success is not full validation.
+
+Harness regression tests (no real Cargo execution):
+
+```bash
+bash scripts/tests/full_validation_test.sh
+```
 
 ## Coverage scripts
 
