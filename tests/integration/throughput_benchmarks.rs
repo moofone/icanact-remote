@@ -514,6 +514,156 @@ async fn create_registry(seed: &str, config: GossipConfig) -> GossipRegistryHand
     .unwrap()
 }
 
+/// A common, closed-loop concurrency fixture: all depths use the same runtime,
+/// request API, transport, payload and validation. It is deliberately separate
+/// from the historical short-throughput tests. These are saturation latencies,
+/// not fixed-offered-load latencies (no coordinated-omission correction).
+async fn measure_concurrent_asks(
+    remote: icanact_remote::RemoteActorRef,
+    inflight: usize,
+    duration: Duration,
+) -> (u64, Duration, Vec<u64>) {
+    assert!(matches!(inflight, 1 | 8 | 64 | 512));
+    let start = Instant::now();
+    let deadline = start + duration;
+    let mut pending = FuturesUnordered::new();
+    let mut next = 0u64;
+    let mut latencies = Vec::new();
+    loop {
+        while pending.len() < inflight && Instant::now() < deadline {
+            let id = next;
+            next += 1;
+            let remote = remote.clone();
+            pending.push(async move {
+                // Unique identity proves correlations cannot silently swap
+                // equally-sized echo responses under concurrent completion.
+                let mut bytes = [13u8; PAYLOAD_BYTES];
+                bytes[..8].copy_from_slice(&id.to_be_bytes());
+                let payload = Bytes::copy_from_slice(&bytes);
+                let started = Instant::now();
+                let reply = remote
+                    .ask_actor_frame_no_timeout(BENCH_ACTOR_ID, BENCH_TYPE_HASH, payload.clone())
+                    .await
+                    .expect("measured ask must complete successfully");
+                let latency = started.elapsed().as_nanos() as u64;
+                assert_eq!(reply, payload, "response identity/content mismatch");
+                latency
+            });
+        }
+        match pending.next().await {
+            Some(latency) => latencies.push(latency),
+            None => break,
+        }
+    }
+    assert_eq!(
+        latencies.len() as u64,
+        next,
+        "all admitted asks must complete"
+    );
+    (next, start.elapsed(), latencies)
+}
+
+async fn concurrent_ask_fixture(
+    inflight: usize,
+    warmup: Duration,
+    duration: Duration,
+) -> (u64, Duration, Vec<u64>) {
+    let config = GossipConfig {
+        gossip_interval: Duration::from_secs(60),
+        ask_window: 65_536,
+        ..Default::default()
+    };
+    let receiver = create_registry("measured-concurrency-receiver", config.clone()).await;
+    let sender = create_registry("measured-concurrency-sender", config).await;
+    register_echo_actor(
+        &receiver.registry,
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(Notify::new()),
+    )
+    .await;
+    connect_unidirectional(&sender, &receiver).await;
+    // An outbound connect resolves after enqueueing identify, not after the
+    // other side publishes its inbound session. Wait for the exact admission
+    // precondition instead of sleeping or accidentally dialing a rival.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !sender
+            .registry
+            .connection_pool
+            .has_connection_by_peer_id(&receiver.registry.peer_id)
+        {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("sender must admit the preferred connection");
+    let remote = sender
+        .lookup_peer(&receiver.registry.peer_id)
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(
+        warmup + Duration::from_secs(10),
+        measure_concurrent_asks(remote.clone(), inflight, warmup),
+    )
+    .await
+    .expect("warmup must not stall");
+    let result = tokio::time::timeout(
+        duration + Duration::from_secs(10),
+        measure_concurrent_asks(remote, inflight, duration),
+    )
+    .await
+    .expect("measured requests must not stall");
+    sender.shutdown().await;
+    receiver.shutdown().await;
+    result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_measurement_fixture_checks_all_depths() {
+    for inflight in [1, 8, 64, 512] {
+        let (count, elapsed, latencies) = concurrent_ask_fixture(
+            inflight,
+            Duration::from_millis(20),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert!(count > 0);
+        assert!(elapsed >= Duration::from_millis(50));
+        assert_eq!(latencies.len() as u64, count);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measurement-only; explicit duration/depth and paired orchestration required"]
+async fn test_actor_ask_concurrency_measurement() {
+    let inflight = bench_env_u64("ICANACT_MEASURE_INFLIGHT", 64) as usize;
+    let warmup = Duration::from_millis(bench_env_u64("ICANACT_MEASURE_WARMUP_MS", 5000));
+    let duration = Duration::from_millis(bench_env_u64("ICANACT_MEASURE_MS", 10000));
+    assert!(
+        duration >= Duration::from_secs(10),
+        "acceptance fixture must run >= 10 seconds"
+    );
+    let (count, elapsed, mut latencies) = concurrent_ask_fixture(inflight, warmup, duration).await;
+    latencies.sort_unstable();
+    let percentile = |percent: usize| {
+        let rank = (latencies.len() * percent).div_ceil(100);
+        latencies[rank.saturating_sub(1)]
+    };
+    // Fixture setup/shutdown and percentile sorting are outside the timer.
+    // Throughput includes client scheduling, payload construction and full
+    // identity checks; per-ask latency starts immediately before calling ask.
+    println!(
+        "AB_METRICS {{\"workload\":\"ask_inflight{}\",\"completed\":{},\"errors\":0,\"drops\":0,\"metrics\":{{\"throughput\":{},\"p50_ns\":{},\"p95_ns\":{},\"p99_ns\":{},\"duration_ns\":{}}}}}",
+        inflight,
+        count,
+        count as f64 / elapsed.as_secs_f64(),
+        percentile(50),
+        percentile(95),
+        percentile(99),
+        elapsed.as_nanos(),
+    );
+}
+
 fn testing_keypair(seed: &str) -> KeyPair {
     let mut digest = [0u8; 32];
     digest.copy_from_slice(&Sha256::digest(seed.as_bytes()));

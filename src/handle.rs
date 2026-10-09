@@ -1236,11 +1236,18 @@ mod tests {
             );
         let mut existing = crate::connection_pool::LockFreeConnection::new(
             existing_addr,
-            crate::connection_pool::ConnectionDirection::Inbound,
+            crate::connection_pool::ConnectionDirection::Outbound,
         );
         existing.stream_handle = Some(Arc::new(existing_stream_handle));
         existing.set_state(crate::connection_pool::ConnectionState::Connected);
         let existing = Arc::new(existing);
+        assert!(
+            handle.registry.should_keep_connection(
+                &remote_peer_id,
+                existing.direction == crate::connection_pool::ConnectionDirection::Outbound,
+            ),
+            "the duplicate-rejection fixture requires a preferred surviving connection"
+        );
         assert!(handle.registry.connection_pool.add_connection_by_peer_id(
             remote_peer_id.clone(),
             existing_addr,
@@ -1342,13 +1349,23 @@ mod tests {
                 handle.registry.config.schema_hash,
                 None,
             );
+        // This test needs a lasting concurrent creator, not a temporary
+        // wrong-direction session that the required-peer supervisor may
+        // legitimately replace while the rejection/rollback is observed.
         let mut survivor = crate::connection_pool::LockFreeConnection::new(
             survivor_addr,
-            crate::connection_pool::ConnectionDirection::Inbound,
+            crate::connection_pool::ConnectionDirection::Outbound,
         );
         survivor.stream_handle = Some(Arc::new(survivor_stream));
         survivor.set_state(crate::connection_pool::ConnectionState::Connected);
         let survivor = Arc::new(survivor);
+        assert!(
+            handle.registry.should_keep_connection(
+                &remote_peer_id,
+                survivor.direction == crate::connection_pool::ConnectionDirection::Outbound,
+            ),
+            "the concurrent-creator fixture must install a preferred survivor, not a link the supervisor must replace"
+        );
 
         let _guard = {
             let registry = handle.registry.clone();
@@ -1503,20 +1520,27 @@ mod tests {
             );
         let mut existing = crate::connection_pool::LockFreeConnection::new(
             existing_addr,
-            crate::connection_pool::ConnectionDirection::Inbound,
+            crate::connection_pool::ConnectionDirection::Outbound,
         );
         existing.stream_handle = Some(Arc::new(existing_stream_handle));
         existing.set_state(crate::connection_pool::ConnectionState::Connected);
         let existing = Arc::new(existing);
+        assert!(
+            handle.registry.should_keep_connection(
+                &remote_peer_id,
+                existing.direction == crate::connection_pool::ConnectionDirection::Outbound,
+            ),
+            "the duplicate-rejection fixture requires a preferred surviving connection"
+        );
         assert!(handle.registry.connection_pool.add_connection_by_peer_id(
             remote_peer_id.clone(),
             existing_addr,
             existing.clone(),
         ));
 
-        // Simulate the existing connection's own earlier, successful accept:
+        // Simulate the surviving connection's earlier successful admission:
         // its session is armed at `bind_addr` with its OWN (`existing_addr`)
-        // source, exactly like the real accept path does after this fix.
+        // source, as for a real admitted connection.
         handle
             .registry
             .add_peer_with_node_id(
@@ -5622,12 +5646,10 @@ where
     let pool = aligned_pool
         .cloned()
         .unwrap_or_else(|| Arc::new(crate::AlignedBytesPool::default()));
-    let mut buffer = unsafe {
-        crate::PooledAlignedBuffer::with_len_uninit(
-            crate::framing::LENGTH_PREFIX_LEN + decoded.body_len,
-            pool,
-        )
-    };
+    let mut buffer = crate::PooledAlignedBuffer::with_len(
+        crate::framing::LENGTH_PREFIX_LEN + decoded.body_len,
+        pool,
+    );
     buffer.as_mut_slice()[..crate::framing::LENGTH_PREFIX_LEN].copy_from_slice(&control);
     reader
         .read_exact(&mut buffer.as_mut_slice()[crate::framing::LENGTH_PREFIX_LEN..])
@@ -5656,16 +5678,36 @@ mod framing_tests {
             .unwrap()
     }
 
+    #[tokio::test]
+    async fn first_frame_exposes_only_initialized_storage_across_partial_reads() {
+        let frame = framing::write_stream_abort_header(7, 9);
+        let mut reader = crate::aligned::InitializedReadProbe::new(frame.to_vec());
+        assert!(matches!(
+            read_message_from_tls_reader(&mut reader, 1024, None)
+                .await
+                .unwrap(),
+            MessageReadResult::StreamAbort {
+                stream_id: 7,
+                reason: 9
+            }
+        ));
+        let mut truncated =
+            crate::aligned::InitializedReadProbe::new(frame[..frame.len() - 1].to_vec());
+        assert!(
+            read_message_from_tls_reader(&mut truncated, 1024, None)
+                .await
+                .is_err()
+        );
+    }
+
     fn parse_with_routes(
         frame: &[u8],
         routes: &crate::route_interning::RouteTable,
     ) -> crate::Result<MessageReadResult> {
-        let mut buffer = unsafe {
-            crate::PooledAlignedBuffer::with_len_uninit(
-                frame.len(),
-                std::sync::Arc::new(crate::AlignedBytesPool::default()),
-            )
-        };
+        let mut buffer = crate::PooledAlignedBuffer::with_len(
+            frame.len(),
+            std::sync::Arc::new(crate::AlignedBytesPool::default()),
+        );
         buffer.as_mut_slice().copy_from_slice(frame);
         parse_message_from_pooled_buffer_with_routes(
             buffer,

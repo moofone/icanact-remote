@@ -570,6 +570,28 @@ mod read_pipeline_tests {
     }
 
     #[tokio::test]
+    async fn framed_reads_expose_initialized_storage_in_every_mode() {
+        let frame = crate::framing::write_stream_abort_header(7, 9);
+        for mode in READ_MODES {
+            let ctx = test_read_context(9199);
+            for bytes in [frame.to_vec(), frame[..frame.len() - 1].to_vec()] {
+                let complete = bytes.len() == frame.len();
+                let mut reader = crate::aligned::InitializedReadProbe::new(bytes);
+                let (frames, error) = drain_until_error(
+                    mode, &mut reader, &mut super::ReadState::new(), &ctx,
+                    &mut crate::protocol::StreamingState::new(),
+                ).await;
+                assert_eq!(frames, usize::from(complete));
+                if complete {
+                    assert!(super::is_orderly_peer_close(&error));
+                } else {
+                    assert_truncation(&error, "body");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn eof_between_frames_is_an_orderly_peer_close_in_every_read_mode() {
         let frame = crate::framing::write_stream_abort_header(7, 9);
         for mode in READ_MODES {
@@ -1174,12 +1196,8 @@ where
                         }));
                     }
                     let total_len = msg_len + crate::framing::LENGTH_PREFIX_LEN;
-                    let mut buffer = unsafe {
-                        crate::PooledAlignedBuffer::with_len_uninit(
-                            total_len,
-                            ctx.aligned_pool.clone(),
-                        )
-                    };
+                    let mut buffer =
+                        crate::PooledAlignedBuffer::with_len(total_len, ctx.aligned_pool.clone());
                     buffer.as_mut_slice()[..crate::framing::LENGTH_PREFIX_LEN].copy_from_slice(buf);
 
                     *state = ReadState::ReadBody {
@@ -1469,12 +1487,8 @@ where
                         }));
                     }
                     let total_len = msg_len + crate::framing::LENGTH_PREFIX_LEN;
-                    let mut buffer = unsafe {
-                        crate::PooledAlignedBuffer::with_len_uninit(
-                            total_len,
-                            ctx.aligned_pool.clone(),
-                        )
-                    };
+                    let mut buffer =
+                        crate::PooledAlignedBuffer::with_len(total_len, ctx.aligned_pool.clone());
                     buffer.as_mut_slice()[..crate::framing::LENGTH_PREFIX_LEN].copy_from_slice(buf);
 
                     *state = ReadState::ReadBody {

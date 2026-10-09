@@ -4560,29 +4560,45 @@ mod tests {
         let old_session = addr(30_041);
         let new_session = addr(30_042);
 
-        owner
-            .claim_connection_scoped(
-                target,
-                claim_of(node.clone(), ClaimKind::Verified),
-                old_session,
-            )
-            .await;
-        // What a dead-peer sweep would have fixed as the failure evidence's
-        // Instant-equivalent at selection time -- BEFORE the reconnect
-        // below, e.g. because `old_session` had already gone quiet and
-        // `gossip_state` looked dead at that exact moment.
-        let evidence_before = std::time::Instant::now();
+        // Fix the source-evidence history explicitly. Program order between
+        // two Instant::now calls does not promise distinct clock ticks,
+        // especially in the optimized build; equality would violate this
+        // fixture's claimed strictly-before precondition, not the owner's
+        // intentionally strict causal comparison. No production fence or
+        // outcome assertion is relaxed.
+        let now = std::time::Instant::now();
+        let old_evidence_at = now.checked_sub(Duration::from_secs(1)).unwrap();
+        let evidence_before = now.checked_sub(Duration::from_millis(500)).unwrap();
+        assert!(old_evidence_at < evidence_before && evidence_before < now);
+        assert!(
+            owner
+                .claim_connection_scoped_at(
+                    target,
+                    claim_of(node.clone(), ClaimKind::Verified),
+                    old_session,
+                    legacy_connection_instance_id(old_session),
+                    old_evidence_at,
+                )
+                .await
+                .is_accepted()
+        );
+        // The fixed failure evidence is after the old session's direct
+        // evidence and strictly before the fresh reconnect below.
 
         // The reconnect: a fresh, genuinely live claim for the SAME
-        // identity, committed strictly AFTER the fixed failure evidence but
+        // identity, evidenced strictly AFTER the fixed failure evidence but
         // well before its (delayed) release actually runs.
-        owner
-            .claim_connection_scoped(
-                target,
-                claim_of(node.clone(), ClaimKind::Verified),
-                new_session,
-            )
-            .await;
+        assert!(std::time::Instant::now() > evidence_before);
+        assert!(
+            owner
+                .claim_connection_scoped(
+                    target,
+                    claim_of(node.clone(), ClaimKind::Verified),
+                    new_session,
+                )
+                .await
+                .is_accepted()
+        );
 
         // Enough wall time now passes that any elapsed-time check, measured
         // from the reconnect's own commit, would no longer protect it. The

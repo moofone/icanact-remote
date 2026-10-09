@@ -4389,6 +4389,20 @@ impl<T> ConnectionPool<T> {
         }
 
         if identify_send_failed {
+            // A preferred sibling can legitimately retire this published
+            // candidate while it is building/sending identify. In that case
+            // this attempt lost admission, not peer liveness: use the same
+            // neutral outcome as a pre-publication tie-break rejection. Never
+            // return the abandoned candidate as a handle, and keep the guard
+            // armed so its identity-scoped cleanup still runs. A missing,
+            // identical, or unusable current connection is a real failure.
+            if let Some(peer_id) = peer_id_opt.as_ref()
+                && self.peer_current_connection_snapshot(peer_id).is_some_and(|current| {
+                    !Arc::ptr_eq(&current, &connection_arc) && self.is_usable_connection(&current)
+                })
+            {
+                return Err(crate::GossipError::ConnectionExists);
+            }
             // Unlike a candidate that loses the outbound tie-break above,
             // this one WAS published (and counted): `connections_by_addr`,
             // `addr_to_peer_id`, the peer's session slot, and

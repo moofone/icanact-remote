@@ -7,6 +7,8 @@ use std::task::{Context, Poll};
 use tokio::runtime::Builder;
 use tokio::time::sleep;
 
+mod qa_connect_publication;
+
 struct TestActor;
 
 impl crate::registry::ActorMessageHandlerSync for TestActor {
