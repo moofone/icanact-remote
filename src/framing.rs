@@ -832,6 +832,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wire_spec_table_matches_canonical_kinds_and_sizes() {
+        let spec = include_str!("../spec/WIRE_V5.md");
+        for kind in WireKind::ALL {
+            let expected = match kind {
+                WireKind::Gossip => GOSSIP_FRAME_HEADER_LEN,
+                WireKind::Ask | WireKind::Response => ASK_RESPONSE_FRAME_HEADER_LEN,
+                WireKind::ActorTell => ACTOR_TELL_FRAME_HEADER_LEN,
+                WireKind::ActorAsk => ACTOR_ASK_FRAME_HEADER_LEN,
+                WireKind::StreamStart => STREAM_REQUEST_START_FRAME_HEADER_LEN,
+                WireKind::StreamResponseStart => STREAM_RESPONSE_START_FRAME_HEADER_LEN,
+                WireKind::StreamData | WireKind::StreamResponseData | WireKind::StreamAbort => {
+                    STREAM_DATA_FRAME_HEADER_LEN
+                }
+                WireKind::DirectAsk => DIRECT_ASK_FRAME_HEADER_LEN,
+                WireKind::DirectResponse => DIRECT_RESPONSE_FRAME_HEADER_LEN,
+                WireKind::PubSub => PUBSUB_FRAME_HEADER_LEN,
+                WireKind::RouteBind => ROUTE_BIND_FRAME_HEADER_LEN,
+                WireKind::RoutedActorAsk => ROUTED_ACTOR_ASK_FRAME_HEADER_LEN,
+            };
+            let prefix = format!("| {} | {kind:?} |", kind as u8);
+            let rows: Vec<_> = spec
+                .lines()
+                .filter(|line| line.starts_with(&prefix))
+                .collect();
+            assert_eq!(rows.len(), 1, "exactly one documented row for {kind:?}");
+            let size: usize = rows[0].split('|').nth(3).unwrap().trim().parse().unwrap();
+            assert_eq!(size, expected, "documented header size for {kind:?}");
+        }
+        assert_eq!(
+            crate::handshake::ALPN_ICANACT_V6,
+            crate::tls::ALPN_ICANACT_V6
+        );
+        assert!(spec.contains(std::str::from_utf8(crate::handshake::ALPN_ICANACT_V6).unwrap()));
+        assert!(spec.contains(&format!(
+            "protocol version **{}**",
+            crate::handshake::CURRENT_PROTOCOL_VERSION
+        )));
+    }
+
+    #[test]
     fn control_round_trip_and_rejects_unknown_kind() {
         let bytes = encode_control(WireKind::ActorTell, 123);
         assert_eq!(

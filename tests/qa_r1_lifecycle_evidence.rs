@@ -8,7 +8,7 @@ use icanact_remote::{
     BuilderTlsBootstrap, GossipConfig, GossipRegistryHandle, KeyPair, PeerId, TransportDirection,
     TransportLifecycleEvent, TransportLifecycleRecorderGuard,
 };
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
@@ -40,12 +40,22 @@ impl Gate {
         }
     }
 
+    fn release_on_drop(&self) -> GateRelease {
+        GateRelease(self.clone())
+    }
+
     fn wait(&self) {
-        let (lock, wake) = &*self.state;
-        let mut open = lock.lock().expect("gate mutex poisoned");
-        while !*open {
-            open = wake.wait(open).expect("gate mutex poisoned");
-        }
+        // A synchronous recorder may run on a Tokio worker. Hand off its
+        // scheduling core (including its non-stealable LIFO task) before
+        // pinning the callback, otherwise the reconnect needed to release
+        // this gate can be stranded behind this very callback.
+        tokio::task::block_in_place(|| {
+            let (lock, wake) = &*self.state;
+            let mut open = lock.lock().expect("gate mutex poisoned");
+            while !*open {
+                open = wake.wait(open).expect("gate mutex poisoned");
+            }
+        });
     }
 
     fn open(&self) {
@@ -53,6 +63,100 @@ impl Gate {
         *lock.lock().expect("gate mutex poisoned") = true;
         wake.notify_all();
     }
+}
+
+// Callback pins must be released even if an assertion/timeout unwinds the
+// controller. Otherwise Tokio runtime destruction waits forever for a worker
+// blocked in Condvar::wait, hiding the original test failure.
+struct GateRelease(Gate);
+impl Drop for GateRelease {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
+struct InstancePin {
+    expected: AtomicU64,
+    once: AtomicBool,
+}
+impl InstancePin {
+    fn new() -> Self {
+        Self {
+            expected: AtomicU64::new(0),
+            once: AtomicBool::new(true),
+        }
+    }
+    fn arm(&self, instance: u64) {
+        assert_ne!(instance, 0, "physical instance IDs are nonzero");
+        self.expected.store(instance, Ordering::Release);
+    }
+    fn claim(&self, instance: u64) -> bool {
+        let expected = self.expected.load(Ordering::Acquire);
+        expected != 0 && expected == instance && self.once.swap(false, Ordering::AcqRel)
+    }
+}
+
+#[test]
+fn teardown_pin_ignores_setup_events_and_other_instances() {
+    let pin = InstancePin::new();
+    assert!(
+        !pin.claim(7),
+        "setup churn must not capture the teardown gate"
+    );
+    pin.arm(7);
+    assert!(
+        !pin.claim(6),
+        "another physical instance must not capture the gate"
+    );
+    assert!(pin.claim(7));
+    assert!(!pin.claim(7), "exactly one callback owns the pin");
+}
+
+#[test]
+fn callback_gate_does_not_strand_worker_local_publication_tasks() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let gate = Gate::new();
+    let release = gate.release_on_drop();
+    let callback_gate = gate.clone();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let callback = runtime.spawn(async move {
+        // This child begins in the callback worker's local/LIFO scheduling
+        // domain, just like the owner/publication task needed by a reconnect.
+        tokio::spawn(async move {
+            sender.send(()).unwrap();
+        });
+        callback_gate.wait();
+    });
+    let progress = receiver.recv_timeout(Duration::from_secs(1));
+    // Release BEFORE asserting: the RED path must fail, not hang in runtime
+    // destruction. Completion after release cannot turn this into a pass.
+    drop(release);
+    runtime.block_on(callback).expect("callback must not panic");
+    assert!(
+        progress.is_ok(),
+        "a blocked recorder must hand off its worker's queued publication tasks"
+    );
+}
+
+#[test]
+fn callback_gate_is_released_when_controller_unwinds() {
+    let gate = Gate::new();
+    let release = gate.release_on_drop();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        gate.wait();
+        sender.send(()).unwrap();
+    });
+    assert!(receiver.try_recv().is_err());
+    drop(release);
+    receiver
+        .recv_timeout(EVIDENCE_TIMEOUT)
+        .expect("unwind cleanup must release the worker");
+    worker.join().expect("callback worker must not panic");
 }
 
 fn event_sequence(event: &TransportTestHelperEvent) -> Option<u64> {
@@ -196,8 +300,10 @@ async fn ordered_lifecycle_evidence_proves_publication_and_stale_teardown_fencin
     let (event_sender, mut events) = unbounded_channel::<TransportTestHelperEvent>();
     let recorded = Arc::new(Mutex::new(Vec::<TransportTestHelperEvent>::new()));
     let publication_gate = Gate::new();
+    let _publication_release = publication_gate.release_on_drop();
     let publication_once = Arc::new(AtomicBool::new(true));
     let stale_gate = Gate::new();
+    let _stale_release = stale_gate.release_on_drop();
     let stale_gate_enabled = Arc::new(AtomicBool::new(false));
     let stale_once = Arc::new(AtomicBool::new(false));
     let recorder_events = Arc::clone(&recorded);
@@ -449,6 +555,7 @@ async fn late_replacement_before_disconnect_callback_is_fenced() -> Result<(), D
     let (event_sender, mut events) = unbounded_channel::<TransportTestHelperEvent>();
     let recorded = Arc::new(Mutex::new(Vec::<TransportTestHelperEvent>::new()));
     let accounting_gate = Gate::new();
+    let _accounting_release = accounting_gate.release_on_drop();
     let accounting_entered = Arc::new(AtomicBool::new(false));
     // Armed (set true) only once setup has settled, so duplicate-session
     // tie-break churn during setup can never trip the gate in the recorder.
@@ -840,6 +947,7 @@ async fn genuine_eof_lookup_miss_runs_fenced_failure_lifecycle() -> Result<(), D
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn identified_failure_lookup_miss_preserves_replacement() -> Result<(), DynError> {
+    eprintln!("lookup-miss evidence: test starting");
     let _test_serial = lifecycle_test_serial().await;
     let config = GossipConfig {
         connection_timeout: EVIDENCE_TIMEOUT,
@@ -855,10 +963,11 @@ async fn identified_failure_lookup_miss_preserves_replacement() -> Result<(), Dy
 
     let (event_sender, mut events) = unbounded_channel::<TransportTestHelperEvent>();
     let teardown_gate = Gate::new();
-    let teardown_once = Arc::new(AtomicBool::new(true));
+    let _teardown_release = teardown_gate.release_on_drop();
+    let teardown_pin = Arc::new(InstancePin::new());
     let recorder_sender = event_sender.clone();
     let recorder_gate = teardown_gate.clone();
-    let recorder_once = Arc::clone(&teardown_once);
+    let recorder_pin = Arc::clone(&teardown_pin);
     let recorder_peer_b = peer_b.clone();
     let _guard = TransportLifecycleRecorderGuard::install(Arc::new(|_event| {}));
     _guard.install_test_helper_recorder(Arc::new(move |event| {
@@ -868,14 +977,16 @@ async fn identified_failure_lookup_miss_preserves_replacement() -> Result<(), Dy
         if let TransportTestHelperEvent::TeardownAttempt {
             peer,
             addr,
-            instance_id: _,
+            instance_id,
             ..
         } = &event
             && *peer == recorder_peer_b
             && *addr == addr_b
-            && recorder_once.swap(false, Ordering::AcqRel)
+            && recorder_pin.claim(*instance_id)
         {
+            eprintln!("lookup-miss evidence: blocking teardown instance={instance_id}");
             recorder_gate.wait();
+            eprintln!("lookup-miss evidence: teardown released");
         }
     }));
 
@@ -894,6 +1005,10 @@ async fn identified_failure_lookup_miss_preserves_replacement() -> Result<(), Dy
         .client()
         .current_peer_connection_instance(&peer_b)
         .expect("initial current B instance");
+    // Setup may itself retire simultaneous-dial candidates. Only block the
+    // exact settled instance, and only after the controller is ready to
+    // exercise its intentionally missing-lookup failure path.
+    teardown_pin.arm(old_instance);
 
     // Remove the old session before invoking its identified failure callback.
     // This deliberately makes the callback's initial peer lookup miss while
@@ -911,7 +1026,9 @@ async fn identified_failure_lookup_miss_preserves_replacement() -> Result<(), Dy
         None,
         "the identified failure must begin with no current peer lookup result"
     );
+    eprintln!("lookup-miss evidence: old instance={old_instance}, shutting down B");
     node_b.shutdown().await;
+    eprintln!("lookup-miss evidence: B shutdown done");
 
     let failure_registry = node_a.registry.clone();
     let failure_task = tokio::spawn(async move {
@@ -932,9 +1049,12 @@ async fn identified_failure_lookup_miss_preserves_replacement() -> Result<(), Dy
     })
     .await;
     let old_teardown_sequence = event_sequence(&old_teardown).unwrap();
+    eprintln!("lookup-miss evidence: old teardown observed; starting replacement");
 
     let replacement_b = node_at(addr_b, key_b, config).await?;
+    eprintln!("lookup-miss evidence: replacement constructed; connecting");
     connect_bidirectional(&node_a, &replacement_b).await?;
+    eprintln!("lookup-miss evidence: replacement connected");
     let replacement_publication = next_event(&mut events, |event| {
         publication_for(event, &peer_b, addr_b, None)
             && matches!(

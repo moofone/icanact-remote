@@ -20,6 +20,10 @@ jobs:
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
       - name: Enforce formatting
         run: cargo fmt --all -- --check
+      - name: Test validation and A/B harnesses
+        run: |
+          python3 -m unittest discover -s scripts/tests -v
+          bash scripts/tests/full_validation_test.sh
       - name: Enforce strict linting
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Enforce warning-free documentation
@@ -32,10 +36,14 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        features: ["", "--features test-helpers", "--all-features"]
     steps:
       - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
-      - name: Test every feature and target
-        run: cargo test --all-features
+      - name: Test explicit feature lane
+        run: cargo test --workspace ${{ matrix.features }} -- --test-threads=1
 
   audit:
     runs-on: ubuntu-latest

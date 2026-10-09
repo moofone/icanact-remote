@@ -400,6 +400,30 @@ struct LocalStreamingQueue {
 /// the wire.
 const PENDING_ASK_NACK_CAP: usize = 64;
 
+#[derive(Debug)]
+struct AskCapacityViolation(&'static str);
+
+impl std::fmt::Display for AskCapacityViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} capacity exhausted", self.0)
+    }
+}
+impl std::error::Error for AskCapacityViolation {}
+
+fn ask_capacity_violation(resource: &'static str) -> GossipError {
+    GossipError::Network(std::io::Error::other(AskCapacityViolation(resource)))
+}
+
+fn is_ask_capacity_violation(error: &GossipError) -> bool {
+    matches!(error, GossipError::Network(io)
+        if io.get_ref().is_some_and(|inner| inner.is::<AskCapacityViolation>()))
+}
+
+// Passive observation only in library tests; no production metric/state.
+#[cfg(test)]
+static TEST_PENDING_NACK_PEAK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Keep the local response queue within the normal response-batch cap while
 /// allowing one protocol-sized stream to be retained behind an in-flight
 /// response. The hard cap is an aggregate resident bound; the normal queue
@@ -461,10 +485,9 @@ impl LocalStreamingQueue {
         }
     }
 
-    /// Queue a backpressure NACK header for the peer. Always succeeds --
-    /// never blocks, never fails, never consults `is_full`/response
-    /// admission at all, since a fixed 16-byte header cannot meaningfully
-    /// threaten the retention bound those exist to enforce.
+    /// Queue a terminal NACK without consulting streaming-response admission.
+    /// The read side reserves capacity before dispatch. An invariant violation
+    /// is an explicit error, not unbounded growth or eviction of an older reply.
     ///
     /// Never evicts an already-queued entry to make room for a new one:
     /// that header is the *only* remaining record that a specific,
@@ -478,8 +501,20 @@ impl LocalStreamingQueue {
     /// that method), so this is structurally never called while the queue
     /// is already at `PENDING_ASK_NACK_CAP` -- growth stops at the source
     /// of new entries, not by discarding existing ones.
-    fn queue_ask_nack(&mut self, header: [u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN]) {
+    fn queue_ask_nack(
+        &mut self,
+        header: [u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN],
+    ) -> Result<()> {
+        if !self.has_room_for_ask_nack_occupying(0) {
+            return Err(ask_capacity_violation("pending ask NACK"));
+        }
         self.pending_ask_nacks.push_back(header);
+        #[cfg(test)]
+        TEST_PENDING_NACK_PEAK.fetch_max(
+            self.pending_ask_nacks.len(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        Ok(())
     }
 
     /// Whether the queue has room for one more NACK without exceeding

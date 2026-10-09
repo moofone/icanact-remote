@@ -1,6 +1,6 @@
 mod common;
 
-use common::{create_tls_node, wait_for_condition};
+use common::{create_tls_node, create_tls_node_with_keypair, wait_for_condition};
 use icanact_remote::registry::{ActorMessageFuture, ActorMessageHandler};
 use icanact_remote::{GossipConfig, KeyPair};
 use std::future::Future;
@@ -9,6 +9,28 @@ use std::sync::{Arc, Mutex, OnceLock};
 use tokio::time::{Duration, sleep};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::SubscriberInitExt};
+
+fn client_fixture_keypair() -> KeyPair {
+    // A random client may sort above every member of the finite missing-peer
+    // inventory, failing setup before exercising the connection-error oracle.
+    // Keep a fixed, explicitly checked client identity; the server remains
+    // randomized, so either physical connection direction is still exercised.
+    KeyPair::new_for_testing("ask-reply-e2e-client-fixture")
+}
+
+#[test]
+fn client_fixture_has_a_distinct_outbound_preferred_missing_identity() {
+    let local = client_fixture_keypair().peer_id().to_node_id();
+    assert!(
+        (0..100).any(|idx| {
+            let missing = KeyPair::new_for_testing(format!("node_missing_{idx}"))
+                .peer_id()
+                .to_node_id();
+            local.as_bytes() < missing.as_bytes()
+        }),
+        "the fixture must satisfy the original outbound-preference precondition"
+    );
+}
 
 const TEST_ACTOR_ID: u64 = 7;
 const TEST_TYPE_HASH: u32 = 0xA57A_A5C0;
@@ -123,7 +145,9 @@ fn test_end_to_end_ask_reply() {
             gossip_interval: Duration::from_secs(3600),
             ..Default::default()
         };
-        let handle_a = create_tls_node(config.clone()).await.unwrap();
+        let handle_a = create_tls_node_with_keypair(client_fixture_keypair(), config.clone())
+            .await
+            .unwrap();
         let handle_b = create_tls_node(config).await.unwrap();
         handle_b
             .registry

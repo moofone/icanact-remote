@@ -1531,15 +1531,15 @@ fn actor_ask_correlation_id(result: &crate::handle::MessageReadResult) -> Option
 fn queue_ask_backpressure_nack(
     local_streaming_queue: &mut LocalStreamingQueue,
     result: &crate::handle::MessageReadResult,
-) -> bool {
+) -> Result<bool> {
     let Some(correlation_id) = actor_ask_correlation_id(result) else {
-        return false;
+        return Ok(false);
     };
     local_streaming_queue.queue_ask_nack(crate::framing::write_ask_nack_header(
         correlation_id,
         crate::framing::AskNackReason::Backpressure,
-    ));
-    true
+    ))?;
+    Ok(true)
 }
 
 /// Park an already-read ask until budget or NACK-queue room exists.
@@ -1554,18 +1554,21 @@ fn park_deferred_ask(
     result: crate::handle::MessageReadResult,
     local_streaming_queue: &mut LocalStreamingQueue,
     nack_extra: usize,
-) {
+) -> Result<()> {
     if slot.len() < DEFERRED_ASK_CAP {
         slot.push_back(result);
-        return;
+        return Ok(());
     }
-    if local_streaming_queue.has_room_for_ask_nack_occupying(nack_extra) {
-        queue_ask_backpressure_nack(local_streaming_queue, &result);
-        return;
+    if local_streaming_queue.has_room_for_ask_nack_occupying(nack_extra)
+        && queue_ask_backpressure_nack(local_streaming_queue, &result)?
+    {
+        return Ok(());
     }
     if slot.len() < DEFERRED_ASK_HOLD_CAP {
         slot.push_back(result);
+        return Ok(());
     }
+    Err(ask_capacity_violation("deferred ask"))
 }
 
 /// Write one bounded slice of a lazily framed `Bytes` response. Returning a
@@ -4268,13 +4271,9 @@ impl LockFreeStreamHandle {
                         // drain at the top of the next turn make room first.
                         // (Deliberately not also gating on `is_full()` here
                         // -- see the doc comment above this loop.)
-                        && (deferred_asks.len() < DEFERRED_ASK_CAP
-                            || local_streaming_queue.has_room_for_ask_nack_occupying(0)
-                            || (!deferred_asks.is_empty()
-                                && !inline_response_budget_exhausted(
-                                    &pending_ordinary_write,
-                                    &response_batch,
-                                )))
+                        && local_streaming_queue.has_room_for_ask_nack_occupying(
+                            pending_ask_nack_occupancy(&pending_ordinary_write),
+                        )
                         && (pending_stream_cmd.is_none()
                             || (response_batch.total_bytes() < RESPONSE_BATCH_BYTE_CAP
                                 ))
@@ -4397,27 +4396,36 @@ impl LockFreeStreamHandle {
                                     if local_streaming_queue.has_room_for_ask_nack_occupying(
                                         pending_ask_nack_occupancy(&pending_ordinary_write),
                                     ) {
-                                        queue_ask_backpressure_nack(
+                                        if let Err(error) = queue_ask_backpressure_nack(
                                             &mut local_streaming_queue,
                                             &result,
-                                        );
+                                        ) {
+                                            warn!(peer = %ctx.peer_addr, error = %error, "ask capacity invariant violated; closing connection");
+                                            return;
+                                        }
                                         continue;
                                     }
-                                    park_deferred_ask(
+                                    if let Err(error) = park_deferred_ask(
                                         &mut deferred_asks,
                                         result,
                                         &mut local_streaming_queue,
                                         pending_ask_nack_occupancy(&pending_ordinary_write),
-                                    );
+                                    ) {
+                                        warn!(peer = %ctx.peer_addr, error = %error, "ask capacity invariant violated; closing connection");
+                                        return;
+                                    }
                                     break;
                                 }
                                 AskBudgetAction::Defer => {
-                                    park_deferred_ask(
+                                    if let Err(error) = park_deferred_ask(
                                         &mut deferred_asks,
                                         result,
                                         &mut local_streaming_queue,
                                         pending_ask_nack_occupancy(&pending_ordinary_write),
-                                    );
+                                    ) {
+                                        warn!(peer = %ctx.peer_addr, error = %error, "ask capacity invariant violated; closing connection");
+                                        return;
+                                    }
                                     continue;
                                 }
                             }
@@ -4441,6 +4449,9 @@ impl LockFreeStreamHandle {
                                         error = %e,
                                         "Failed to process fast IO message"
                                     );
+                                    if is_ask_capacity_violation(&e) {
+                                        return; // fail closed; never silently lose a consumed ask
+                                    }
                                     if is_streaming_admission_backpressure(&e) {
                                         break;
                                     }
@@ -4475,6 +4486,9 @@ impl LockFreeStreamHandle {
                                         error = %e,
                                         "Failed to process message on IO task"
                                     );
+                                    if is_ask_capacity_violation(&e) {
+                                        return; // fail closed; never silently lose a consumed ask
+                                    }
                                     if is_streaming_admission_backpressure(&e) {
                                         break;
                                     }
@@ -4785,27 +4799,36 @@ impl LockFreeStreamHandle {
                                     AskBudgetAction::Dispatch => {}
                                     AskBudgetAction::Nack => {
                                         if local_streaming_queue.has_room_for_ask_nack_occupying(pending_ask_nack_occupancy(&pending_ordinary_write)) {
-                                            queue_ask_backpressure_nack(
+                                            if let Err(error) = queue_ask_backpressure_nack(
                                                 &mut local_streaming_queue,
                                                 &result,
-                                            );
+                                            ) {
+                                                warn!(peer = %ctx.peer_addr, error = %error, "ask capacity invariant violated; closing connection");
+                                                return;
+                                            }
                                             continue;
                                         }
-                                        park_deferred_ask(
+                                        if let Err(error) = park_deferred_ask(
                                                 &mut deferred_asks,
                                                 result,
                                                 &mut local_streaming_queue,
                                                 pending_ask_nack_occupancy(&pending_ordinary_write),
-                                            );
+                                            ) {
+                                            warn!(peer = %ctx.peer_addr, error = %error, "ask capacity invariant violated; closing connection");
+                                            return;
+                                        }
                                         continue;
                                     }
                                     AskBudgetAction::Defer => {
-                                        park_deferred_ask(
+                                        if let Err(error) = park_deferred_ask(
                                                 &mut deferred_asks,
                                                 result,
                                                 &mut local_streaming_queue,
                                                 pending_ask_nack_occupancy(&pending_ordinary_write),
-                                            );
+                                            ) {
+                                            warn!(peer = %ctx.peer_addr, error = %error, "ask capacity invariant violated; closing connection");
+                                            return;
+                                        }
                                         if let Err(e) = park_ask_response_batch(
                                             &mut pending_ordinary_write,
                                             &mut response_batch,
@@ -4841,6 +4864,9 @@ impl LockFreeStreamHandle {
                                             error = %e,
                                             "Failed to process fast IO message"
                                         );
+                                        if is_ask_capacity_violation(&e) {
+                                            return; // fail closed; never silently lose a consumed ask
+                                        }
                                         if is_streaming_admission_backpressure(&e) {
                                             // The idle select arm has no inner
                                             // drain loop, so `continue` returns
@@ -4879,6 +4905,9 @@ impl LockFreeStreamHandle {
                                                 error = %e,
                                                 "Failed to process message on IO task"
                                             );
+                                            if is_ask_capacity_violation(&e) {
+                                                return; // fail closed; never silently lose a consumed ask
+                                            }
                                             if is_streaming_admission_backpressure(&e) {
                                                 continue;
                                             }
@@ -4905,12 +4934,12 @@ impl LockFreeStreamHandle {
                             // for the same reason.
                             while drained < drain_batch_limit
                                 // See the identical check in the primary
-                                // drain loop above, minus the budget-not-
-                                // exhausted clause: this inner drain only
-                                // reads new socket frames, it does not pop
-                                // `deferred_asks`.
-                                && (deferred_asks.len() < DEFERRED_ASK_CAP
-                                    || local_streaming_queue.has_room_for_ask_nack_occupying(0))
+                                // drain loop above: any next frame can need
+                                // a NACK, including DirectAsk, which never
+                                // occupies the deferred actor-ask deque.
+                                && local_streaming_queue.has_room_for_ask_nack_occupying(
+                                    pending_ask_nack_occupancy(&pending_ordinary_write),
+                                )
                                 && (pending_stream_cmd.is_none()
                                     || (response_batch.total_bytes() < RESPONSE_BATCH_BYTE_CAP
                                         ))
@@ -4980,27 +5009,36 @@ impl LockFreeStreamHandle {
                                         AskBudgetAction::Dispatch => {}
                                         AskBudgetAction::Nack => {
                                             if local_streaming_queue.has_room_for_ask_nack_occupying(pending_ask_nack_occupancy(&pending_ordinary_write)) {
-                                                queue_ask_backpressure_nack(
+                                                if let Err(error) = queue_ask_backpressure_nack(
                                                     &mut local_streaming_queue,
                                                     &result,
-                                                );
+                                                ) {
+                                                    warn!(peer = %ctx.peer_addr, error = %error, "ask capacity invariant violated; closing connection");
+                                                    return;
+                                                }
                                                 continue;
                                             }
-                                            park_deferred_ask(
+                                            if let Err(error) = park_deferred_ask(
                                                 &mut deferred_asks,
                                                 result,
                                                 &mut local_streaming_queue,
                                                 pending_ask_nack_occupancy(&pending_ordinary_write),
-                                            );
+                                            ) {
+                                                warn!(peer = %ctx.peer_addr, error = %error, "ask capacity invariant violated; closing connection");
+                                                return;
+                                            }
                                             break;
                                         }
                                         AskBudgetAction::Defer => {
-                                            park_deferred_ask(
+                                            if let Err(error) = park_deferred_ask(
                                                 &mut deferred_asks,
                                                 result,
                                                 &mut local_streaming_queue,
                                                 pending_ask_nack_occupancy(&pending_ordinary_write),
-                                            );
+                                            ) {
+                                                warn!(peer = %ctx.peer_addr, error = %error, "ask capacity invariant violated; closing connection");
+                                                return;
+                                            }
                                             break;
                                         }
                                     }
@@ -5024,6 +5062,9 @@ impl LockFreeStreamHandle {
                                                 error = %e,
                                                 "Failed to process fast IO message"
                                             );
+                                            if is_ask_capacity_violation(&e) {
+                                                return; // fail closed; never silently lose a consumed ask
+                                            }
                                             if is_streaming_admission_backpressure(&e) {
                                                 break;
                                             }
@@ -5058,6 +5099,9 @@ impl LockFreeStreamHandle {
                                                     error = %e,
                                                     "Failed to process message on IO task"
                                                 );
+                                                if is_ask_capacity_violation(&e) {
+                                                    return; // fail closed; never silently lose a consumed ask
+                                                }
                                                 if is_streaming_admission_backpressure(&e) {
                                                     break;
                                                 }

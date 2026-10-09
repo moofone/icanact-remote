@@ -17,11 +17,13 @@ echo "$*" >> "$CALLS"
 case "$SCENARIO" in
     missing) exit 127 ;;
     compile) exit 101 ;;
-    assertion) exit 1 ;;
+    assertion) if [[ " $* " == *' test '* && " $* " != *' --list '* ]]; then exit 1; fi ;;
     flaky) [[ $(wc -l < "$CALLS") -gt 1 ]] || exit 1 ;;
 esac
 if [[ " $* " == *' --list '* ]]; then
     [[ "$SCENARIO" == zero ]] || echo 'fixture::test: test'
+elif [[ " $* " == *' test '* ]]; then
+    echo 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out;'
 fi
 CARGO
 chmod +x "$tmp/bin/cargo"
@@ -36,12 +38,17 @@ for scenario in missing compile assertion flaky zero success; do
         bash "$tmp/project/scripts/full_validation.sh" > "$tmp/output" 2>&1 || status=$?
     fi
     if [[ "$scenario" == success ]]; then
-        [[ "$status" == 0 && $(wc -l < "$CALLS") == 2 ]]
+        [[ "$status" == 0 && $(wc -l < "$CALLS") == 18 ]]
         grep -q -- '--all-features' "$CALLS"
-        grep -q 'VALIDATION PASSED' "$tmp/output"
+        grep -q -- 'test-helpers' "$CALLS"
+        grep -q -- '--release' "$CALLS"
+        grep -q 'TEST_COUNTS selected=1 executed=1' "$tmp/output"
+        grep -q 'VALIDATION COMPLETE' "$tmp/output"
     else
-        [[ "$status" != 0 && $(wc -l < "$CALLS") == 1 ]]
-        ! grep -q 'VALIDATION PASSED' "$tmp/output"
+        expected_calls=1
+        [[ "$scenario" != assertion ]] || expected_calls=8
+        [[ "$status" != 0 && $(wc -l < "$CALLS") == "$expected_calls" ]]
+        ! grep -q 'VALIDATION COMPLETE' "$tmp/output"
     fi
 done
 export SCENARIO=success

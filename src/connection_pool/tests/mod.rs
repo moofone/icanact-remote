@@ -7,6 +7,9 @@ use std::task::{Context, Poll};
 use tokio::runtime::Builder;
 use tokio::time::sleep;
 
+mod qa_connect_publication;
+mod qa_nack_capacity;
+
 struct TestActor;
 
 impl crate::registry::ActorMessageHandlerSync for TestActor {
@@ -3199,10 +3202,12 @@ fn drain_pending_ask_nacks_reports_outstanding_work_past_the_per_turn_cap() {
     run_multi_thread_test(async {
         let mut queue = LocalStreamingQueue::new();
         for i in 0..9u32 {
-            queue.queue_ask_nack(crate::framing::write_ask_nack_header(
-                i,
-                crate::framing::AskNackReason::Backpressure,
-            ));
+            queue
+                .queue_ask_nack(crate::framing::write_ask_nack_header(
+                    i,
+                    crate::framing::AskNackReason::Backpressure,
+                ))
+                .unwrap();
         }
         assert_eq!(queue.pending_ask_nack_count(), 9);
 
@@ -3271,10 +3276,12 @@ fn drain_pending_ask_nacks_reports_outstanding_work_past_the_per_turn_cap() {
 fn drain_pending_ask_nacks_requeues_on_zero_byte_write_miss() {
     run_multi_thread_test(async {
         let mut queue = LocalStreamingQueue::new();
-        queue.queue_ask_nack(crate::framing::write_ask_nack_header(
-            0x51_E11D,
-            crate::framing::AskNackReason::Backpressure,
-        ));
+        queue
+            .queue_ask_nack(crate::framing::write_ask_nack_header(
+                0x51_E11D,
+                crate::framing::AskNackReason::Backpressure,
+            ))
+            .unwrap();
         assert_eq!(queue.pending_ask_nack_count(), 1);
 
         let (mut server_half, mut client_half) = tokio::io::duplex(32);
@@ -3371,24 +3378,26 @@ fn park_deferred_ask_does_not_grow_nack_queue_past_cap() {
     let mut deferred = std::collections::VecDeque::new();
     let mut queue = LocalStreamingQueue::new();
     for i in 1..=DEFERRED_ASK_CAP as u32 {
-        park_deferred_ask(&mut deferred, ask(i), &mut queue, 0);
+        park_deferred_ask(&mut deferred, ask(i), &mut queue, 0).unwrap();
     }
     assert_eq!(deferred.len(), DEFERRED_ASK_CAP);
     assert_eq!(queue.pending_ask_nack_count(), 0);
 
-    park_deferred_ask(&mut deferred, ask(1_000), &mut queue, 0);
+    park_deferred_ask(&mut deferred, ask(1_000), &mut queue, 0).unwrap();
     assert_eq!(deferred.len(), DEFERRED_ASK_CAP);
     assert_eq!(queue.pending_ask_nack_count(), 1);
 
     while queue.has_room_for_ask_nack() {
-        queue.queue_ask_nack(crate::framing::write_ask_nack_header(
-            2_000 + queue.pending_ask_nack_count() as u32,
-            crate::framing::AskNackReason::Backpressure,
-        ));
+        queue
+            .queue_ask_nack(crate::framing::write_ask_nack_header(
+                2_000 + queue.pending_ask_nack_count() as u32,
+                crate::framing::AskNackReason::Backpressure,
+            ))
+            .unwrap();
     }
     let nacks_at_cap = queue.pending_ask_nack_count();
     assert!(!queue.has_room_for_ask_nack());
-    park_deferred_ask(&mut deferred, ask(3_000), &mut queue, 0);
+    park_deferred_ask(&mut deferred, ask(3_000), &mut queue, 0).unwrap();
     assert_eq!(
         queue.pending_ask_nack_count(),
         nacks_at_cap,
@@ -3399,7 +3408,10 @@ fn park_deferred_ask_does_not_grow_nack_queue_past_cap() {
         DEFERRED_ASK_HOLD_CAP,
         "the already-read ask is retained until NACK room exists"
     );
-    park_deferred_ask(&mut deferred, ask(4_000), &mut queue, 0);
+    assert!(
+        park_deferred_ask(&mut deferred, ask(4_000), &mut queue, 0).is_err(),
+        "already-full hold capacity must be rejected explicitly, not silently lose an ask"
+    );
     assert_eq!(
         deferred.len(),
         DEFERRED_ASK_HOLD_CAP,

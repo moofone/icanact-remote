@@ -28,6 +28,14 @@ fn init_crypto() {
         // The library code may have already installed it by the time this runs, so
         // make init idempotent to avoid flakes.
         icanact_remote::tls::ensure_crypto_provider();
+        if std::env::var_os("ICANACT_DISCOVERY_DIAGNOSTIC_TRACE").is_some() {
+            tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .with_ansi(false)
+                .with_test_writer()
+                .try_init()
+                .expect("diagnostic tracing subscriber");
+        }
     });
 }
 
@@ -76,7 +84,25 @@ where
 /// Test helper: Create a TLS-enabled node
 async fn create_tls_node(config: GossipConfig) -> Result<GossipRegistryHandle, DynError> {
     init_crypto();
-    let secret_key = SecretKey::generate();
+    // Optional deterministic identities make diagnostic runs replayable.
+    // Normal test execution retains its existing randomized identity coverage.
+    static NODE_INDEX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let secret_key = if let Ok(seed) = std::env::var("ICANACT_DISCOVERY_DIAGNOSTIC_SEED") {
+        let offset = std::env::var("ICANACT_DISCOVERY_DIAGNOSTIC_OFFSET")
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .expect("diagnostic node offset must be an integer")
+            })
+            .unwrap_or(0);
+        let index = NODE_INDEX
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .checked_add(offset)
+            .expect("diagnostic node index overflow");
+        icanact_remote::KeyPair::new_for_testing(format!("{seed}:{index}")).to_secret_key()
+    } else {
+        SecretKey::generate()
+    };
     let node = GossipRegistryHandle::new_with_transport_stack(
         "127.0.0.1:0".parse()?,
         secret_key,
