@@ -4,11 +4,15 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 PLAN_PATH=""
+FOCUS=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -p|--plan)
             [[ $# -ge 2 && -n "$2" ]] || { echo "Missing plan path" >&2; exit 2; }
             PLAN_PATH="$2"; shift 2 ;;
+        --focus)
+            [[ $# -ge 2 && -n "$2" ]] || { echo "Missing test filter" >&2; exit 2; }
+            FOCUS="$2"; shift 2 ;;
         *)
             [[ -z "$PLAN_PATH" ]] || { echo "Unexpected argument: $1" >&2; exit 2; }
             PLAN_PATH="$1"; shift ;;
@@ -55,6 +59,12 @@ test_lane() {
     [[ "$executed" -gt 0 ]] || { echo "ERROR: zero executed tests" | tee -a "$LOG_FILE"; exit 1; }
     printf 'TEST_COUNTS selected=%s executed=%s\n' "$selected" "$executed" | tee -a "$LOG_FILE"
 }
+
+if [[ -n "$FOCUS" ]]; then
+    test_lane --workspace --all-features "$FOCUS"
+    printf 'FOCUSED PASS (not full validation): %s\n' "$LOG_DIR" | tee -a "$LOG_FILE"
+    exit 0
+fi
 
 run cargo fmt --all -- --check
 run cargo build --offline --locked --lib --no-default-features

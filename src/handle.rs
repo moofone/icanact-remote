@@ -363,12 +363,7 @@ impl<T> GossipRegistryHandle<T> {
         address: SocketAddr,
         priority: RegistrationPriority,
     ) -> Result<()> {
-        let mut location =
-            RemoteActorLocation::new_with_peer(address, self.registry.peer_id.clone());
-        location.priority = priority;
-        self.registry
-            .register_actor_with_priority(name, location, priority)
-            .await
+        self.register_with_priority(name, address, priority).await
     }
 
     /// Register a local actor with specified priority
@@ -979,6 +974,47 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn registration_aliases_preserve_caller_priority_and_location() -> crate::Result<()> {
+        let key = KeyPair::new_for_testing("registration-alias-cleanup");
+        let handle = GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:0".parse().unwrap(),
+            key.to_secret_key(),
+            Some(test_cfg()),
+            TestNoopBootstrap,
+        )
+        .await?;
+        let addr: SocketAddr = "127.0.0.1:41099".parse().unwrap();
+        for (i, priority) in [
+            RegistrationPriority::Normal,
+            RegistrationPriority::Immediate,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let urgent_name = format!("alias-urgent-{i}");
+            let general_name = format!("alias-general-{i}");
+            handle
+                .register_urgent(urgent_name.clone(), addr, priority)
+                .await?;
+            handle
+                .register_with_priority(general_name.clone(), addr, priority)
+                .await?;
+            for name in [urgent_name, general_name] {
+                let location = handle
+                    .registry
+                    .lookup_actor(&name)
+                    .await
+                    .expect("alias must register actor");
+                assert_eq!(location.address, addr.to_string());
+                assert_eq!(location.priority, priority);
+                assert_eq!(location.peer_id, handle.registry.peer_id);
+            }
+        }
+        handle.shutdown_and_wait().await;
+        Ok(())
+    }
+
     #[test]
     fn inbound_peer_state_addr_rejects_loopback_advertisement_from_remote_source() {
         let peer_addr: SocketAddr = "10.10.0.8:49152".parse().unwrap();
@@ -1317,13 +1353,21 @@ mod tests {
         let remote_node_id = remote_peer_id.to_node_id();
         let mut config = test_cfg();
         config.key_pair = Some(local_keypair.clone());
-        let handle = GossipRegistryHandle::new_with_transport_stack(
+        let mut handle = GossipRegistryHandle::new_with_transport_stack(
             "127.0.0.1:0".parse().unwrap(),
             local_keypair.to_secret_key(),
             Some(config),
             TestNoopBootstrap,
         )
         .await?;
+        // This fixture schedules the competing ownership command itself. The
+        // periodic gossip/supervisor task must not dial the synthetic addresses
+        // or retire its incumbent while the asserted tie-break runs.
+        if let Some(timer) = handle._timer_handle.take() {
+            timer.abort();
+            let result = timer.await;
+            assert!(result.unwrap_err().is_cancelled());
+        }
 
         assert!(
             !handle

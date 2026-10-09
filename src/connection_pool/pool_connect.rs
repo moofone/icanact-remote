@@ -1,6 +1,5 @@
 #[cfg(test)]
-type FallbackAdoptionHook =
-    Arc<dyn Fn(&Arc<LockFreeConnection>) + Send + Sync + 'static>;
+type FallbackAdoptionHook = Arc<dyn Fn(&Arc<LockFreeConnection>) + Send + Sync + 'static>;
 
 #[cfg(test)]
 static FALLBACK_ADOPTION_HOOK: OnceLock<std::sync::Mutex<Option<FallbackAdoptionHook>>> =
@@ -579,7 +578,7 @@ impl<T> ConnectionPool<T> {
                     || current
                         .as_ref()
                         .is_some_and(|current| Arc::ptr_eq(connection, current))
-        });
+            });
     }
 
     /// Publish an address-index entry under the same atomic gate used by
@@ -1799,12 +1798,8 @@ impl<T> ConnectionPool<T> {
                 peer: peer_id.clone(),
                 addr: candidate.addr,
                 direction: match candidate.direction {
-                    ConnectionDirection::Inbound => {
-                        crate::lifecycle::TransportDirection::Inbound
-                    }
-                    ConnectionDirection::Outbound => {
-                        crate::lifecycle::TransportDirection::Outbound
-                    }
+                    ConnectionDirection::Inbound => crate::lifecycle::TransportDirection::Inbound,
+                    ConnectionDirection::Outbound => crate::lifecycle::TransportDirection::Outbound,
                 },
                 reason: crate::lifecycle::SessionRemovalReason::CurrentConnectionCleared,
             },
@@ -4397,9 +4392,12 @@ impl<T> ConnectionPool<T> {
             // armed so its identity-scoped cleanup still runs. A missing,
             // identical, or unusable current connection is a real failure.
             if let Some(peer_id) = peer_id_opt.as_ref()
-                && self.peer_current_connection_snapshot(peer_id).is_some_and(|current| {
-                    !Arc::ptr_eq(&current, &connection_arc) && self.is_usable_connection(&current)
-                })
+                && self
+                    .peer_current_connection_snapshot(peer_id)
+                    .is_some_and(|current| {
+                        !Arc::ptr_eq(&current, &connection_arc)
+                            && self.is_usable_connection(&current)
+                    })
             {
                 return Err(crate::GossipError::ConnectionExists);
             }
@@ -5361,14 +5359,14 @@ pub(crate) fn handle_incoming_message_with_instance(
                     // Send the response back through existing connection.
                     // Split oversized snapshots the same way periodic gossip
                     // does; a truncated FullSyncResponse would omission-prune.
-                    let payloads =
-                        match registry.encode_outbound_gossip_for_inline_limit(&response) {
-                            Ok(payloads) => payloads,
-                            Err(e) => {
-                                warn!(error = %e, "Failed to encode FullSync response");
-                                return Ok(());
-                            }
-                        };
+                    let payloads = match registry.encode_outbound_gossip_for_inline_limit(&response)
+                    {
+                        Ok(payloads) => payloads,
+                        Err(e) => {
+                            warn!(error = %e, "Failed to encode FullSync response");
+                            return Ok(());
+                        }
+                    };
 
                     // Try to send immediately on existing connection
                     {
@@ -5434,11 +5432,7 @@ pub(crate) fn handle_incoming_message_with_instance(
                                 Ok(()) => Ok(()),
                                 Err(e) => {
                                     warn!("Failed to send via peer ID {}: {}", sender_peer_id, e);
-                                    pool.send_lock_free_parts(
-                                        sender_socket_addr,
-                                        header,
-                                        payload,
-                                    )
+                                    pool.send_lock_free_parts(sender_socket_addr, header, payload)
                                 }
                             };
                             if send_result.is_err() {

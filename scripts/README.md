@@ -23,6 +23,17 @@ Historical focused pointer/streaming selectors have been removed: the canonical
 workspace lanes cover those targets, without stale names or duplicate filter
 claims. Inventory files show exactly which targets/features were present.
 
+For troubleshooting only, `./scripts/full_validation.sh --focus FILTER`
+uses the same retained inventory/executed-count checks with all features.
+Focused success is explicitly **not full validation**.
+
+Harness regression tests (no real Cargo/project execution):
+
+```bash
+python3 -m unittest discover -s scripts/tests -v
+bash scripts/tests/full_validation_test.sh
+```
+
 Optional coverage (requires already-available tooling):
 
 ```bash

@@ -17,7 +17,7 @@ mode = os.environ.get('FAKE_MODE', '')
 if mode == 'missing_tool':
     print('cargo unavailable', file=sys.stderr)
     sys.exit(127)
-if mode == 'compile' and 'build' in args:
+if (mode == 'compile' and 'build' in args) or (mode == 'list_compile' and '--list' in args):
     print('compile error', file=sys.stderr)
     sys.exit(101)
 if 'test' not in args:
@@ -37,7 +37,7 @@ print('test result: ok. %s passed; 0 failed; 0 ignored; 0 measured; 0 filtered o
 """
 
 class ValidationTests(unittest.TestCase):
-    def run_fixture(self, mode="", coverage=False):
+    def run_fixture(self, mode="", coverage=False, focus=False):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             (root / "scripts").mkdir()
@@ -62,6 +62,8 @@ class ValidationTests(unittest.TestCase):
             command = ["bash", str(root / "scripts/full_validation.sh")]
             if coverage:
                 command += ["--plan", "plan.md"]
+            if focus:
+                command += ["--focus", "fixture"]
             result = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True)
             commands = (root / "commands.jsonl").read_text() if (root / "commands.jsonl").exists() else ""
             attempts = (root / "attempts").read_text() if (root / "attempts").exists() else "0"
@@ -102,6 +104,23 @@ class ValidationTests(unittest.TestCase):
             self.assertEqual(result.returncode, status)
             self.assertEqual(attempts, 0)
             self.assertNotIn("VALIDATION COMPLETE", logs)
+
+    def test_focus_preserves_counts_and_never_claims_full_validation(self):
+        result, commands, attempts, logs = self.run_fixture(focus=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(attempts, 1)
+        self.assertEqual(len(commands.splitlines()), 2)
+        self.assertIn("--all-features", commands)
+        self.assertIn("TEST_COUNTS selected=1 executed=1", logs)
+        self.assertIn("FOCUSED PASS (not full validation)", logs)
+        self.assertNotIn("VALIDATION COMPLETE", logs)
+        for mode in ("zero_selected", "zero_executed", "first_fail", "list_compile", "missing_tool"):
+            with self.subTest(mode=mode):
+                result, _, attempts, logs = self.run_fixture(mode, focus=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertLessEqual(attempts, 1)
+                self.assertNotIn("FOCUSED PASS", logs)
+                self.assertNotIn("VALIDATION COMPLETE", logs)
 
     def test_capture_failure_blocks(self):
         result, _, _, logs = self.run_fixture("capture")

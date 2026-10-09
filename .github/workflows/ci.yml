@@ -21,7 +21,9 @@ jobs:
       - name: Enforce formatting
         run: cargo fmt --all -- --check
       - name: Test validation and A/B harnesses
-        run: python3 -m unittest discover -s scripts/tests -v
+        run: |
+          python3 -m unittest discover -s scripts/tests -v
+          bash scripts/tests/full_validation_test.sh
       - name: Enforce strict linting
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Enforce warning-free documentation

@@ -4,15 +4,15 @@
 
 - Isolated worktree: `/Users/greg/dev/icanact-remote-remediation`; validation was performed on the remediation snapshot based on `da560aa1f1874bdbf4ae5cb7a459ffaaaa68555b`.
 - Source checkout: `/Users/greg/dev/icanact-remote`, preserved; its two existing untracked planning documents were copied to the worktree, not replaced in source.
-- During validation: no commits, pushes, PRs, merges, deployments, dependency installs or fetches. The user's subsequent PR request separately authorizes publishing this snapshot; dependency installation, deployment and merge are not authorized.
-- Publication note: canonical main advanced to `d846d69924d4d8282006cabbad5f915a4a3a3d55` (cleanup #237) after the validated base. The draft preserves the tested snapshot; integration with that overlapping cleanup needs revalidation. The counts below do not claim validation of a combined tree.
+- During the original validation: no commits, pushes, PRs, merges, deployments, dependency installs or fetches. The subsequent PR request authorized publication; the later conflict-fix request authorizes local integration with canonical main, not a GitHub PR merge or deployment.
+- Publication/integration note: draft PR #238 was published at `072c9d4a959c98422da283a86f368b90acac3a8a`. Conflict resolution incorporates canonical main `d846d69924d4d8282006cabbad5f915a4a3a3d55` (cleanup #237), preserving its deleted private paths, canonical reader/writer, dependency narrowing and regression tests. Combined-tree validation now passes; its new evidence is recorded separately below. The original counts still apply only to the pre-integration snapshot.
 - **Partial implementation; required acceptance gates blocked.** See [PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md) for all measurements, limits and failure evidence.
 
 ## Implemented groundwork
 
 ### F01 / S0 — receive-buffer safety
 
-- Both pooled readers and initial TLS reader use initialized `with_len` storage.
+- The canonical pooled reader (used by both wait policies) and initial TLS reader use initialized `with_len` storage. Main's duplicated-reader removal is preserved.
 - `with_len_uninit` retains its public unsafe signature for compatibility, but delegates to initialized storage because ordinary byte-slice exposure cannot represent uninitialized bytes safely.
 - Pool regression covers fresh fallback allocation, growth, reuse and the compatibility constructor.
 - Shared legal AsyncRead probe inspects initialized storage before writing; it fragments reads to one byte, alternates Pending and checks complete/truncated frames in all three pooled read modes and initial reader.
@@ -23,7 +23,7 @@
 - Full-validation script now records commands, complete output, exit/capture status, inventory and positive executed counts.
 - Removed unclassified retries, nonexistent named checks, substring skips and empty rollout/telemetry headings.
 - Added explicit default, test-helper, all-feature and release feature lanes; preserved isolated TLS coverage and optional coverage gates (missing requested plan now fails).
-- CI adds default/test-helper/all-feature matrix and deterministic tooling tests. Remote CI has not run.
+- CI adds default/test-helper/all-feature matrix and both Python and shell tooling tests. Remote CI outcomes are not claimed here.
 - Fake command fixtures test first-fail/then-pass, persistent/environment errors, zero selected/executed tests, compile/missing-tool and capture failures.
 - Real full validation correctly stopped on connection/fixture failures and a hang. Each failed run remains intact; subsequent validation followed scoped remediation, not automatic failed-run retries. The latest 20-step script completes with positive counts in every lane.
 
@@ -74,7 +74,34 @@
   its original ownership/proven-alive assertions. No production comparison
   changed. The original failed run did not capture the exact timestamp values.
 
-## Latest complete local validation
+## Conflict integration and new scoped corrections
+
+- **S13 — pending-NACK resource bound:** the user-supplied High finding remained present after main integration. Controlled RED observed 17,335 queued headers against a 64-entry cap. Both read loops now require room, counting an active partial NACK; insertion is independently checked and typed capacity failures close explicitly. Three focused regressions pass: real primary/idle owners with large/eight-byte transports, actual authenticated TCP/TLS, and preserved outcomes on rejected insertion. All 100,000 requests across transport scenarios receive ordered NoDispatcher replies; observed peaks are 64 (large/TLS) and 1 (eight-byte). See [SECURITY_NACK_CAPACITY_FIX.md](SECURITY_NACK_CAPACITY_FIX.md). Cost is unmeasured; no speedup claim.
+- **D07 — sleep-based timeout fixture ordering:** initial combined-tree validation stopped at helper-lane step 12 because the 50 ms ask returned the delayed reply instead of Timeout. The original log is retained as `conflict-full-validation.log`. Tokio timeouts are not preemptive; the original run did not capture precise scheduling, so no definitive original-cause claim is made. A test-only reply gate now retains the actual request until the caller observes Timeout, using `block_in_place` and unwind release. The unchanged timeout/healthy-session/subsequent-payload assertions and all nine scripted-network tests pass. A one-worker regression proves timer progress while the callback is pinned and release on controller unwind. No production timeout policy changed.
+- Python tooling: 20 regressions pass, including retained main-compatible `--focus` selection/execution checks; the shell fake-Cargo harness passes and is also included in CI. Separate Rustfmt checks cover selected changed include files in addition to Cargo formatting.
+- Offline lock resolution pruned only main's removed test dependencies and their unused transitive crates; retained package versions/checksums did not change. New lock hash: `19c5ebe1eeb2cc3015e6dd6eb317fc306b58b13c47ad3135ad93b0c28b47f208`. The old ignored lock is preserved outside the repository.
+- Full combined-tree feature/release validation passes after these scoped changes. The first failed run was not retried unchanged.
+
+## Latest combined-tree validation
+
+Completed **2026-10-09 12:07:14 UTC**, 20 script steps, with no source/lock drift during execution.
+
+| Lane | Selected | Passing records |
+|---|---:|---:|
+| Isolated TLS ask/reply | 4 | 4 |
+| Workspace default/debug | 1,427 | 1,381 |
+| Workspace test-helpers/debug | 1,478 | 1,431 |
+| Workspace all-features/debug | 1,478 | 1,431 |
+| Workspace default/release | 1,425 | 1,381 |
+| Workspace all-features/release | 1,478 | 1,431 |
+
+**7,059 passing records across repeated lanes/doctests, not unique tests; ignored tests are not passes.** No-default/default/all-feature builds, strict all-target/all-feature Clippy, rustdoc, Cargo formatting and both copy guards pass. Separate no-default-library strict Clippy, selected include-file Rustfmt checks, 20 Python regressions and the shell fake-Cargo harness pass.
+
+Evidence: `/Users/greg/dev/icanact-remediation-evidence/conflict-security-full-validation.log`, worktree `logs/validation_20261009_075321_zfQuNV/`, `conflict-security-tooling-validation.log` and `conflict-security-no-default-clippy.log`. Pre-run staged-diff hash `e50ec43dfbc3063b64bbbd1c3888c60935c18b2d5454c31191f69c4b07f344fc` and lock hash `19c5ebe1eeb2cc3015e6dd6eb317fc306b58b13c47ad3135ad93b0c28b47f208` match after the run. Subsequent edits record these results in documentation only.
+
+The initial combined-tree failure and controlled RED/prototype failures remain retained. This success follows scoped corrections, not an unchanged automatic retry. Linux/other-platform CI and Miri are not claimed as passes; historical discovery risk and performance acceptance remain open.
+
+## Historical pre-integration complete local validation
 
 Completed 2026-10-09 00:02:47 UTC; no source modifications during this run.
 
@@ -106,6 +133,6 @@ under the evidence root; see the performance report for dispositions.
 
 ## Remaining plan
 
-F03–F11 remain unimplemented, including dead writer removal/test migration, reader/writer consolidation, empty direct batching, speculative parser states, chunk progress, actor-ref ownership, PubSub shared backing and dependency/features. F12 documentation/table coverage is implemented independently; overall acceptance remains blocked. No per-optimization A/B acceptance is claimed. Public/compatibility-sensitive legacy decisions remain open. The earlier public-alias idea remains out of scope.
+Main's #237 independently implemented changes overlapping F03–F07 and F11 (obsolete writer/test migration, canonical readers/writers, empty direct batching/speculative-state removal and dependency/features). Conflict resolution retains those changes, but does not establish their individual measured A/B acceptance under this plan. F08 chunk optimization, F09 ownership and F10 PubSub backing remain unimplemented. The inherited public-alias delegation is retained as main's existing behavior, not a newly expanded remediation. F12 documentation/table coverage is implemented independently; overall acceptance remains blocked. No per-optimization A/B acceptance is claimed. Public/compatibility-sensitive legacy decisions remain open. No additional public-alias change is introduced here.
 
 The local S0/S1 matrix is complete. Resolve the remaining diagnostic risk and establish E0 precision/path-specific measurement before checking off downstream optimizer milestones. The safety correction remains necessary even if later timing work finds a cost. Revert optional failed optimizations individually; never weaken assertions or retries to disguise a regression.
