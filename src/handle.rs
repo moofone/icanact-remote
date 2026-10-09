@@ -542,11 +542,13 @@ impl<T> GossipRegistryHandle<T> {
     pub async fn lookup_address(&self, addr: SocketAddr) -> Result<crate::RemoteActorRef> {
         let conn = self.get_connection(addr).await?;
 
-        // Try to resolve the PeerId
+        // The returned connection is authoritative. Its address route can
+        // already have been retired, or the live session can be indexed at
+        // a different address than the one requested.
         let peer_id = self
             .registry
             .connection_pool
-            .get_peer_id_by_addr(&addr)
+            .peer_id_for_connected_addr(&addr, conn.addr)
             .ok_or_else(|| {
                 crate::GossipError::ActorNotFound(format!("No peer ID found for {}", addr))
             })?;
@@ -794,7 +796,7 @@ impl<T> GossipClient<T> {
         let peer_id = self
             .registry
             .connection_pool
-            .get_peer_id_by_addr(&addr)
+            .peer_id_for_connected_addr(&addr, conn.addr)
             .ok_or_else(|| {
                 crate::GossipError::ActorNotFound(format!("No peer ID found for {}", addr))
             })?;
@@ -4357,6 +4359,7 @@ where
                 registry.config.schema_hash,
                 Some(read_context),
                 connection_instance_id,
+                false,
             );
         let stream_handle = Arc::new(stream_handle);
         response_writer.bind_stream_handle(stream_handle.clone());
@@ -4400,9 +4403,10 @@ where
         // CRITICAL: Set embedded_peer_id so responses can find the shared correlation tracker
         // even after addr_to_peer_id mapping is migrated from ephemeral to bind address
         connection.embedded_peer_id = Some(peer_id.clone());
-        connection.remote_boot_id = registry
+        connection.peer_capabilities = registry
             .peer_capabilities
-            .read_sync(&peer_addr, |_, caps| caps.remote_boot_id);
+            .read_sync(&peer_addr, |_, caps| *caps);
+        connection.remote_boot_id = connection.peer_capabilities.map(|caps| caps.remote_boot_id);
 
         let connection_arc = Arc::new(connection);
 

@@ -101,6 +101,36 @@ Evidence: `/Users/greg/dev/icanact-remediation-evidence/conflict-security-full-v
 
 The initial combined-tree failure and controlled RED/prototype failures remain retained. This success follows scoped corrections, not an unchanged automatic retry. Linux/other-platform CI and Miri are not claimed as passes; historical discovery risk and performance acceptance remain open.
 
+## Post-merge continuation — discovery lifecycle
+
+- **D08 — live capability authority:** negotiated `PeerCapabilities` now belongs to the physical `LockFreeConnection`; address/identity side maps are projections. Queries prefer a usable address-indexed session, then the verified address→node→current-peer session. A deterministic regression removes the configured alias, clears/poisons projections and proves the live session remains authoritative for peer-list and clock features.
+- **D09 — identify-first outbound owner:** outbound IO starts gated before task scheduling. It cannot read peer traffic or drain shared queues until the first FullSync is in the priority lane. Finalization waits for physical write progress or exact stream exit/timeout. A controlled test queues ordinary traffic through the published connection while identify construction is parked and verifies Gossip is the first frame on the wire. Existing dead-stream, cancellation, registry-drop, restart-exemption and racing-ask tests pass.
+- Diagnostic state from a fresh fixed-seed full-target failure showed `active_peers=1` and a verified address→node mapping while the configured-address alias and both capability projections were absent. A later traced random failure showed another registry message arriving as the acceptor's first message before identify, invalid PeerId parsing and identifying-FullSync failure.
+- After D08: 160/160 fresh fixed-seed full-target processes passed. Random identities still exposed D09. After D08+D09: 100/100 fixed-seed and 100/100 random-identity fresh full-target processes pass (3,800 test executions), sequential and stop-on-first-failure. Earlier capability, mesh, partition and identify failures remain retained.
+- First D08 compilation was unavailable because generated build output filled the host filesystem. Only generated remediation/cleanup `target/` trees were removed; source, evidence, dependency caches and plans were preserved. The subsequent focused checks pass.
+- **D10 fixture precondition:** the connect-contention correctness test now installs its expected persistent peer through `configure_peer`; direct cache writes remain only in the ignored benchmark's explicit restoration treatment. This fixes a deterministic 80-error RED exposed when D09 made first-round finalizers settle before disconnect.
+- **D11 alias failure accounting:** when no replacement is current, a physical peer failure marks every gossip alias carrying the authenticated node identity failed under one lock. The deterministic RED had a configured alias at failures=2 and an observed inbound alias at failures=0, producing active=1/failed=1 after shutdown. The focused connection-failure test now reaches active=0 while instance fencing remains intact. That assertion is only after shutdown. The focused GREEN run already showed 1 active and 1 failed before shutdown, so a healthy session is not shown to be quiet.
+- **D12 successor address route:** instance retirement no longer deletes `addr_to_peer_id` once a successor owns the address, and `lookup_address` can name a live connection by its embedded identity when that route row is missing. Release validation v4 stopped on `publisher_recovers_from_every_round_of_connection_churn` with `No peer ID found` after a successful connect. The gap regression passes. v2 Clippy and the externally aborted v3 run remain retained; v3 steps 1–16 are not a complete matrix.
+- Validation v5 then stopped in default workspace step 10: the identify-supersession test sampled the provisional address alias before the session slot existed, so `connection_count` was 0. The observation now waits for that slot and a count of 1. The assertion is unchanged. v5 is retained and is not a pass.
+- See [DISCOVERY_CAPABILITY_REMEDIATION.md](DISCOVERY_CAPABILITY_REMEDIATION.md) for the full failure/evidence ledger.
+
+## Post-merge continuation complete local validation
+
+Completed 2026-10-09 16:18:05 UTC on the D08–D12 tree after the identify-supersession observation fix. Log `/Users/greg/dev/icanact-remediation-evidence/post-merge-continuation-full-validation-v6.log` and worktree `logs/validation_20261009_122559_6ka5vb/`. Pre-run diff SHA-256 `373f183802ac37669b116fe07a71cda727b1c00cc6ad3c32cc0d4f3abd5c2ac2`. Lock SHA-256 `19c5ebe1eeb2cc3015e6dd6eb317fc306b58b13c47ad3135ad93b0c28b47f208`. This documentation edit is after that run.
+
+| Lane | Selected | Passed records |
+|---|---:|---:|
+| Isolated TLS ask/reply | 4 | 4 |
+| Workspace default/debug | 1,431 | 1,385 |
+| Workspace test-helpers/debug | 1,482 | 1,435 |
+| Workspace all-features/debug | 1,482 | 1,435 |
+| Workspace default/release | 1,429 | 1,385 |
+| Workspace all-features/release | 1,482 | 1,435 |
+
+**7,079 passing records** across repeated lanes and doctests, not unique tests. Ignored tests are not passes. Formatting, no-default/default/all-feature builds, strict all-target/all-feature Clippy, rustdoc and both copy guards passed in the same 20 steps.
+
+Earlier continuation attempts stay retained and are not passes: v1 stopped at default step 10 (D10 and D11), v2 stopped at Clippy step 5, v3 was aborted during step 17 with no command status, v4 failed the publisher flap test in release/default, and v5 failed the provisional-alias `connection_count` sample. v6 follows those scoped fixes.
+
 ## Historical pre-integration complete local validation
 
 Completed 2026-10-09 00:02:47 UTC; no source modifications during this run.
@@ -128,11 +158,11 @@ under the evidence root; see the performance report for dispositions.
 ## Blocking findings and next action
 
 1. **Historical discovery risk:** D01 reproduces and fixes an identifying-FullSync error mechanism; the complete local matrix now passes. The original untraced failure's exact cause and the separate seed-39 capability-negotiation failure are not conclusively attributed. Keep the latter open; passing isolated replays or the latest matrix does not erase it.
-2. **Measurement:** long concurrent windows and full reply identity are now established, with greatly improved precision. The complete A/A matrix still cannot establish <=3% non-regression (notably p99 and some depths). Improve isolation; add fixed-offered-load/fairness, allocation/copy and retention evidence before optimizer acceptance.
-3. **Coverage:** all mandatory local feature/release lanes now pass. Supported-platform/Linux CI has not run and Miri is unavailable on the installed toolchain. Keep those limits explicit.
+2. **Measurement:** long concurrent windows and full reply identity are established. That A/A matrix still cannot establish <=3% non-regression (notably p99 and some depths). The offered-load A/A at 1,000/s (40 release processes, 2026-10-09 18:07–18:17 UTC) also misses the 3% latency gates; pooled p99 upper bound was +33.4%, and one session reached +287.7%. Every sample completed 10,000/10,000 with zero drops. Later 100/s clock probes are in the performance report. Spinning waits of 20 ms or less brought three samples to p50 0.241–0.254 ms and p99 0.392–0.446 ms, backlog 1. That is not an A/A, not host isolation, and not unloaded service time. Allocation, fairness, and retention evidence are still missing.
+3. **Coverage:** the post-merge continuation matrix v6 passes, 7,079 records. Supported-platform/Linux CI has not run and Miri is unavailable on the installed toolchain. Keep those limits explicit. v1–v5 remain retained failures or an aborted run.
 
 ## Remaining plan
 
-Main's #237 independently implemented changes overlapping F03–F07 and F11 (obsolete writer/test migration, canonical readers/writers, empty direct batching/speculative-state removal and dependency/features). Conflict resolution retains those changes, but does not establish their individual measured A/B acceptance under this plan. F08 chunk optimization, F09 ownership and F10 PubSub backing remain unimplemented. The inherited public-alias delegation is retained as main's existing behavior, not a newly expanded remediation. F12 documentation/table coverage is implemented independently; overall acceptance remains blocked. No per-optimization A/B acceptance is claimed. Public/compatibility-sensitive legacy decisions remain open. No additional public-alias change is introduced here.
+Main's #237 independently implemented changes overlapping F03–F07 and F11 (obsolete writer/test migration, canonical readers/writers, empty direct batching/speculative-state removal and dependency/features). Conflict resolution retains those changes, but does not establish their individual measured A/B acceptance under this plan. F08–F10 are deferred and are not part of this branch: the chunk writer still rescans, release refs still keep the private connection snapshot, and PubSub still copies per subscriber category. The inherited public-alias delegation is retained as main's existing behavior, not a newly expanded remediation. F12 documentation/table coverage is implemented independently; overall acceptance remains blocked. No per-optimization A/B acceptance is claimed. The source classification is [LEGACY_INVENTORY.md](LEGACY_INVENTORY.md). The disabled `get_connection` example stays uncompiled; the method remains `pub(crate)`. Public/compatibility-sensitive legacy decisions remain open. No additional public-alias change is introduced here.
 
 The local S0/S1 matrix is complete. Resolve the remaining diagnostic risk and establish E0 precision/path-specific measurement before checking off downstream optimizer milestones. The safety correction remains necessary even if later timing work finds a cost. Revert optional failed optimizations individually; never weaken assertions or retries to disguise a regression.

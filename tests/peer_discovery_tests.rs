@@ -827,19 +827,69 @@ fn test_version_negotiation_v3_capabilities() -> Result<(), DynError> {
         connect_preferred(&node_a, &node_b).await?;
 
         // Allow a few discovery rounds for the peer capability negotiation to complete.
+        let a_supports_b = common::wait_for_condition(Duration::from_secs(5), || async {
+            node_a.registry.peer_supports_peer_list(&addr_b).await
+        })
+        .await;
+        if !a_supports_b {
+            eprintln!(
+                "CAPABILITY_TIMEOUT side=A addr={addr_b} peer={} stats={:?} addr_caps={:?} \
+                 node_caps={:?} addr_node={:?} addr_connection={:?}",
+                node_b.registry.peer_id,
+                node_a.stats().await,
+                node_a
+                    .registry
+                    .peer_capabilities
+                    .read_sync(&addr_b, |_, caps| *caps),
+                node_a
+                    .registry
+                    .peer_capabilities_by_node
+                    .read_sync(&node_b.registry.peer_id.to_node_id(), |_, caps| *caps,),
+                node_a
+                    .registry
+                    .peer_capability_addr_to_node
+                    .read_sync(&addr_b, |_, node| *node),
+                node_a
+                    .registry
+                    .connection_pool
+                    .get_lock_free_connection(addr_b),
+            );
+        }
         assert!(
-            common::wait_for_condition(Duration::from_secs(5), || async {
-                node_a.registry.peer_supports_peer_list(&addr_b).await
-            })
-            .await,
+            a_supports_b,
             "Node A should negotiate peer discovery with node B"
         );
 
+        let b_supports_a = common::wait_for_condition(Duration::from_secs(5), || async {
+            node_b.registry.peer_supports_peer_list(&addr_a).await
+        })
+        .await;
+        if !b_supports_a {
+            eprintln!(
+                "CAPABILITY_TIMEOUT side=B addr={addr_a} peer={} stats={:?} addr_caps={:?} \
+                 node_caps={:?} addr_node={:?} addr_connection={:?}",
+                node_a.registry.peer_id,
+                node_b.stats().await,
+                node_b
+                    .registry
+                    .peer_capabilities
+                    .read_sync(&addr_a, |_, caps| *caps),
+                node_b
+                    .registry
+                    .peer_capabilities_by_node
+                    .read_sync(&node_a.registry.peer_id.to_node_id(), |_, caps| *caps,),
+                node_b
+                    .registry
+                    .peer_capability_addr_to_node
+                    .read_sync(&addr_a, |_, node| *node),
+                node_b
+                    .registry
+                    .connection_pool
+                    .get_lock_free_connection(addr_a),
+            );
+        }
         assert!(
-            common::wait_for_condition(Duration::from_secs(5), || async {
-                node_b.registry.peer_supports_peer_list(&addr_a).await
-            })
-            .await,
+            b_supports_a,
             "Node B should negotiate peer discovery with node A"
         );
 

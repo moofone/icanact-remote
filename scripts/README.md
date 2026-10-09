@@ -124,8 +124,16 @@ independent process samples.
 `sample_concurrent.py --inflight 64` runs a common four-worker TLS fixture with
 five-second warmup, ten-second measurement, full nonce/payload checks and
 per-operation p50/p95/p99. Supported depths are 1/8/64/512. These are closed-loop
-saturation latencies, not fixed-offered-load/coordinated-omission-corrected results.
-The normal integration smoke test exercises each depth.
+saturation latencies. The normal integration smoke test exercises each depth.
+
+`sample_offered.py --rate 1000` schedules that same ask path at a constant
+rate. Latency starts at the scheduled instant, so a late issue keeps the
+delay. The issuer spins any wait of 20 ms or less and never sends early.
+An offer still unissued after the lateness bound is a drop and the
+adapter rejects it. The offer count must equal rate times the measured
+window. This is not a saturation-throughput result and has no accepted A/A.
+The frozen 1,000/s A/A missed its latency gates. Later 100/s clock probes
+are not a replacement baseline. The integration smoke checks a 200/s, 50 ms window.
 
 For these experiments, declare `"completion_policy": "fixed_duration"`, a
 `"duration_metric": "duration_ns"`, and `"minimum_duration": 10000000000`;

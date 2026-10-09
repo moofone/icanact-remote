@@ -308,6 +308,21 @@ async fn test_node_a_killed_b_detects_immediately() {
 
     // B should quickly realize A is gone
     let stats_after = handle_b.stats().await;
+    if stats_after.active_peers != 0 {
+        let state = handle_b.registry.gossip_state.lock().await;
+        for (addr, peer) in &state.peers {
+            eprintln!(
+                "DISCONNECT_STATE addr={addr} node_id={:?} verified={} failures={} outbound_success={} inbound_observed={} last_success={} last_attempt={}",
+                peer.node_id,
+                peer.identity_verified,
+                peer.failures,
+                peer.outbound_dial_success,
+                peer.inbound_observed,
+                peer.last_success,
+                peer.last_attempt,
+            );
+        }
+    }
     assert_eq!(
         stats_after.active_peers, 0,
         "Node B should detect A disconnected"

@@ -2393,6 +2393,22 @@ impl LockFreeStreamHandle {
         Arc::clone(&self.reply_slots)
     }
 
+    /// Confirm that the IO owner advanced through an enqueued identifying
+    /// frame, or fail if the physical stream exits first. The same notification
+    /// is subscribed before each atomic check, preventing a missed wake.
+    pub(crate) async fn wait_until_bytes_written(&self, minimum: usize) -> Result<()> {
+        loop {
+            let notified = self.exit_notify.notified();
+            if self.bytes_written.load(Ordering::Acquire) >= minimum {
+                return Ok(());
+            }
+            if self.exit_flag.load(Ordering::Acquire) {
+                return Err(GossipError::ConnectionClosed(self.addr));
+            }
+            notified.await;
+        }
+    }
+
     /// Arm the identify gate: `write_routed_actor_ask` on this handle will
     /// park in `Self::wait_until_identified` until [`Self::mark_identified`]
     /// is called. Only ever called by `finalize_new_outbound_connection`,
@@ -2492,6 +2508,7 @@ impl LockFreeStreamHandle {
             schema_hash,
             read_context,
             Self::next_instance_id(),
+            false,
         )
     }
 
@@ -2503,6 +2520,7 @@ impl LockFreeStreamHandle {
         schema_hash: Option<u64>,
         read_context: Option<ReadContext>,
         instance_id: u64,
+        identify_gated: bool,
     ) -> (Self, JoinHandle<()>, Option<JoinHandle<()>>)
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -2516,6 +2534,7 @@ impl LockFreeStreamHandle {
         let exit_flag = Arc::new(AtomicBool::new(false));
         let exit_notify = Arc::new(Notify::new());
         let known_superseded = Arc::new(AtomicBool::new(false));
+        let identify_ready = Arc::new(AtomicBool::new(!identify_gated));
         // Set by the IO task when it ends for an expected reason (the peer
         // closed between frames, or a local graceful shutdown completed), so
         // exit logging can tell it from a fault.
@@ -2552,6 +2571,7 @@ impl LockFreeStreamHandle {
             let known_superseded_for_task = known_superseded.clone();
             let orderly_exit_for_task = orderly_exit.clone();
             let failure_lifecycle_for_task = failure_lifecycle.clone();
+            let identify_ready_for_task = identify_ready.clone();
             let writer_addr = addr;
             let writer_channel_id = channel_id;
             let write_queue = write_queue.clone();
@@ -2584,6 +2604,7 @@ impl LockFreeStreamHandle {
                     exit_flag_for_task,
                     exit_notify_for_task,
                     known_superseded_for_task,
+                    identify_ready_for_task,
                     orderly_exit_for_task.clone(),
                     failure_lifecycle_for_task,
                 )
@@ -2631,7 +2652,7 @@ impl LockFreeStreamHandle {
                 buffer_config,
                 max_message_size,
                 schema_hash,
-                identify_ready: Arc::new(AtomicBool::new(true)),
+                identify_ready,
                 #[cfg(test)]
                 wait_for_exit_race_hook: Arc::new(std::sync::Mutex::new(None)),
             },
@@ -2660,6 +2681,7 @@ impl LockFreeStreamHandle {
         exit_flag: Arc<AtomicBool>,
         exit_notify: Arc<Notify>,
         known_superseded: Arc<AtomicBool>,
+        identify_ready: Arc<AtomicBool>,
         orderly_exit: Arc<AtomicBool>,
         failure_lifecycle: Arc<crate::registry::FailureLifecycleOwner>,
     ) where
@@ -2950,7 +2972,7 @@ impl LockFreeStreamHandle {
 
         let _exit_guard = ExitGuard {
             flag: exit_flag,
-            notify: exit_notify,
+            notify: exit_notify.clone(),
             write_queue: write_queue.clone(),
             immediate_write_queue: immediate_write_queue.clone(),
             streaming_queue: streaming_queue.clone(),
@@ -3089,6 +3111,21 @@ impl LockFreeStreamHandle {
         let mut ordinary_write_stalled = false;
 
         while !shutdown_signal.load(Ordering::Acquire) {
+            // A fresh outbound owner must not read peer traffic or write any
+            // shared queue before its own identifying FullSync is queued.
+            // The finalizer wakes this exact task after placing that frame in
+            // the immediate lane; every normal producer may queue meanwhile,
+            // but none can reach the wire or trigger a response first.
+            if !identify_ready.load(Ordering::Acquire) {
+                let notified = exit_notify.notified();
+                if !identify_ready.load(Ordering::Acquire)
+                    && !shutdown_signal.load(Ordering::Acquire)
+                {
+                    notified.await;
+                }
+                continue;
+            }
+
             let mut total_bytes_written = 0;
             let mut did_work = false;
             let mut ordinary_write_blocked = false;
@@ -4127,6 +4164,7 @@ impl LockFreeStreamHandle {
                                 );
                             }
                             if is_immediate_payload && total_bytes_written > 0 {
+                                exit_notify.notify_waiters();
                                 match bounded_stream_flush(
                                     &mut stream,
                                     &mut stream_write_wedged_since,
@@ -4189,6 +4227,11 @@ impl LockFreeStreamHandle {
             }
 
             bytes_since_flush += total_bytes_written;
+            if total_bytes_written > 0 {
+                // Also wakes the outbound finalizer waiting for proof that its
+                // identifying frame reached the physical stream owner.
+                exit_notify.notify_waiters();
+            }
             if should_flush_stream_output_owned(
                 bytes_since_flush,
                 pending_stream_cmd.as_ref(),
@@ -5873,6 +5916,28 @@ impl LockFreeStreamHandle {
         }
     }
 
+    async fn enqueue_immediate_write(&self, payload: WritePayload) -> Result<()> {
+        if self.exit_flag.load(Ordering::Acquire) {
+            return Err(GossipError::ConnectionClosed(self.addr));
+        }
+        if self.shutdown_signal.load(Ordering::Acquire) {
+            return Err(GossipError::Shutdown);
+        }
+        self.reject_oversize_write_payload(&payload)?;
+        self.sequence_counter.fetch_add(1, Ordering::Relaxed);
+        let command = WriteCommand::ImmediatePayload(payload);
+        match self.immediate_write_queue.try_push(command) {
+            Ok(()) => {
+                self.immediate_write_queue.notify_data();
+                Ok(())
+            }
+            Err(WriteTryPushError::Full(command)) => self.immediate_write_queue.push(command).await,
+            Err(WriteTryPushError::Closed(_) | WriteTryPushError::ClosedDropped) => {
+                Err(GossipError::ConnectionClosed(self.addr))
+            }
+        }
+    }
+
     fn enqueue_immediate_write_nonblocking(&self, payload: WritePayload) -> Result<()> {
         if self.exit_flag.load(Ordering::Acquire) {
             return Err(GossipError::ConnectionClosed(self.addr));
@@ -6120,6 +6185,23 @@ impl LockFreeStreamHandle {
         payload: bytes::Bytes,
     ) -> Result<()> {
         self.enqueue_write(WritePayload::HeaderInline {
+            header,
+            header_len,
+            payload,
+        })
+        .await
+    }
+
+    /// Queue the first identifying FullSync in the lane drained before all
+    /// ordinary traffic. Only the outbound finalizer may bypass the startup
+    /// read/write gate this way.
+    pub(crate) async fn write_identifying_gossip_inline(
+        &self,
+        header: [u8; 16],
+        header_len: u8,
+        payload: bytes::Bytes,
+    ) -> Result<()> {
+        self.enqueue_immediate_write(WritePayload::HeaderInline {
             header,
             header_len,
             payload,
