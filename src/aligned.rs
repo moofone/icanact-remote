@@ -37,20 +37,16 @@ impl PooledAlignedBuffer {
         Self { buffer, pool }
     }
 
-    /// Create a pooled buffer with logical length set but without zero-filling the contents.
+    /// Compatibility constructor. Storage is initialized even though the old
+    /// name suggests otherwise: this owner exposes ordinary byte slices, so it
+    /// cannot soundly represent uninitialized bytes.
     ///
     /// # Safety
     ///
-    /// Callers must fully initialize every byte before any read from the slice.
+    /// No additional caller obligations. The unsafe signature is retained for
+    /// source compatibility; new callers should use [`Self::with_len`].
     pub unsafe fn with_len_uninit(len: usize, pool: Arc<AlignedBytesPool>) -> Self {
-        let mut buffer = pool.get_buffer(len);
-        if buffer.capacity() < len {
-            buffer.reserve(len - buffer.len());
-        }
-        unsafe {
-            buffer.set_len(len);
-        }
-        Self { buffer, pool }
+        Self::with_len(len, pool)
     }
 
     pub fn from_slice(data: &[u8], pool: Arc<AlignedBytesPool>) -> Self {
@@ -350,9 +346,72 @@ impl Default for AlignedBytesPool {
     }
 }
 
+/// A legal reader may inspect any initialized byte before replacing it. This
+/// probe also fragments reads and alternates Pending to test resumable storage.
+#[cfg(test)]
+pub(crate) struct InitializedReadProbe {
+    bytes: Vec<u8>,
+    offset: usize,
+    pending: bool,
+}
+
+#[cfg(test)]
+impl InitializedReadProbe {
+    pub(crate) fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            offset: 0,
+            pending: false,
+        }
+    }
+}
+
+#[cfg(test)]
+impl tokio::io::AsyncRead for InitializedReadProbe {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        assert!(
+            buf.initialized()[buf.filled().len()..]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+        if self.pending {
+            self.pending = false;
+            cx.waker().wake_by_ref();
+            return std::task::Poll::Pending;
+        }
+        if self.offset < self.bytes.len() && buf.remaining() > 0 {
+            buf.put_slice(&self.bytes[self.offset..self.offset + 1]);
+            self.offset += 1;
+            self.pending = true;
+        }
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn receive_storage_is_initialized_after_exhaustion_growth_and_reuse() {
+        let pool = Arc::new(AlignedBytesPool::new(1));
+        let held = pool.get_buffer(64);
+        // Exhaustion forces fresh allocation; later requests grow reused storage.
+        for len in [0, 1, 257, 4096, 32] {
+            let mut buffer = PooledAlignedBuffer::with_len(len, pool.clone());
+            assert_eq!(buffer.as_ref(), vec![0; len]);
+            buffer.as_mut_slice().fill(0xa5);
+            drop(buffer);
+            // SAFETY: the compatibility constructor has no caller obligations.
+            let compat = unsafe { PooledAlignedBuffer::with_len_uninit(len, pool.clone()) };
+            assert_eq!(compat.as_ref(), vec![0; len]);
+        }
+        pool.return_buffer(held);
+    }
 
     #[test]
     fn aligned_bytes_pool_reuses_buffers_and_alignment() {

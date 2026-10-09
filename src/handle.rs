@@ -363,12 +363,7 @@ impl<T> GossipRegistryHandle<T> {
         address: SocketAddr,
         priority: RegistrationPriority,
     ) -> Result<()> {
-        let mut location =
-            RemoteActorLocation::new_with_peer(address, self.registry.peer_id.clone());
-        location.priority = priority;
-        self.registry
-            .register_actor_with_priority(name, location, priority)
-            .await
+        self.register_with_priority(name, address, priority).await
     }
 
     /// Register a local actor with specified priority
@@ -547,11 +542,13 @@ impl<T> GossipRegistryHandle<T> {
     pub async fn lookup_address(&self, addr: SocketAddr) -> Result<crate::RemoteActorRef> {
         let conn = self.get_connection(addr).await?;
 
-        // Try to resolve the PeerId
+        // The returned connection is authoritative. Its address route can
+        // already have been retired, or the live session can be indexed at
+        // a different address than the one requested.
         let peer_id = self
             .registry
             .connection_pool
-            .get_peer_id_by_addr(&addr)
+            .peer_id_for_connected_addr(&addr, conn.addr)
             .ok_or_else(|| {
                 crate::GossipError::ActorNotFound(format!("No peer ID found for {}", addr))
             })?;
@@ -799,7 +796,7 @@ impl<T> GossipClient<T> {
         let peer_id = self
             .registry
             .connection_pool
-            .get_peer_id_by_addr(&addr)
+            .peer_id_for_connected_addr(&addr, conn.addr)
             .ok_or_else(|| {
                 crate::GossipError::ActorNotFound(format!("No peer ID found for {}", addr))
             })?;
@@ -977,6 +974,47 @@ mod tests {
             ask_window: 1024,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn registration_aliases_preserve_caller_priority_and_location() -> crate::Result<()> {
+        let key = KeyPair::new_for_testing("registration-alias-cleanup");
+        let handle = GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:0".parse().unwrap(),
+            key.to_secret_key(),
+            Some(test_cfg()),
+            TestNoopBootstrap,
+        )
+        .await?;
+        let addr: SocketAddr = "127.0.0.1:41099".parse().unwrap();
+        for (i, priority) in [
+            RegistrationPriority::Normal,
+            RegistrationPriority::Immediate,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let urgent_name = format!("alias-urgent-{i}");
+            let general_name = format!("alias-general-{i}");
+            handle
+                .register_urgent(urgent_name.clone(), addr, priority)
+                .await?;
+            handle
+                .register_with_priority(general_name.clone(), addr, priority)
+                .await?;
+            for name in [urgent_name, general_name] {
+                let location = handle
+                    .registry
+                    .lookup_actor(&name)
+                    .await
+                    .expect("alias must register actor");
+                assert_eq!(location.address, addr.to_string());
+                assert_eq!(location.priority, priority);
+                assert_eq!(location.peer_id, handle.registry.peer_id);
+            }
+        }
+        handle.shutdown_and_wait().await;
+        Ok(())
     }
 
     #[test]
@@ -1236,11 +1274,18 @@ mod tests {
             );
         let mut existing = crate::connection_pool::LockFreeConnection::new(
             existing_addr,
-            crate::connection_pool::ConnectionDirection::Inbound,
+            crate::connection_pool::ConnectionDirection::Outbound,
         );
         existing.stream_handle = Some(Arc::new(existing_stream_handle));
         existing.set_state(crate::connection_pool::ConnectionState::Connected);
         let existing = Arc::new(existing);
+        assert!(
+            handle.registry.should_keep_connection(
+                &remote_peer_id,
+                existing.direction == crate::connection_pool::ConnectionDirection::Outbound,
+            ),
+            "the duplicate-rejection fixture requires a preferred surviving connection"
+        );
         assert!(handle.registry.connection_pool.add_connection_by_peer_id(
             remote_peer_id.clone(),
             existing_addr,
@@ -1310,13 +1355,21 @@ mod tests {
         let remote_node_id = remote_peer_id.to_node_id();
         let mut config = test_cfg();
         config.key_pair = Some(local_keypair.clone());
-        let handle = GossipRegistryHandle::new_with_transport_stack(
+        let mut handle = GossipRegistryHandle::new_with_transport_stack(
             "127.0.0.1:0".parse().unwrap(),
             local_keypair.to_secret_key(),
             Some(config),
             TestNoopBootstrap,
         )
         .await?;
+        // This fixture schedules the competing ownership command itself. The
+        // periodic gossip/supervisor task must not dial the synthetic addresses
+        // or retire its incumbent while the asserted tie-break runs.
+        if let Some(timer) = handle._timer_handle.take() {
+            timer.abort();
+            let result = timer.await;
+            assert!(result.unwrap_err().is_cancelled());
+        }
 
         assert!(
             !handle
@@ -1342,13 +1395,23 @@ mod tests {
                 handle.registry.config.schema_hash,
                 None,
             );
+        // This test needs a lasting concurrent creator, not a temporary
+        // wrong-direction session that the required-peer supervisor may
+        // legitimately replace while the rejection/rollback is observed.
         let mut survivor = crate::connection_pool::LockFreeConnection::new(
             survivor_addr,
-            crate::connection_pool::ConnectionDirection::Inbound,
+            crate::connection_pool::ConnectionDirection::Outbound,
         );
         survivor.stream_handle = Some(Arc::new(survivor_stream));
         survivor.set_state(crate::connection_pool::ConnectionState::Connected);
         let survivor = Arc::new(survivor);
+        assert!(
+            handle.registry.should_keep_connection(
+                &remote_peer_id,
+                survivor.direction == crate::connection_pool::ConnectionDirection::Outbound,
+            ),
+            "the concurrent-creator fixture must install a preferred survivor, not a link the supervisor must replace"
+        );
 
         let _guard = {
             let registry = handle.registry.clone();
@@ -1503,20 +1566,27 @@ mod tests {
             );
         let mut existing = crate::connection_pool::LockFreeConnection::new(
             existing_addr,
-            crate::connection_pool::ConnectionDirection::Inbound,
+            crate::connection_pool::ConnectionDirection::Outbound,
         );
         existing.stream_handle = Some(Arc::new(existing_stream_handle));
         existing.set_state(crate::connection_pool::ConnectionState::Connected);
         let existing = Arc::new(existing);
+        assert!(
+            handle.registry.should_keep_connection(
+                &remote_peer_id,
+                existing.direction == crate::connection_pool::ConnectionDirection::Outbound,
+            ),
+            "the duplicate-rejection fixture requires a preferred surviving connection"
+        );
         assert!(handle.registry.connection_pool.add_connection_by_peer_id(
             remote_peer_id.clone(),
             existing_addr,
             existing.clone(),
         ));
 
-        // Simulate the existing connection's own earlier, successful accept:
+        // Simulate the surviving connection's earlier successful admission:
         // its session is armed at `bind_addr` with its OWN (`existing_addr`)
-        // source, exactly like the real accept path does after this fix.
+        // source, as for a real admitted connection.
         handle
             .registry
             .add_peer_with_node_id(
@@ -4289,6 +4359,7 @@ where
                 registry.config.schema_hash,
                 Some(read_context),
                 connection_instance_id,
+                false,
             );
         let stream_handle = Arc::new(stream_handle);
         response_writer.bind_stream_handle(stream_handle.clone());
@@ -4332,9 +4403,10 @@ where
         // CRITICAL: Set embedded_peer_id so responses can find the shared correlation tracker
         // even after addr_to_peer_id mapping is migrated from ephemeral to bind address
         connection.embedded_peer_id = Some(peer_id.clone());
-        connection.remote_boot_id = registry
+        connection.peer_capabilities = registry
             .peer_capabilities
-            .read_sync(&peer_addr, |_, caps| caps.remote_boot_id);
+            .read_sync(&peer_addr, |_, caps| *caps);
+        connection.remote_boot_id = connection.peer_capabilities.map(|caps| caps.remote_boot_id);
 
         let connection_arc = Arc::new(connection);
 
@@ -5622,12 +5694,10 @@ where
     let pool = aligned_pool
         .cloned()
         .unwrap_or_else(|| Arc::new(crate::AlignedBytesPool::default()));
-    let mut buffer = unsafe {
-        crate::PooledAlignedBuffer::with_len_uninit(
-            crate::framing::LENGTH_PREFIX_LEN + decoded.body_len,
-            pool,
-        )
-    };
+    let mut buffer = crate::PooledAlignedBuffer::with_len(
+        crate::framing::LENGTH_PREFIX_LEN + decoded.body_len,
+        pool,
+    );
     buffer.as_mut_slice()[..crate::framing::LENGTH_PREFIX_LEN].copy_from_slice(&control);
     reader
         .read_exact(&mut buffer.as_mut_slice()[crate::framing::LENGTH_PREFIX_LEN..])
@@ -5656,16 +5726,36 @@ mod framing_tests {
             .unwrap()
     }
 
+    #[tokio::test]
+    async fn first_frame_exposes_only_initialized_storage_across_partial_reads() {
+        let frame = framing::write_stream_abort_header(7, 9);
+        let mut reader = crate::aligned::InitializedReadProbe::new(frame.to_vec());
+        assert!(matches!(
+            read_message_from_tls_reader(&mut reader, 1024, None)
+                .await
+                .unwrap(),
+            MessageReadResult::StreamAbort {
+                stream_id: 7,
+                reason: 9
+            }
+        ));
+        let mut truncated =
+            crate::aligned::InitializedReadProbe::new(frame[..frame.len() - 1].to_vec());
+        assert!(
+            read_message_from_tls_reader(&mut truncated, 1024, None)
+                .await
+                .is_err()
+        );
+    }
+
     fn parse_with_routes(
         frame: &[u8],
         routes: &crate::route_interning::RouteTable,
     ) -> crate::Result<MessageReadResult> {
-        let mut buffer = unsafe {
-            crate::PooledAlignedBuffer::with_len_uninit(
-                frame.len(),
-                std::sync::Arc::new(crate::AlignedBytesPool::default()),
-            )
-        };
+        let mut buffer = crate::PooledAlignedBuffer::with_len(
+            frame.len(),
+            std::sync::Arc::new(crate::AlignedBytesPool::default()),
+        );
         buffer.as_mut_slice().copy_from_slice(frame);
         parse_message_from_pooled_buffer_with_routes(
             buffer,

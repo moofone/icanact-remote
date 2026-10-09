@@ -558,6 +558,63 @@ mod read_pipeline_tests {
         reader
     }
 
+    #[tokio::test]
+    async fn fragmented_actor_frame_resumes_after_cancelled_reads_in_every_mode() {
+        for mode in READ_MODES {
+            let (mut peer, mut reader) = tokio::io::duplex(8192);
+            let ctx = test_read_context(9209);
+            let mut state = super::ReadState::new();
+            let mut streams = crate::protocol::StreamingState::new();
+            let mut frame = crate::framing::write_actor_ask_header(19, 23, 29, 4).to_vec();
+            frame.extend_from_slice(b"data");
+            let mut completed = 0;
+            for byte in frame {
+                // Cancel a genuinely waiting read at every fragment boundary.
+                let mut waiting = Box::pin(super::read_message_step_poll(
+                    &mut reader,
+                    &mut state,
+                    &ctx,
+                    &mut streams,
+                    true,
+                ));
+                assert!(futures::poll!(waiting.as_mut()).is_pending());
+                drop(waiting);
+                if !matches!(mode, ReadMode::PollBlocking) {
+                    let idle = tokio::time::timeout(
+                        std::time::Duration::from_secs(1),
+                        step_in_mode(mode, &mut reader, &mut state, &ctx, &mut streams),
+                    )
+                    .await
+                    .expect("busy nonblocking reader must not wait")
+                    .unwrap();
+                    assert!(!idle.progressed && idle.result.is_none());
+                }
+                peer.write_all(&[byte]).await.unwrap();
+                let step = step_in_mode(mode, &mut reader, &mut state, &ctx, &mut streams)
+                    .await
+                    .unwrap();
+                assert!(step.progressed);
+                if let Some(result) = step.result {
+                    match result {
+                        crate::handle::MessageReadResult::Actor {
+                            correlation_id,
+                            actor_id,
+                            type_hash,
+                            payload,
+                            ..
+                        } => {
+                            assert_eq!((correlation_id, actor_id, type_hash), (19, 23, 29));
+                            assert_eq!(payload.as_ref(), b"data");
+                            completed += 1;
+                        }
+                        other => panic!("unexpected parsed frame: {other:?}"),
+                    }
+                }
+            }
+            assert_eq!(completed, 1);
+        }
+    }
+
     fn assert_truncation(error: &crate::GossipError, what: &str) {
         assert!(
             !super::is_orderly_peer_close(error),
@@ -567,6 +624,32 @@ mod read_pipeline_tests {
             matches!(error, crate::GossipError::Network(io) if io.kind() == std::io::ErrorKind::UnexpectedEof),
             "EOF during {what} must remain UnexpectedEof, got {error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn framed_reads_expose_initialized_storage_in_every_mode() {
+        let frame = crate::framing::write_stream_abort_header(7, 9);
+        for mode in READ_MODES {
+            let ctx = test_read_context(9199);
+            for bytes in [frame.to_vec(), frame[..frame.len() - 1].to_vec()] {
+                let complete = bytes.len() == frame.len();
+                let mut reader = crate::aligned::InitializedReadProbe::new(bytes);
+                let (frames, error) = drain_until_error(
+                    mode,
+                    &mut reader,
+                    &mut super::ReadState::new(),
+                    &ctx,
+                    &mut crate::protocol::StreamingState::new(),
+                )
+                .await;
+                assert_eq!(frames, usize::from(complete));
+                if complete {
+                    assert!(super::is_orderly_peer_close(&error));
+                } else {
+                    assert_truncation(&error, "body");
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -583,7 +666,10 @@ mod read_pipeline_tests {
                 &mut crate::protocol::StreamingState::new(),
             )
             .await;
-            assert_eq!(frames, 1, "the complete frame is delivered first ({mode:?})");
+            assert_eq!(
+                frames, 1,
+                "the complete frame is delivered first ({mode:?})"
+            );
             assert!(
                 super::is_orderly_peer_close(&error),
                 "EOF with zero prefix bytes consumed is an orderly close ({mode:?}): {error:?}"
@@ -719,7 +805,10 @@ mod read_pipeline_tests {
             &mut streams,
         )
         .await;
-        assert!(matches!(state, super::ReadState::DiscardStreamPayload { .. }));
+        assert!(matches!(
+            state,
+            super::ReadState::DiscardStreamPayload { .. }
+        ));
         assert_truncation(&error, "the discard of a rejected stream payload");
     }
 }
@@ -1026,63 +1115,12 @@ where
     // Tests drive the production poll path; this wrapper only adapts the
     // result type so existing regressions keep their assertions.
     let poll = read_message_step_poll(stream, state, ctx, streaming_state, true).await?;
-    Ok(match poll.result {
-        None => None,
-        Some(ReadIoResult::Generic(result)) => Some(result),
-        Some(ReadIoResult::DirectAsk { .. } | ReadIoResult::ActorAsk { .. }) => {
-            unreachable!("try_handle_read_fast_from_pooled currently always returns Unhandled")
-        }
-    })
+    Ok(poll.result)
 }
 
 struct ReadPollResult {
-    result: Option<ReadIoResult>,
+    result: Option<crate::handle::MessageReadResult>,
     progressed: bool,
-}
-
-#[expect(
-    dead_code,
-    reason = "the direct ask fast-path shares these result variants with the IO owner and remains intentionally pre-wired"
-)]
-enum ReadIoResult {
-    Generic(crate::handle::MessageReadResult),
-    DirectAsk {
-        correlation_id: u32,
-        /// Stable, caller-controlled ask identity. Carried here so wiring the
-        /// zero-copy parser to this seam cannot quietly skip the nonzero
-        /// check the generic parser enforces: whoever constructs this variant
-        /// has to produce the id, and `parse_direct_ask_request_id` is the
-        /// only way to get one.
-        request_id: u64,
-        payload: crate::AlignedBytes,
-    },
-    ActorAsk {
-        correlation_id: u32,
-        actor_id: u64,
-        type_hash: u32,
-        payload: crate::AlignedBytes,
-    },
-}
-
-#[expect(
-    dead_code,
-    reason = "the direct ask fast-path result variants are retained for the zero-copy parser seam"
-)]
-enum FastReadOutcome {
-    Handled,
-    Parsed(ReadIoResult),
-    Unhandled(crate::PooledAlignedBuffer),
-}
-
-fn try_handle_read_fast_from_pooled(
-    buffer: crate::PooledAlignedBuffer,
-    _msg_len: usize,
-    _ctx: &ReadContext,
-) -> Result<FastReadOutcome> {
-    // V5's shared parser owns the packed-control dispatch. Keeping this seam
-    // intentionally boring until the specialized direct-read stream state lands
-    // avoids duplicating V5 frame decoding in the I/O hot path.
-    Ok(FastReadOutcome::Unhandled(buffer))
 }
 
 fn poll_read_once<S>(stream: &mut S, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<Result<usize>>
@@ -1174,12 +1212,8 @@ where
                         }));
                     }
                     let total_len = msg_len + crate::framing::LENGTH_PREFIX_LEN;
-                    let mut buffer = unsafe {
-                        crate::PooledAlignedBuffer::with_len_uninit(
-                            total_len,
-                            ctx.aligned_pool.clone(),
-                        )
-                    };
+                    let mut buffer =
+                        crate::PooledAlignedBuffer::with_len(total_len, ctx.aligned_pool.clone());
                     buffer.as_mut_slice()[..crate::framing::LENGTH_PREFIX_LEN].copy_from_slice(buf);
 
                     *state = ReadState::ReadBody {
@@ -1240,22 +1274,11 @@ where
                         _ => unreachable!("read state must be ReadBody when complete"),
                     };
 
-                    let result = match try_handle_read_fast_from_pooled(buffer, msg_len, ctx)? {
-                        FastReadOutcome::Handled => {
-                            return Poll::Ready(Ok(ReadPollResult {
-                                result: None,
-                                progressed: true,
-                            }));
-                        }
-                        FastReadOutcome::Parsed(result) => result,
-                        FastReadOutcome::Unhandled(buffer) => ReadIoResult::Generic(
-                            crate::handle::parse_message_from_pooled_buffer_with_routes(
-                                buffer,
-                                msg_len,
-                                Some(&ctx.inbound_routes),
-                            )?,
-                        ),
-                    };
+                    let result = crate::handle::parse_message_from_pooled_buffer_with_routes(
+                        buffer,
+                        msg_len,
+                        Some(&ctx.inbound_routes),
+                    )?;
                     Poll::Ready(Ok(ReadPollResult {
                         result: Some(result),
                         progressed: true,
@@ -1340,8 +1363,7 @@ where
                     };
                     let result = streaming_state
                         .commit_v5_chunk(reservation)?
-                        .map(completed_v5_stream_result)
-                        .map(ReadIoResult::Generic);
+                        .map(completed_v5_stream_result);
                     Poll::Ready(Ok(ReadPollResult {
                         result,
                         progressed: true,
@@ -1408,274 +1430,7 @@ async fn read_message_step_nonblocking<S>(
 where
     S: AsyncRead + Unpin,
 {
-    futures::future::poll_fn(|cx| match state {
-        ReadState::ReadLen { buf, read } => {
-            let target = &mut buf[*read..];
-            if target.is_empty() {
-                return Poll::Ready(Ok(ReadPollResult {
-                    result: None,
-                    progressed: false,
-                }));
-            }
-            match poll_read_once(stream, cx, target) {
-                Poll::Pending => Poll::Ready(Ok(ReadPollResult {
-                    result: None,
-                    progressed: false,
-                })),
-                Poll::Ready(Ok(0)) => Poll::Ready(Err(eof_in_length_prefix(*read))),
-                Poll::Ready(Ok(n)) => {
-                    *read += n;
-                    if *read < crate::framing::LENGTH_PREFIX_LEN {
-                        return Poll::Ready(Ok(ReadPollResult {
-                            result: None,
-                            progressed: true,
-                        }));
-                    }
-
-                    let control = crate::framing::decode_control(*buf).ok_or_else(|| {
-                        crate::GossipError::Network(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "unknown V5 wire kind",
-                        ))
-                    })?;
-                    let msg_len = control.body_len;
-                    if msg_len == 0 {
-                        return Poll::Ready(Err(reject_zero_length_frame()));
-                    }
-                    if msg_len > ctx.max_message_size {
-                        return Poll::Ready(Err(GossipError::MessageTooLarge {
-                            size: msg_len,
-                            max: ctx.max_message_size,
-                        }));
-                    }
-
-                    if let Some(meta_len) = stream_meta_len(control.kind) {
-                        if msg_len < meta_len {
-                            return Poll::Ready(Err(GossipError::Network(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                "truncated V5 stream metadata",
-                            ))));
-                        }
-                        *state = ReadState::ReadStreamMeta {
-                            kind: control.kind,
-                            body_len: msg_len,
-                            meta: [0; crate::framing::STREAM_REQUEST_START_HEADER_LEN],
-                            meta_len,
-                            read: 0,
-                        };
-                        return Poll::Ready(Ok(ReadPollResult {
-                            result: None,
-                            progressed: true,
-                        }));
-                    }
-                    let total_len = msg_len + crate::framing::LENGTH_PREFIX_LEN;
-                    let mut buffer = unsafe {
-                        crate::PooledAlignedBuffer::with_len_uninit(
-                            total_len,
-                            ctx.aligned_pool.clone(),
-                        )
-                    };
-                    buffer.as_mut_slice()[..crate::framing::LENGTH_PREFIX_LEN].copy_from_slice(buf);
-
-                    *state = ReadState::ReadBody {
-                        msg_len,
-                        buffer,
-                        read: 0,
-                    };
-                    Poll::Ready(Ok(ReadPollResult {
-                        result: None,
-                        progressed: true,
-                    }))
-                }
-                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            }
-        }
-        ReadState::ReadBody {
-            msg_len,
-            buffer,
-            read,
-        } => {
-            let offset = crate::framing::LENGTH_PREFIX_LEN + *read;
-            let end = crate::framing::LENGTH_PREFIX_LEN + *msg_len;
-            let target = &mut buffer.as_mut_slice()[offset..end];
-            if target.is_empty() {
-                return Poll::Ready(Ok(ReadPollResult {
-                    result: None,
-                    progressed: false,
-                }));
-            }
-            match poll_read_once(stream, cx, target) {
-                Poll::Pending => Poll::Ready(Ok(ReadPollResult {
-                    result: None,
-                    progressed: false,
-                })),
-                Poll::Ready(Ok(0)) => Poll::Ready(Err(GossipError::Network(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "connection closed",
-                )))),
-                Poll::Ready(Ok(n)) => {
-                    *read += n;
-                    if *read < *msg_len {
-                        return Poll::Ready(Ok(ReadPollResult {
-                            result: None,
-                            progressed: true,
-                        }));
-                    }
-
-                    let (msg_len, buffer) = match std::mem::replace(state, ReadState::new()) {
-                        ReadState::ReadBody {
-                            msg_len, buffer, ..
-                        } => (msg_len, buffer),
-                        _ => unreachable!("read state must be ReadBody when complete"),
-                    };
-
-                    let result = match try_handle_read_fast_from_pooled(buffer, msg_len, ctx)? {
-                        FastReadOutcome::Handled => {
-                            return Poll::Ready(Ok(ReadPollResult {
-                                result: None,
-                                progressed: true,
-                            }));
-                        }
-                        FastReadOutcome::Parsed(result) => result,
-                        FastReadOutcome::Unhandled(buffer) => ReadIoResult::Generic(
-                            crate::handle::parse_message_from_pooled_buffer_with_routes(
-                                buffer,
-                                msg_len,
-                                Some(&ctx.inbound_routes),
-                            )?,
-                        ),
-                    };
-                    Poll::Ready(Ok(ReadPollResult {
-                        result: Some(result),
-                        progressed: true,
-                    }))
-                }
-                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            }
-        }
-        ReadState::ReadStreamMeta {
-            kind,
-            body_len,
-            meta,
-            meta_len,
-            read,
-        } => match poll_read_once(stream, cx, &mut meta[*read..*meta_len]) {
-            Poll::Pending => Poll::Ready(Ok(ReadPollResult {
-                result: None,
-                progressed: false,
-            })),
-            Poll::Ready(Ok(0)) => Poll::Ready(Err(GossipError::Network(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "connection closed during V5 stream metadata",
-            )))),
-            Poll::Ready(Ok(n)) => {
-                *read += n;
-                if *read < *meta_len {
-                    return Poll::Ready(Ok(ReadPollResult {
-                        result: None,
-                        progressed: true,
-                    }));
-                }
-                let reservation = reserve_v5_stream_payload(
-                    *kind,
-                    *body_len,
-                    &meta[..*meta_len],
-                    streaming_state,
-                    ctx.aligned_pool.clone(),
-                )?;
-                *state = stream_payload_state(reservation, *body_len, *meta_len);
-                Poll::Ready(Ok(ReadPollResult {
-                    result: None,
-                    progressed: true,
-                }))
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-        },
-        ReadState::ReadStreamPayload { reservation, read } => {
-            let target = match streaming_state.v5_chunk_target(*reservation, *read) {
-                Ok(target) => target,
-                Err(e) if crate::protocol::is_stream_reaped_error(&e) => {
-                    *state = discard_remainder_of_reservation(*reservation, *read);
-                    return Poll::Ready(Ok(ReadPollResult {
-                        result: None,
-                        progressed: true,
-                    }));
-                }
-                Err(e) => return Poll::Ready(Err(e)),
-            };
-            match poll_read_once(stream, cx, target) {
-                Poll::Pending => Poll::Ready(Ok(ReadPollResult {
-                    result: None,
-                    progressed: false,
-                })),
-                Poll::Ready(Ok(0)) => Poll::Ready(Err(GossipError::Network(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "connection closed during V5 stream payload",
-                )))),
-                Poll::Ready(Ok(n)) => {
-                    *read += n;
-                    streaming_state.record_v5_chunk_progress(*reservation, n);
-                    if *read < reservation.len() {
-                        return Poll::Ready(Ok(ReadPollResult {
-                            result: None,
-                            progressed: true,
-                        }));
-                    }
-                    let reservation = match std::mem::replace(state, ReadState::new()) {
-                        ReadState::ReadStreamPayload { reservation, .. } => reservation,
-                        _ => unreachable!(),
-                    };
-                    let result = streaming_state
-                        .commit_v5_chunk(reservation)?
-                        .map(completed_v5_stream_result)
-                        .map(ReadIoResult::Generic);
-                    Poll::Ready(Ok(ReadPollResult {
-                        result,
-                        progressed: true,
-                    }))
-                }
-                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            }
-        }
-        ReadState::DiscardStreamPayload {
-            remaining,
-            scratch,
-            on_complete_mark_received,
-        } => {
-            let read_len = (*remaining).min(scratch.len());
-            if read_len == 0 {
-                finish_discarding_reservation(streaming_state, *on_complete_mark_received);
-                *state = ReadState::new();
-                return Poll::Ready(Ok(ReadPollResult {
-                    result: None,
-                    progressed: true,
-                }));
-            }
-            match poll_read_once(stream, cx, &mut scratch[..read_len]) {
-                Poll::Pending => Poll::Ready(Ok(ReadPollResult {
-                    result: None,
-                    progressed: false,
-                })),
-                Poll::Ready(Ok(0)) => Poll::Ready(Err(GossipError::Network(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "connection closed while discarding rejected stream payload",
-                )))),
-                Poll::Ready(Ok(n)) => {
-                    *remaining -= n;
-                    if *remaining == 0 {
-                        finish_discarding_reservation(streaming_state, *on_complete_mark_received);
-                        *state = ReadState::new();
-                    }
-                    Poll::Ready(Ok(ReadPollResult {
-                        result: None,
-                        progressed: true,
-                    }))
-                }
-                Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
-            }
-        }
-    })
-    .await
+    read_message_step_poll(stream, state, ctx, streaming_state, false).await
 }
 
 async fn write_header_payload_vectored<S>(
@@ -1970,7 +1725,7 @@ where
             streaming_responses.queue_ask_nack(crate::framing::write_ask_nack_header(
                 correlation_id,
                 reason,
-            ));
+            ))?;
             *wrote_response_bytes = true;
         }
         crate::registry::AskDisposition::Immediate(response) => match response {
@@ -2312,7 +2067,7 @@ fn queue_streaming_response_bytes_or_nack(
             streaming_responses.queue_ask_nack(crate::framing::write_ask_nack_header(
                 correlation_id,
                 crate::framing::AskNackReason::Backpressure,
-            ));
+            ))?;
             Ok(())
         }
         Err(e) => Err(e),
@@ -2343,7 +2098,7 @@ fn queue_streaming_response_pooled_or_nack(
             streaming_responses.queue_ask_nack(crate::framing::write_ask_nack_header(
                 correlation_id,
                 crate::framing::AskNackReason::Backpressure,
-            ));
+            ))?;
             Ok(())
         }
         Err(e) => Err(e),
@@ -2371,7 +2126,6 @@ async fn process_read_result_io<S>(
     bytes_since_flush: &mut usize,
     response_batch: &mut ResponseBatch,
     streaming_responses: &mut LocalStreamingQueue,
-    direct_response_batch: &mut DirectResponseBatch,
     perf: Option<&IoPerfCounters>,
 ) -> Result<()>
 where
@@ -2508,13 +2262,12 @@ where
             // isn't consumed yet (no dispatcher exists to hand it to), but
             // it was already fail-closed validated (nonzero) by the parser.
             let _ = (payload, request_id);
-            let _ = &direct_response_batch;
             // Queued, not written directly here -- see the identical
             // reasoning on `AskDisposition::Nack` in `write_ask_disposition_io`.
             streaming_responses.queue_ask_nack(crate::framing::write_ask_nack_header(
                 correlation_id,
                 crate::framing::AskNackReason::NoDispatcher,
-            ));
+            ))?;
             Ok(())
         }
         crate::handle::MessageReadResult::DirectResponse {
@@ -2559,7 +2312,7 @@ where
             streaming_responses.queue_ask_nack(crate::framing::write_ask_nack_header(
                 correlation_id,
                 crate::framing::AskNackReason::NoDispatcher,
-            ));
+            ))?;
             Ok(())
         }
         other => {
@@ -2580,14 +2333,13 @@ where
 }
 
 async fn try_handle_fast_io<S>(
-    result: ReadIoResult,
+    result: crate::handle::MessageReadResult,
     ctx: &ReadContext,
     stream: &mut S,
     bytes_written_counter: &Arc<AtomicUsize>,
     bytes_since_flush: &mut usize,
     response_batch: &mut ResponseBatch,
     streaming_responses: &mut LocalStreamingQueue,
-    direct_response_batch: &mut DirectResponseBatch,
     wrote_response_bytes: &mut bool,
     perf: Option<&IoPerfCounters>,
 ) -> Result<Option<crate::handle::MessageReadResult>>
@@ -2757,7 +2509,7 @@ where
                 streaming_responses.queue_ask_nack(crate::framing::write_ask_nack_header(
                     correlation_id,
                     crate::framing::AskNackReason::UnknownActor,
-                ));
+                ))?;
                 *wrote_response_bytes = true;
             }
             return Ok(());
@@ -2797,66 +2549,7 @@ where
     }
 
     match result {
-        ReadIoResult::DirectAsk {
-            correlation_id,
-            request_id,
-            payload,
-        } => {
-            // DirectAsk has no registered application handler in any build
-            // mode: never fabricate a response from the request bytes,
-            // identically in test/test-helpers/debug/release.
-            let _ = payload;
-            let _ = request_id;
-            let _ = &direct_response_batch;
-            // Queued, not written directly here -- see the identical
-            // reasoning on `AskDisposition::Nack` in `write_ask_disposition_io`.
-            streaming_responses.queue_ask_nack(crate::framing::write_ask_nack_header(
-                correlation_id,
-                crate::framing::AskNackReason::NoDispatcher,
-            ));
-            *wrote_response_bytes = true;
-            Ok(None)
-        }
-        ReadIoResult::ActorAsk {
-            correlation_id,
-            actor_id,
-            type_hash,
-            payload,
-        } => {
-            if ctx.ask_immediate_handler_sync.is_none()
-                && ctx.ask_handler_sync.is_none()
-                && ctx.sync_actor_handler.is_none()
-            {
-                return Ok(Some(crate::handle::MessageReadResult::Actor {
-                    msg_type: crate::MessageType::ActorAsk as u8,
-                    correlation_id,
-                    actor_id,
-                    type_hash,
-                    request_id: None,
-                    schema_hash: ctx.expected_schema_hash,
-                    payload,
-                }));
-            }
-            handle_fast_actor_sync_io(
-                ctx,
-                crate::MessageType::ActorAsk as u8,
-                actor_id,
-                type_hash,
-                payload,
-                Some(correlation_id),
-                None,
-                stream,
-                bytes_written_counter,
-                bytes_since_flush,
-                response_batch,
-                streaming_responses,
-                wrote_response_bytes,
-                perf,
-            )
-            .await?;
-            Ok(None)
-        }
-        ReadIoResult::Generic(crate::handle::MessageReadResult::Actor {
+        crate::handle::MessageReadResult::Actor {
             msg_type,
             correlation_id,
             actor_id,
@@ -2864,7 +2557,7 @@ where
             schema_hash,
             request_id,
             payload,
-        }) => {
+        } => {
             let is_tell = msg_type == crate::MessageType::ActorTell as u8 && correlation_id == 0;
             let is_ask = msg_type == crate::MessageType::ActorAsk as u8 && correlation_id != 0;
             let has_split = (is_tell && ctx.tell_handler_sync.is_some())
@@ -2909,31 +2602,30 @@ where
             .await?;
             Ok(None)
         }
-        ReadIoResult::Generic(crate::handle::MessageReadResult::DirectAsk {
+        crate::handle::MessageReadResult::DirectAsk {
             correlation_id,
             request_id,
             payload,
-        }) => {
+        } => {
             // DirectAsk has no registered application handler in any build
             // mode: never fabricate a response from the request bytes,
             // identically in test/test-helpers/debug/release. request_id
             // isn't consumed yet (no dispatcher exists to hand it to), but
             // it was already fail-closed validated (nonzero) by the parser.
             let _ = (payload, request_id);
-            let _ = &direct_response_batch;
             // Queued, not written directly here -- see the identical
             // reasoning on `AskDisposition::Nack` in `write_ask_disposition_io`.
             streaming_responses.queue_ask_nack(crate::framing::write_ask_nack_header(
                 correlation_id,
                 crate::framing::AskNackReason::NoDispatcher,
-            ));
+            ))?;
             *wrote_response_bytes = true;
             Ok(None)
         }
-        ReadIoResult::Generic(crate::handle::MessageReadResult::DirectResponse {
+        crate::handle::MessageReadResult::DirectResponse {
             correlation_id,
             payload,
-        }) => {
+        } => {
             let mut payload = Some(payload);
             if let Some(correlation) = ctx.response_correlation.as_deref()
                 && correlation.complete_attributed(
@@ -2949,10 +2641,10 @@ where
                 payload: payload.expect("payload retained when direct response was not consumed"),
             }))
         }
-        ReadIoResult::Generic(crate::handle::MessageReadResult::Response {
+        crate::handle::MessageReadResult::Response {
             correlation_id,
             payload,
-        }) => {
+        } => {
             let mut payload = Some(payload);
             if let Some(correlation) = ctx.response_correlation.as_deref()
                 && correlation.complete_attributed(
@@ -2968,7 +2660,7 @@ where
                 payload: payload.expect("payload retained when response was not consumed"),
             }))
         }
-        ReadIoResult::Generic(other) => Ok(Some(other)),
+        other => Ok(Some(other)),
     }
 }
 

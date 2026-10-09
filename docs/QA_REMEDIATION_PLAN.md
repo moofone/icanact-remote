@@ -2,7 +2,7 @@
 
 ## Status and source of truth
 
-**Planning only. All implementation and measurement gates are pending.** Creating this document does not run project code, authorize execution, or establish performance gains. Implementation, host builds/tests/benchmarks, and any later GitHub action require separate approval. Host execution is not a security sandbox. Use installed tools and cached dependencies only; no implicit installs or network fetches.
+**Execution started; acceptance blocked.** The user authorized implementation and requested a performance report. Safety, validation/tooling and a narrow connection-admission correction are in the isolated remediation worktree. The pre-integration mandatory local matrix passed; combined-tree validation passes separately (7,059 passing records); the post-merge continuation matrix v6 also passes (7,079 passing records). Earlier continuation attempts v1–v5 remain retained. Historical capability-negotiation risk, inadequate A/A precision and missing path-specific measurements still hold optimizer acceptance. See [REMEDIATION_STATUS.md](REMEDIATION_STATUS.md) and [PERFORMANCE_REPORT.md](PERFORMANCE_REPORT.md). No optimization is accepted. Host execution is not a security sandbox. Only installed tools and offline cached dependencies were used; no installs or network fetches. This validation plan does not itself authorize publication. The user's later PR request separately authorizes a branch, commit, push and draft PR; it does not authorize deployment or GitHub PR merge. The later conflict-fix request authorizes local main integration. Canonical main advanced with overlapping cleanup #237; those inherited F03–F07/F11 changes are retained but are not accepted as measured optimizations under this plan. Historical snapshot validation must not be represented as combined-tree validation.
 
 This plan covers **F01–F12** from the latest GPT Pro static review of snapshot `da560aa1f1874bdbf4ae5cb7a459ffaaaa68555b`, request `15c48db93e8eee7008b14e41fd3526f0e5399cb8a9d6faf1e4c21365cdf84962`.
 
@@ -126,7 +126,7 @@ At each exit record accepted/rejected/inconclusive/blocked status. No milestone 
 
 ## 5. Repository-derived validation and benchmark commands (future execution)
 
-Commands are based on `Cargo.toml`, `.github/workflows/ci.yml`, the earlier plan, and existing benchmark targets. **They have not been executed for this plan.** Generate a worktree-only lock offline, then freeze it. Unavailable tools/cache, unresolved dependencies or socket restrictions are blockers, not permission to fetch or silently skip.
+Commands are based on `Cargo.toml`, `.github/workflows/ci.yml`, the earlier plan, and existing benchmark targets. **The attempted subset and results are recorded in PERFORMANCE_REPORT.md; the complete matrix has not passed.** Generate a worktree-only lock offline, then freeze it. Unavailable tools/cache, unresolved dependencies or socket restrictions are blockers, not permission to fetch or silently skip.
 
 ```bash
 cargo generate-lockfile --offline
@@ -175,14 +175,22 @@ Store raw experiment artifacts outside tracked source, for example under a separ
 - `analysis.md`: paired ratios/CIs, per-session results, target and control workload outcomes, limitations and disposition;
 - assertion migration map, before/after references, API/wire decision log, and rollback patch identity.
 
-Final legacy inventory must classify every review item as **removed with evidence**, **retained for a documented live contract**, **requires owner/API decision**, or **blocked**. Re-scan source, tests, examples, benches, docs and scripts for obsolete names/comments and real callers, including include/macro-generated seams where applicable. Do not claim “no legacy remains” while compatibility decisions or uninspected paths remain unresolved. The disabled negative-API example should become a real compile-fail test or receive an explicit documented disposition.
+The current classification is [LEGACY_INVENTORY.md](LEGACY_INVENTORY.md). It does not close the final comparison or rollback evidence. Final legacy inventory must classify every review item as **removed with evidence**, **retained for a documented live contract**, **requires owner/API decision**, or **blocked**. Re-scan source, tests, examples, benches, docs and scripts for obsolete names/comments and real callers, including include/macro-generated seams where applicable. Do not claim “no legacy remains” while compatibility decisions or uninspected paths remain unresolved. The disabled negative-API example should become a real compile-fail test or receive an explicit documented disposition.
 
 Reject/revert an optimization independently if correctness fails or a preregistered gate fails. Preserve its harness and evidence for diagnosis. Never add a hidden fallback, weaken a test, or increase a queue limit to conceal a regression. Required safety fixes remain; redesign the optional optimization instead.
 
+## Additional user-authorized safety scope
+
+The later linked security finding adds **S13**, pending-NACK resource isolation, without renumbering F01–F12. It is a correctness fix, not an accepted optimization: restore admission capacity at both read loops, count active partial NACK occupancy, independently check insertion and propagate invariant failure explicitly. Controlled RED/GREEN, sustained authenticated TCP/TLS, partial writes and no-eviction tests are recorded in [SECURITY_NACK_CAPACITY_FIX.md](SECURITY_NACK_CAPACITY_FIX.md). No OOM or performance-cost experiment was authorized or claimed. D07's controlled timeout-reply fixture addresses the first combined-tree validation failure without changing production timeout policy. Full combined-tree checks finished successfully before publishing the conflict-fix update; see the separate 7,059-record matrix and retained failure ledger.
+
+## Post-merge correctness prerequisites
+
+Merged main is the new safe baseline. D08/D09 address reproducible discovery lifecycle failures before any optional optimization resumes: live physical sessions own negotiated capabilities despite side-map/alias cleanup, and a new outbound physical owner cannot read or emit shared traffic before its first identifying FullSync. D10–D12 then corrected the contention fixture, authenticated-alias failure accounting, and successor address-route retirement. Evidence and retained failed series are in [DISCOVERY_CAPABILITY_REMEDIATION.md](DISCOVERY_CAPABILITY_REMEDIATION.md). These are correctness changes; no speedup or A/B acceptance is inferred. Continuation matrix v6 passes locally (7,079 records, 2026-10-09 16:18:05 UTC). A fixed offered-load fixture was added after that matrix. Its frozen 1,000/s A/A pilot then ran (40 processes, 2026-10-09 18:07–18:17 UTC) and failed every latency gate; the 3% bound was not widened. Later 100/s clock probes, including a 20 ms spin that tightened three samples, are recorded in the performance report and were not turned into another A/A. F08–F10 are deferred and are not in this branch. Explicit connection-setup cost accounting, other-platform CI, and Miri remain required.
+
 ## 7. Completion checklist
 
-- [ ] F01 safe initialization and regressions; any later zero-fill optimization separately measured
-- [ ] F02 truthful failure/selection/feature reporting and fake-command tests
+- [x] F01 safe initialization and regressions (complete local matrix; Miri unavailable); any later zero-fill optimization separately measured
+- [x] F02 truthful failure/selection/feature reporting and fake-command tests (20-step local matrix and 19 Python regressions)
 - [ ] E0 common A/B harness, path coverage, A/A noise and frozen experiment records
 - [ ] F03 obsolete helper/writer removal with assertion migration and evidence
 - [ ] F04 one reader with measured non-regression
@@ -193,8 +201,8 @@ Reject/revert an optimization independently if correctness fails or a preregiste
 - [ ] F09 ownership optimization measured; diagnostic API decision recorded
 - [ ] F10 shared PubSub backing measured across subscriber combinations
 - [ ] F11 dependency/feature decisions validated; all optimization claims measured
-- [ ] F12 current wire specification and golden/table checks
+- [x] F12 current wire specification and golden/table checks (20 framing + 15 handshake tests; independent documentation work, not full matrix acceptance)
 - [ ] Every optimization has an individual A/B result, controls and explicit disposition
 - [ ] Final safe-baseline/final comparison, complete validation, legacy inventory and rollback evidence
 
-**Current result: plan created; zero optimizations implemented or measured.**
+**Current result: safety and evidence tooling implemented; final acceptance blocked. A/A noise was measured in short and long concurrent fixtures; F12 specification/table coverage is corrected. The pre-integration mandatory local matrix passed after scoped connection/fixture fixes; combined-tree validation passes (7,059 records) and post-merge continuation validation v6 passes (7,079 records). Inherited cleanup still needs plan-compliant measurement evidence. Historical capability diagnostics, measurement precision and overall optimization acceptance remain unresolved. Zero optimizations have been accepted or credited with a speedup.**

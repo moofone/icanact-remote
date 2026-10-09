@@ -359,7 +359,7 @@ mod qa_queue_retention_review {
 ///
 /// Inline response batches have their own ~8MB budget (`RESPONSE_BATCH_BYTE_CAP`).
 /// Parking a batch into `PendingOrdinaryWrite` keeps that charge; ask dispatch
-/// is NACKed (`AskNackReason::Backpressure`) once parked bytes plus both batches
+/// is NACKed (`AskNackReason::Backpressure`) once parked bytes plus the batch
 /// reach the cap, including while an ordinary frame owns the wire. Tells and
 /// control frames keep being read. A partial *streaming* frame together with
 /// batches already at cap still stops the read loop, because those batches
@@ -383,21 +383,9 @@ mod qa_queue_retention_review {
 /// `StreamingCommand::Flush` path, since only one flush-shaped attempt on
 /// this transport is ever outstanding at a time.
 ///
-/// **Known gap, not yet closed:** `write_response_batch`,
-/// `write_direct_response_batch`, and `write_chunks_batched` (this
-/// connection's ordinary, non-streaming response/tell writers) still loop
-/// over multiple `poll_write`/`write_vectored` calls with no per-attempt
-/// timeout. Inline pooled/bytes replies are now parked on `ResponseBatch`
-/// instead of flushing from the read loop. Remaining ordinary writers are
-/// not individually cancel-safe to wrap in a naive
-/// `tokio::time::timeout` the way this file's slice writers are --
-/// `write_all`-shaped internals mean a cancelled attempt can abandon a
-/// partially-written frame mid-flight and corrupt every later frame on the
-/// connection (see `write_ask_nack_header_bounded`'s doc comment for the
-/// exact failure this already burned once). Closing them needs the same
-/// single-attempt-then-retry redesign `write_vectored_once` gave the
-/// streaming path, not a one-line timeout wrapper; tracked as follow-up
-/// work rather than folded into this fix.
+/// Ordinary response batches use resumable pending writes. Keep those writes
+/// ahead of later frames and preserve offsets across bounded attempts;
+/// cancellation of a write-all loop would corrupt subsequent framing.
 const STREAM_WRITE_SLICE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Log the end of the read side. A peer close between frames (TLS
@@ -721,18 +709,6 @@ fn park_ask_response_batch(
     Ok(true)
 }
 
-fn park_direct_response_batch(
-    pending_ordinary_write: &mut Option<PendingOrdinaryWrite>,
-    batch: &mut DirectResponseBatch,
-) -> Result<bool> {
-    if batch.is_empty() || pending_ordinary_write.is_some() {
-        return Ok(false);
-    }
-    let chunks = batch.take_wire_chunks()?;
-    *pending_ordinary_write = Some(PendingOrdinaryWrite::Chunks { chunks, offset: 0 });
-    Ok(true)
-}
-
 fn park_ask_response_batch_if_over_byte_cap(
     pending_ordinary_write: &mut Option<PendingOrdinaryWrite>,
     batch: &mut ResponseBatch,
@@ -741,16 +717,6 @@ fn park_ask_response_batch_if_over_byte_cap(
         return Ok(false);
     }
     park_ask_response_batch(pending_ordinary_write, batch)
-}
-
-fn park_direct_response_batch_if_over_byte_cap(
-    pending_ordinary_write: &mut Option<PendingOrdinaryWrite>,
-    batch: &mut DirectResponseBatch,
-) -> Result<bool> {
-    if batch.total_bytes() < RESPONSE_BATCH_BYTE_CAP {
-        return Ok(false);
-    }
-    park_direct_response_batch(pending_ordinary_write, batch)
 }
 
 fn pending_ordinary_write_retained_bytes(pending: &Option<PendingOrdinaryWrite>) -> usize {
@@ -789,14 +755,12 @@ fn pending_ordinary_write_retained_bytes(pending: &Option<PendingOrdinaryWrite>)
 fn inline_response_retained_bytes(
     pending_ordinary_write: &Option<PendingOrdinaryWrite>,
     response_batch: &ResponseBatch,
-    direct_response_batch: &DirectResponseBatch,
 ) -> usize {
     pending_ordinary_write_retained_bytes(pending_ordinary_write)
         .saturating_add(response_batch.total_bytes())
-        .saturating_add(direct_response_batch.total_bytes())
 }
 
-/// True when parked ordinary frames plus both response batches already occupy
+/// True when parked ordinary frames plus the response batch already occupy
 /// the inline response budget. Ask dispatch must not run another handler:
 /// parking a batch into `PendingOrdinaryWrite` zeros the batch counters, and
 /// without this sum a non-reading peer can keep filling a fresh batch while
@@ -806,13 +770,9 @@ fn inline_response_retained_bytes(
 fn inline_response_budget_exhausted(
     pending_ordinary_write: &Option<PendingOrdinaryWrite>,
     response_batch: &ResponseBatch,
-    direct_response_batch: &DirectResponseBatch,
 ) -> bool {
-    inline_response_retained_bytes(
-        pending_ordinary_write,
-        response_batch,
-        direct_response_batch,
-    ) >= RESPONSE_BATCH_BYTE_CAP
+    inline_response_retained_bytes(pending_ordinary_write, response_batch)
+        >= RESPONSE_BATCH_BYTE_CAP
 }
 
 fn advance_header_payload_offset(
@@ -1084,20 +1044,6 @@ where
 /// One `poll_write`/`poll_write_vectored` with no wait. `Pending` becomes
 /// `Partial(0)` so the IO loop can NACK readable asks instead of sitting in
 /// `STREAM_WRITE_SLICE_TIMEOUT` while a non-reading peer's duplex is full.
-async fn poll_vectored_nowait<S>(
-    stream: &mut S,
-    slices: &[std::io::IoSlice<'_>],
-) -> OrdinaryWriteProgress
-where
-    S: AsyncWrite + Unpin,
-{
-    std::future::poll_fn(|cx| match poll_vectored(stream, slices, cx) {
-        Poll::Pending => Poll::Ready(OrdinaryWriteProgress::Partial(0)),
-        ready => ready,
-    })
-    .await
-}
-
 async fn poll_pending_ordinary_nowait<S>(
     stream: &mut S,
     pending: &mut PendingOrdinaryWrite,
@@ -1105,85 +1051,11 @@ async fn poll_pending_ordinary_nowait<S>(
 where
     S: AsyncWrite + Unpin,
 {
-    match pending {
-        PendingOrdinaryWrite::HeaderInline {
-            header,
-            header_len,
-            payload,
-            header_off,
-            payload_off,
-        } => {
-            poll_header_payload_nowait(
-                stream,
-                &header[..*header_len],
-                header_off,
-                payload.as_ref(),
-                payload_off,
-            )
-            .await
-        }
-        PendingOrdinaryWrite::HeaderInlineAligned {
-            header,
-            header_len,
-            payload,
-            header_off,
-            payload_off,
-        } => {
-            poll_header_payload_nowait(
-                stream,
-                &header[..*header_len],
-                header_off,
-                payload.as_ref(),
-                payload_off,
-            )
-            .await
-        }
-        PendingOrdinaryWrite::Chunks { chunks, offset } => {
-            let total: usize = chunks.iter().map(|chunk| chunk.len()).sum();
-            if *offset >= total {
-                return OrdinaryWriteProgress::Complete(0);
-            }
-            let (index, chunk_off) = skip_written_chunks(chunks, *offset);
-            if index >= chunks.len() {
-                return OrdinaryWriteProgress::Complete(0);
-            }
-            let first = &chunks[index][chunk_off..];
-            let rest = &chunks[index + 1..];
-            let mut storage: Vec<std::io::IoSlice<'_>> = Vec::with_capacity(1 + rest.len());
-            storage.push(std::io::IoSlice::new(first));
-            storage.extend(rest.iter().map(|chunk| std::io::IoSlice::new(chunk)));
-            match poll_vectored_nowait(stream, &storage).await {
-                OrdinaryWriteProgress::Partial(0) => OrdinaryWriteProgress::Partial(0),
-                OrdinaryWriteProgress::Partial(n) | OrdinaryWriteProgress::Complete(n) => {
-                    *offset += n;
-                    if *offset >= total {
-                        OrdinaryWriteProgress::Complete(n)
-                    } else {
-                        OrdinaryWriteProgress::Partial(n)
-                    }
-                }
-                OrdinaryWriteProgress::Failed => OrdinaryWriteProgress::Failed,
-            }
-        }
-        PendingOrdinaryWrite::Buf { buf } => poll_generic_buf_nowait(stream, buf).await,
-        PendingOrdinaryWrite::AskNack { header, offset } => {
-            if *offset >= header.len() {
-                return OrdinaryWriteProgress::Complete(0);
-            }
-            match poll_vectored_nowait(stream, &[std::io::IoSlice::new(&header[*offset..])]).await {
-                OrdinaryWriteProgress::Partial(0) => OrdinaryWriteProgress::Partial(0),
-                OrdinaryWriteProgress::Partial(n) | OrdinaryWriteProgress::Complete(n) => {
-                    *offset += n;
-                    if *offset >= header.len() {
-                        OrdinaryWriteProgress::Complete(n)
-                    } else {
-                        OrdinaryWriteProgress::Partial(n)
-                    }
-                }
-                OrdinaryWriteProgress::Failed => OrdinaryWriteProgress::Failed,
-            }
-        }
-    }
+    std::future::poll_fn(|cx| match poll_pending_ordinary(stream, pending, cx) {
+        Poll::Pending => Poll::Ready(OrdinaryWriteProgress::Partial(0)),
+        ready => ready,
+    })
+    .await
 }
 
 fn poll_header_payload<S>(
@@ -1371,53 +1243,6 @@ where
     std::future::poll_fn(|cx| poll_pending_ordinary(stream, pending, cx)).await
 }
 
-async fn poll_header_payload_nowait<S>(
-    stream: &mut S,
-    header: &[u8],
-    header_off: &mut usize,
-    payload: &[u8],
-    payload_off: &mut usize,
-) -> OrdinaryWriteProgress
-where
-    S: AsyncWrite + Unpin,
-{
-    let header_len = header.len();
-    if *header_off >= header_len && *payload_off >= payload.len() {
-        return OrdinaryWriteProgress::Complete(0);
-    }
-    let h = if *header_off < header_len {
-        &header[*header_off..]
-    } else {
-        &[]
-    };
-    let p = if *payload_off < payload.len() {
-        &payload[*payload_off..]
-    } else {
-        &[]
-    };
-    let mut slices = [std::io::IoSlice::new(h), std::io::IoSlice::new(p)];
-    let slice_count = if h.is_empty() {
-        slices[0] = std::io::IoSlice::new(p);
-        1
-    } else if p.is_empty() {
-        1
-    } else {
-        2
-    };
-    match poll_vectored_nowait(stream, &slices[..slice_count]).await {
-        OrdinaryWriteProgress::Partial(0) => OrdinaryWriteProgress::Partial(0),
-        OrdinaryWriteProgress::Partial(n) | OrdinaryWriteProgress::Complete(n) => {
-            advance_header_payload_offset(header_len, header_off, payload_off, n);
-            if *header_off >= header_len && *payload_off >= payload.len() {
-                OrdinaryWriteProgress::Complete(n)
-            } else {
-                OrdinaryWriteProgress::Partial(n)
-            }
-        }
-        OrdinaryWriteProgress::Failed => OrdinaryWriteProgress::Failed,
-    }
-}
-
 fn append_fixed_header_payloads<const N: usize>(
     chunks: &mut Vec<bytes::Bytes>,
     headers: &mut Vec<[u8; N]>,
@@ -1540,32 +1365,6 @@ where
         stream_write_wedged_since,
         stream_flush_wedged_since,
     );
-    buf.advance(n);
-    if buf.has_remaining() {
-        OrdinaryWriteProgress::Partial(n)
-    } else {
-        OrdinaryWriteProgress::Complete(n)
-    }
-}
-
-async fn poll_generic_buf_nowait<S>(
-    stream: &mut S,
-    buf: &mut Box<dyn bytes::Buf + Send>,
-) -> OrdinaryWriteProgress
-where
-    S: AsyncWrite + Unpin,
-{
-    if !buf.has_remaining() {
-        return OrdinaryWriteProgress::Complete(0);
-    }
-    let n = {
-        let chunk = buf.chunk();
-        match poll_vectored_nowait(stream, &[std::io::IoSlice::new(chunk)]).await {
-            OrdinaryWriteProgress::Partial(0) => return OrdinaryWriteProgress::Partial(0),
-            OrdinaryWriteProgress::Partial(n) | OrdinaryWriteProgress::Complete(n) => n,
-            OrdinaryWriteProgress::Failed => return OrdinaryWriteProgress::Failed,
-        }
-    };
     buf.advance(n);
     if buf.has_remaining() {
         OrdinaryWriteProgress::Partial(n)
@@ -1718,30 +1517,29 @@ const DEFERRED_ASK_CAP: usize = 64;
 /// turn frees a slot. The read loop must stop admitting before this grows.
 const DEFERRED_ASK_HOLD_CAP: usize = DEFERRED_ASK_CAP + 1;
 
-fn actor_ask_correlation_id(result: &ReadIoResult) -> Option<u32> {
+fn actor_ask_correlation_id(result: &crate::handle::MessageReadResult) -> Option<u32> {
     match result {
-        ReadIoResult::ActorAsk { correlation_id, .. } => Some(*correlation_id),
-        ReadIoResult::Generic(crate::handle::MessageReadResult::Actor {
+        crate::handle::MessageReadResult::Actor {
             msg_type,
             correlation_id,
             ..
-        }) if *msg_type == crate::MessageType::ActorAsk as u8 => Some(*correlation_id),
+        } if *msg_type == crate::MessageType::ActorAsk as u8 => Some(*correlation_id),
         _ => None,
     }
 }
 
 fn queue_ask_backpressure_nack(
     local_streaming_queue: &mut LocalStreamingQueue,
-    result: &ReadIoResult,
-) -> bool {
+    result: &crate::handle::MessageReadResult,
+) -> Result<bool> {
     let Some(correlation_id) = actor_ask_correlation_id(result) else {
-        return false;
+        return Ok(false);
     };
     local_streaming_queue.queue_ask_nack(crate::framing::write_ask_nack_header(
         correlation_id,
         crate::framing::AskNackReason::Backpressure,
-    ));
-    true
+    ))?;
+    Ok(true)
 }
 
 /// Park an already-read ask until budget or NACK-queue room exists.
@@ -1752,22 +1550,25 @@ fn queue_ask_backpressure_nack(
 /// extra already-read ask is held (`DEFERRED_ASK_HOLD_CAP`); the read loop
 /// must stop admitting until a drain turn frees NACK or deferred room.
 fn park_deferred_ask(
-    slot: &mut std::collections::VecDeque<ReadIoResult>,
-    result: ReadIoResult,
+    slot: &mut std::collections::VecDeque<crate::handle::MessageReadResult>,
+    result: crate::handle::MessageReadResult,
     local_streaming_queue: &mut LocalStreamingQueue,
     nack_extra: usize,
-) {
+) -> Result<()> {
     if slot.len() < DEFERRED_ASK_CAP {
         slot.push_back(result);
-        return;
+        return Ok(());
     }
-    if local_streaming_queue.has_room_for_ask_nack_occupying(nack_extra) {
-        queue_ask_backpressure_nack(local_streaming_queue, &result);
-        return;
+    if local_streaming_queue.has_room_for_ask_nack_occupying(nack_extra)
+        && queue_ask_backpressure_nack(local_streaming_queue, &result)?
+    {
+        return Ok(());
     }
     if slot.len() < DEFERRED_ASK_HOLD_CAP {
         slot.push_back(result);
+        return Ok(());
     }
+    Err(ask_capacity_violation("deferred ask"))
 }
 
 /// Write one bounded slice of a lazily framed `Bytes` response. Returning a
@@ -2592,6 +2393,22 @@ impl LockFreeStreamHandle {
         Arc::clone(&self.reply_slots)
     }
 
+    /// Confirm that the IO owner advanced through an enqueued identifying
+    /// frame, or fail if the physical stream exits first. The same notification
+    /// is subscribed before each atomic check, preventing a missed wake.
+    pub(crate) async fn wait_until_bytes_written(&self, minimum: usize) -> Result<()> {
+        loop {
+            let notified = self.exit_notify.notified();
+            if self.bytes_written.load(Ordering::Acquire) >= minimum {
+                return Ok(());
+            }
+            if self.exit_flag.load(Ordering::Acquire) {
+                return Err(GossipError::ConnectionClosed(self.addr));
+            }
+            notified.await;
+        }
+    }
+
     /// Arm the identify gate: `write_routed_actor_ask` on this handle will
     /// park in `Self::wait_until_identified` until [`Self::mark_identified`]
     /// is called. Only ever called by `finalize_new_outbound_connection`,
@@ -2691,6 +2508,7 @@ impl LockFreeStreamHandle {
             schema_hash,
             read_context,
             Self::next_instance_id(),
+            false,
         )
     }
 
@@ -2702,6 +2520,7 @@ impl LockFreeStreamHandle {
         schema_hash: Option<u64>,
         read_context: Option<ReadContext>,
         instance_id: u64,
+        identify_gated: bool,
     ) -> (Self, JoinHandle<()>, Option<JoinHandle<()>>)
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -2715,6 +2534,7 @@ impl LockFreeStreamHandle {
         let exit_flag = Arc::new(AtomicBool::new(false));
         let exit_notify = Arc::new(Notify::new());
         let known_superseded = Arc::new(AtomicBool::new(false));
+        let identify_ready = Arc::new(AtomicBool::new(!identify_gated));
         // Set by the IO task when it ends for an expected reason (the peer
         // closed between frames, or a local graceful shutdown completed), so
         // exit logging can tell it from a fault.
@@ -2751,6 +2571,7 @@ impl LockFreeStreamHandle {
             let known_superseded_for_task = known_superseded.clone();
             let orderly_exit_for_task = orderly_exit.clone();
             let failure_lifecycle_for_task = failure_lifecycle.clone();
+            let identify_ready_for_task = identify_ready.clone();
             let writer_addr = addr;
             let writer_channel_id = channel_id;
             let write_queue = write_queue.clone();
@@ -2783,6 +2604,7 @@ impl LockFreeStreamHandle {
                     exit_flag_for_task,
                     exit_notify_for_task,
                     known_superseded_for_task,
+                    identify_ready_for_task,
                     orderly_exit_for_task.clone(),
                     failure_lifecycle_for_task,
                 )
@@ -2830,7 +2652,7 @@ impl LockFreeStreamHandle {
                 buffer_config,
                 max_message_size,
                 schema_hash,
-                identify_ready: Arc::new(AtomicBool::new(true)),
+                identify_ready,
                 #[cfg(test)]
                 wait_for_exit_race_hook: Arc::new(std::sync::Mutex::new(None)),
             },
@@ -2859,6 +2681,7 @@ impl LockFreeStreamHandle {
         exit_flag: Arc<AtomicBool>,
         exit_notify: Arc<Notify>,
         known_superseded: Arc<AtomicBool>,
+        identify_ready: Arc<AtomicBool>,
         orderly_exit: Arc<AtomicBool>,
         failure_lifecycle: Arc<crate::registry::FailureLifecycleOwner>,
     ) where
@@ -2866,20 +2689,16 @@ impl LockFreeStreamHandle {
     {
         // CRITICAL_PATH: owner-batched send queue + vectored TLS writes.
 
-        fn read_batch_limit_for(result: &ReadIoResult) -> usize {
+        fn read_batch_limit_for(result: &crate::handle::MessageReadResult) -> usize {
             match result {
-                ReadIoResult::DirectAsk { .. } => ASK_READ_BATCH_LIMIT,
-                ReadIoResult::ActorAsk { .. } => ASK_READ_BATCH_LIMIT,
-                ReadIoResult::Generic(crate::handle::MessageReadResult::Actor {
-                    msg_type, ..
-                }) if *msg_type == crate::MessageType::ActorAsk as u8 => ASK_READ_BATCH_LIMIT,
-                ReadIoResult::Generic(crate::handle::MessageReadResult::DirectAsk { .. })
-                | ReadIoResult::Generic(crate::handle::MessageReadResult::DirectResponse {
-                    ..
-                })
-                | ReadIoResult::Generic(crate::handle::MessageReadResult::Response { .. }) => {
+                crate::handle::MessageReadResult::Actor { msg_type, .. }
+                    if *msg_type == crate::MessageType::ActorAsk as u8 =>
+                {
                     ASK_READ_BATCH_LIMIT
                 }
+                crate::handle::MessageReadResult::DirectAsk { .. }
+                | crate::handle::MessageReadResult::DirectResponse { .. }
+                | crate::handle::MessageReadResult::Response { .. } => ASK_READ_BATCH_LIMIT,
                 _ => READ_BATCH_LIMIT,
             }
         }
@@ -2923,16 +2742,11 @@ impl LockFreeStreamHandle {
         /// A bounded deque keeps the last unread socket frames from sitting
         /// in the duplex forever when `PENDING_ASK_NACK_CAP` is full.
         fn take_deferred_if_budget_allows(
-            slot: &mut std::collections::VecDeque<ReadIoResult>,
+            slot: &mut std::collections::VecDeque<crate::handle::MessageReadResult>,
             pending_ordinary_write: &Option<PendingOrdinaryWrite>,
             response_batch: &ResponseBatch,
-            direct_response_batch: &DirectResponseBatch,
-        ) -> Option<ReadIoResult> {
-            if inline_response_budget_exhausted(
-                pending_ordinary_write,
-                response_batch,
-                direct_response_batch,
-            ) {
+        ) -> Option<crate::handle::MessageReadResult> {
+            if inline_response_budget_exhausted(pending_ordinary_write, response_batch) {
                 return None;
             }
             slot.pop_front()
@@ -3158,7 +2972,7 @@ impl LockFreeStreamHandle {
 
         let _exit_guard = ExitGuard {
             flag: exit_flag,
-            notify: exit_notify,
+            notify: exit_notify.clone(),
             write_queue: write_queue.clone(),
             immediate_write_queue: immediate_write_queue.clone(),
             streaming_queue: streaming_queue.clone(),
@@ -3216,12 +3030,11 @@ impl LockFreeStreamHandle {
         let mut inline32_headers: Vec<[u8; 32]> = Vec::with_capacity(OWNER_BATCH_SIZE);
         let mut inline32_payloads: Vec<bytes::Bytes> = Vec::with_capacity(OWNER_BATCH_SIZE);
         let mut response_batch = ResponseBatch::new(READ_BATCH_LIMIT);
-        let mut direct_response_batch = DirectResponseBatch::new(READ_BATCH_LIMIT);
         let mut pending_cmd: Option<WriteCommand> = None;
         let mut pending_immediate_cmd: Option<WriteCommand> = None;
         let mut pending_stream_cmd: Option<PendingStreamingCommand> = None;
         let mut pending_ordinary_write: Option<PendingOrdinaryWrite> = None;
-        let mut deferred_asks: std::collections::VecDeque<ReadIoResult> =
+        let mut deferred_asks: std::collections::VecDeque<crate::handle::MessageReadResult> =
             std::collections::VecDeque::new();
         let mut leftover_commands: Vec<WriteCommand> = Vec::new();
         // A local response that just completed a frame yields here instead of
@@ -3298,6 +3111,21 @@ impl LockFreeStreamHandle {
         let mut ordinary_write_stalled = false;
 
         while !shutdown_signal.load(Ordering::Acquire) {
+            // A fresh outbound owner must not read peer traffic or write any
+            // shared queue before its own identifying FullSync is queued.
+            // The finalizer wakes this exact task after placing that frame in
+            // the immediate lane; every normal producer may queue meanwhile,
+            // but none can reach the wire or trigger a response first.
+            if !identify_ready.load(Ordering::Acquire) {
+                let notified = exit_notify.notified();
+                if !identify_ready.load(Ordering::Acquire)
+                    && !shutdown_signal.load(Ordering::Acquire)
+                {
+                    notified.await;
+                }
+                continue;
+            }
+
             let mut total_bytes_written = 0;
             let mut did_work = false;
             let mut ordinary_write_blocked = false;
@@ -3319,21 +3147,9 @@ impl LockFreeStreamHandle {
                     );
                     return;
                 }
-                if let Err(e) = park_direct_response_batch(
-                    &mut pending_ordinary_write,
-                    &mut direct_response_batch,
-                ) {
-                    warn!(
-                        peer = ?read_context.as_ref().map(|c| c.peer_addr),
-                        error = %e,
-                        "Failed to park direct response batch"
-                    );
-                    return;
-                }
             }
             if pending_stream_cmd.is_none() && pending_ordinary_write.is_none() {
                 response_batch.clear();
-                direct_response_batch.clear();
             }
 
             // Complete one bounded piece of the current frame before handling
@@ -4348,6 +4164,7 @@ impl LockFreeStreamHandle {
                                 );
                             }
                             if is_immediate_payload && total_bytes_written > 0 {
+                                exit_notify.notify_waiters();
                                 match bounded_stream_flush(
                                     &mut stream,
                                     &mut stream_write_wedged_since,
@@ -4410,6 +4227,11 @@ impl LockFreeStreamHandle {
             }
 
             bytes_since_flush += total_bytes_written;
+            if total_bytes_written > 0 {
+                // Also wakes the outbound finalizer waiting for proof that its
+                // identifying frame reached the physical stream owner.
+                exit_notify.notify_waiters();
+            }
             if should_flush_stream_output_owned(
                 bytes_since_flush,
                 pending_stream_cmd.as_ref(),
@@ -4492,18 +4314,12 @@ impl LockFreeStreamHandle {
                         // drain at the top of the next turn make room first.
                         // (Deliberately not also gating on `is_full()` here
                         // -- see the doc comment above this loop.)
-                        && (deferred_asks.len() < DEFERRED_ASK_CAP
-                            || local_streaming_queue.has_room_for_ask_nack_occupying(0)
-                            || (!deferred_asks.is_empty()
-                                && !inline_response_budget_exhausted(
-                                    &pending_ordinary_write,
-                                    &response_batch,
-                                    &direct_response_batch,
-                                )))
+                        && local_streaming_queue.has_room_for_ask_nack_occupying(
+                            pending_ask_nack_occupancy(&pending_ordinary_write),
+                        )
                         && (pending_stream_cmd.is_none()
                             || (response_batch.total_bytes() < RESPONSE_BATCH_BYTE_CAP
-                                && direct_response_batch.total_bytes()
-                                    < RESPONSE_BATCH_BYTE_CAP))
+                                ))
                     {
                         // R-I: cap per-turn byte accumulation independent of
                         // the frame-count cap above. Checked every iteration
@@ -4511,7 +4327,7 @@ impl LockFreeStreamHandle {
                         // paths below) so a peer packing its ask window with
                         // max-size response frames cannot force unbounded
                         // memory growth before `read_batch_limit` frames are
-                        // seen. See `flush_response_batch_if_over_byte_cap`.
+                        // seen. See `park_ask_response_batch_if_over_byte_cap`.
                         if pending_stream_cmd.is_none() {
                             match park_ask_response_batch_if_over_byte_cap(
                                 &mut pending_ordinary_write,
@@ -4531,31 +4347,12 @@ impl LockFreeStreamHandle {
                                     return;
                                 }
                             }
-                            match park_direct_response_batch_if_over_byte_cap(
-                                &mut pending_ordinary_write,
-                                &mut direct_response_batch,
-                            ) {
-                                Ok(true) => {
-                                    wrote_fast_responses = true;
-                                    break;
-                                }
-                                Ok(false) => {}
-                                Err(e) => {
-                                    warn!(
-                                        peer = %ctx.peer_addr,
-                                        error = %e,
-                                        "Failed to park direct response batch (byte cap)"
-                                    );
-                                    return;
-                                }
-                            }
                         }
 
                         let read_result = if let Some(result) = take_deferred_if_budget_allows(
                             &mut deferred_asks,
                             &pending_ordinary_write,
                             &response_batch,
-                            &direct_response_batch,
                         ) {
                             ReadPollResult {
                                 result: Some(result),
@@ -4578,8 +4375,12 @@ impl LockFreeStreamHandle {
                                         &e,
                                         &orderly_exit,
                                         ctx.peer_addr,
-                                        partial_frame_possible(&pending_ordinary_write, &pending_stream_cmd),
-                                    ).await;
+                                        partial_frame_possible(
+                                            &pending_ordinary_write,
+                                            &pending_stream_cmd,
+                                        ),
+                                    )
+                                    .await;
                                     return;
                                 }
                             };
@@ -4630,7 +4431,6 @@ impl LockFreeStreamHandle {
                                 inline_response_budget_exhausted(
                                     &pending_ordinary_write,
                                     &response_batch,
-                                    &direct_response_batch,
                                 ),
                                 ordinary_write_stalled,
                             ) {
@@ -4639,27 +4439,36 @@ impl LockFreeStreamHandle {
                                     if local_streaming_queue.has_room_for_ask_nack_occupying(
                                         pending_ask_nack_occupancy(&pending_ordinary_write),
                                     ) {
-                                        queue_ask_backpressure_nack(
+                                        if let Err(error) = queue_ask_backpressure_nack(
                                             &mut local_streaming_queue,
                                             &result,
-                                        );
+                                        ) {
+                                            warn!(peer = %ctx.peer_addr, error = %error, "ask capacity invariant violated; closing connection");
+                                            return;
+                                        }
                                         continue;
                                     }
-                                    park_deferred_ask(
+                                    if let Err(error) = park_deferred_ask(
                                         &mut deferred_asks,
                                         result,
                                         &mut local_streaming_queue,
                                         pending_ask_nack_occupancy(&pending_ordinary_write),
-                                    );
+                                    ) {
+                                        warn!(peer = %ctx.peer_addr, error = %error, "ask capacity invariant violated; closing connection");
+                                        return;
+                                    }
                                     break;
                                 }
                                 AskBudgetAction::Defer => {
-                                    park_deferred_ask(
+                                    if let Err(error) = park_deferred_ask(
                                         &mut deferred_asks,
                                         result,
                                         &mut local_streaming_queue,
                                         pending_ask_nack_occupancy(&pending_ordinary_write),
-                                    );
+                                    ) {
+                                        warn!(peer = %ctx.peer_addr, error = %error, "ask capacity invariant violated; closing connection");
+                                        return;
+                                    }
                                     continue;
                                 }
                             }
@@ -4671,7 +4480,6 @@ impl LockFreeStreamHandle {
                                 &mut bytes_since_flush,
                                 &mut response_batch,
                                 &mut local_streaming_queue,
-                                &mut direct_response_batch,
                                 &mut wrote_fast_responses,
                                 perf,
                             )
@@ -4684,6 +4492,9 @@ impl LockFreeStreamHandle {
                                         error = %e,
                                         "Failed to process fast IO message"
                                     );
+                                    if is_ask_capacity_violation(&e) {
+                                        return; // fail closed; never silently lose a consumed ask
+                                    }
                                     if is_streaming_admission_backpressure(&e) {
                                         break;
                                     }
@@ -4709,7 +4520,6 @@ impl LockFreeStreamHandle {
                                     &mut bytes_since_flush,
                                     &mut response_batch,
                                     &mut local_streaming_queue,
-                                    &mut direct_response_batch,
                                     perf,
                                 )
                                 .await
@@ -4719,6 +4529,9 @@ impl LockFreeStreamHandle {
                                         error = %e,
                                         "Failed to process message on IO task"
                                     );
+                                    if is_ask_capacity_violation(&e) {
+                                        return; // fail closed; never silently lose a consumed ask
+                                    }
                                     if is_streaming_admission_backpressure(&e) {
                                         break;
                                     }
@@ -4746,21 +4559,6 @@ impl LockFreeStreamHandle {
                                     peer = %ctx.peer_addr,
                                     error = %e,
                                     "Failed to park response batch"
-                                );
-                                return;
-                            }
-                        }
-                        match park_direct_response_batch(
-                            &mut pending_ordinary_write,
-                            &mut direct_response_batch,
-                        ) {
-                            Ok(true) => wrote_fast_responses = true,
-                            Ok(false) => {}
-                            Err(e) => {
-                                warn!(
-                                    peer = %ctx.peer_addr,
-                                    error = %e,
-                                    "Failed to park direct response batch"
                                 );
                                 return;
                             }
@@ -4953,17 +4751,6 @@ impl LockFreeStreamHandle {
                             );
                             return;
                         }
-                        if let Err(e) = park_direct_response_batch(
-                            &mut pending_ordinary_write,
-                            &mut direct_response_batch,
-                        ) {
-                            warn!(
-                                peer = ?read_context.as_ref().map(|c| c.peer_addr),
-                                error = %e,
-                                "Failed to park direct response batch"
-                            );
-                            return;
-                        }
                     }
                 }
                 continue;
@@ -5049,34 +4836,42 @@ impl LockFreeStreamHandle {
                                     inline_response_budget_exhausted(
                                         &pending_ordinary_write,
                                         &response_batch,
-                                        &direct_response_batch,
                                     ),
                                     ordinary_write_stalled,
                                 ) {
                                     AskBudgetAction::Dispatch => {}
                                     AskBudgetAction::Nack => {
                                         if local_streaming_queue.has_room_for_ask_nack_occupying(pending_ask_nack_occupancy(&pending_ordinary_write)) {
-                                            queue_ask_backpressure_nack(
+                                            if let Err(error) = queue_ask_backpressure_nack(
                                                 &mut local_streaming_queue,
                                                 &result,
-                                            );
+                                            ) {
+                                                warn!(peer = %ctx.peer_addr, error = %error, "ask capacity invariant violated; closing connection");
+                                                return;
+                                            }
                                             continue;
                                         }
-                                        park_deferred_ask(
+                                        if let Err(error) = park_deferred_ask(
                                                 &mut deferred_asks,
                                                 result,
                                                 &mut local_streaming_queue,
                                                 pending_ask_nack_occupancy(&pending_ordinary_write),
-                                            );
+                                            ) {
+                                            warn!(peer = %ctx.peer_addr, error = %error, "ask capacity invariant violated; closing connection");
+                                            return;
+                                        }
                                         continue;
                                     }
                                     AskBudgetAction::Defer => {
-                                        park_deferred_ask(
+                                        if let Err(error) = park_deferred_ask(
                                                 &mut deferred_asks,
                                                 result,
                                                 &mut local_streaming_queue,
                                                 pending_ask_nack_occupancy(&pending_ordinary_write),
-                                            );
+                                            ) {
+                                            warn!(peer = %ctx.peer_addr, error = %error, "ask capacity invariant violated; closing connection");
+                                            return;
+                                        }
                                         if let Err(e) = park_ask_response_batch(
                                             &mut pending_ordinary_write,
                                             &mut response_batch,
@@ -5088,17 +4883,7 @@ impl LockFreeStreamHandle {
                                             );
                                             return;
                                         }
-                                        if let Err(e) = park_direct_response_batch(
-                                            &mut pending_ordinary_write,
-                                            &mut direct_response_batch,
-                                        ) {
-                                            warn!(
-                                                peer = %ctx.peer_addr,
-                                                error = %e,
-                                                "Failed to park direct response batch"
-                                            );
-                                            return;
-                                        }
+
                                         continue;
                                     }
                                 }
@@ -5110,7 +4895,6 @@ impl LockFreeStreamHandle {
                                     &mut bytes_since_flush,
                                     &mut response_batch,
                                     &mut local_streaming_queue,
-                                    &mut direct_response_batch,
                                     &mut wrote_fast_responses,
                                     perf,
                                 )
@@ -5123,6 +4907,9 @@ impl LockFreeStreamHandle {
                                             error = %e,
                                             "Failed to process fast IO message"
                                         );
+                                        if is_ask_capacity_violation(&e) {
+                                            return; // fail closed; never silently lose a consumed ask
+                                        }
                                         if is_streaming_admission_backpressure(&e) {
                                             // The idle select arm has no inner
                                             // drain loop, so `continue` returns
@@ -5152,7 +4939,6 @@ impl LockFreeStreamHandle {
                                             &mut bytes_since_flush,
                                             &mut response_batch,
                                             &mut local_streaming_queue,
-                                            &mut direct_response_batch,
                                             perf,
                                         )
                                         .await
@@ -5162,6 +4948,9 @@ impl LockFreeStreamHandle {
                                                 error = %e,
                                                 "Failed to process message on IO task"
                                             );
+                                            if is_ask_capacity_violation(&e) {
+                                                return; // fail closed; never silently lose a consumed ask
+                                            }
                                             if is_streaming_admission_backpressure(&e) {
                                                 continue;
                                             }
@@ -5188,20 +4977,19 @@ impl LockFreeStreamHandle {
                             // for the same reason.
                             while drained < drain_batch_limit
                                 // See the identical check in the primary
-                                // drain loop above, minus the budget-not-
-                                // exhausted clause: this inner drain only
-                                // reads new socket frames, it does not pop
-                                // `deferred_asks`.
-                                && (deferred_asks.len() < DEFERRED_ASK_CAP
-                                    || local_streaming_queue.has_room_for_ask_nack_occupying(0))
+                                // drain loop above: any next frame can need
+                                // a NACK, including DirectAsk, which never
+                                // occupies the deferred actor-ask deque.
+                                && local_streaming_queue.has_room_for_ask_nack_occupying(
+                                    pending_ask_nack_occupancy(&pending_ordinary_write),
+                                )
                                 && (pending_stream_cmd.is_none()
                                     || (response_batch.total_bytes() < RESPONSE_BATCH_BYTE_CAP
-                                        && direct_response_batch.total_bytes()
-                                            < RESPONSE_BATCH_BYTE_CAP))
+                                        ))
                             {
                                 // R-I: same per-turn byte cap as the primary
                                 // drain loop above; see
-                                // `flush_response_batch_if_over_byte_cap`.
+                                // `park_ask_response_batch_if_over_byte_cap`.
                                 if pending_stream_cmd.is_none() {
                                     match park_ask_response_batch_if_over_byte_cap(
                                         &mut pending_ordinary_write,
@@ -5218,21 +5006,7 @@ impl LockFreeStreamHandle {
                                             return;
                                         }
                                     }
-                                    match park_direct_response_batch_if_over_byte_cap(
-                                        &mut pending_ordinary_write,
-                                        &mut direct_response_batch,
-                                    ) {
-                                        Ok(true) => break,
-                                        Ok(false) => {}
-                                        Err(e) => {
-                                            warn!(
-                                                peer = %ctx.peer_addr,
-                                                error = %e,
-                                                "Failed to park direct response batch (byte cap)"
-                                            );
-                                            return;
-                                        }
-                                    }
+
                                 }
 
                                 let read_start = perf.map(|_| Instant::now());
@@ -5272,34 +5046,42 @@ impl LockFreeStreamHandle {
                                         inline_response_budget_exhausted(
                                             &pending_ordinary_write,
                                             &response_batch,
-                                            &direct_response_batch,
                                         ),
                                         ordinary_write_stalled,
                                     ) {
                                         AskBudgetAction::Dispatch => {}
                                         AskBudgetAction::Nack => {
                                             if local_streaming_queue.has_room_for_ask_nack_occupying(pending_ask_nack_occupancy(&pending_ordinary_write)) {
-                                                queue_ask_backpressure_nack(
+                                                if let Err(error) = queue_ask_backpressure_nack(
                                                     &mut local_streaming_queue,
                                                     &result,
-                                                );
+                                                ) {
+                                                    warn!(peer = %ctx.peer_addr, error = %error, "ask capacity invariant violated; closing connection");
+                                                    return;
+                                                }
                                                 continue;
                                             }
-                                            park_deferred_ask(
+                                            if let Err(error) = park_deferred_ask(
                                                 &mut deferred_asks,
                                                 result,
                                                 &mut local_streaming_queue,
                                                 pending_ask_nack_occupancy(&pending_ordinary_write),
-                                            );
+                                            ) {
+                                                warn!(peer = %ctx.peer_addr, error = %error, "ask capacity invariant violated; closing connection");
+                                                return;
+                                            }
                                             break;
                                         }
                                         AskBudgetAction::Defer => {
-                                            park_deferred_ask(
+                                            if let Err(error) = park_deferred_ask(
                                                 &mut deferred_asks,
                                                 result,
                                                 &mut local_streaming_queue,
                                                 pending_ask_nack_occupancy(&pending_ordinary_write),
-                                            );
+                                            ) {
+                                                warn!(peer = %ctx.peer_addr, error = %error, "ask capacity invariant violated; closing connection");
+                                                return;
+                                            }
                                             break;
                                         }
                                     }
@@ -5311,7 +5093,6 @@ impl LockFreeStreamHandle {
                                         &mut bytes_since_flush,
                                         &mut response_batch,
                                         &mut local_streaming_queue,
-                                        &mut direct_response_batch,
                                         &mut wrote_fast_responses,
                                         perf,
                                     )
@@ -5324,6 +5105,9 @@ impl LockFreeStreamHandle {
                                                 error = %e,
                                                 "Failed to process fast IO message"
                                             );
+                                            if is_ask_capacity_violation(&e) {
+                                                return; // fail closed; never silently lose a consumed ask
+                                            }
                                             if is_streaming_admission_backpressure(&e) {
                                                 break;
                                             }
@@ -5349,7 +5133,6 @@ impl LockFreeStreamHandle {
                                             &mut bytes_since_flush,
                                             &mut response_batch,
                                             &mut local_streaming_queue,
-                                            &mut direct_response_batch,
                                             perf,
                                         )
                                         .await
@@ -5359,6 +5142,9 @@ impl LockFreeStreamHandle {
                                                     error = %e,
                                                     "Failed to process message on IO task"
                                                 );
+                                                if is_ask_capacity_violation(&e) {
+                                                    return; // fail closed; never silently lose a consumed ask
+                                                }
                                                 if is_streaming_admission_backpressure(&e) {
                                                     break;
                                                 }
@@ -5387,17 +5173,7 @@ impl LockFreeStreamHandle {
                                     );
                                     return;
                                 }
-                                if let Err(e) = park_direct_response_batch(
-                                    &mut pending_ordinary_write,
-                                    &mut direct_response_batch,
-                                ) {
-                                    warn!(
-                                        peer = %ctx.peer_addr,
-                                        error = %e,
-                                        "Failed to park direct response batch"
-                                    );
-                                    return;
-                                }
+
                             }
                             // Ensure request/response traffic does not sit in TLS buffers on
                             // quiet links. The idle branch has no outer fast-flush checkpoint
@@ -6140,6 +5916,28 @@ impl LockFreeStreamHandle {
         }
     }
 
+    async fn enqueue_immediate_write(&self, payload: WritePayload) -> Result<()> {
+        if self.exit_flag.load(Ordering::Acquire) {
+            return Err(GossipError::ConnectionClosed(self.addr));
+        }
+        if self.shutdown_signal.load(Ordering::Acquire) {
+            return Err(GossipError::Shutdown);
+        }
+        self.reject_oversize_write_payload(&payload)?;
+        self.sequence_counter.fetch_add(1, Ordering::Relaxed);
+        let command = WriteCommand::ImmediatePayload(payload);
+        match self.immediate_write_queue.try_push(command) {
+            Ok(()) => {
+                self.immediate_write_queue.notify_data();
+                Ok(())
+            }
+            Err(WriteTryPushError::Full(command)) => self.immediate_write_queue.push(command).await,
+            Err(WriteTryPushError::Closed(_) | WriteTryPushError::ClosedDropped) => {
+                Err(GossipError::ConnectionClosed(self.addr))
+            }
+        }
+    }
+
     fn enqueue_immediate_write_nonblocking(&self, payload: WritePayload) -> Result<()> {
         if self.exit_flag.load(Ordering::Acquire) {
             return Err(GossipError::ConnectionClosed(self.addr));
@@ -6387,6 +6185,23 @@ impl LockFreeStreamHandle {
         payload: bytes::Bytes,
     ) -> Result<()> {
         self.enqueue_write(WritePayload::HeaderInline {
+            header,
+            header_len,
+            payload,
+        })
+        .await
+    }
+
+    /// Queue the first identifying FullSync in the lane drained before all
+    /// ordinary traffic. Only the outbound finalizer may bypass the startup
+    /// read/write gate this way.
+    pub(crate) async fn write_identifying_gossip_inline(
+        &self,
+        header: [u8; 16],
+        header_len: u8,
+        payload: bytes::Bytes,
+    ) -> Result<()> {
+        self.enqueue_immediate_write(WritePayload::HeaderInline {
             header,
             header_len,
             payload,

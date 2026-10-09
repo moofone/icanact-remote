@@ -28,6 +28,14 @@ fn init_crypto() {
         // The library code may have already installed it by the time this runs, so
         // make init idempotent to avoid flakes.
         icanact_remote::tls::ensure_crypto_provider();
+        if std::env::var_os("ICANACT_DISCOVERY_DIAGNOSTIC_TRACE").is_some() {
+            tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .with_ansi(false)
+                .with_test_writer()
+                .try_init()
+                .expect("diagnostic tracing subscriber");
+        }
     });
 }
 
@@ -76,7 +84,25 @@ where
 /// Test helper: Create a TLS-enabled node
 async fn create_tls_node(config: GossipConfig) -> Result<GossipRegistryHandle, DynError> {
     init_crypto();
-    let secret_key = SecretKey::generate();
+    // Optional deterministic identities make diagnostic runs replayable.
+    // Normal test execution retains its existing randomized identity coverage.
+    static NODE_INDEX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let secret_key = if let Ok(seed) = std::env::var("ICANACT_DISCOVERY_DIAGNOSTIC_SEED") {
+        let offset = std::env::var("ICANACT_DISCOVERY_DIAGNOSTIC_OFFSET")
+            .map(|value| {
+                value
+                    .parse::<u64>()
+                    .expect("diagnostic node offset must be an integer")
+            })
+            .unwrap_or(0);
+        let index = NODE_INDEX
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .checked_add(offset)
+            .expect("diagnostic node index overflow");
+        icanact_remote::KeyPair::new_for_testing(format!("{seed}:{index}")).to_secret_key()
+    } else {
+        SecretKey::generate()
+    };
     let node = GossipRegistryHandle::new_with_transport_stack(
         "127.0.0.1:0".parse()?,
         secret_key,
@@ -801,19 +827,69 @@ fn test_version_negotiation_v3_capabilities() -> Result<(), DynError> {
         connect_preferred(&node_a, &node_b).await?;
 
         // Allow a few discovery rounds for the peer capability negotiation to complete.
+        let a_supports_b = common::wait_for_condition(Duration::from_secs(5), || async {
+            node_a.registry.peer_supports_peer_list(&addr_b).await
+        })
+        .await;
+        if !a_supports_b {
+            eprintln!(
+                "CAPABILITY_TIMEOUT side=A addr={addr_b} peer={} stats={:?} addr_caps={:?} \
+                 node_caps={:?} addr_node={:?} addr_connection={:?}",
+                node_b.registry.peer_id,
+                node_a.stats().await,
+                node_a
+                    .registry
+                    .peer_capabilities
+                    .read_sync(&addr_b, |_, caps| *caps),
+                node_a
+                    .registry
+                    .peer_capabilities_by_node
+                    .read_sync(&node_b.registry.peer_id.to_node_id(), |_, caps| *caps,),
+                node_a
+                    .registry
+                    .peer_capability_addr_to_node
+                    .read_sync(&addr_b, |_, node| *node),
+                node_a
+                    .registry
+                    .connection_pool
+                    .get_lock_free_connection(addr_b),
+            );
+        }
         assert!(
-            common::wait_for_condition(Duration::from_secs(5), || async {
-                node_a.registry.peer_supports_peer_list(&addr_b).await
-            })
-            .await,
+            a_supports_b,
             "Node A should negotiate peer discovery with node B"
         );
 
+        let b_supports_a = common::wait_for_condition(Duration::from_secs(5), || async {
+            node_b.registry.peer_supports_peer_list(&addr_a).await
+        })
+        .await;
+        if !b_supports_a {
+            eprintln!(
+                "CAPABILITY_TIMEOUT side=B addr={addr_a} peer={} stats={:?} addr_caps={:?} \
+                 node_caps={:?} addr_node={:?} addr_connection={:?}",
+                node_a.registry.peer_id,
+                node_b.stats().await,
+                node_b
+                    .registry
+                    .peer_capabilities
+                    .read_sync(&addr_a, |_, caps| *caps),
+                node_b
+                    .registry
+                    .peer_capabilities_by_node
+                    .read_sync(&node_a.registry.peer_id.to_node_id(), |_, caps| *caps,),
+                node_b
+                    .registry
+                    .peer_capability_addr_to_node
+                    .read_sync(&addr_a, |_, node| *node),
+                node_b
+                    .registry
+                    .connection_pool
+                    .get_lock_free_connection(addr_a),
+            );
+        }
         assert!(
-            common::wait_for_condition(Duration::from_secs(5), || async {
-                node_b.registry.peer_supports_peer_list(&addr_a).await
-            })
-            .await,
+            b_supports_a,
             "Node B should negotiate peer discovery with node A"
         );
 

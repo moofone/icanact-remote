@@ -7,6 +7,9 @@ use std::task::{Context, Poll};
 use tokio::runtime::Builder;
 use tokio::time::sleep;
 
+mod qa_connect_publication;
+mod qa_nack_capacity;
+
 struct TestActor;
 
 impl crate::registry::ActorMessageHandlerSync for TestActor {
@@ -3199,10 +3202,12 @@ fn drain_pending_ask_nacks_reports_outstanding_work_past_the_per_turn_cap() {
     run_multi_thread_test(async {
         let mut queue = LocalStreamingQueue::new();
         for i in 0..9u32 {
-            queue.queue_ask_nack(crate::framing::write_ask_nack_header(
-                i,
-                crate::framing::AskNackReason::Backpressure,
-            ));
+            queue
+                .queue_ask_nack(crate::framing::write_ask_nack_header(
+                    i,
+                    crate::framing::AskNackReason::Backpressure,
+                ))
+                .unwrap();
         }
         assert_eq!(queue.pending_ask_nack_count(), 9);
 
@@ -3271,10 +3276,12 @@ fn drain_pending_ask_nacks_reports_outstanding_work_past_the_per_turn_cap() {
 fn drain_pending_ask_nacks_requeues_on_zero_byte_write_miss() {
     run_multi_thread_test(async {
         let mut queue = LocalStreamingQueue::new();
-        queue.queue_ask_nack(crate::framing::write_ask_nack_header(
-            0x51_E11D,
-            crate::framing::AskNackReason::Backpressure,
-        ));
+        queue
+            .queue_ask_nack(crate::framing::write_ask_nack_header(
+                0x51_E11D,
+                crate::framing::AskNackReason::Backpressure,
+            ))
+            .unwrap();
         assert_eq!(queue.pending_ask_nack_count(), 1);
 
         let (mut server_half, mut client_half) = tokio::io::duplex(32);
@@ -3354,34 +3361,43 @@ fn drain_pending_ask_nacks_requeues_on_zero_byte_write_miss() {
 #[test]
 fn park_deferred_ask_does_not_grow_nack_queue_past_cap() {
     let pool = Arc::new(crate::AlignedBytesPool::default());
-    let ask = |id: u32| ReadIoResult::ActorAsk {
-        correlation_id: id,
-        actor_id: 1,
-        type_hash: 1,
-        payload: crate::AlignedBytes::from_pooled_slice(&[], pool.clone()),
+    let ask = |id: u32| {
+        let header = crate::framing::write_actor_ask_header(id, 1, 1, 0);
+        let buffer = crate::PooledAlignedBuffer::from_slice(&header, pool.clone());
+        let result = crate::handle::parse_message_from_pooled_buffer(
+            buffer,
+            header.len() - crate::framing::LENGTH_PREFIX_LEN,
+        )
+        .expect("deferred fixture must be a real parsed actor ask");
+        assert!(matches!(result, crate::handle::MessageReadResult::Actor {
+            correlation_id, ..
+        } if correlation_id == id));
+        result
     };
 
     let mut deferred = std::collections::VecDeque::new();
     let mut queue = LocalStreamingQueue::new();
-    for i in 0..DEFERRED_ASK_CAP as u32 {
-        park_deferred_ask(&mut deferred, ask(i), &mut queue, 0);
+    for i in 1..=DEFERRED_ASK_CAP as u32 {
+        park_deferred_ask(&mut deferred, ask(i), &mut queue, 0).unwrap();
     }
     assert_eq!(deferred.len(), DEFERRED_ASK_CAP);
     assert_eq!(queue.pending_ask_nack_count(), 0);
 
-    park_deferred_ask(&mut deferred, ask(1_000), &mut queue, 0);
+    park_deferred_ask(&mut deferred, ask(1_000), &mut queue, 0).unwrap();
     assert_eq!(deferred.len(), DEFERRED_ASK_CAP);
     assert_eq!(queue.pending_ask_nack_count(), 1);
 
     while queue.has_room_for_ask_nack() {
-        queue.queue_ask_nack(crate::framing::write_ask_nack_header(
-            2_000 + queue.pending_ask_nack_count() as u32,
-            crate::framing::AskNackReason::Backpressure,
-        ));
+        queue
+            .queue_ask_nack(crate::framing::write_ask_nack_header(
+                2_000 + queue.pending_ask_nack_count() as u32,
+                crate::framing::AskNackReason::Backpressure,
+            ))
+            .unwrap();
     }
     let nacks_at_cap = queue.pending_ask_nack_count();
     assert!(!queue.has_room_for_ask_nack());
-    park_deferred_ask(&mut deferred, ask(3_000), &mut queue, 0);
+    park_deferred_ask(&mut deferred, ask(3_000), &mut queue, 0).unwrap();
     assert_eq!(
         queue.pending_ask_nack_count(),
         nacks_at_cap,
@@ -3392,7 +3408,10 @@ fn park_deferred_ask_does_not_grow_nack_queue_past_cap() {
         DEFERRED_ASK_HOLD_CAP,
         "the already-read ask is retained until NACK room exists"
     );
-    park_deferred_ask(&mut deferred, ask(4_000), &mut queue, 0);
+    assert!(
+        park_deferred_ask(&mut deferred, ask(4_000), &mut queue, 0).is_err(),
+        "already-full hold capacity must be rejected explicitly, not silently lose an ask"
+    );
     assert_eq!(
         deferred.len(),
         DEFERRED_ASK_HOLD_CAP,
@@ -13826,6 +13845,93 @@ async fn fresh_outbound_connect_aborts_when_identify_send_fails_instead_of_publi
         "a candidate whose identify send failed must not leak a counted \
          connection-instance"
     );
+}
+
+/// A newly published outbound used to let its IO owner read peer traffic and
+/// drain ordinary writes before the finalizer enqueued its identifying
+/// FullSync. Discovery gossip racing publication could therefore become the
+/// acceptor's first frame and be rejected as an invalid identity. Hold identify
+/// construction, queue a real ordinary frame through the published handle,
+/// then prove the identifying Gossip frame is nevertheless first on the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn outbound_owner_emits_identify_before_racing_ordinary_traffic() {
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("identify-first-owner")),
+            ..Default::default()
+        },
+    ));
+    let pool = registry.connection_pool.clone();
+    let addr: SocketAddr = "127.0.0.1:41779".parse().unwrap();
+    let (io, mut peer) = tokio::io::duplex(64 * 1024);
+
+    let gossip_guard = registry.gossip_state.lock().await;
+    let finalize_registry = Arc::downgrade(&registry);
+    let pool_for_finalize = pool.clone();
+    let finalize = tokio::spawn(async move {
+        pool_for_finalize
+            .finalize_new_outbound_connection(addr, io, finalize_registry, None, addr, None)
+            .await
+    });
+
+    let stream = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(connection) = pool.get_connection_by_addr(&addr)
+                && let Some(stream) = connection.stream_handle.clone()
+            {
+                break stream;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("candidate must publish before identify construction");
+    stream
+        .write_trusted_bytes_control(bytes::Bytes::copy_from_slice(
+            &crate::framing::write_stream_abort_header(77, 9),
+        ))
+        .await
+        .expect("racing ordinary control frame must queue");
+    drop(gossip_guard);
+
+    let handle = finalize
+        .await
+        .expect("finalizer must not panic")
+        .expect("finalizer must identify");
+    drop(handle);
+
+    let mut prefix = [0; crate::framing::LENGTH_PREFIX_LEN];
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read_exact(&mut peer, &mut prefix),
+    )
+    .await
+    .expect("first frame must arrive")
+    .expect("first frame must be complete");
+    let first = crate::framing::decode_control(prefix).expect("valid first control");
+    assert_eq!(
+        first.kind,
+        crate::framing::WireKind::Gossip,
+        "identifying FullSync must precede ordinary traffic queued after publication"
+    );
+    let mut identify_body = vec![0; first.body_len];
+    tokio::io::AsyncReadExt::read_exact(&mut peer, &mut identify_body)
+        .await
+        .expect("identifying body");
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read_exact(&mut peer, &mut prefix),
+    )
+    .await
+    .expect("racing frame must follow")
+    .expect("racing frame must be complete");
+    assert_eq!(
+        crate::framing::decode_control(prefix).unwrap().kind,
+        crate::framing::WireKind::StreamAbort,
+    );
+    assert!(pool.remove_connection(addr).is_some());
 }
 
 // R-11 regression coverage for `finalize_new_outbound_connection`'s own

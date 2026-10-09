@@ -4,7 +4,7 @@
 
 Reduce implementation paths, impossible states, allocations, and validation ambiguity while preserving public API, wire compatibility, ownership, bounded resources, and duplex progress. Prefer deletion and delegation to existing implementations over new abstraction layers.
 
-**Status: planning only.** No remediation, builds, tests, benchmarks, or dependency installation have been performed by creating this plan. Execution needs a separate go-ahead. Build/test commands execute project code on the host; they are not sandboxed by this plan.
+**Status: local execution complete in the isolated `cleanup-remediation` worktree.** See [CLEANUP_REMEDIATION_STATUS.md](CLEANUP_REMEDIATION_STATUS.md) for finding dispositions, the preserved failure ledger, validation evidence, and the M10 no-change decision. The original plan was created without execution; implementation and dependency fetching were subsequently authorized. Build/test commands execute project code on the host, not in a security sandbox. Remote CI and any later merge remain pending.
 
 Basis: GPT Pro static review of snapshot `da560aa1f1874bdbf4ae5cb7a459ffaaaa68555b`, findings R1–R7. The downloaded report is available locally at `/Users/greg/.pi/agent/pro-responses/19edb80d5374/artifacts/review-report.md`. The handoff is artifact-incomplete: the graph receipt downloaded under a nested filename, but the integration rejected the missing required root receipt. The receipt reports successful indexing; that is remote evidence, not independent local verification. Do not treat the recommendations as established acceptance results or silently mark the handoff complete.
 
@@ -213,15 +213,16 @@ If a milestone regresses behavior, revert only that milestone in the isolated wo
 
 ## Tracking checklist
 
-- [ ] M0: Findings verified; baseline and assertion map recorded
-- [ ] M1: R6 validation harness hardened and simplified
-- [ ] M2: R1 unused subset and R7 duplicate dependency removed
-- [ ] M3: R2 readers consolidated
-- [ ] M4: R5 writers consolidated
-- [ ] M5: R1 tests migrated; remaining obsolete writers removed
-- [ ] M6: R3 empty batching removed
-- [ ] M7: R4 speculative parser/dispatch states removed
-- [ ] M8: R7 dependency/features narrowed and consumer validated
-- [ ] M9: Public alias delegation consolidated; API decisions deferred explicitly
-- [ ] M10: Chunk-write experiment completed or no-change decision recorded
-- [ ] M11: Final matrix, evidence, documentation, and reduction report complete
+- [x] M0: Findings verified; baseline and assertion map recorded
+- [x] M1: R6 validation harness hardened and simplified
+- [x] M2: R1 unused subset and R7 duplicate dependency removed
+- [x] M3: R2 readers consolidated
+- [x] M4: R5 writers consolidated
+- [x] M5: R1 tests migrated; remaining obsolete writers removed
+- [x] M6: R3 empty batching removed
+- [x] M7: R4 speculative parser/dispatch states removed
+- [x] M8: R7 dependency/features narrowed and consumer validated
+- [x] M9: Public alias delegation consolidated; API decisions deferred explicitly
+- [x] M10: Chunk-write experiment completed; no cursor/cache change selected
+- [x] M11: Local matrix, evidence, documentation, and reduction report complete
+- [ ] Remote CI and any later merge (not authorized/performed by this execution)

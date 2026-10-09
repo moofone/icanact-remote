@@ -4010,8 +4010,40 @@ impl<T: 'static> GossipRegistry<T> {
         }
     }
 
+    /// Capabilities owned by the currently live physical session at `addr`.
+    /// This is authoritative over cleanup-prone address projections: a losing
+    /// sibling may clear those projections after the winner's Hello, but it
+    /// cannot mutate the winner's immutable connection snapshot.
+    fn live_connection_capabilities(
+        &self,
+        addr: &SocketAddr,
+    ) -> Option<crate::handshake::PeerCapabilities> {
+        if let Some(caps) = self
+            .connection_pool
+            .get_connection_by_addr(addr)
+            .and_then(|connection| connection.peer_capabilities)
+        {
+            return Some(caps);
+        }
+
+        // A verified inbound may intentionally retain only its observed
+        // ephemeral address alias while the caller asks about the advertised
+        // bind address. Teardown can also remove that advertised alias without
+        // removing the live identity-indexed session. The authenticated
+        // addr->node projection lets the query reach that same live owner.
+        let node_id = self
+            .peer_capability_addr_to_node
+            .read_sync(addr, |_, node_id| *node_id)?;
+        self.connection_pool
+            .get_connection_by_peer_id(&node_id.to_peer_id())
+            .and_then(|connection| connection.peer_capabilities)
+    }
+
     /// Determine whether a peer supports receiving PeerListGossip
     pub async fn peer_supports_peer_list(&self, addr: &SocketAddr) -> bool {
+        if let Some(caps) = self.live_connection_capabilities(addr) {
+            return caps.can_send_peer_list();
+        }
         if let Some(caps) = self.peer_capabilities.read_sync(addr, |_, v| *v) {
             return caps.can_send_peer_list();
         }
@@ -4051,6 +4083,9 @@ impl<T: 'static> GossipRegistry<T> {
     }
 
     pub async fn peer_supports_clock_calibration(&self, addr: &SocketAddr) -> bool {
+        if let Some(caps) = self.live_connection_capabilities(addr) {
+            return caps.can_calibrate_clock();
+        }
         if let Some(caps) = self.peer_capabilities.read_sync(addr, |_, v| *v) {
             return caps.can_calibrate_clock();
         }
@@ -12484,6 +12519,7 @@ impl<T: 'static> GossipRegistry<T> {
             );
         }
         let mut crossed_threshold = false;
+        #[cfg(feature = "test-helpers")]
         let mut applied = false;
         let replacement_is_current;
         let delivery_epoch;
@@ -12540,20 +12576,34 @@ impl<T: 'static> GossipRegistry<T> {
                 .is_some_and(|(failed, current)| failed != current)
                 || address_replacement_is_current;
             if !replacement_is_current {
-                if let Some(peer_info) = gossip_state.peers.get_mut(&failed_peer_addr) {
+                let failed_node_id = peer_id.as_ref().map(|peer| peer.to_node_id());
+                let failed_instant = std::time::Instant::now();
+                for (alias_addr, peer_info) in gossip_state.peers.iter_mut() {
+                    if *alias_addr != failed_peer_addr
+                        && failed_node_id.is_none_or(|node_id| peer_info.node_id != Some(node_id))
+                    {
+                        continue;
+                    }
                     let was_below = peer_info.failures < self.config.max_peer_failures;
                     peer_info.failures = self.config.max_peer_failures;
                     peer_info.last_failure_time = Some(current_time);
-                    // Capture at the actual write, not before the intervening
-                    // teardown awaits.
-                    peer_info.last_failure_instant = Some(std::time::Instant::now());
+                    // All aliases of one authenticated physical peer describe
+                    // the same failed session when no replacement is current.
+                    // Leaving an inbound-source alias at failures=0 makes stats
+                    // and discovery report an active peer after its only
+                    // connection has gone.
+                    peer_info.last_failure_instant = Some(failed_instant);
                     peer_info.last_attempt = current_time;
-                    crossed_threshold = was_below;
-                    applied = true;
+                    crossed_threshold |= was_below;
+                    #[cfg(feature = "test-helpers")]
+                    {
+                        applied = true;
+                    }
                     info!(
-                        peer = %failed_peer_addr,
+                        peer = %alias_addr,
+                        failed_peer = %failed_peer_addr,
                         retry_after_secs = self.config.peer_retry_interval.as_secs(),
-                        "marked peer as disconnected in local state, will retry after interval"
+                        "marked peer alias as disconnected in local state, will retry after interval"
                     );
                 }
             }
@@ -34714,6 +34764,82 @@ mod tests {
         assert!(
             !registry.peer_capabilities_by_node.contains_sync(&old_owner),
             "the displaced owner's identity-keyed capabilities must be removed"
+        );
+    }
+
+    /// Address projections are cleanup caches, not the capability owner. A
+    /// superseded sibling can clear or overwrite them after a winner's Hello;
+    /// feature decisions must still follow the currently indexed live session.
+    #[tokio::test]
+    async fn live_session_capabilities_survive_stale_projection_cleanup() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_114), test_config());
+        let addr = test_addr(20_115);
+        let peer = test_peer_id("live-session-capability-owner");
+        let hello =
+            crate::handshake::Hello::with_features(vec![crate::handshake::Feature::PeerListGossip]);
+        let live_caps = crate::handshake::PeerCapabilities::from_hello_exchange(&hello, &hello);
+        let stale_caps = clock_caps();
+        assert!(live_caps.can_send_peer_list());
+        assert!(!stale_caps.can_send_peer_list());
+
+        let (io, _peer_io) = tokio::io::duplex(4096);
+        let (stream, task, _) = crate::connection_pool::LockFreeStreamHandle::new(
+            io,
+            addr,
+            crate::connection_pool::ChannelId::Global,
+            crate::connection_pool::BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut connection = crate::connection_pool::LockFreeConnection::new(
+            addr,
+            crate::connection_pool::ConnectionDirection::Outbound,
+        );
+        connection.stream_handle = Some(Arc::new(stream));
+        connection.embedded_peer_id = Some(peer.clone());
+        connection.peer_capabilities = Some(live_caps);
+        connection.remote_boot_id = Some(live_caps.remote_boot_id);
+        connection.set_state(crate::connection_pool::ConnectionState::Connected);
+        let connection = Arc::new(connection);
+        assert!(registry.connection_pool.add_connection_by_peer_id(
+            peer.clone(),
+            addr,
+            connection.clone(),
+        ));
+
+        // Model a losing sibling's delayed cleanup followed by a stale cache
+        // write. Neither may override the immutable capabilities attached to
+        // the currently live physical connection.
+        registry.connection_pool.evict_pin_alias(&peer, addr);
+        assert!(
+            registry
+                .connection_pool
+                .get_lock_free_connection(addr)
+                .is_none(),
+            "precondition: configured-address alias is absent while peer session remains live"
+        );
+        registry.clear_peer_capabilities(&addr);
+        let _ = registry
+            .peer_capability_addr_to_node
+            .upsert_sync(addr, peer.to_node_id());
+        registry.set_peer_capabilities(addr, stale_caps);
+        assert!(
+            registry.peer_supports_peer_list(&addr).await,
+            "the live winner, not an address cache race, owns negotiated features"
+        );
+
+        assert!(
+            registry
+                .connection_pool
+                .disconnect_connection_instance(&peer, &connection)
+        );
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("connection task must terminate")
+            .expect("connection task must not panic");
+        assert!(
+            !registry.peer_supports_peer_list(&addr).await,
+            "once the live owner is retired, the deliberately stale projection is not upgraded"
         );
     }
 

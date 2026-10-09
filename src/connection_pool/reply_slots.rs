@@ -182,9 +182,9 @@ impl ReplySlotRecord {
     }
 
     pub(crate) fn cancel(&self) {
-        let was_cancelled = self.cancelled.swap(true, Ordering::AcqRel);
+        let _was_cancelled = self.cancelled.swap(true, Ordering::AcqRel);
         #[cfg(any(test, feature = "test-helpers"))]
-        if !was_cancelled {
+        if !_was_cancelled {
             self.stats
                 .cancellation_publications
                 .fetch_add(1, Ordering::Relaxed);

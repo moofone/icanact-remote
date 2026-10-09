@@ -61,6 +61,95 @@ impl ActorMessageHandlerSync for EchoHandler {
     }
 }
 
+// Delay alone cannot guarantee timeout ordering: Tokio polls the wrapped
+// future before its timer, so a worker stalled until a reply is ready can
+// return that reply after the nominal deadline. Pin the reply until the caller
+// has observed Timeout, without pinning a Tokio scheduling core.
+#[derive(Default)]
+struct SlowReplyGate {
+    open: Mutex<bool>,
+    changed: std::sync::Condvar,
+    entered: tokio::sync::Notify,
+}
+
+impl SlowReplyGate {
+    fn wait(&self) {
+        tokio::task::block_in_place(|| {
+            let mut open = self.open.lock().unwrap();
+            self.entered.notify_one();
+            while !*open {
+                open = self.changed.wait(open).unwrap();
+            }
+        });
+    }
+
+    fn release(&self) {
+        *self
+            .open
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = true;
+        self.changed.notify_all();
+    }
+}
+
+struct ReleaseSlowReplyOnDrop(Arc<SlowReplyGate>);
+impl Drop for ReleaseSlowReplyOnDrop {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
+
+struct GatedEchoHandler {
+    echo: EchoHandler,
+    gate: Arc<SlowReplyGate>,
+}
+
+impl ActorMessageHandlerSync for GatedEchoHandler {
+    fn handle_actor_message_sync(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: AlignedBytes,
+        correlation_id: Option<u32>,
+    ) -> icanact_remote::Result<Option<ActorResponse>> {
+        assert_eq!(actor_id, TEST_ACTOR_ID);
+        assert_eq!(type_hash, TEST_TYPE_HASH);
+        if correlation_id.is_some() && payload.as_ref() == b"slow" {
+            self.gate.wait();
+        }
+        self.echo
+            .handle_actor_message_sync(actor_id, type_hash, payload, correlation_id)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn controlled_slow_reply_leaves_timer_progress_and_releases_on_unwind() {
+    let gate = Arc::new(SlowReplyGate::default());
+    let release = ReleaseSlowReplyOnDrop(Arc::clone(&gate));
+    let waiting_gate = Arc::clone(&gate);
+    let mut waiting = tokio::spawn(async move {
+        waiting_gate.wait();
+    });
+    timeout(Duration::from_secs(2), gate.entered.notified())
+        .await
+        .unwrap();
+    assert!(
+        timeout(Duration::from_millis(20), &mut waiting)
+            .await
+            .is_err(),
+        "the callback must remain pinned while the controller's timer progresses"
+    );
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _release = release;
+        panic!("controlled controller unwind");
+    }));
+    assert!(unwound.is_err());
+    timeout(Duration::from_secs(2), waiting)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 #[derive(Clone, Copy, Default)]
 struct ProxyPlan {
     connect_delay: Duration,
@@ -720,13 +809,20 @@ async fn actor_timeout_does_not_destroy_healthy_session() -> icanact_remote::Res
     let asks_local = Arc::new(AtomicU64::new(0));
     let asks_remote = Arc::new(AtomicU64::new(0));
     let local = node(local_key, "local", Arc::clone(&asks_local)).await?;
-    let remote = node_with_slow_payload(
-        remote_key,
-        "remote",
-        Arc::clone(&asks_remote),
-        Some(Duration::from_millis(250)),
-    )
-    .await?;
+    let gate = Arc::new(SlowReplyGate::default());
+    let release = ReleaseSlowReplyOnDrop(Arc::clone(&gate));
+    let remote = node(remote_key, "remote", Arc::clone(&asks_remote)).await?;
+    remote
+        .registry
+        .set_actor_message_handler_sync(Arc::new(GatedEchoHandler {
+            echo: EchoHandler {
+                label: "remote",
+                asks: Arc::clone(&asks_remote),
+                slow_payload_delay: None,
+            },
+            gate: Arc::clone(&gate),
+        }))
+        .await;
     let remote_to_local = ScriptedProxy::new(local.registry.bind_addr, Duration::ZERO).await;
     let local_to_remote = ScriptedProxy::new(remote.registry.bind_addr, Duration::ZERO).await;
 
@@ -745,18 +841,28 @@ async fn actor_timeout_does_not_destroy_healthy_session() -> icanact_remote::Res
     connect_preferred_direction(&local, &remote, &remote_to_local).await?;
 
     let remote_ref = local.lookup_peer(&remote.registry.peer_id).await?;
-    let timed_out = remote_ref
-        .ask_actor_frame(
-            TEST_ACTOR_ID,
-            TEST_TYPE_HASH,
-            Bytes::from_static(b"slow"),
-            Duration::from_millis(50),
-        )
-        .await;
+    let ask = tokio::spawn(async move {
+        remote_ref
+            .ask_actor_frame(
+                TEST_ACTOR_ID,
+                TEST_TYPE_HASH,
+                Bytes::from_static(b"slow"),
+                Duration::from_millis(50),
+            )
+            .await
+    });
+    timeout(Duration::from_secs(2), gate.entered.notified())
+        .await
+        .expect("the real remote handler must receive and retain the slow request");
+    let timed_out = timeout(Duration::from_secs(2), ask)
+        .await
+        .expect("the caller must finish while the remote reply is still pinned")
+        .unwrap();
     assert!(
         matches!(timed_out, Err(icanact_remote::GossipError::Timeout)),
         "slow actor ask should time out without being treated as transport death: {timed_out:?}"
     );
+    drop(release);
 
     ask_once(&local, &remote.registry.peer_id, b"fast", b"remote:fast").await;
     with_events(&events, |events| {
