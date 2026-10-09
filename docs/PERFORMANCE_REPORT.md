@@ -8,7 +8,7 @@ The receive-buffer safety correction and fail-first validation/A/B tooling were 
 
 The historical pre-integration mandatory local matrix passed after a narrow connection-admission fix and verified fixture corrections: **7,009 passing records across feature/profile lanes**, plus builds, strict Clippy, rustdoc and copy guards. Failed runs were retained; no outcome assertions or thresholds were weakened. Combined-tree correctness validation now passes separately (Phase 4: 7,059 passing records); it does not substitute for performance A/B evidence.
 
-Optimization acceptance is still held: A/A controls do not meet all <=3% precision gates, fixed-offered-load/allocation/retention evidence remains incomplete, and the historical seed-39 capability-negotiation failure has not been conclusively attributed. A deterministic finalizer test reproduces the identifying-FullSync error mechanism, but cannot prove it caused the original untraced run. Supported-platform CI/Miri limits remain explicit. The new runtime correctness fix has not received a performance A/B cost estimate.
+Optimization acceptance is still held: closed-loop and offered-load A/A controls both miss the <=3% latency gates, allocation/retention evidence is still absent, and the historical seed-39 capability-negotiation failure has not been conclusively attributed. A deterministic finalizer test reproduces the identifying-FullSync error mechanism, but cannot prove it caused the original untraced run. Supported-platform CI/Miri limits remain explicit. The new runtime correctness fix has not received a performance A/B cost estimate.
 
 Safety is not optional: the previous uninitialized-memory implementation was not run as a valid performance competitor. The corrected initialized version is the baseline for future A/B work. There is no numerical estimate of the safety fix's performance cost versus a valid alternate design yet.
 
@@ -337,6 +337,47 @@ The initial combined-tree failure and controlled RED/prototype failures remain r
 
 This is correctness/resource-isolation evidence, **not a performance experiment**. Historical A/A measurements do not measure main's cleanup or S13. Their individual/cumulative costs, allocation/RSS and fixed-load fairness still require separate experiments. No OOM attack, speedup or allocator-savings claim is made.
 
+## Phase 5 — post-merge discovery correctness continuation
+
+Merged main became the new safe baseline for future performance work. The historical capability failure was still reproducible: an initial fixed-seed series passed 40 fresh full-target processes and failed on process 41; a later instrumented maximum-160 series stopped on capability failure at run 126. State at timeout showed one active peer and verified address→node attribution, but no configured-address alias and no capability projections. D08 retains immutable negotiated capabilities on the physical connection and resolves the live owner through either address alias or verified identity.
+
+After D08, 160/160 fresh fixed-seed full-target processes passed, but random identities exposed identifying-FullSync failures in mesh/recovery scenarios. A traced failure showed an ordinary registry message being processed as the acceptor's first message before local identify, producing invalid identity parsing and connection teardown. D09 starts outbound IO behind an identify barrier, sends the first FullSync through the priority lane, and waits for physical write progress. A controlled wire test proves identify precedes ordinary traffic queued through the already-published connection.
+
+After D08+D09, 100 fixed-seed and 100 random-identity fresh full-target processes all pass (3,800 test executions). Existing dead-stream/cancellation/restart/racing-ask checks pass. Earlier failures are retained and this bounded stress does not prove every interleaving.
+
+The first complete continuation matrix then exposed two deterministic integration issues and stopped at default workspace step 10. D10 corrects the contention fixture's missing durable configured-peer precondition; D11 marks every authenticated alias failed when the physical peer has no replacement, instead of leaving an observed-source alias active. Both focused tests pass.
+
+The renewed matrix then stopped twice more before completion. v2 failed strict Clippy on a non-minimal boolean, which was rewritten equivalently. v3 passed steps 1–16 and was aborted externally during the release all-features compile; that incomplete run is retained and is not a pass. v4 reached release/default and failed `publisher_recovers_from_every_round_of_connection_churn` because instance retirement cleared the successor's address-to-peer route. D12 publishes the connection index before that route and clears the route only while the retired instance still owns the address. Lookup also uses the live connection's embedded identity. The gap regression and five post-fix release runs of that publisher test pass. Validation v5 then stopped in the default workspace lane because the identify-supersession test treated a provisional address alias as the installed session and observed `connection_count` 0. The test now waits for the session slot and a count of 1 before identify; the assertion is unchanged. v5 is retained.
+
+Validation v6 then completed the 20-step matrix at 2026-10-09 16:18:05 UTC, status 0: **7,079 passing records** (isolated TLS 4; default/debug 1,385 of 1,431; test-helpers/debug 1,435 of 1,482; all-features/debug 1,435 of 1,482; default/release 1,385 of 1,429; all-features/release 1,435 of 1,482). Repeated lanes and doctests, not unique tests; ignored tests are not passes. Evidence: `/Users/greg/dev/icanact-remediation-evidence/post-merge-continuation-full-validation-v6.log` and `logs/validation_20261009_122559_6ka5vb/`. Pre-run diff SHA-256 `373f183802ac37669b116fe07a71cda727b1c00cc6ad3c32cc0d4f3abd5c2ac2`; lock SHA-256 unchanged. v1–v5 remain retained. This paragraph is a documentation edit after that run. Detailed evidence: [DISCOVERY_CAPABILITY_REMEDIATION.md](DISCOVERY_CAPABILITY_REMEDIATION.md).
+
+These changes are correctness/lifecycle remediation, **not performance optimizations**. Their connection-setup latency and retained-field cost are unmeasured. No improvement is claimed, and all previous throughput/A/A measurements predate them. Future optimization A/B work must branch from merged main including these safety fixes; an unsafe or misidentified session is not an admissible faster baseline.
+
+## Phase 6 — fixed offered-load harness
+
+`measure_offered_asks` schedules the same TLS ask path at a constant rate. Latency starts at the scheduled instant, and an offer still unissued after the lateness bound is a drop. `scripts/sample_offered.py` rejects a short window, a drop, or a backlog above the declared cap. The 50 ms smoke and the schedule unit test pass. This fixture is not in validation v6.
+
+Two single release proofs were run at 1,000 offers/s, 5 s warmup, 10 s window, cap 64, and 1 s lateness. Neither is an A/A or a service-time baseline.
+
+- `offered-load-harness-proof.log`: 10,000/10,000 completed, 0 drops. p50 1.352 ms, p95 8.491 ms, p99 19.267 ms, max backlog 64. The issuer could enqueue a full cap of unpolled asks, so this backlog is a fixture defect.
+- `offered-load-harness-proof-v2.log`: after polling ready completions before the next issue, 10,000/10,000 completed, 0 drops. p50 1.303 ms, p95 2.884 ms, p99 6.263 ms, max backlog 22. The cap is no longer saturated. A 1 ms offer interval is at host timer granularity, so this one sample still does not establish unloaded service latency.
+
+Two more single release samples were then run, before the A/A config was frozen, and were not used to change the planned 1,000/s rate. `offered-load-rate-100.log`: 1,000/1,000, 0 drops, p50 2.066 ms, p99 4.625 ms, max backlog 2. `offered-load-rate-10000.log`: 100,000/100,000, 0 drops, p50 0.268 ms, p99 1.307 ms, max backlog 36. The low-rate backlog is small while its latency stays in milliseconds, which is consistent with sleep lateness being part of intended-start latency. Neither sample is an A/A.
+
+The frozen pilot is `offered-aa-config.json`, experiment `E0-AA-offered-asks-1000`: identical source in both arms, 10 pairs × 2 sessions, seed 20261009, 1,000/s, 5 s warmup, 10 s window, cap 64, 1 s lateness. Primary metrics are p50/p95/p99. `offer_window_ns` is the duration contract. `achieved_rate` and `max_backlog` are not in the 3% gate. It ran 2026-10-09 18:07:08–18:17:31 UTC, 40/40 processes exit 0, every sample 10,000/10,000 with 0 drops. Evidence: `/Users/greg/dev/icanact-remediation-evidence/offered-aa/`. Config SHA-256 `ab45ecdb012f346d42cce6683cbe4dea84a9740bdc23f3e33e1b930eb3a7c38f`; runner SHA-256 unchanged from the concurrent pilot; measured diff SHA-256 `a6f9bbf5888ce068baa48acf05efbe9617eac5da70b418b9faa73ca7935db035`; lock SHA-256 unchanged. Across the 40 samples, p50 was 0.741–8.707 ms (median 1.013 ms), p99 was 1.629–184.1 ms (median 2.311 ms), and max backlog was 2–64 (median 17). Three samples sat on the cap; the largest p99 was 184.1 ms.
+
+Pooled paired cost change and 95% CI, lower-is-better: p50 +8.03% [−8.34%, +31.85%]; p95 +11.50% [−6.64%, +32.98%]; p99 +3.73% [−9.90%, +33.38%]. Every latency gate failed. Session 1 p99’s upper bound was +287.7%. The offer window was exactly 10 s in every sample, so that control passes without measuring noise. Runner disposition is `pilot-only` because the config mode is pilot; that exit is not a passed precision gate.
+
+Allocation, CPU, ownership, and duplex-fairness counters are still absent. No optimization is accepted. The 3% threshold was not widened.
+
+The issuer clock was then changed, after that failed A/A, and was not used to retarget it. Three single release samples at 100/s, same warmup, window, cap, and lateness, compared clocks. None is an A/A or a service-time baseline. Closed-loop inflight-1 median run p50 was 42.29 µs, so a 0.25 ms offered-load median is still several times the saturated single-flight figure and still includes issue delay.
+
+- Relative sleep, waking 1 ms early (`offered-load-spin100-1.log` through `-3`, 18:28–18:30 UTC): 1,000/1,000, 0 drops, backlog 1–2. p50 1.260–1.287 ms. p99 3.549–11.053 ms (max/min 3.11). The sleep was still the median.
+- `mach_wait_until`, spinning the last 200 µs (`offered-load-mach100-1.log` through `-3`, 19:41–19:42 UTC): 1,000/1,000, 0 drops, backlog 2–4. p50 2.976–3.230 ms. p99 6.829–8.306 ms. Worse than the relative sleep. That clock was removed.
+- Spin for any wait of 20 ms or less (`offered-load-spin20-100-1.log` through `-3`, 19:44–19:45 UTC): 1,000/1,000, 0 drops, backlog 1. p50 0.241–0.254 ms. p99 0.392–0.446 ms (max/min 1.14). This is the issuer left in the tree. A 100/s interval is 10 ms, so these samples do not park.
+
+The 20 ms spin’s three-sample p99 ratio is under 3×. That is not host isolation and not a reason to open another preregistered A/A or to move the frozen 1,000/s experiment. The failed 1,000/s matrix still stands.
+
 ## Every proposed optimization: disposition
 
 | Finding | Implemented? | Individual optimization A/B | Current disposition |
@@ -348,19 +389,24 @@ This is correctness/resource-isolation evidence, **not a performance experiment*
 | F05 empty direct batch | Inherited from main #237 | Pending allocation + runtime comparison | Removal retained; no measured allocator result |
 | F06 speculative parser states | Inherited from main #237 | Pending | Real parsed-result path retained; no inferred fast-path gain |
 | F07 writer consolidation | Inherited from main #237 | Pending | Canonical poller retained; no timing acceptance |
-| F08 chunk progress optimization | No | Pending CPU/allocation/fairness comparison | Blocked |
-| F09 connection ownership | No | Pending reclamation/heap + timing comparison | Blocked |
-| F10 PubSub shared backing | No | Pending mixed borrowed-ingress/copy + timing comparison | Blocked |
+| F08 chunk progress optimization | No | Not run | Blocked. `skip_written_chunks` still rescans. F07 has no measured non-regression. Cleanup already recorded no-change for a cursor. Not accepted and not freshly rejected |
+| F09 connection ownership | No. A cfg-gated prototype was restored before this branch was published | Not run | Deferred. Release builds still keep the private original snapshot. `connection_ref` remains the live slot |
+| F10 PubSub shared backing | No. A shared-buffer prototype and its pointer test were restored before this branch was published | Not run | Deferred. Each matching category still builds its own `Bytes` |
 | F11 dependencies/features | Inherited from main #237 | Pending matched graph/build/consumer performance comparison | Narrowing retained; no build/runtime gain claimed |
 | F12 wire documentation | Yes, plus canonical table/ALPN regression | Documentation-only, no performance claim | 20 framing and 15 handshake tests pass; overall acceptance still blocked |
 | S13 pending-NACK resource isolation | Yes, user-authorized additional safety scope | Cost unmeasured; no performance claim | Controlled RED/GREEN, actual TLS and insertion preservation pass; full renewed matrix passed; performance acceptance still held |
+| D08 live capability ownership | Yes, correctness continuation | Connection/retention cost unmeasured; no performance claim | Deterministic projection-loss regression and 160 fixed-seed full targets pass |
+| D09 identify-first outbound owner | Yes, correctness continuation | Connection-setup cost unmeasured; no performance claim | Controlled wire-order regression plus 100 fixed/100 random full targets pass; continuation matrix v6 passes |
+| D10 contention fixture configuration | Test-only correction | No runtime claim | Production configuration precondition explicit; focused target and continuation matrix v6 pass |
+| D11 authenticated-alias failure accounting | Yes, correctness continuation | Failure-path cost unmeasured; no performance claim | Deterministic alias-state RED and focused integration GREEN; continuation matrix v6 passes. Healthy-session quietness is not asserted |
+| D12 successor address route | Yes, correctness continuation | No performance claim | Release lookup RED and v5 provisional-alias sample retained; gap regression passes; continuation matrix v6 passes |
 
 ## Required next steps
 
 1. D01's identifying-FullSync mechanism is reproduced/fixed and the local matrix completes. Keep the historical capability-negotiation finding open; do not infer its cause from those passes.
-2. Mandatory local correctness lanes now pass. Supported-platform CI remains unrun and Miri unavailable; do not call them passes.
-3. Long concurrent windows and full reply identity are now measured. Improve remaining host/control precision and add fixed offered-load latency, allocation/copy counters, ownership probes and fairness controls. Verify the actual changed paths, especially mixed borrowed PubSub ingress.
-4. Improve host isolation, rerun a preregistered A/A pilot and obtain confidence bounds within the declared limits. Preserve previous noisy runs.
-5. Reconcile inherited F03–F07/F11 changes with this plan's individual measurement contracts, and implement remaining F08–F10 separately. Run individual A/B experiments and mandatory checks, then accept/reject/inconclusive explicitly. Finish with the cumulative safe-baseline/final comparison and documented legacy inventory.
+2. The post-merge continuation matrix v6 passes (7,079 records). Supported-platform CI remains unrun and Miri unavailable; do not call them passes. v1–v5 stay retained.
+3. Long concurrent windows, full reply identity, and one offered-load A/A at 1,000/s are measured. The offered-load latency gates failed, as recorded above. Add allocation/copy counters, ownership probes and fairness controls. Verify the actual changed paths, especially mixed borrowed PubSub ingress.
+4. Improve host isolation before another preregistered A/A pilot. Do not widen the 3% gate. Do not retarget the frozen 1,000/s run because three 100/s spin samples were tighter. Preserve the closed-loop matrix, the failed offered-load A/A, and the later clock probes.
+5. F08–F10 are deferred. They are not in this branch. Inherited F03–F07/F11 still need individual A/B results. The current classification is [LEGACY_INVENTORY.md](LEGACY_INVENTORY.md). The cumulative safe-baseline comparison and rollback evidence are still open.
 
 This report is the current measured handoff, **not the final optimization-success report**. The complete remediation plan remains open.

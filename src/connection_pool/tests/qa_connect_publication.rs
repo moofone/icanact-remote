@@ -39,16 +39,28 @@ async fn exercise_identify_supersession(survivor_alive: bool) {
                 .await
         })
     };
+    // Address publication is visible before the peer session is installed.
+    // The snapshot can return that provisional alias — this test already
+    // seeded `addr_to_peer_id`, and the connection index is written first —
+    // while `connection_count` still only counts the current session.
+    // Identify cannot have been built yet: the gossip-state lock is held.
     let candidate = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             if let Some(conn) = pool.peer_current_connection_snapshot(&peer) {
-                break conn;
+                let installed = pool
+                    .peer_sessions
+                    .read_sync(&peer, |_, session| session.current_connection())
+                    .flatten()
+                    .is_some_and(|current| Arc::ptr_eq(&current, &conn));
+                if installed && pool.connection_count() == 1 {
+                    break conn;
+                }
             }
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("outbound must publish before building identify");
+    .expect("outbound session must be installed before identify is built");
     assert_eq!(candidate.direction, ConnectionDirection::Outbound);
     assert_eq!(pool.connection_count(), 1);
 

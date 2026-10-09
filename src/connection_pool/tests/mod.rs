@@ -13847,6 +13847,93 @@ async fn fresh_outbound_connect_aborts_when_identify_send_fails_instead_of_publi
     );
 }
 
+/// A newly published outbound used to let its IO owner read peer traffic and
+/// drain ordinary writes before the finalizer enqueued its identifying
+/// FullSync. Discovery gossip racing publication could therefore become the
+/// acceptor's first frame and be rejected as an invalid identity. Hold identify
+/// construction, queue a real ordinary frame through the published handle,
+/// then prove the identifying Gossip frame is nevertheless first on the wire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn outbound_owner_emits_identify_before_racing_ordinary_traffic() {
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        "127.0.0.1:0".parse().unwrap(),
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("identify-first-owner")),
+            ..Default::default()
+        },
+    ));
+    let pool = registry.connection_pool.clone();
+    let addr: SocketAddr = "127.0.0.1:41779".parse().unwrap();
+    let (io, mut peer) = tokio::io::duplex(64 * 1024);
+
+    let gossip_guard = registry.gossip_state.lock().await;
+    let finalize_registry = Arc::downgrade(&registry);
+    let pool_for_finalize = pool.clone();
+    let finalize = tokio::spawn(async move {
+        pool_for_finalize
+            .finalize_new_outbound_connection(addr, io, finalize_registry, None, addr, None)
+            .await
+    });
+
+    let stream = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(connection) = pool.get_connection_by_addr(&addr)
+                && let Some(stream) = connection.stream_handle.clone()
+            {
+                break stream;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("candidate must publish before identify construction");
+    stream
+        .write_trusted_bytes_control(bytes::Bytes::copy_from_slice(
+            &crate::framing::write_stream_abort_header(77, 9),
+        ))
+        .await
+        .expect("racing ordinary control frame must queue");
+    drop(gossip_guard);
+
+    let handle = finalize
+        .await
+        .expect("finalizer must not panic")
+        .expect("finalizer must identify");
+    drop(handle);
+
+    let mut prefix = [0; crate::framing::LENGTH_PREFIX_LEN];
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read_exact(&mut peer, &mut prefix),
+    )
+    .await
+    .expect("first frame must arrive")
+    .expect("first frame must be complete");
+    let first = crate::framing::decode_control(prefix).expect("valid first control");
+    assert_eq!(
+        first.kind,
+        crate::framing::WireKind::Gossip,
+        "identifying FullSync must precede ordinary traffic queued after publication"
+    );
+    let mut identify_body = vec![0; first.body_len];
+    tokio::io::AsyncReadExt::read_exact(&mut peer, &mut identify_body)
+        .await
+        .expect("identifying body");
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::io::AsyncReadExt::read_exact(&mut peer, &mut prefix),
+    )
+    .await
+    .expect("racing frame must follow")
+    .expect("racing frame must be complete");
+    assert_eq!(
+        crate::framing::decode_control(prefix).unwrap().kind,
+        crate::framing::WireKind::StreamAbort,
+    );
+    assert!(pool.remove_connection(addr).is_some());
+}
+
 // R-11 regression coverage for `finalize_new_outbound_connection`'s own
 // arm-then-identify sequencing (as opposed to `arm_sequence_reset_for_new_session`'s
 // own internal race-safety, already covered by the `qa_r11_*` tests in

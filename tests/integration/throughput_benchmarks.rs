@@ -516,8 +516,9 @@ async fn create_registry(seed: &str, config: GossipConfig) -> GossipRegistryHand
 
 /// A common, closed-loop concurrency fixture: all depths use the same runtime,
 /// request API, transport, payload and validation. It is deliberately separate
-/// from the historical short-throughput tests. These are saturation latencies,
-/// not fixed-offered-load latencies (no coordinated-omission correction).
+/// from the historical short-throughput tests. These are saturation latencies.
+/// Fixed offered load, with lateness included from the scheduled start, is
+/// `measure_offered_asks`.
 async fn measure_concurrent_asks(
     remote: icanact_remote::RemoteActorRef,
     inflight: usize,
@@ -662,6 +663,329 @@ async fn test_actor_ask_concurrency_measurement() {
         percentile(99),
         elapsed.as_nanos(),
     );
+}
+
+struct OfferedAskMeasurement {
+    offered: u64,
+    completed: u64,
+    drops: u64,
+    max_backlog: u64,
+    offer_window: Duration,
+    elapsed: Duration,
+    latencies: Vec<u64>,
+}
+
+/// Exact number of offers in `duration` at `rate_per_sec`.
+///
+/// Uses integer nanoseconds, so a rate that divides one second and a window
+/// that divides that rate land on the same count the sample adapter checks.
+fn offered_count(rate_per_sec: u64, duration: Duration) -> u64 {
+    let count = (rate_per_sec as u128).saturating_mul(duration.as_nanos()) / 1_000_000_000;
+    u64::try_from(count).expect("offer count must fit u64")
+}
+
+fn offered_instant(start: Instant, index: u64, rate_per_sec: u64) -> Instant {
+    let nanos = (index as u128).saturating_mul(1_000_000_000) / rate_per_sec as u128;
+    start + Duration::from_nanos(u64::try_from(nanos).expect("offer schedule must fit u64"))
+}
+
+/// Waits at or below this length are spun. Relative sleep and
+/// `mach_wait_until` both woke after the deadline on this host (about 1.3 ms
+/// and about 3 ms at 100/s). A 100/s interval is 10 ms, so the measurement
+/// clock does not park.
+const OFFER_CLOCK_SPIN_TAIL: Duration = Duration::from_millis(20);
+
+/// Block until `intended`. Never returns earlier.
+fn wait_until_scheduled(intended: Instant) {
+    while Instant::now() < intended {
+        let remaining = intended.saturating_duration_since(Instant::now());
+        if remaining > OFFER_CLOCK_SPIN_TAIL {
+            std::thread::sleep(remaining - OFFER_CLOCK_SPIN_TAIL);
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+}
+
+/// Open-loop asks at a fixed rate.
+///
+/// Latency starts at the scheduled instant, not when a full inflight slot
+/// finally becomes free, so a late issue keeps the delay. An offer that is
+/// still unissued after `max_lateness` is a drop and is not sent. The caller
+/// reports those drops; this does not stretch the schedule to hide them.
+async fn measure_offered_asks(
+    remote: icanact_remote::RemoteActorRef,
+    rate_per_sec: u64,
+    duration: Duration,
+    max_inflight: usize,
+    max_lateness: Duration,
+) -> OfferedAskMeasurement {
+    assert!(rate_per_sec > 0, "offer rate must be positive");
+    assert!(max_inflight > 0, "admission bound must be positive");
+    let offered = offered_count(rate_per_sec, duration);
+    assert!(
+        offered > 0,
+        "offer window must schedule at least one request"
+    );
+    let start = Instant::now();
+    let mut pending = FuturesUnordered::new();
+    let mut latencies = Vec::with_capacity(offered as usize);
+    let mut max_backlog = 0u64;
+    // The issuer is a normal thread so the offer spin does not block a runtime
+    // worker, and so the offer clock is not the runtime timer. It never sends
+    // before the scheduled instant. A full admission slot drops the offer once
+    // it is later than max_lateness.
+    let (tx, mut rx) = mpsc::channel::<(u64, Instant)>(1);
+    let offered_for_thread = offered;
+    let rate_for_thread = rate_per_sec;
+    let lateness = max_lateness;
+    let issuer = std::thread::spawn(move || {
+        let mut next = 0u64;
+        let mut dropped = 0u64;
+        while next < offered_for_thread {
+            let intended = offered_instant(start, next, rate_for_thread);
+            wait_until_scheduled(intended);
+            if Instant::now().saturating_duration_since(intended) > lateness {
+                dropped += 1;
+                next += 1;
+                continue;
+            }
+            loop {
+                match tx.try_send((next, intended)) {
+                    Ok(()) => {
+                        next += 1;
+                        break;
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        if Instant::now().saturating_duration_since(intended) > lateness {
+                            dropped += 1;
+                            next += 1;
+                            break;
+                        }
+                        std::thread::yield_now();
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => return dropped,
+                }
+            }
+        }
+        dropped
+    });
+
+    loop {
+        let at_cap = pending.len() >= max_inflight;
+        tokio::select! {
+            biased;
+            completed = pending.next(), if !pending.is_empty() => {
+                latencies.push(completed.expect("an admitted ask must complete"));
+            }
+            msg = rx.recv(), if !at_cap => {
+                match msg {
+                    Some((id, scheduled)) => {
+                        let remote = remote.clone();
+                        pending.push(async move {
+                            let mut bytes = [13u8; PAYLOAD_BYTES];
+                            bytes[..8].copy_from_slice(&id.to_be_bytes());
+                            let payload = Bytes::copy_from_slice(&bytes);
+                            let reply = remote
+                                .ask_actor_frame_no_timeout(
+                                    BENCH_ACTOR_ID,
+                                    BENCH_TYPE_HASH,
+                                    payload.clone(),
+                                )
+                                .await
+                                .expect("offered ask must complete successfully");
+                            assert_eq!(reply, payload, "response identity/content mismatch");
+                            Instant::now()
+                                .saturating_duration_since(scheduled)
+                                .as_nanos() as u64
+                        });
+                        max_backlog = max_backlog.max(pending.len() as u64);
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    while let Some(latency) = pending.next().await {
+        latencies.push(latency);
+    }
+    drop(rx);
+    let drops = issuer.join().expect("offer issuer thread");
+
+    assert_eq!(
+        latencies.len() as u64 + drops,
+        offered,
+        "every scheduled offer must complete or drop"
+    );
+    OfferedAskMeasurement {
+        offered,
+        completed: latencies.len() as u64,
+        drops,
+        max_backlog,
+        offer_window: duration,
+        elapsed: start.elapsed(),
+        latencies,
+    }
+}
+
+async fn offered_ask_fixture(
+    rate_per_sec: u64,
+    warmup: Duration,
+    duration: Duration,
+    max_inflight: usize,
+    max_lateness: Duration,
+) -> OfferedAskMeasurement {
+    let config = GossipConfig {
+        gossip_interval: Duration::from_secs(60),
+        ask_window: 65_536,
+        ..Default::default()
+    };
+    let receiver = create_registry("measured-offered-receiver", config.clone()).await;
+    let sender = create_registry("measured-offered-sender", config).await;
+    register_echo_actor(
+        &receiver.registry,
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(Notify::new()),
+    )
+    .await;
+    connect_unidirectional(&sender, &receiver).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !sender
+            .registry
+            .connection_pool
+            .has_connection_by_peer_id(&receiver.registry.peer_id)
+        {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("sender must admit the preferred connection");
+    let remote = sender
+        .lookup_peer(&receiver.registry.peer_id)
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(
+        warmup + max_lateness + Duration::from_secs(10),
+        measure_offered_asks(
+            remote.clone(),
+            rate_per_sec,
+            warmup,
+            max_inflight,
+            max_lateness,
+        ),
+    )
+    .await
+    .expect("offered-load warmup must not stall");
+    let result = tokio::time::timeout(
+        duration + max_lateness + Duration::from_secs(10),
+        measure_offered_asks(remote, rate_per_sec, duration, max_inflight, max_lateness),
+    )
+    .await
+    .expect("offered-load measurement must not stall");
+    sender.shutdown().await;
+    receiver.shutdown().await;
+    result
+}
+
+fn nearest_rank_ns(latencies: &[u64], percent: usize) -> u64 {
+    let rank = (latencies.len() * percent).div_ceil(100);
+    latencies[rank.saturating_sub(1)]
+}
+
+#[test]
+fn offered_schedule_counts_exact_windows() {
+    assert_eq!(offered_count(200, Duration::from_millis(50)), 10);
+    assert_eq!(offered_count(1_000, Duration::from_secs(10)), 10_000);
+    assert_eq!(offered_count(1, Duration::from_millis(999)), 0);
+    let start = Instant::now();
+    let first = offered_instant(start, 0, 1_000);
+    let later = offered_instant(start, 1_000, 1_000);
+    assert_eq!(first, start);
+    assert_eq!(later.duration_since(start), Duration::from_secs(1));
+}
+
+#[test]
+fn offer_clock_does_not_return_before_the_scheduled_instant() {
+    let intended = Instant::now() + Duration::from_millis(5);
+    wait_until_scheduled(intended);
+    assert!(Instant::now() >= intended);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn offered_load_fixture_records_every_scheduled_ask() {
+    let measurement = offered_ask_fixture(
+        200,
+        Duration::from_millis(20),
+        Duration::from_millis(50),
+        8,
+        Duration::from_secs(1),
+    )
+    .await;
+    assert_eq!(measurement.offered, 10);
+    assert_eq!(measurement.drops, 0);
+    assert_eq!(measurement.completed, measurement.offered);
+    assert_eq!(measurement.offer_window, Duration::from_millis(50));
+    // The last of ten offers at 200/s is at 45 ms, not at the window end.
+    assert!(measurement.elapsed >= Duration::from_millis(45));
+    assert!(measurement.max_backlog >= 1 && measurement.max_backlog <= 8);
+    let mut latencies = measurement.latencies;
+    latencies.sort_unstable();
+    assert!(nearest_rank_ns(&latencies, 50) <= nearest_rank_ns(&latencies, 95));
+    assert!(nearest_rank_ns(&latencies, 95) <= nearest_rank_ns(&latencies, 99));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "measurement-only; fixed offer rate and paired orchestration required"]
+async fn test_actor_ask_offered_load_measurement() {
+    let rate = bench_env_u64("ICANACT_MEASURE_OFFER_RATE", 0);
+    let warmup = Duration::from_millis(bench_env_u64("ICANACT_MEASURE_WARMUP_MS", 5000));
+    let duration = Duration::from_millis(bench_env_u64("ICANACT_MEASURE_MS", 10000));
+    let max_inflight = bench_env_u64("ICANACT_MEASURE_MAX_INFLIGHT", 64) as usize;
+    let max_lateness =
+        Duration::from_millis(bench_env_u64("ICANACT_MEASURE_MAX_LATENESS_MS", 1000));
+    assert!(rate > 0, "ICANACT_MEASURE_OFFER_RATE is required");
+    assert!(
+        duration >= Duration::from_secs(10),
+        "acceptance fixture must offer for >= 10 seconds"
+    );
+    assert!(
+        warmup >= Duration::from_secs(5),
+        "acceptance fixture must warm up for >= 5 seconds"
+    );
+    let measurement = offered_ask_fixture(rate, warmup, duration, max_inflight, max_lateness).await;
+    let mut latencies = measurement.latencies;
+    if latencies.is_empty() {
+        println!(
+            "AB_METRICS {{\"workload\":\"ask_offered{}\",\"completed\":0,\"offered\":{},\"errors\":0,\"drops\":{},\"metrics\":{{\"p50_ns\":0,\"p95_ns\":0,\"p99_ns\":0,\"duration_ns\":{},\"offer_window_ns\":{},\"max_backlog\":{}}}}}",
+            rate,
+            measurement.offered,
+            measurement.drops,
+            measurement.elapsed.as_nanos(),
+            measurement.offer_window.as_nanos(),
+            measurement.max_backlog,
+        );
+        panic!("fixed offered load completed nothing");
+    }
+    latencies.sort_unstable();
+    println!(
+        "AB_METRICS {{\"workload\":\"ask_offered{}\",\"completed\":{},\"offered\":{},\"errors\":0,\"drops\":{},\"metrics\":{{\"p50_ns\":{},\"p95_ns\":{},\"p99_ns\":{},\"duration_ns\":{},\"offer_window_ns\":{},\"max_backlog\":{}}}}}",
+        rate,
+        measurement.completed,
+        measurement.offered,
+        measurement.drops,
+        nearest_rank_ns(&latencies, 50),
+        nearest_rank_ns(&latencies, 95),
+        nearest_rank_ns(&latencies, 99),
+        measurement.elapsed.as_nanos(),
+        measurement.offer_window.as_nanos(),
+        measurement.max_backlog,
+    );
+    assert_eq!(
+        measurement.drops, 0,
+        "fixed offered load dropped scheduled asks"
+    );
+    assert_eq!(measurement.completed, measurement.offered);
 }
 
 fn testing_keypair(seed: &str) -> KeyPair {
@@ -4397,11 +4721,24 @@ async fn test_connect_to_peer_contention_has_no_errors() {
 
     let peer_id = receiver.registry.peer_id.clone();
     let target_addr = receiver.registry.bind_addr;
-    let _ = sender
+    // This correctness regression expects disconnect/reconnect rounds to
+    // preserve a required peer. Install that production precondition through
+    // the registry owner instead of writing the legacy address cache directly;
+    // the benchmark helper's restore_mapping switch separately measures raw
+    // cache-loss behavior.
+    sender
         .registry
-        .connection_pool
-        .peer_id_to_addr
-        .upsert_sync(peer_id.clone(), target_addr);
+        .configure_peer(peer_id.clone(), target_addr)
+        .await;
+    assert_eq!(
+        sender
+            .registry
+            .connection_pool
+            .peer_id_to_addr
+            .read_sync(&peer_id, |_, addr| *addr),
+        Some(target_addr),
+        "contention fixture requires a durable configured peer mapping"
+    );
 
     let (_checksum, errors) = run_connect_to_peer_contention_rounds(
         sender.registry.clone(),

@@ -61,8 +61,12 @@ pub struct LockFreeConnection {
     /// IMPORTANT: This allows looking up peer_id for inbound connections even after
     /// addr_to_peer_id mapping has been migrated to bind address (ephemeral port removed)
     pub(crate) embedded_peer_id: Option<crate::PeerId>,
-    /// Authenticated process incarnation from the remote Hello exchange.
+    /// Full negotiated Hello state for this physical connection. Address- and
+    /// identity-keyed projections can be cleared by a superseded sibling's
+    /// teardown; the live session remains the authoritative capability owner.
     /// `None` exists only for synthetic/unit connections and pre-Hello paths.
+    pub(crate) peer_capabilities: Option<crate::handshake::PeerCapabilities>,
+    /// Authenticated process incarnation retained separately for conflict logic.
     pub(crate) remote_boot_id: Option<crate::handshake::RemoteBootId>,
     /// Task tracker for background tasks (writer and reader)
     pub task_tracker: TaskTracker,
@@ -102,6 +106,7 @@ impl Clone for LockFreeConnection {
             correlation: self.correlation.clone(),
             direction: self.direction,
             embedded_peer_id: self.embedded_peer_id.clone(),
+            peer_capabilities: self.peer_capabilities,
             remote_boot_id: self.remote_boot_id,
             // Note: TaskTracker is not cloned - each clone gets a fresh tracker
             // This is intentional: clones are typically used for metadata snapshots,
@@ -125,6 +130,7 @@ impl LockFreeConnection {
             correlation: Some(CorrelationTracker::new()),
             direction,
             embedded_peer_id: None,
+            peer_capabilities: None,
             remote_boot_id: None,
             task_tracker: TaskTracker::new(),
             // Default matches the inbound case (session_source == addr).

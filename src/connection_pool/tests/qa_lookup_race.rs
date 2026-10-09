@@ -315,3 +315,89 @@ async fn publication_lifecycle_recorder_can_reenter_after_gate_release() {
     initial.abort_tasks();
     replacement.abort_tasks();
 }
+
+struct AddressRouteRetireHookReset;
+
+impl Drop for AddressRouteRetireHookReset {
+    fn drop(&mut self) {
+        set_address_route_retire_hook(None);
+    }
+}
+
+/// A live connection still names its peer after the address route is removed.
+#[tokio::test]
+async fn connected_addr_keeps_embedded_identity_when_route_row_is_missing() {
+    let pool = ConnectionPool::<()>::new(4, Duration::from_secs(1));
+    let peer_id = crate::KeyPair::new_for_testing("qa-embedded-route-gap").peer_id();
+    let addr: SocketAddr = "127.0.0.1:60992".parse().unwrap();
+    let connection = make_live_connection(addr, ConnectionDirection::Outbound).await;
+    let connection = Arc::new(LockFreeConnection {
+        embedded_peer_id: Some(peer_id.clone()),
+        ..(*connection).clone()
+    });
+    pool.publish_address_index(addr, connection.clone(), Some(&peer_id));
+    assert!(pool.addr_to_peer_id.remove_sync(&addr).is_some());
+    assert_eq!(pool.peer_id_for_connected_addr(&addr, addr), Some(peer_id));
+    connection.abort_tasks();
+}
+
+/// Retirement of an old instance must not delete the successor's address
+/// route after the successor has taken the address index.
+#[tokio::test]
+async fn retired_instance_does_not_clear_successor_address_route() {
+    let pool = Arc::new(ConnectionPool::<()>::new(4, Duration::from_secs(1)));
+    let peer_id = crate::KeyPair::new_for_testing("qa-successor-addr-route").peer_id();
+    let addr: SocketAddr = "127.0.0.1:60991".parse().unwrap();
+    let retired = make_live_connection(addr, ConnectionDirection::Outbound).await;
+    let successor = make_live_connection(addr, ConnectionDirection::Outbound).await;
+    let retired = Arc::new(LockFreeConnection {
+        embedded_peer_id: Some(peer_id.clone()),
+        ..(*retired).clone()
+    });
+    let successor = Arc::new(LockFreeConnection {
+        embedded_peer_id: Some(peer_id.clone()),
+        ..(*successor).clone()
+    });
+    pool.publish_address_index(addr, retired.clone(), Some(&peer_id));
+    let retired_id = retired
+        .stream_handle
+        .as_ref()
+        .expect("retired connection has a stream")
+        .instance_id();
+
+    let captured = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    let hook_captured = Arc::clone(&captured);
+    let hook_resume = Arc::clone(&resume);
+    set_address_route_retire_hook(Some(Arc::new(move |_addr, _retired| {
+        hook_captured.wait();
+        hook_resume.wait();
+    })));
+    let _hook_reset = AddressRouteRetireHookReset;
+
+    let retire_pool = Arc::clone(&pool);
+    let retire = tokio::task::spawn_blocking(move || {
+        retire_pool.remove_connection_instance_by_id(addr, retired_id);
+    });
+
+    captured.wait();
+    pool.publish_address_index(addr, successor.clone(), Some(&peer_id));
+    resume.wait();
+    retire
+        .await
+        .expect("instance retirement task must not panic");
+
+    assert_eq!(
+        pool.get_peer_id_by_addr(&addr),
+        Some(peer_id),
+        "retiring the old instance must leave the successor's address route in place"
+    );
+    assert!(
+        pool.get_lock_free_connection(addr)
+            .is_some_and(|current| Arc::ptr_eq(&current, &successor)),
+        "the successor connection must remain indexed"
+    );
+
+    successor.abort_tasks();
+    retired.abort_tasks();
+}
