@@ -76,6 +76,63 @@ struct PeerSession {
     /// per-peer. Reset on a successful ask or on eviction.
     consecutive_ask_timeouts: AtomicU8,
     outbound_dial_retry: OutboundDialRetry,
+    // Control-plane only: orders session-qualified metadata commit with CAS publication.
+    control_mutation: std::sync::Mutex<()>,
+}
+
+#[cfg(test)]
+mod session_control_tests {
+    use super::*;
+    #[test]
+    fn established_current_slot_read_does_not_acquire_control_mutation_lock() {
+        let session = Arc::new(PeerSession::new());
+        let target = Arc::new(LockFreeConnection::new("127.0.0.1:45001".parse().unwrap(), ConnectionDirection::Outbound));
+        session.set_current_connection(Some(Arc::clone(&target)));
+        std::thread::scope(|scope| {
+            let guard = session.control_mutation.lock().unwrap();
+            let reader_session = Arc::clone(&session);
+            let expected = Arc::clone(&target);
+            let (send, receive) = std::sync::mpsc::channel();
+            let reader = scope.spawn(move || {
+                send.send(reader_session.current_connection().is_some_and(|actual| Arc::ptr_eq(&actual, &expected))).unwrap();
+            });
+            let progress = receive.recv_timeout(Duration::from_secs(1));
+            // Release before assertion/join on the known-bad blocked-read path.
+            drop(guard);
+            reader.join().unwrap();
+            assert!(progress.unwrap(), "current-slot read remains independent of paused control mutation");
+        });
+    }
+
+    #[test]
+    fn metadata_commit_orders_publication_without_holding_a_data_read_lock() {
+        let pool = Arc::new(ConnectionPool::<()>::new(4, Duration::from_secs(1)));
+        let peer = crate::KeyPair::new_for_testing("session-control-peer").peer_id();
+        let old = Arc::new(LockFreeConnection::new("127.0.0.1:45002".parse().unwrap(), ConnectionDirection::Outbound));
+        let new = Arc::new(LockFreeConnection::new("127.0.0.1:45002".parse().unwrap(), ConnectionDirection::Outbound));
+        pool.publish_current_peer_connection(&peer, Arc::clone(&old));
+        std::thread::scope(|scope| {
+            let (entered, ready) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel();
+            let committing = Arc::clone(&pool); let identity = peer.clone(); let captured = Arc::clone(&old);
+            let commit = scope.spawn(move || committing.with_current_session_control(&identity, &captured, || {
+                entered.send(()).unwrap();
+                // A bounded harness gate, not an application callback.
+                released.recv_timeout(Duration::from_secs(5)).unwrap();
+            }));
+            ready.recv_timeout(Duration::from_secs(5)).unwrap();
+            let publishing = Arc::clone(&pool); let identity = peer.clone(); let replacement = Arc::clone(&new);
+            let publication = scope.spawn(move || publishing.publish_current_peer_connection(&identity, replacement));
+            // Read is observable while commit is paused, with old still authoritative.
+            let observed = pool.peer_current_connection_snapshot(&peer).unwrap();
+            assert!(Arc::ptr_eq(&observed, &old));
+            release.send(()).unwrap();
+            assert!(commit.join().unwrap());
+            publication.join().unwrap();
+            assert!(Arc::ptr_eq(&pool.peer_current_connection_snapshot(&peer).unwrap(), &new));
+            assert!(!pool.with_current_session_control(&peer, &old, || panic!("stale work must not reach mutation")));
+        });
+    }
 }
 
 const OUTBOUND_DIAL_RETRY_FLOOR: Duration = Duration::from_secs(1);
@@ -218,6 +275,7 @@ impl PeerSession {
             required_peer: AtomicBool::new(false),
             correlation: CorrelationTracker::new(),
             current_connection: ArcSwapOption::empty(),
+            control_mutation: std::sync::Mutex::new(()),
             consecutive_ask_timeouts: AtomicU8::new(0),
             outbound_dial_retry: OutboundDialRetry::new(),
         }
@@ -304,10 +362,12 @@ impl PeerSession {
     }
 
     fn set_current_connection(&self, connection: Option<Arc<LockFreeConnection>>) {
+        let _guard = self.control_mutation.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         self.current_connection.store(connection);
     }
 
     fn take_current_connection(&self) -> Option<Arc<LockFreeConnection>> {
+        let _guard = self.control_mutation.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         self.current_connection.swap(None)
     }
 
@@ -325,6 +385,7 @@ impl PeerSession {
     /// something else and leaves the slot untouched — there is no
     /// observable state in between.
     fn compare_and_clear_current_connection(&self, expected: &Arc<LockFreeConnection>) -> bool {
+        let _guard = self.control_mutation.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = self.current_connection.compare_and_swap(expected, None);
         matches!(&*previous, Some(prev) if Arc::ptr_eq(prev, expected))
     }
@@ -347,6 +408,7 @@ impl PeerSession {
         &self,
         expected: &Arc<LockFreeConnection>,
     ) -> std::result::Result<(), Option<Arc<LockFreeConnection>>> {
+        let _guard = self.control_mutation.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = self.current_connection.compare_and_swap(expected, None);
         if matches!(&*previous, Some(prev) if Arc::ptr_eq(prev, expected)) {
             Ok(())
@@ -377,6 +439,7 @@ impl PeerSession {
         expected: Option<&Arc<LockFreeConnection>>,
         new: Arc<LockFreeConnection>,
     ) -> std::result::Result<(), Option<Arc<LockFreeConnection>>> {
+        let _guard = self.control_mutation.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let expected_owned: Option<Arc<LockFreeConnection>> = expected.cloned();
         let previous = self
             .current_connection

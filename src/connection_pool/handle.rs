@@ -224,6 +224,13 @@ impl<T> ConnectionHandle<T> {
         self.direction
     }
 
+    pub(crate) fn matches_stream(&self, connection: &LockFreeConnection) -> bool {
+        matches!(
+            (&self.stream_handle, &connection.stream_handle),
+            (Some(observed), Some(indexed)) if Arc::ptr_eq(observed, indexed)
+        )
+    }
+
     /// Instance id of the specific stream-handle backing this connection
     /// handle, if any. Callers that need to retire *this exact* connection
     /// instance (rather than "whatever is currently indexed for the peer")

@@ -290,8 +290,8 @@ async fn ordered_lifecycle_evidence_proves_publication_and_stale_teardown_fencin
     };
     let key_a = KeyPair::new_for_testing("qa-r1-ordered-evidence-a");
     let key_b = KeyPair::new_for_testing("qa-r1-ordered-evidence-b");
-    let node_a = create_tls_node_with_keypair(key_a, config.clone()).await?;
-    let node_b = create_tls_node_with_keypair(key_b.clone(), config.clone()).await?;
+    let node_a = Arc::new(create_tls_node_with_keypair(key_a, config.clone()).await?);
+    let node_b = Arc::new(create_tls_node_with_keypair(key_b.clone(), config.clone()).await?);
     let addr_a = node_a.registry.bind_addr;
     let addr_b = node_b.registry.bind_addr;
     let peer_a = node_a.registry.peer_id.clone();
@@ -343,7 +343,15 @@ async fn ordered_lifecycle_evidence_proves_publication_and_stale_teardown_fencin
     // Run the real bidirectional setup concurrently with the recorder wait.
     // The publication callback blocks before returning, so no re-mark can be
     // observed until this test explicitly releases the publication gate.
-    let mut setup = Box::pin(connect_bidirectional(&node_a, &node_b));
+    // Never inline-poll a future that can synchronously enter the blocking
+    // recorder gate: it would park this controller before it can receive the
+    // event/release the gate, and even its Tokio timeout could not be polled.
+    // Keep the real helper and assertions; only isolate the gated producer.
+    let mut setup = tokio::spawn({
+        let node_a = Arc::clone(&node_a);
+        let node_b = Arc::clone(&node_b);
+        async move { connect_bidirectional(&node_a, &node_b).await }
+    });
     let first_publication = tokio::time::timeout(EVIDENCE_TIMEOUT, async {
         loop {
             tokio::select! {
@@ -382,7 +390,7 @@ async fn ordered_lifecycle_evidence_proves_publication_and_stale_teardown_fencin
         "pre-re-mark cannot precede the gated completed-publication event"
     );
     publication_gate.open();
-    setup.await?;
+    setup.await??;
 
     let initial_pre_remark = next_event(&mut events, |event| {
         pre_remark_for(event, &initial_peer, initial_addr, initial_instance)

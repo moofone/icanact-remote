@@ -2385,6 +2385,10 @@ impl LockFreeStreamHandle {
         self.instance_id
     }
 
+    pub(crate) fn closed_signal(&self) -> (Arc<AtomicBool>, Arc<Notify>) {
+        (Arc::clone(&self.exit_flag), Arc::clone(&self.exit_notify))
+    }
+
     pub(crate) fn failure_lifecycle_owner(&self) -> Arc<crate::registry::FailureLifecycleOwner> {
         self.failure_lifecycle.clone()
     }

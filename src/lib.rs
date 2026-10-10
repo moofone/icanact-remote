@@ -95,7 +95,11 @@ pub use pubsub::{
 pub use registry::{ClockEchoV1, ClockProbeV1, GossipExtensionsV1, PeerClockSnapshot};
 pub use remote_actor_location::RemoteActorLocation;
 pub use remote_actor_ref::{RemoteActorRef, RemoteConnection};
+mod session_receipt;
 pub use reply_lease::{ReplyDeliveryBudget, ReplyLease, ReplyLeaseAdmissionError, ReplyPayload};
+pub use session_receipt::{
+    AuthenticatedSessionReceipt, SessionCaptureError, SessionMutationOutcome,
+};
 
 /// Connection-local construction hooks used by the bounded lease
 /// qualification suite and benchmark harness. They are absent from normal

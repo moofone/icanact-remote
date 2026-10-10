@@ -23,6 +23,10 @@ impl RemoteConnection {
         }
     }
 
+    pub(crate) fn control_session_handle(&self) -> &crate::connection_pool::ConnectionHandle {
+        &self.inner
+    }
+
     pub fn bytes_written(&self) -> usize {
         self.inner.bytes_written()
     }

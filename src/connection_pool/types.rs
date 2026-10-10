@@ -91,6 +91,8 @@ pub struct LockFreeConnection {
     /// `ReadContext` is constructed (the stream handle -- and this struct
     /// wrapping it -- is built from that same `ReadContext`).
     pub(crate) session_source: SocketAddr,
+    /// Identity verified by this stream's own TLS certificate, never cache fallback.
+    pub(crate) authenticated_peer_id: Option<crate::PeerId>,
 }
 
 impl Clone for LockFreeConnection {
@@ -113,6 +115,7 @@ impl Clone for LockFreeConnection {
             // not to transfer task ownership
             task_tracker: TaskTracker::new(),
             session_source: self.session_source,
+            authenticated_peer_id: self.authenticated_peer_id.clone(),
         }
     }
 }
@@ -138,6 +141,7 @@ impl LockFreeConnection {
             // dialling socket's own local ephemeral port immediately after
             // construction, before the connection is published.
             session_source: addr,
+            authenticated_peer_id: None,
         }
     }
 
