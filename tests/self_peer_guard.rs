@@ -44,5 +44,5 @@ async fn registry_handle_self_peer_connect_is_noop() {
     );
     drop(gossip_state);
 
-    handle.shutdown().await;
+    handle.shutdown().await.unwrap();
 }

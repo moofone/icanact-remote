@@ -176,12 +176,13 @@ async fn qa_dropped_forwarder_reclaims_pending_worker() {
     let weak_observer = Arc::downgrade(&observer);
     let forwarder =
         crate::ask_forwarder::AskForwarder::new_with_observer(1, 128, Some(observer.clone()));
+    let destination = forwarder.bind_destination(connection).unwrap();
     forwarder
         .try_forward_actor_ask_no_timeout(
-            connection,
+            destination,
             1,
             1,
-            bytes::Bytes::from_static(b"request"),
+            crate::ask_forwarder::ForwardPayload::from_static(b"request"),
             crate::AskResponder::from_stream_handle(
                 1,
                 writer.clone(),
@@ -242,6 +243,7 @@ async fn qa_forward_timeout_includes_worker_queue_wait() {
     let completed = Arc::new(ForwardCompletions(AtomicUsize::new(0)));
     let forwarder =
         crate::ask_forwarder::AskForwarder::new_with_observer(1, 128, Some(completed.clone()));
+    let destination = forwarder.bind_destination(connection).unwrap();
     for id in 1..=32 {
         let responder = crate::AskResponder::from_stream_handle(
             id,
@@ -250,14 +252,14 @@ async fn qa_forward_timeout_includes_worker_queue_wait() {
         );
         forwarder
             .try_forward_actor_ask_combined_timeout(
-                connection.clone(),
+                destination,
                 1,
                 1,
-                bytes::Bytes::from_static(b"request"),
+                crate::ask_forwarder::ForwardPayload::from_static(b"request"),
                 Duration::from_millis(200),
                 responder,
-                bytes::Bytes::from_static(b"timeout"),
-                bytes::Bytes::from_static(b"error"),
+                crate::ask_forwarder::ForwardPayload::from_static(b"timeout"),
+                crate::ask_forwarder::ForwardPayload::from_static(b"error"),
             )
             .unwrap();
     }
@@ -309,6 +311,7 @@ async fn qa_zero_duration_forward_delivers_timeout_reply() {
     let completed = Arc::new(ForwardCompletions(AtomicUsize::new(0)));
     let forwarder =
         crate::ask_forwarder::AskForwarder::new_with_observer(1, 128, Some(completed.clone()));
+    let destination = forwarder.bind_destination(connection).unwrap();
     let responder = crate::AskResponder::from_stream_handle(
         9,
         writer.clone(),
@@ -316,14 +319,14 @@ async fn qa_zero_duration_forward_delivers_timeout_reply() {
     );
     forwarder
         .try_forward_actor_ask_combined_timeout(
-            connection,
+            destination,
             1,
             1,
-            bytes::Bytes::from_static(b"request"),
+            crate::ask_forwarder::ForwardPayload::from_static(b"request"),
             Duration::ZERO,
             responder,
-            bytes::Bytes::from_static(b"zero-timeout-reply"),
-            bytes::Bytes::from_static(b"error"),
+            crate::ask_forwarder::ForwardPayload::from_static(b"zero-timeout-reply"),
+            crate::ask_forwarder::ForwardPayload::from_static(b"error"),
         )
         .expect("zero duration must still be admitted so timeout_reply can be delivered");
     tokio::time::timeout(Duration::from_secs(2), async {

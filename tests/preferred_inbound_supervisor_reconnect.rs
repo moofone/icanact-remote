@@ -153,6 +153,6 @@ async fn higher_id_supervisor_reconnect_completes_within_debounce_window() {
         test_cfg().connection_timeout.as_secs(),
     );
 
-    high.shutdown().await;
-    low.shutdown().await;
+    high.shutdown().await.unwrap();
+    low.shutdown().await.unwrap();
 }

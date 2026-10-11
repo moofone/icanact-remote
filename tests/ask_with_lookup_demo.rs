@@ -282,7 +282,10 @@ fn test_ask_with_lookup_and_performance() {
             lookup_time,
             lookup_time.as_nanos() as f64 / 1000.0
         );
-        println!("   💡 Each RemoteActorRef has connection cached - zero lookups for ask()!");
+        let db_actor = db_actor.session().await.unwrap();
+        let compute_actor = compute_actor.session().await.unwrap();
+        let cache_actor = cache_actor.session().await.unwrap();
+        println!("   💡 Each scoped session borrows one exact connection for ask()!");
 
         // ===========================================
         // PART 2: ASK() PERFORMANCE TESTING
@@ -327,7 +330,10 @@ fn test_ask_with_lookup_and_performance() {
                 let start = Instant::now();
                 while start.elapsed() < Duration::from_secs(5) {
                     match actor
-                        .ask(bytes::Bytes::copy_from_slice(query.as_bytes()))
+                        .ask_owned(
+                            icanact_remote::ForwardPayload::from_static(query.as_bytes()),
+                            Duration::from_secs(30),
+                        )
                         .await
                     {
                         Ok(r) => {
@@ -379,12 +385,30 @@ fn test_ask_with_lookup_and_performance() {
         // Send all queries in parallel
         // Send all queries in parallel using RemoteActorRefs (each uses cached connection)
         let (r1, r2, r3, r4, r5, r6) = tokio::join!(
-            db_actor.ask(bytes::Bytes::copy_from_slice(queries[0].1.as_bytes())),
-            compute_actor.ask(bytes::Bytes::copy_from_slice(queries[1].1.as_bytes())),
-            cache_actor.ask(bytes::Bytes::copy_from_slice(queries[2].1.as_bytes())),
-            db_actor.ask(bytes::Bytes::copy_from_slice(queries[3].1.as_bytes())),
-            compute_actor.ask(bytes::Bytes::copy_from_slice(queries[4].1.as_bytes())),
-            cache_actor.ask(bytes::Bytes::copy_from_slice(queries[5].1.as_bytes())),
+            db_actor.ask_owned(
+                icanact_remote::ForwardPayload::from_static(queries[0].1.as_bytes()),
+                Duration::from_secs(30),
+            ),
+            compute_actor.ask_owned(
+                icanact_remote::ForwardPayload::from_static(queries[1].1.as_bytes()),
+                Duration::from_secs(30),
+            ),
+            cache_actor.ask_owned(
+                icanact_remote::ForwardPayload::from_static(queries[2].1.as_bytes()),
+                Duration::from_secs(30),
+            ),
+            db_actor.ask_owned(
+                icanact_remote::ForwardPayload::from_static(queries[3].1.as_bytes()),
+                Duration::from_secs(30),
+            ),
+            compute_actor.ask_owned(
+                icanact_remote::ForwardPayload::from_static(queries[4].1.as_bytes()),
+                Duration::from_secs(30),
+            ),
+            cache_actor.ask_owned(
+                icanact_remote::ForwardPayload::from_static(queries[5].1.as_bytes()),
+                Duration::from_secs(30),
+            ),
         );
 
         // Verify all responses
@@ -424,7 +448,7 @@ fn test_ask_with_lookup_and_performance() {
         println!("\n📊 PART 3: ASK() VS TELL() COMPARISON");
         println!("=====================================");
 
-        let test_message = bytes::Bytes::from_static(b"PING test request");
+        let test_message: &'static [u8] = b"PING test request";
         let iterations = 100;
 
         println!(
@@ -433,7 +457,10 @@ fn test_ask_with_lookup_and_performance() {
         );
         let tell_start = Instant::now();
         for _ in 0..iterations {
-            db_actor.tell(test_message.clone()).await.unwrap();
+            db_actor
+                .tell_owned(icanact_remote::ForwardPayload::from_static(test_message))
+                .await
+                .unwrap();
         }
         let tell_total = tell_start.elapsed();
         let tell_avg = tell_total / iterations;
@@ -460,7 +487,13 @@ fn test_ask_with_lookup_and_performance() {
         );
         let ask_start = Instant::now();
         for _ in 0..iterations {
-            let _ = db_actor.ask(test_message.clone()).await.unwrap();
+            let _ = db_actor
+                .ask_owned(
+                    icanact_remote::ForwardPayload::from_static(test_message),
+                    Duration::from_secs(30),
+                )
+                .await
+                .unwrap();
         }
         let ask_total = ask_start.elapsed();
         let ask_avg = ask_total / iterations;
@@ -532,9 +565,9 @@ fn test_ask_with_lookup_and_performance() {
         println!("   In production, implement proper request-response correlation.");
 
         // Cleanup
-        node1.shutdown().await;
-        node2.shutdown().await;
-        node3.shutdown().await;
+        node1.shutdown().await.unwrap();
+        node2.shutdown().await.unwrap();
+        node3.shutdown().await.unwrap();
 
         println!("\n✅ Test completed successfully!");
     });
@@ -603,7 +636,8 @@ fn test_ask_high_throughput() {
         // NEW API: Lookup to get RemoteActorRef (includes cached connection)
         let api_actor = wait_for_actor(&node1, "api_service", Duration::from_secs(5)).await;
         let api_conn = api_actor
-            .connection_ref()
+            .session()
+            .await
             .expect("API service should be connected");
 
         // Test parameters
@@ -618,7 +652,10 @@ fn test_ask_high_throughput() {
         println!("\n🔥 Warming up...");
         for _ in 0..10 {
             let _ = api_conn
-                .ask(bytes::Bytes::from_static(b"warmup"))
+                .ask_owned(
+                    icanact_remote::ForwardPayload::from_static(b"warmup"),
+                    Duration::from_secs(30),
+                )
                 .await
                 .unwrap();
         }
@@ -636,13 +673,16 @@ fn test_ask_high_throughput() {
             // Send concurrent requests
             let mut handles = Vec::new();
             for i in 0..concurrent_requests {
-                let conn = api_conn.clone();
+                let conn = &api_conn;
                 let request_id = batch * concurrent_requests + i;
-                let handle = tokio::spawn(async move {
+                let handle = async move {
                     let req_start = Instant::now();
                     let request = format!("REQUEST:{}", request_id);
                     match conn
-                        .ask(bytes::Bytes::copy_from_slice(request.as_bytes()))
+                        .ask_owned(
+                            icanact_remote::ForwardPayload::from(request.into_bytes()),
+                            Duration::from_secs(30),
+                        )
                         .await
                     {
                         Ok(_) => Some(req_start.elapsed()),
@@ -656,19 +696,15 @@ fn test_ask_high_throughput() {
                             None
                         }
                     }
-                });
+                };
                 handles.push(handle);
             }
 
             // Wait for batch to complete
-            for handle in handles {
-                match handle.await {
-                    Ok(Some(latency)) => latencies.push(latency),
-                    Ok(None) => failed_requests += 1,
-                    Err(join_err) => {
-                        failed_requests += 1;
-                        eprintln!("⚠️ ask() task join error: {}", join_err);
-                    }
+            for result in futures::future::join_all(handles).await {
+                match result {
+                    Some(latency) => latencies.push(latency),
+                    None => failed_requests += 1,
                 }
             }
 
@@ -728,8 +764,8 @@ fn test_ask_high_throughput() {
         );
 
         // Cleanup
-        node1.shutdown().await;
-        node2.shutdown().await;
+        node1.shutdown().await.unwrap();
+        node2.shutdown().await.unwrap();
 
         println!("\n✅ High-throughput test completed!");
     });

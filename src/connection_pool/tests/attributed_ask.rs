@@ -35,7 +35,7 @@ async fn attributed_ask_over_duplex(
         },
     ));
     server_registry
-        .set_actor_ask_handler_sync(Arc::new(DeferredTestActor))
+        .set_actor_ask_handler_sync(Arc::new(DeferredTestActor::new()))
         .await;
 
     let client_registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
@@ -113,7 +113,9 @@ async fn attributed_ask_over_duplex(
         Some(server_read_ctx),
     );
     let server_writer = Arc::new(server_writer);
-    response_writer.bind_stream_handle(server_writer.clone());
+    response_writer
+        .bind_stream_handle(server_writer.clone())
+        .unwrap();
 
     let result = client_conn
         .ask_actor_frame_aligned_attributed(
@@ -207,7 +209,7 @@ async fn correlation_plain_completion_stays_unattributed() {
     let guard = tracker.allocate().expect("slot should allocate");
     let id = guard.id();
     let pool = Arc::new(crate::AlignedBytesPool::default());
-    let mut response = Some(crate::AlignedBytes::from_pooled_slice(b"plain", pool));
+    let mut response = Some(crate::AlignedBytes::from_pooled_slice(b"plain", pool).unwrap());
     assert!(tracker.complete(id, &mut response));
 
     let reply = tracker
@@ -231,7 +233,7 @@ async fn correlation_completion_carries_attribution_atomically() {
     let mut response = Some(crate::AlignedBytes::from_pooled_slice(
         b"attributed",
         pool.clone(),
-    ));
+    ).unwrap());
     assert!(tracker.complete_attributed(attributed_id, &mut response, Some(&peer)));
     let (completed_by, bytes) = tracker
         .wait_for_response_no_timeout_outcome(attributed_id)
@@ -244,7 +246,7 @@ async fn correlation_completion_carries_attribution_atomically() {
 
     let bare_guard = tracker.allocate().expect("slot should allocate");
     let bare_id = bare_guard.id();
-    let mut response = Some(crate::AlignedBytes::from_pooled_slice(b"bare", pool));
+    let mut response = Some(crate::AlignedBytes::from_pooled_slice(b"bare", pool).unwrap());
     assert!(tracker.complete_attributed(bare_id, &mut response, None));
     let outcome = tracker
         .wait_for_response_no_timeout_outcome(bare_id)

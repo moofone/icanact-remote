@@ -128,8 +128,8 @@ async fn bidirectional_inline_burst_must_resume_delivery() {
         ab.is_closed(),
         ba.is_closed()
     );
-    a.shutdown().await;
-    b.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
     assert!(
         progress.is_ok(),
         "healthy TLS peers failed to drain a finite inline burst"

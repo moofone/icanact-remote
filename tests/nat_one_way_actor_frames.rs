@@ -246,7 +246,7 @@ async fn one_way_nat_allows_unsolicited_bidirectional_actor_frames_and_reconnect
 
     // Outage of NAT-side node; inbound side cannot dial back directly.
     let disconnect_start = Instant::now();
-    handle_a_1.shutdown().await;
+    handle_a_1.shutdown().await.unwrap();
     let observed_disconnect = wait_for_active_peers(&handle_b, 0, Duration::from_secs(8))
         .await
         .is_ok();
@@ -305,7 +305,7 @@ async fn one_way_nat_allows_unsolicited_bidirectional_actor_frames_and_reconnect
         RECONNECT_BIDIR_SLA
     );
 
-    handle_a_2.shutdown().await;
-    handle_b.shutdown().await;
+    handle_a_2.shutdown().await.unwrap();
+    handle_b.shutdown().await.unwrap();
     Ok(())
 }

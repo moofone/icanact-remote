@@ -81,13 +81,20 @@ where
 
 async fn run_sequential() {
     let (handle_a, handle_b, conn) = setup("seq", 7920, 7921).await;
+    let conn = conn.session().await.unwrap();
 
     // Warmup: a few asks to amortise TLS handshake / TCP slow-start before
     // we start the timer. This keeps the steady-state number out of the
     // setup noise.
     for i in 0..32 {
         let req = format!("ECHO:warmup-{i}").into_bytes();
-        let _ = conn.ask(bytes::Bytes::from(req)).await.unwrap();
+        let _ = conn
+            .ask_owned(
+                icanact_remote::ForwardPayload::from(req),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
     }
 
     let start = Instant::now();
@@ -95,7 +102,13 @@ async fn run_sequential() {
         // Real wire ask: TCP write of request frame, server-side ECHO,
         // TCP read of response frame, CorrelationTracker park/wake.
         let req = format!("ECHO:seq-{i}").into_bytes();
-        let resp = conn.ask(bytes::Bytes::from(req)).await.unwrap();
+        let resp = conn
+            .ask_owned(
+                icanact_remote::ForwardPayload::from(req),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
         // Cheap correctness check that the right response routed back to
         // the right SlotGuard. Cost is dominated by `==` on a small Bytes.
         debug_assert!(resp.starts_with(b"ECHOED:seq-"));
@@ -105,17 +118,24 @@ async fn run_sequential() {
 
     report("sequential", ITERS_SEQUENTIAL, elapsed);
 
-    handle_a.shutdown().await;
-    handle_b.shutdown().await;
+    handle_a.shutdown().await.unwrap();
+    handle_b.shutdown().await.unwrap();
 }
 
 async fn run_concurrent() {
     let (handle_a, handle_b, conn) = setup("conc", 7922, 7923).await;
+    let conn = conn.session().await.unwrap();
 
     // Warmup
     for i in 0..64 {
         let req = format!("ECHO:warmup-{i}").into_bytes();
-        let _ = conn.ask(bytes::Bytes::from(req)).await.unwrap();
+        let _ = conn
+            .ask_owned(
+                icanact_remote::ForwardPayload::from(req),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
     }
 
     // Pipelined producer: keep INFLIGHT asks in flight at all times until
@@ -127,11 +147,16 @@ async fn run_concurrent() {
     let mut completed = 0usize;
     while completed < ITERS_CONCURRENT {
         while pending.len() < INFLIGHT && launched < ITERS_CONCURRENT {
-            let conn = conn.clone();
+            let conn = &conn;
             let i = launched;
             pending.push(async move {
                 let req = format!("ECHO:conc-{i}").into_bytes();
-                conn.ask(bytes::Bytes::from(req)).await.unwrap()
+                conn.ask_owned(
+                    icanact_remote::ForwardPayload::from(req),
+                    Duration::from_secs(30),
+                )
+                .await
+                .unwrap()
             });
             launched += 1;
         }
@@ -146,8 +171,8 @@ async fn run_concurrent() {
 
     report("concurrent", ITERS_CONCURRENT, elapsed);
 
-    handle_a.shutdown().await;
-    handle_b.shutdown().await;
+    handle_a.shutdown().await.unwrap();
+    handle_b.shutdown().await.unwrap();
 }
 
 fn report(label: &str, ops: usize, elapsed: Duration) {

@@ -539,9 +539,17 @@ async fn make_peer_silent(node: &TlsHandle, peer_addr: SocketAddr, silence: Dura
 }
 
 async fn apply_no_response_rounds(node: &TlsHandle, peer_addr: SocketAddr, rounds: usize) {
+    let handle = node
+        .registry
+        .connection_pool
+        .get_existing_connection(peer_addr)
+        .expect("no-response simulation requires a live sending stream");
+    let session = icanact_remote::registry::SessionReceipt::from_handle(&handle)
+        .expect("the sending stream must have authenticated provenance");
     for sequence in 0..rounds {
         node.registry
             .apply_gossip_results(vec![icanact_remote::registry::GossipResult {
+                session: Some(session.clone()),
                 peer_addr,
                 sent_sequence: sequence as u64,
                 outcome: Ok(None),
@@ -685,8 +693,8 @@ async fn required_peer_actor_route_and_ask_survive_cadence_gap_silence() -> Resu
         "remote actor should receive exactly the baseline and post-gap asks"
     );
 
-    node_a.shutdown().await;
-    node_b.shutdown().await;
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
     Ok(())
 }
 
@@ -752,9 +760,9 @@ async fn required_peer_mesh_does_not_cascade_false_failures_under_jitter() -> Re
         "B-owned actor should receive one ask from each neighbour after jitter"
     );
 
-    node_a.shutdown().await;
-    node_b.shutdown().await;
-    node_c.shutdown().await;
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
+    node_c.shutdown().await.unwrap();
     Ok(())
 }
 
@@ -841,8 +849,8 @@ async fn configured_peers_retry_until_late_peer_comes_online() -> Result<(), Dyn
         "late peer actor should receive at least one post-convergence ask"
     );
 
-    node_a.shutdown().await;
-    node_b.shutdown().await;
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
     Ok(())
 }
 
@@ -898,8 +906,8 @@ async fn required_peer_is_not_dropped_by_fire_and_forget_gossip_results() -> Res
          the settling helper retries at the RPC layer, so delivery is at least once"
     );
 
-    node_a.shutdown().await;
-    node_b.shutdown().await;
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
     Ok(())
 }
 
@@ -962,7 +970,7 @@ async fn configured_peer_reconnects_within_one_second_after_drop_and_return() ->
         b"b:before-drop"
     );
 
-    node_b.shutdown().await;
+    node_b.shutdown().await.unwrap();
     assert!(
         wait_for_condition(Duration::from_secs(1), || async {
             node_a.client().lookup_connected_peer(&peer_b_id).is_none()
@@ -1009,8 +1017,8 @@ async fn configured_peer_reconnects_within_one_second_after_drop_and_return() ->
         "B actor should receive asks before drop and after return"
     );
 
-    node_a.shutdown().await;
-    node_b.shutdown().await;
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
     Ok(())
 }
 
@@ -1071,8 +1079,8 @@ async fn indirect_peer_is_rediscovered_immediately_when_seen_by_direct_neighbor(
         "C actor should receive at least one ask through A's rediscovered direct route"
     );
 
-    node_a.shutdown().await;
-    node_b.shutdown().await;
-    node_c.shutdown().await;
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
+    node_c.shutdown().await.unwrap();
     Ok(())
 }

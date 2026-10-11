@@ -179,8 +179,8 @@ async fn undialable_actor_address_still_delivers_by_identity() -> icanact_remote
         "the verified connection must never be dropped over an address"
     );
 
-    node_a.shutdown().await;
-    node_b.shutdown().await;
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
     Ok(())
 }
 
@@ -257,8 +257,8 @@ async fn inbound_from_unknown_source_accepted_by_key_despite_wrong_configured_ad
         .await
         .expect("delivery must work over the key-accepted inbound connection");
 
-    node_a.shutdown().await;
-    node_b.shutdown().await;
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
     Ok(())
 }
 
@@ -332,8 +332,8 @@ async fn wildcard_interest_from_unconfigured_inbound_peer_resolves_to_source_ip(
     );
     assert_eq!(stored_addr.port(), 9400, "advertised port preserved");
 
-    dialer.shutdown().await;
-    listener.shutdown().await;
+    dialer.shutdown().await.unwrap();
+    listener.shutdown().await.unwrap();
     Ok(())
 }
 
@@ -401,8 +401,8 @@ async fn full_sync_wildcard_repair_uses_verified_source_not_advertised_bind()
     );
     assert_eq!(stored_addr.port(), 7777, "advertised port preserved");
 
-    dialer.shutdown().await;
-    listener.shutdown().await;
+    dialer.shutdown().await.unwrap();
+    listener.shutdown().await.unwrap();
     Ok(())
 }
 
@@ -463,7 +463,7 @@ async fn wildcard_interest_repair_prefers_live_source_over_stale_config()
         stored.address
     );
 
-    dialer.shutdown().await;
-    listener.shutdown().await;
+    dialer.shutdown().await.unwrap();
+    listener.shutdown().await.unwrap();
     Ok(())
 }

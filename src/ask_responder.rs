@@ -1,35 +1,10 @@
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
-use arc_swap::ArcSwapOption;
 use bytes::{Buf, Bytes};
 
 use crate::{GossipError, Result, connection_pool::LockFreeStreamHandle, framing};
-
-/// R-E (P1): nonblocking/"immediate" reply lanes (`try_reply_bytes`,
-/// `try_reply_bytes_immediate`) cannot enter the async auto-streaming path
-/// (`stream_response_bytes`) without either blocking or duplicating its
-/// queue/permit machinery in a sync context. Above the streaming threshold
-/// they therefore reject the reply outright instead of ever building an
-/// oversize inline frame (peer teardown, see `send_response_auto_bytes`/R-9)
-/// or, at >= 2^27 bytes, panicking `framing::checked_body_len`'s `.expect`.
-/// Callers with a payload this large must use the async `reply`/`reply_typed`
-/// path, which auto-streams (mirrors `send_response_auto_bytes`).
-#[inline]
-fn reject_oversize_for_nonblocking_lane(
-    stream_handle: &LockFreeStreamHandle,
-    payload_len: usize,
-) -> Result<()> {
-    let threshold = stream_handle.streaming_threshold();
-    if payload_len > threshold {
-        return Err(GossipError::MessageTooLarge {
-            size: payload_len,
-            max: threshold,
-        });
-    }
-    Ok(())
-}
 
 /// R-E (P1): shared gate for the typed/pooled deferred-reply path
 /// (`AskResponder::reply_typed` -> `send_response_pooled`), mirroring
@@ -37,14 +12,14 @@ fn reject_oversize_for_nonblocking_lane(
 /// A payload above `MAX_STREAM_SIZE` is rejected locally (every receiver
 /// hard-rejects a larger stream as FATAL); a payload above the streaming
 /// threshold, or whose inline-encoded size would exceed `max_message_size`,
-/// is auto-streamed via `stream_response_bytes` — the same machinery the
-/// `Bytes` reply path uses, reached here via one copy of the (rare,
-/// already-oversized) payload into `Bytes`. Checking only the streaming
+/// is auto-streamed with its original pooled owner and separate prefix.
+/// Both paths use nonblocking, capacity-accounted owner admission.
+/// Checking only the streaming
 /// threshold here (as this used to) would pick the inline branch below for
 /// a payload the inline gate then has to refuse whenever `max_message_size`
 /// is smaller than the threshold -- streaming can still deliver it in
 /// bounded chunks, so `MessageTooLarge` must stay reserved for payloads
-/// that cannot be sent at all (>= `MAX_STREAM_SIZE`), mirroring
+/// that cannot be sent at all (> `MAX_STREAM_SIZE`), mirroring
 /// `LockFreeStreamHandle::should_stream_response`.
 async fn send_pooled_via_stream_handle(
     stream_handle: &LockFreeStreamHandle,
@@ -53,29 +28,13 @@ async fn send_pooled_via_stream_handle(
     prefix: Option<[u8; 16]>,
     payload_len: usize,
 ) -> Result<()> {
-    if payload_len > crate::MAX_STREAM_SIZE {
-        return Err(GossipError::MessageTooLarge {
-            size: payload_len,
-            max: crate::MAX_STREAM_SIZE,
-        });
-    }
     let inline_payload_limit = stream_handle
         .max_message_size()
         .saturating_sub(framing::ASK_RESPONSE_HEADER_LEN);
-    if payload_len > stream_handle.streaming_threshold() || payload_len > inline_payload_limit {
-        let bytes = pooled_payload_into_bytes(prefix, payload);
-        return stream_handle
-            .stream_response_bytes(bytes, correlation_id)
-            .await;
-    }
-    let header = framing::try_write_ask_response_header(
-        crate::MessageType::Response,
-        correlation_id,
-        payload_len,
-    )?;
-    let prefix_len = prefix.as_ref().map(|bytes| bytes.len()).unwrap_or(0) as u8;
+    let streaming =
+        payload_len > stream_handle.streaming_threshold() || payload_len > inline_payload_limit;
     stream_handle
-        .write_pooled_ask_inline(header, 16, prefix, prefix_len, payload)
+        .send_response_pooled_owned(correlation_id, payload, prefix, payload_len, streaming)
         .await
 }
 
@@ -83,6 +42,7 @@ async fn send_pooled_via_stream_handle(
 /// optional debug type-hash prefix into one contiguous `Bytes` for
 /// `stream_response_bytes`, which needs owned, slice-able `Bytes` to chunk
 /// without an extra copy per chunk.
+#[cfg(test)]
 fn pooled_payload_into_bytes(
     prefix: Option<[u8; 16]>,
     mut payload: crate::typed::PooledPayload,
@@ -199,58 +159,84 @@ pub trait AskReplyObserver: Send + Sync {
 }
 
 #[derive(Clone)]
-enum AskResponseSink {
-    StreamHandle(Arc<LockFreeStreamHandle>),
-    DeferredWriter(Arc<ResponseWriter>),
+enum AskResponseSink<'a> {
+    StreamHandle(&'a Arc<LockFreeStreamHandle>),
+    DeferredWriter(&'a Arc<ResponseWriter>),
+    #[cfg(any(test, feature = "test-helpers"))]
+    OwnedStreamHandle(Arc<LockFreeStreamHandle>),
 }
 
-impl AskResponseSink {
-    async fn send_response_bytes(&self, correlation_id: u32, payload: Bytes) -> Result<()> {
+#[derive(Clone)]
+enum ReplyClaim<'a> {
+    Scoped(&'a AtomicBool),
+    #[cfg(any(test, feature = "test-helpers"))]
+    Owned(Arc<AtomicBool>),
+}
+
+impl std::ops::Deref for ReplyClaim<'_> {
+    type Target = AtomicBool;
+
+    fn deref(&self) -> &Self::Target {
         match self {
-            Self::StreamHandle(stream_handle) => {
-                stream_handle
-                    .send_response_auto_bytes(correlation_id, payload)
-                    .await
-            }
-            Self::DeferredWriter(writer) => {
-                writer.send_response_bytes(correlation_id, payload).await
-            }
+            Self::Scoped(used) => used,
+            #[cfg(any(test, feature = "test-helpers"))]
+            Self::Owned(used) => used,
+        }
+    }
+}
+
+impl AskResponseSink<'_> {
+    fn stream_handle(&self) -> Result<&Arc<LockFreeStreamHandle>> {
+        match self {
+            Self::StreamHandle(stream) => Ok(stream),
+            Self::DeferredWriter(writer) => writer.stream_handle(),
+            #[cfg(any(test, feature = "test-helpers"))]
+            Self::OwnedStreamHandle(stream) => Ok(stream),
         }
     }
 
-    fn try_send_response_bytes(&self, correlation_id: u32, payload: Bytes) -> Result<()> {
-        match self {
-            Self::StreamHandle(stream_handle) => {
-                reject_oversize_for_nonblocking_lane(stream_handle, payload.len())?;
-                let header = framing::try_write_ask_response_header(
-                    crate::MessageType::Response,
-                    correlation_id,
-                    payload.len(),
-                )?;
-                stream_handle
-                    .write_header_and_payload_control_inline_nonblocking(header, 16, payload)
-            }
-            Self::DeferredWriter(writer) => writer.try_send_response_bytes(correlation_id, payload),
-        }
+    fn try_send_response_owned(
+        &self,
+        correlation_id: u32,
+        payload: crate::ForwardPayload,
+        immediate: bool,
+    ) -> Result<()> {
+        self.stream_handle()?
+            .try_send_response_owned(correlation_id, payload, immediate)
     }
 
-    fn try_send_response_bytes_immediate(&self, correlation_id: u32, payload: Bytes) -> Result<()> {
-        match self {
-            Self::StreamHandle(stream_handle) => {
-                reject_oversize_for_nonblocking_lane(stream_handle, payload.len())?;
-                let header = framing::try_write_ask_response_header(
-                    crate::MessageType::Response,
-                    correlation_id,
-                    payload.len(),
-                )?;
-                stream_handle.write_header_and_payload_control_inline_immediate_nonblocking(
-                    header, 16, payload,
-                )
-            }
-            Self::DeferredWriter(writer) => {
-                writer.try_send_response_bytes_immediate(correlation_id, payload)
-            }
-        }
+    async fn send_response_owned(
+        &self,
+        correlation_id: u32,
+        payload: crate::ForwardPayload,
+    ) -> Result<()> {
+        self.stream_handle()?
+            .send_response_owned_wait(correlation_id, payload)
+            .await
+    }
+
+    async fn send_response_bytes(
+        &self,
+        correlation_id: u32,
+        payload: crate::ForwardPayload,
+    ) -> Result<()> {
+        self.send_response_owned(correlation_id, payload).await
+    }
+
+    fn try_send_response_bytes(
+        &self,
+        correlation_id: u32,
+        payload: crate::ForwardPayload,
+    ) -> Result<()> {
+        self.try_send_response_owned(correlation_id, payload, false)
+    }
+
+    fn try_send_response_bytes_immediate(
+        &self,
+        correlation_id: u32,
+        payload: crate::ForwardPayload,
+    ) -> Result<()> {
+        self.try_send_response_owned(correlation_id, payload, true)
     }
 
     async fn send_response_pooled(
@@ -260,23 +246,14 @@ impl AskResponseSink {
         prefix: Option<[u8; 16]>,
         payload_len: usize,
     ) -> Result<()> {
-        match self {
-            Self::StreamHandle(stream_handle) => {
-                send_pooled_via_stream_handle(
-                    stream_handle,
-                    correlation_id,
-                    payload,
-                    prefix,
-                    payload_len,
-                )
-                .await
-            }
-            Self::DeferredWriter(writer) => {
-                writer
-                    .send_response_pooled(correlation_id, payload, prefix, payload_len)
-                    .await
-            }
-        }
+        send_pooled_via_stream_handle(
+            self.stream_handle()?,
+            correlation_id,
+            payload,
+            prefix,
+            payload_len,
+        )
+        .await
     }
 }
 
@@ -290,16 +267,23 @@ pub struct AskContext<'a> {
     request_id: Option<u64>,
     authenticated_peer_id: Option<&'a crate::PeerId>,
     sink: AskContextSink<'a>,
-    /// ACTOR_REM_2 R15: shared single-use guard for this inbound ask. Every
-    /// responder minted from this context (and their clones) share it, so at
-    /// most one reply for the correlation ever reaches the wire — a second
-    /// would otherwise complete an unrelated ask after correlation-id reuse
-    /// wraps.
-    used: Arc<AtomicBool>,
+    /// Scoped single-use guard for this inbound ask. Responders borrow this
+    /// fixed field; deferring transfers the claim into a bound session token.
+    /// Neither path allocates a per-ask shared guard.
+    used: AtomicBool,
     reply_observer: Option<Arc<dyn AskReplyObserver>>,
 }
 
 impl<'a> AskContext<'a> {
+    /// Construct the production scoped context in external qualification tests.
+    #[cfg(feature = "test-helpers")]
+    pub fn from_stream_handle_for_test(
+        correlation_id: u32,
+        stream_handle: &'a Arc<LockFreeStreamHandle>,
+    ) -> Self {
+        Self::from_stream_handle_with_request_id(correlation_id, stream_handle, None, None)
+    }
+
     pub(crate) fn from_stream_handle_with_request_id(
         correlation_id: u32,
         stream_handle: &'a Arc<LockFreeStreamHandle>,
@@ -311,7 +295,7 @@ impl<'a> AskContext<'a> {
             request_id,
             authenticated_peer_id,
             sink: AskContextSink::StreamHandle(stream_handle),
-            used: Arc::new(AtomicBool::new(false)),
+            used: AtomicBool::new(false),
             reply_observer: None,
         }
     }
@@ -336,7 +320,7 @@ impl<'a> AskContext<'a> {
             request_id,
             authenticated_peer_id,
             sink: AskContextSink::DeferredWriter(writer),
-            used: Arc::new(AtomicBool::new(false)),
+            used: AtomicBool::new(false),
             reply_observer: None,
         }
     }
@@ -363,56 +347,440 @@ impl<'a> AskContext<'a> {
         self
     }
 
-    pub fn responder(&self) -> AskResponder {
-        match &self.sink {
-            AskContextSink::StreamHandle(stream_handle) => {
-                if let Some(observer) = &self.reply_observer {
-                    AskResponder::from_stream_handle_with_observer(
-                        self.correlation_id,
-                        (*stream_handle).clone(),
-                        Arc::clone(&self.used),
-                        Some(Arc::clone(observer)),
-                    )
-                } else {
-                    AskResponder::from_stream_handle(
-                        self.correlation_id,
-                        (*stream_handle).clone(),
-                        Arc::clone(&self.used),
-                    )
-                }
-            }
-            AskContextSink::DeferredWriter(writer) => {
-                if let Some(observer) = &self.reply_observer {
-                    AskResponder::from_writer_with_observer(
-                        self.correlation_id,
-                        (*writer).clone(),
-                        Arc::clone(&self.used),
-                        Some(Arc::clone(observer)),
-                    )
-                } else {
-                    AskResponder::from_writer(
-                        self.correlation_id,
-                        (*writer).clone(),
-                        Arc::clone(&self.used),
-                    )
-                }
-            }
+    /// Borrow this ask's single-use claim. The responder cannot outlive its
+    /// context; use a bound `ReplySession` token for deferred ownership.
+    pub fn responder(&self) -> AskResponder<'_> {
+        let sink = match &self.sink {
+            AskContextSink::StreamHandle(stream) => AskResponseSink::StreamHandle(stream),
+            AskContextSink::DeferredWriter(writer) => AskResponseSink::DeferredWriter(writer),
+        };
+        AskResponder {
+            correlation_id: self.correlation_id,
+            sink,
+            used: ReplyClaim::Scoped(&self.used),
+            reply_observer: self.reply_observer.clone(),
+            observer_notified: false,
         }
+    }
+
+    /// Bind deferred reply storage once to this physical connection.
+    pub fn reply_session(&self) -> Result<ReplySession> {
+        self.responder().reply_session()
+    }
+
+    /// Move the sole reply claim into bounded, exact-session storage.
+    pub fn into_forward_reply(self, session: &ReplySession) -> Result<ForwardReplyToken> {
+        self.responder().into_forward_reply(session)
     }
 }
 
 #[derive(Clone)]
-pub struct AskResponder {
+pub struct AskResponder<'a> {
     correlation_id: u32,
-    sink: AskResponseSink,
-    /// ACTOR_REM_2 R15: shared single-use guard (see [`AskContext::used`]).
-    /// Clones share the same `Arc`, so only the first reply across all clones
-    /// and sibling responders for this correlation reaches the wire.
-    used: Arc<AtomicBool>,
+    sink: AskResponseSink<'a>,
+    /// Shared, scoped single-use claim (see [`AskContext::used`]). Clones borrow
+    /// the same field; production responders cannot outlive their context.
+    used: ReplyClaim<'a>,
     reply_observer: Option<Arc<dyn AskReplyObserver>>,
     /// Kept with the claimed responder when an immediate enqueue is transferred
     /// into a lease, preventing fallback retry from notifying twice.
     observer_notified: bool,
+}
+
+/// Maximum preallocated deferred claims per physical reply endpoint.
+pub const MAX_REPLY_SESSION_CAPACITY: usize = 65_552;
+const DEFAULT_REPLY_SESSION_CAPACITY: usize = 64;
+const TOKEN_READY: u64 = 1;
+const TOKEN_CLAIMED: u64 = 2;
+const TOKEN_GENERATION_MAX: u64 = u64::MAX >> 2;
+static NEXT_REPLY_SESSION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A bounded deferred reply claim for one exact physical stream.
+///
+/// Copies are harmless: only one full-generation transition can claim or cancel
+/// a token. The owning `ReplySession` must be retained until every accepted token
+/// is completed or cancelled. Dropping a token alone does not release its slot;
+/// queue owners must cancel rejected/drained work. Metadata lifetime is bounded
+/// by that session; forwarding additionally applies its configured job deadline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ForwardReplyToken {
+    session_id: u64,
+    index: usize,
+    generation: u64,
+}
+
+struct ReplySessionEntry {
+    correlation_id: u32,
+    observer: Option<Arc<dyn AskReplyObserver>>,
+    observer_notified: bool,
+}
+
+struct ReplySessionCell {
+    state: std::sync::atomic::AtomicU64,
+    entry: std::cell::UnsafeCell<Option<ReplySessionEntry>>,
+}
+
+// SAFETY: the free queue gives one admission writer exclusive EMPTY storage.
+// Release publication makes the entry visible. A full-generation READY ->
+// CLAIMED CAS gives exactly one guard access and exclusive destruction. Reuse
+// is possible only after that guard destroys the entry and recycles its index.
+unsafe impl Sync for ReplySessionCell {}
+
+/// A cold-bound reply endpoint with fixed metadata and no per-token owner.
+///
+/// This endpoint retains one exact physical stream. It never resolves a peer
+/// address or a replacement stream. Admission saturates with `WriteQueueFull`;
+/// no hidden queue, allocation, timeout task, or eviction is created per reply.
+pub struct ReplySession {
+    session_id: u64,
+    stream: Arc<LockFreeStreamHandle>,
+    cells: Box<[ReplySessionCell]>,
+    free: crossbeam_queue::ArrayQueue<usize>,
+}
+
+impl std::fmt::Debug for ReplySession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplySession")
+            .field("session_id", &self.session_id)
+            .field("stream_instance_id", &self.stream.instance_id())
+            .field("capacity", &self.cells.len())
+            .finish()
+    }
+}
+
+impl ReplySession {
+    fn new(stream: Arc<LockFreeStreamHandle>) -> Result<Self> {
+        Self::with_capacity(stream, DEFAULT_REPLY_SESSION_CAPACITY)
+    }
+
+    fn with_capacity(stream: Arc<LockFreeStreamHandle>, capacity: usize) -> Result<Self> {
+        if capacity == 0 || capacity > MAX_REPLY_SESSION_CAPACITY {
+            return Err(GossipError::InvalidConfig(format!(
+                "reply session capacity must be 1..={MAX_REPLY_SESSION_CAPACITY}"
+            )));
+        }
+        let session_id = NEXT_REPLY_SESSION_ID
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| {
+                if id == 0 { None } else { id.checked_add(1) }
+            })
+            .map_err(|_| GossipError::WriteQueueFull)?;
+        let free = crossbeam_queue::ArrayQueue::new(capacity);
+        let cells = (0..capacity)
+            .map(|index| {
+                let _ = free.push(index);
+                ReplySessionCell {
+                    state: std::sync::atomic::AtomicU64::new(0),
+                    entry: std::cell::UnsafeCell::new(None),
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Ok(Self {
+            session_id,
+            stream,
+            cells,
+            free,
+        })
+    }
+
+    pub(crate) fn stream_handle(&self) -> &Arc<LockFreeStreamHandle> {
+        &self.stream
+    }
+
+    pub fn instance_id(&self) -> u64 {
+        self.stream.instance_id()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.cells.len()
+    }
+
+    pub fn accepts_token(&self, token: &ForwardReplyToken) -> bool {
+        token.session_id == self.session_id && token.index < self.cells.len()
+    }
+
+    fn admit(&self, responder: &AskResponder<'_>) -> Result<ForwardReplyToken> {
+        let stream = responder.sink.stream_handle()?;
+        if !Arc::ptr_eq(stream, &self.stream) {
+            return Err(GossipError::InvalidConfig(
+                "reply token belongs to a different physical stream".into(),
+            ));
+        }
+        let index = self.free.pop().ok_or(GossipError::WriteQueueFull)?;
+        let cell = &self.cells[index];
+        let previous = cell.state.load(Ordering::Acquire);
+        let generation = previous >> 2;
+        if generation == TOKEN_GENERATION_MAX {
+            // Retire the cell permanently. No stale token can ever match a
+            // reissued generation, including after counter exhaustion.
+            return Err(GossipError::WriteQueueFull);
+        }
+        if let Err(error) = claim_reply(&responder.used) {
+            let recycled = self.free.push(index);
+            debug_assert!(recycled.is_ok());
+            return Err(error);
+        }
+        let generation = generation + 1;
+        let entry = ReplySessionEntry {
+            correlation_id: responder.correlation_id,
+            observer: responder.reply_observer.clone(),
+            observer_notified: responder.observer_notified,
+        };
+        // SAFETY: this free index belongs exclusively to this admission; no
+        // token for the new generation exists before the following release.
+        unsafe { *cell.entry.get() = Some(entry) };
+        cell.state
+            .store((generation << 2) | TOKEN_READY, Ordering::Release);
+        Ok(ForwardReplyToken {
+            session_id: self.session_id,
+            index,
+            generation,
+        })
+    }
+
+    fn claim(&self, token: ForwardReplyToken) -> Result<ReplyTokenGuard<'_>> {
+        if !self.accepts_token(&token) {
+            return Err(GossipError::InvalidConfig(
+                "reply token belongs to another endpoint".into(),
+            ));
+        }
+        let cell = &self.cells[token.index];
+        cell.state
+            .compare_exchange(
+                (token.generation << 2) | TOKEN_READY,
+                (token.generation << 2) | TOKEN_CLAIMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| {
+                GossipError::Network(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "reply token was completed, cancelled, or superseded",
+                ))
+            })?;
+        Ok(ReplyTokenGuard {
+            session: self,
+            token,
+        })
+    }
+
+    /// Cancel only this exact token. Stale, duplicate and foreign tokens cannot
+    /// release a successor's resources or affect its writer.
+    pub fn cancel(&self, token: ForwardReplyToken) {
+        self.try_cancel(token);
+    }
+
+    fn try_cancel(&self, token: ForwardReplyToken) -> bool {
+        if !self.accepts_token(&token) {
+            return false;
+        }
+        let cell = &self.cells[token.index];
+        if cell
+            .state
+            .compare_exchange(
+                (token.generation << 2) | TOKEN_READY,
+                (token.generation << 2) | TOKEN_CLAIMED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return false;
+        }
+        drop(ReplyTokenGuard {
+            session: self,
+            token,
+        });
+        true
+    }
+
+    pub fn try_reply_owned(
+        &self,
+        token: ForwardReplyToken,
+        payload: crate::ForwardPayload,
+    ) -> Result<()> {
+        let mut guard = self.claim(token)?;
+        let correlation_id = guard.observe(&payload);
+        self.stream
+            .try_send_response_owned(correlation_id, payload, false)
+    }
+
+    /// Nonblocking terminal/control reply on the reserved immediate lane.
+    pub fn try_reply_owned_immediate(
+        &self,
+        token: ForwardReplyToken,
+        payload: crate::ForwardPayload,
+    ) -> Result<()> {
+        let mut guard = self.claim(token)?;
+        let correlation_id = guard.observe(&payload);
+        self.stream
+            .try_send_response_owned(correlation_id, payload, true)
+    }
+
+    /// Retain exclusive token ownership if bounded enqueue rejects the payload.
+    pub fn try_reply_owned_with_fallback(
+        &self,
+        token: ForwardReplyToken,
+        payload: crate::ForwardPayload,
+        immediate: bool,
+    ) -> std::result::Result<(), ReplySessionTryError<'_>> {
+        let mut guard = self
+            .claim(token)
+            .map_err(ReplySessionTryError::ClaimUnavailable)?;
+        let correlation_id = guard.observe(&payload);
+        match self
+            .stream
+            .try_send_response_owned(correlation_id, payload, immediate)
+        {
+            Ok(()) => Ok(()),
+            Err(error) => Err(ReplySessionTryError::Enqueue(ReplySessionFallback {
+                guard,
+                error,
+            })),
+        }
+    }
+
+    pub async fn reply_owned(
+        &self,
+        token: ForwardReplyToken,
+        payload: crate::ForwardPayload,
+    ) -> Result<()> {
+        let mut guard = self.claim(token)?;
+        let correlation_id = guard.observe(&payload);
+        self.stream
+            .send_response_owned_wait(correlation_id, payload)
+            .await
+    }
+}
+
+/// Distinguishes an unavailable token from a claimed, retryable enqueue failure.
+pub enum ReplySessionTryError<'a> {
+    ClaimUnavailable(GossipError),
+    Enqueue(ReplySessionFallback<'a>),
+}
+
+impl std::fmt::Debug for ReplySessionTryError<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ClaimUnavailable(error) => {
+                f.debug_tuple("ClaimUnavailable").field(error).finish()
+            }
+            Self::Enqueue(fallback) => f.debug_tuple("Enqueue").field(fallback.error()).finish(),
+        }
+    }
+}
+
+/// A failed token enqueue retains its exact endpoint and exclusive generation.
+pub struct ReplySessionFallback<'a> {
+    guard: ReplyTokenGuard<'a>,
+    error: GossipError,
+}
+
+impl ReplySessionFallback<'_> {
+    pub fn error(&self) -> &GossipError {
+        &self.error
+    }
+
+    pub fn try_reply_owned(
+        mut self,
+        payload: crate::ForwardPayload,
+        immediate: bool,
+    ) -> Result<()> {
+        let correlation_id = self.guard.observe(&payload);
+        self.guard
+            .session
+            .stream
+            .try_send_response_owned(correlation_id, payload, immediate)
+    }
+
+    pub async fn reply_owned(mut self, payload: crate::ForwardPayload) -> Result<()> {
+        let correlation_id = self.guard.observe(&payload);
+        self.guard
+            .session
+            .stream
+            .send_response_owned_wait(correlation_id, payload)
+            .await
+    }
+}
+
+/// Scoped queue-publication transaction. An uncommitted rejection restores the
+/// original context claim only after cancelling its exact unpublished token.
+pub struct ForwardReplyAdmission<'a> {
+    session: &'a ReplySession,
+    used: &'a AtomicBool,
+    token: ForwardReplyToken,
+    committed: bool,
+}
+
+impl ForwardReplyAdmission<'_> {
+    pub fn token(&self) -> ForwardReplyToken {
+        self.token
+    }
+
+    pub fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ForwardReplyAdmission<'_> {
+    fn drop(&mut self) {
+        if !self.committed && self.session.try_cancel(self.token) {
+            self.used.store(false, Ordering::Release);
+        }
+    }
+}
+
+struct ReplyTokenGuard<'a> {
+    session: &'a ReplySession,
+    token: ForwardReplyToken,
+}
+
+impl ReplyTokenGuard<'_> {
+    fn observe(&mut self, payload: &crate::ForwardPayload) -> u32 {
+        let cell = &self.session.cells[self.token.index];
+        // SAFETY: the guard uniquely owns CLAIMED for this immutable token
+        // generation. Neither cancellation nor another claimant can touch it.
+        let entry = unsafe { (&mut *cell.entry.get()).as_mut().unwrap() };
+        if !entry.observer_notified
+            && payload.len() <= crate::MAX_STREAM_SIZE
+            && let Some(observer) = &entry.observer
+        {
+            // Set first so an observer panic cannot produce a second callback.
+            entry.observer_notified = true;
+            observer.reply_claimed_borrowed(ReplyPayloadRef::new(
+                None,
+                payload.as_ref(),
+                payload.len(),
+            ));
+        }
+        entry.correlation_id
+    }
+}
+
+impl Drop for ReplyTokenGuard<'_> {
+    fn drop(&mut self) {
+        let cell = &self.session.cells[self.token.index];
+        // SAFETY: only this full-generation claimant may destroy the entry.
+        // Drop payload metadata before publishing availability to admission.
+        let entry = unsafe { (&mut *cell.entry.get()).take() };
+        cell.state
+            .store(self.token.generation << 2, Ordering::Release);
+        let recycled = self.session.free.push(self.token.index);
+        debug_assert!(recycled.is_ok(), "reply token recycles exactly once");
+        // Observer destruction is user code. Recycling first and containing an
+        // unwind preserves unrelated queue cleanup and cancellation progress.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(entry)));
+    }
+}
+
+impl Drop for ReplySession {
+    fn drop(&mut self) {
+        for cell in &mut self.cells {
+            // Exclusive endpoint destruction excludes every borrowed guard.
+            // Remaining numeric tokens carry no dereferenceable pointer.
+            cell.entry.get_mut().take();
+        }
+    }
 }
 
 /// Exclusive fallback ownership after an immediate reply was rejected before
@@ -422,13 +790,13 @@ pub struct AskResponder {
 /// Constructed only when the caller itself claimed the single-use reply
 /// guard and a subsequent enqueue attempt was rejected — never when the
 /// claim was already taken by a sibling responder (see [`TryReplyError`]).
-pub struct ImmediateReplyFallback {
-    pub(crate) responder: AskResponder,
+pub struct ImmediateReplyFallback<'a> {
+    pub(crate) responder: AskResponder<'a>,
     error: GossipError,
 }
 
-impl ImmediateReplyFallback {
-    pub(crate) fn from_claimed_responder(responder: AskResponder, error: GossipError) -> Self {
+impl<'a> ImmediateReplyFallback<'a> {
+    pub(crate) fn from_claimed_responder(responder: AskResponder<'a>, error: GossipError) -> Self {
         Self { responder, error }
     }
 
@@ -439,7 +807,7 @@ impl ImmediateReplyFallback {
 
     /// Retry through the ordinary nonblocking response queue while retaining
     /// exclusive ownership of the ask correlation.
-    pub fn try_reply_bytes(self, response: Bytes) -> Result<()> {
+    pub fn try_reply_bytes(self, response: crate::ForwardPayload) -> Result<()> {
         self.responder
             .sink
             .try_send_response_bytes(self.responder.correlation_id, response)
@@ -447,7 +815,7 @@ impl ImmediateReplyFallback {
 
     /// Retry through the reserved immediate queue while retaining exclusive
     /// ownership of the ask correlation.
-    pub fn try_reply_bytes_immediate(self, response: Bytes) -> Result<()> {
+    pub fn try_reply_bytes_immediate(self, response: crate::ForwardPayload) -> Result<()> {
         self.responder
             .sink
             .try_send_response_bytes_immediate(self.responder.correlation_id, response)
@@ -455,21 +823,43 @@ impl ImmediateReplyFallback {
 
     /// Fall back to the asynchronous response path while retaining exclusive
     /// ownership of the ask correlation.
-    pub async fn reply_bytes(self, response: Bytes) -> Result<()> {
+    pub async fn reply_bytes(self, response: crate::ForwardPayload) -> Result<()> {
         self.responder
             .sink
             .send_response_bytes(self.responder.correlation_id, response)
             .await
     }
 
+    /// Retry with a complete owner, preserving its retained-capacity receipt.
+    pub fn try_reply_owned(self, response: crate::ForwardPayload) -> Result<()> {
+        self.responder
+            .sink
+            .try_send_response_owned(self.responder.correlation_id, response, false)
+    }
+
+    /// Retry with a complete owner on the reserved immediate response queue.
+    pub fn try_reply_owned_immediate(self, response: crate::ForwardPayload) -> Result<()> {
+        self.responder
+            .sink
+            .try_send_response_owned(self.responder.correlation_id, response, true)
+    }
+
+    /// Await bounded admission without cloning or normalizing the complete owner.
+    pub async fn reply_owned(self, response: crate::ForwardPayload) -> Result<()> {
+        self.responder
+            .sink
+            .send_response_owned(self.responder.correlation_id, response)
+            .await
+    }
+
     /// Transfer this already-claimed fallback into a bounded transport lease.
     /// The transfer path deliberately does not call `claim_reply` again.
-    pub fn try_into_reply_lease(
+    pub fn try_into_reply_lease<'s>(
         self,
-        budget: &crate::ReplyDeliveryBudget,
+        session: &'s crate::ReplyDeliverySession<'_>,
         max_reply_bytes: usize,
-    ) -> std::result::Result<crate::ReplyLease, crate::ReplyLeaseAdmissionError> {
-        crate::reply_lease::reserve_for_responder(self.responder, budget, max_reply_bytes, true)
+    ) -> std::result::Result<crate::ReplyLease<'s>, crate::ReplyLeaseAdmissionError<'a>> {
+        crate::reply_lease::reserve_for_responder(self.responder, session, max_reply_bytes, true)
     }
 }
 
@@ -480,16 +870,16 @@ impl ImmediateReplyFallback {
 /// or in flight, and retrying would send a duplicate on the same correlation
 /// id. A rejected enqueue means this call owns the sole claim and the bytes
 /// were never sent, so it is safe — and necessary — to retry.
-pub enum TryReplyError {
+pub enum TryReplyError<'a> {
     /// The single-use reply guard was already claimed by another responder
     /// for this ask. There is nothing to retry; the reply must be dropped.
     ClaimUnavailable(GossipError),
     /// This call claimed the guard, but the nonblocking enqueue was
     /// rejected. The fallback retains exclusive ownership and may retry.
-    Enqueue(ImmediateReplyFallback),
+    Enqueue(ImmediateReplyFallback<'a>),
 }
 
-impl TryReplyError {
+impl TryReplyError<'_> {
     /// The underlying error, regardless of which case produced it.
     pub fn error(&self) -> &GossipError {
         match self {
@@ -499,13 +889,13 @@ impl TryReplyError {
     }
 }
 
-impl AskResponder {
-    pub fn try_reply_lease(
+impl<'a> AskResponder<'a> {
+    pub fn try_reply_lease<'s>(
         self,
-        budget: &crate::ReplyDeliveryBudget,
+        session: &'s crate::ReplyDeliverySession<'_>,
         max_reply_bytes: usize,
-    ) -> std::result::Result<crate::ReplyLease, crate::ReplyLeaseAdmissionError> {
-        crate::reply_lease::reserve_for_responder(self, budget, max_reply_bytes, false)
+    ) -> std::result::Result<crate::ReplyLease<'s>, crate::ReplyLeaseAdmissionError<'a>> {
+        crate::reply_lease::reserve_for_responder(self, session, max_reply_bytes, false)
     }
 
     pub(crate) fn claim_for_lease(&self) -> Result<()> {
@@ -516,13 +906,40 @@ impl AskResponder {
         (self.reply_observer.clone(), self.observer_notified)
     }
 
-    pub(crate) fn stream_handle_for_lease(&self) -> Result<Arc<LockFreeStreamHandle>> {
-        match &self.sink {
-            AskResponseSink::StreamHandle(handle) => Ok(Arc::clone(handle)),
-            AskResponseSink::DeferredWriter(writer) => writer.stream_handle(),
-        }
+    pub(crate) fn stream_handle_for_lease(&self) -> Result<&Arc<LockFreeStreamHandle>> {
+        self.sink.stream_handle()
     }
 
+    /// Cold setup for a deferred reply endpoint. The endpoint retains this
+    /// exact stream once; per-reply tokens never clone it or resolve an address.
+    pub fn reply_session(&self) -> Result<ReplySession> {
+        ReplySession::new(Arc::clone(self.sink.stream_handle()?))
+    }
+
+    pub fn reply_session_with_capacity(&self, capacity: usize) -> Result<ReplySession> {
+        ReplySession::with_capacity(Arc::clone(self.sink.stream_handle()?), capacity)
+    }
+
+    /// Reserve a deferred claim without losing sibling retry on rejected queue
+    /// publication. Commit only after the queue has accepted the numeric token.
+    pub fn prepare_forward_reply<'b>(
+        &'b self,
+        session: &'b ReplySession,
+    ) -> Result<ForwardReplyAdmission<'b>> {
+        let token = session.admit(self)?;
+        Ok(ForwardReplyAdmission {
+            session,
+            used: &self.used,
+            token,
+            committed: false,
+        })
+    }
+
+    pub fn into_forward_reply(self, session: &ReplySession) -> Result<ForwardReplyToken> {
+        session.admit(&self)
+    }
+
+    #[cfg(any(test, feature = "test-helpers"))]
     pub(crate) fn from_stream_handle(
         correlation_id: u32,
         stream_handle: Arc<LockFreeStreamHandle>,
@@ -540,6 +957,7 @@ impl AskResponder {
         Self::from_stream_handle(correlation_id, stream_handle, used)
     }
 
+    #[cfg(any(test, feature = "test-helpers"))]
     fn from_stream_handle_with_observer(
         correlation_id: u32,
         stream_handle: Arc<LockFreeStreamHandle>,
@@ -548,49 +966,85 @@ impl AskResponder {
     ) -> Self {
         Self {
             correlation_id,
-            sink: AskResponseSink::StreamHandle(stream_handle),
-            used,
+            sink: AskResponseSink::OwnedStreamHandle(stream_handle),
+            used: ReplyClaim::Owned(used),
             reply_observer,
             observer_notified: false,
         }
     }
 
-    pub(crate) fn from_writer(
-        correlation_id: u32,
-        writer: Arc<ResponseWriter>,
-        used: Arc<AtomicBool>,
-    ) -> Self {
-        Self::from_writer_with_observer(correlation_id, writer, used, None)
-    }
-
-    fn from_writer_with_observer(
-        correlation_id: u32,
-        writer: Arc<ResponseWriter>,
-        used: Arc<AtomicBool>,
-        reply_observer: Option<Arc<dyn AskReplyObserver>>,
-    ) -> Self {
-        Self {
-            correlation_id,
-            sink: AskResponseSink::DeferredWriter(writer),
-            used,
-            reply_observer,
-            observer_notified: false,
-        }
+    /// Attach an explicitly requested observer without changing the single-use
+    /// claim or a previously recorded notification outcome.
+    pub fn with_reply_observer(mut self, observer: Arc<dyn AskReplyObserver>) -> Self {
+        self.reply_observer = Some(observer);
+        self
     }
 
     pub fn correlation_id(&self) -> u32 {
         self.correlation_id
     }
 
-    pub async fn reply(mut self, response: Bytes) -> Result<()> {
+    /// Reply with a proven complete owner, without opaque-Bytes normalization.
+    /// Waits for bounded writer-queue admission while retaining the same owner.
+    /// Success means the writer owns this response; cancellation before admission
+    /// drops the response without publishing a partial stream.
+    pub async fn reply_owned(mut self, response: crate::ForwardPayload) -> Result<()> {
         claim_reply(&self.used)?;
-        self.notify_observer(&response);
+        let len = response.len();
+        self.notify_observer_parts(None, response.as_ref(), len);
+        self.sink
+            .send_response_owned(self.correlation_id, response)
+            .await
+    }
+
+    /// Nonblocking inline reply retaining a bounded, proven complete owner.
+    pub fn try_reply_owned(mut self, response: crate::ForwardPayload) -> Result<()> {
+        claim_reply(&self.used)?;
+        self.notify_observer_parts(None, response.as_ref(), response.len());
+        self.sink
+            .try_send_response_owned(self.correlation_id, response, false)
+    }
+
+    /// Immediate reply retaining the original owner and its full capacity.
+    pub fn try_reply_owned_immediate(mut self, response: crate::ForwardPayload) -> Result<()> {
+        claim_reply(&self.used)?;
+        self.notify_observer_parts(None, response.as_ref(), response.len());
+        self.sink
+            .try_send_response_owned(self.correlation_id, response, true)
+    }
+
+    /// Try complete-owner admission while retaining exclusive fallback authority.
+    /// The rejected payload is dropped; a caller needing to retain that exact
+    /// payload through backpressure should use [`Self::reply_owned`] instead.
+    pub fn try_reply_owned_with_fallback(
+        mut self,
+        response: crate::ForwardPayload,
+    ) -> std::result::Result<(), TryReplyError<'a>> {
+        if let Err(error) = claim_reply(&self.used) {
+            return Err(TryReplyError::ClaimUnavailable(error));
+        }
+        self.notify_observer_parts(None, response.as_ref(), response.len());
+        match self
+            .sink
+            .try_send_response_owned(self.correlation_id, response, false)
+        {
+            Ok(()) => Ok(()),
+            Err(error) => Err(TryReplyError::Enqueue(ImmediateReplyFallback {
+                responder: self,
+                error,
+            })),
+        }
+    }
+
+    pub async fn reply(mut self, response: crate::ForwardPayload) -> Result<()> {
+        claim_reply(&self.used)?;
+        self.notify_observer_parts(None, response.as_ref(), response.len());
         self.sink
             .send_response_bytes(self.correlation_id, response)
             .await
     }
 
-    pub async fn reply_bytes(self, response: Bytes) -> Result<()> {
+    pub async fn reply_bytes(self, response: crate::ForwardPayload) -> Result<()> {
         self.reply(response).await
     }
 
@@ -598,9 +1052,9 @@ impl AskResponder {
     /// lost if the caller does not retry from the returned error. Use
     /// [`Self::try_reply_bytes_with_fallback`] when the caller needs an
     /// exclusive retry or fallback path.
-    pub fn try_reply_bytes(mut self, response: Bytes) -> Result<()> {
+    pub fn try_reply_bytes(mut self, response: crate::ForwardPayload) -> Result<()> {
         claim_reply(&self.used)?;
-        self.notify_observer(&response);
+        self.notify_observer_parts(None, response.as_ref(), response.len());
         self.sink
             .try_send_response_bytes(self.correlation_id, response)
     }
@@ -611,12 +1065,12 @@ impl AskResponder {
     /// returned fallback, which cannot be raced by a sibling).
     pub fn try_reply_bytes_with_fallback(
         mut self,
-        response: Bytes,
-    ) -> std::result::Result<(), TryReplyError> {
+        response: crate::ForwardPayload,
+    ) -> std::result::Result<(), TryReplyError<'a>> {
         if let Err(error) = claim_reply(&self.used) {
             return Err(TryReplyError::ClaimUnavailable(error));
         }
-        self.notify_observer(&response);
+        self.notify_observer_parts(None, response.as_ref(), response.len());
         match self
             .sink
             .try_send_response_bytes(self.correlation_id, response)
@@ -629,23 +1083,11 @@ impl AskResponder {
         }
     }
 
-    /// Reply through the ordinary queue with a hard delivery guarantee: if
-    /// this call wins the single-use claim, the reply is either sent
-    /// inline or, on a rejected enqueue, retried through the awaitable,
-    /// backpressured response path before this call returns. There is no
-    /// state in which this call holds the claim but the reply is neither
-    /// sent nor retried.
-    ///
-    /// Returns `Err` only when a sibling responder already held the claim
-    /// (nothing for this call to do — delivery is that sibling's
-    /// responsibility under the same guarantee) or when the connection is
-    /// gone.
-    pub async fn reply_bytes_guaranteed(self, response: Bytes) -> Result<()> {
-        match self.try_reply_bytes_with_fallback(response.clone()) {
-            Ok(()) => Ok(()),
-            Err(TryReplyError::ClaimUnavailable(error)) => Err(error),
-            Err(TryReplyError::Enqueue(fallback)) => fallback.reply_bytes(response).await,
-        }
+    /// Await bounded complete-owner admission without a speculative clone.
+    /// Success transfers the owner to the writer. Cancellation before admission
+    /// drops it; connection closure and impossible retained capacity return errors.
+    pub async fn reply_bytes_guaranteed(self, response: crate::ForwardPayload) -> Result<()> {
+        self.reply_owned(response).await
     }
 
     /// Try to reply through the connection's immediate nonblocking queue.
@@ -656,9 +1098,9 @@ impl AskResponder {
     /// the reply claim, preserving at-most-once ownership across sibling
     /// responders. Use [`Self::try_reply_bytes_immediate_with_fallback`] when
     /// the caller needs an exclusive retry or fallback path.
-    pub fn try_reply_bytes_immediate(mut self, response: Bytes) -> Result<()> {
+    pub fn try_reply_bytes_immediate(mut self, response: crate::ForwardPayload) -> Result<()> {
         claim_reply(&self.used)?;
-        self.notify_observer(&response);
+        self.notify_observer_parts(None, response.as_ref(), response.len());
         self.sink
             .try_send_response_bytes_immediate(self.correlation_id, response)
     }
@@ -669,12 +1111,12 @@ impl AskResponder {
     /// fallback, which cannot be raced by a sibling).
     pub fn try_reply_bytes_immediate_with_fallback(
         mut self,
-        response: Bytes,
-    ) -> std::result::Result<(), TryReplyError> {
+        response: crate::ForwardPayload,
+    ) -> std::result::Result<(), TryReplyError<'a>> {
         if let Err(error) = claim_reply(&self.used) {
             return Err(TryReplyError::ClaimUnavailable(error));
         }
-        self.notify_observer(&response);
+        self.notify_observer_parts(None, response.as_ref(), response.len());
         match self
             .sink
             .try_send_response_bytes_immediate(self.correlation_id, response)
@@ -700,20 +1142,10 @@ impl AskResponder {
                 payload.chunk(),
                 payload_len,
             );
-            let bytes = pooled_payload_into_bytes(prefix, payload);
-            return self
-                .sink
-                .send_response_bytes(self.correlation_id, bytes)
-                .await;
         }
         self.sink
             .send_response_pooled(self.correlation_id, payload, prefix, payload_len)
             .await
-    }
-
-    #[inline]
-    fn notify_observer(&mut self, response: &Bytes) {
-        self.notify_observer_parts(None, response.as_ref(), response.len());
     }
 
     #[inline]
@@ -728,7 +1160,7 @@ impl AskResponder {
     }
 }
 
-impl std::fmt::Debug for AskResponder {
+impl std::fmt::Debug for AskResponder<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AskResponder")
             .field("correlation_id", &self.correlation_id)
@@ -739,82 +1171,50 @@ impl std::fmt::Debug for AskResponder {
 #[cfg(test)]
 mod contract_tests {
     use super::AskResponder;
-    use bytes::Bytes;
 
     // Authority-voter replies must have an explicit immediate, nonblocking
     // response path so a saturated ordinary control queue cannot starve the
     // quorum round-trip.
     #[allow(dead_code)]
     fn immediate_reply_api_is_available(responder: AskResponder) {
-        let _ = responder.try_reply_bytes_immediate(Bytes::new());
+        let _ = responder.try_reply_bytes_immediate(crate::ForwardPayload::from_static(b""));
     }
 }
 
 pub(crate) struct ResponseWriter {
     addr: SocketAddr,
-    stream_handle: ArcSwapOption<LockFreeStreamHandle>,
+    stream_handle: OnceLock<Arc<LockFreeStreamHandle>>,
 }
 
 impl ResponseWriter {
     pub(crate) fn new(addr: SocketAddr) -> Self {
         Self {
             addr,
-            stream_handle: ArcSwapOption::empty(),
+            stream_handle: OnceLock::new(),
         }
     }
 
-    pub(crate) fn bind_stream_handle(&self, stream_handle: Arc<LockFreeStreamHandle>) {
-        self.stream_handle.store(Some(stream_handle));
+    /// Bind once to the physical stream that created this response writer.
+    /// A delayed responder must never resolve a replacement stream at send time.
+    pub(crate) fn bind_stream_handle(
+        &self,
+        stream_handle: Arc<LockFreeStreamHandle>,
+    ) -> Result<()> {
+        self.stream_handle.set(stream_handle).map_err(|_| {
+            GossipError::Network(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "response writer is already bound to its physical stream",
+            ))
+        })
     }
 
-    pub(crate) fn stream_handle(&self) -> Result<Arc<LockFreeStreamHandle>> {
-        self.stream_handle.load_full().ok_or_else(|| {
+    pub(crate) fn stream_handle(&self) -> Result<&Arc<LockFreeStreamHandle>> {
+        self.stream_handle.get().ok_or_else(|| {
             GossipError::Network(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
                 format!("response stream handle is not available for {}", self.addr),
             ))
         })
-    }
-
-    async fn send_response_bytes(&self, correlation_id: u32, payload: Bytes) -> Result<()> {
-        self.stream_handle()?
-            .send_response_auto_bytes(correlation_id, payload)
-            .await
-    }
-
-    fn try_send_response_bytes(&self, correlation_id: u32, payload: Bytes) -> Result<()> {
-        let stream_handle = self.stream_handle()?;
-        reject_oversize_for_nonblocking_lane(&stream_handle, payload.len())?;
-        let header = framing::try_write_ask_response_header(
-            crate::MessageType::Response,
-            correlation_id,
-            payload.len(),
-        )?;
-        stream_handle.write_header_and_payload_control_inline_nonblocking(header, 16, payload)
-    }
-
-    fn try_send_response_bytes_immediate(&self, correlation_id: u32, payload: Bytes) -> Result<()> {
-        let stream_handle = self.stream_handle()?;
-        reject_oversize_for_nonblocking_lane(&stream_handle, payload.len())?;
-        let header = framing::try_write_ask_response_header(
-            crate::MessageType::Response,
-            correlation_id,
-            payload.len(),
-        )?;
-        stream_handle
-            .write_header_and_payload_control_inline_immediate_nonblocking(header, 16, payload)
-    }
-
-    async fn send_response_pooled(
-        &self,
-        correlation_id: u32,
-        payload: crate::typed::PooledPayload,
-        prefix: Option<[u8; 16]>,
-        payload_len: usize,
-    ) -> Result<()> {
-        let stream_handle = self.stream_handle()?;
-        send_pooled_via_stream_handle(&stream_handle, correlation_id, payload, prefix, payload_len)
-            .await
     }
 }
 
@@ -823,6 +1223,177 @@ mod tests {
     use super::*;
     use crate::connection_pool::{BufferConfig, ChannelId};
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn session_tokens_reject_foreign_and_stale_claims_without_owner_churn() {
+        use crate::ask_forwarder::allocation_evidence;
+
+        let (io, mut peer) = tokio::io::duplex(4096);
+        let (handle, writer_task, _) = LockFreeStreamHandle::new(
+            io,
+            "127.0.0.1:40704".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let handle = Arc::new(handle);
+        let first_context = AskContext::from_stream_handle_with_request_id(1, &handle, None, None);
+        let session = first_context
+            .responder()
+            .reply_session_with_capacity(1)
+            .unwrap();
+        let foreign = first_context
+            .responder()
+            .reply_session_with_capacity(1)
+            .unwrap();
+        let references = Arc::strong_count(&handle);
+        let (token, counts) = allocation_evidence::measure(|| {
+            let responder = first_context.responder();
+            let rejected = responder.prepare_forward_reply(&session).unwrap();
+            drop(rejected);
+            assert!(!first_context.used.load(Ordering::Acquire));
+            responder.into_forward_reply(&session).unwrap()
+        });
+        assert_eq!(counts.allocations, 0);
+        assert_eq!(counts.reallocations, 0);
+        assert_eq!(Arc::strong_count(&handle), references);
+        let successor_context =
+            AskContext::from_stream_handle_with_request_id(2, &handle, None, None);
+        assert!(matches!(
+            successor_context.responder().into_forward_reply(&session),
+            Err(GossipError::WriteQueueFull)
+        ));
+        assert!(!successor_context.used.load(Ordering::Acquire));
+        assert!(matches!(
+            foreign.try_reply_owned(token, crate::ForwardPayload::from_static(b"foreign")),
+            Err(GossipError::InvalidConfig(_))
+        ));
+        session.cancel(token);
+        let successor = successor_context
+            .responder()
+            .into_forward_reply(&session)
+            .unwrap();
+        assert_ne!(successor.generation, token.generation);
+        let (_, stale_counts) = allocation_evidence::measure(|| session.cancel(token));
+        assert_eq!(stale_counts.allocations, 0);
+        assert_eq!(
+            session.free.len(),
+            0,
+            "stale cancellation cannot release the successor"
+        );
+        session
+            .reply_owned(successor, crate::ForwardPayload::from_static(b"successor"))
+            .await
+            .unwrap();
+        let mut wire = [0_u8; framing::ASK_RESPONSE_FRAME_HEADER_LEN + b"successor".len()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read_exact(&mut peer, &mut wire),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            &wire[framing::ASK_RESPONSE_FRAME_HEADER_LEN..],
+            b"successor"
+        );
+        assert_eq!(session.free.len(), 1);
+        handle.shutdown();
+        let _ = writer_task.await;
+    }
+
+    #[tokio::test]
+    async fn reply_token_generation_exhaustion_never_reissues_or_claims_context() {
+        let (io, _peer) = tokio::io::duplex(4096);
+        let (handle, writer_task, _) = LockFreeStreamHandle::new(
+            io,
+            "127.0.0.1:40705".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let handle = Arc::new(handle);
+        let context = AskContext::from_stream_handle_with_request_id(1, &handle, None, None);
+        let session = context.responder().reply_session_with_capacity(1).unwrap();
+        session.cells[0]
+            .state
+            .store(TOKEN_GENERATION_MAX << 2, Ordering::Release);
+        assert!(matches!(
+            context.responder().into_forward_reply(&session),
+            Err(GossipError::WriteQueueFull)
+        ));
+        assert_eq!(session.free.len(), 0);
+        assert!(!context.used.load(Ordering::Acquire));
+        assert!(matches!(
+            context.responder().into_forward_reply(&session),
+            Err(GossipError::WriteQueueFull)
+        ));
+        assert!(!context.used.load(Ordering::Acquire));
+        handle.shutdown();
+        let _ = writer_task.await;
+    }
+
+    #[tokio::test]
+    async fn owned_reply_observer_borrows_original_storage_and_preserves_claim() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct BorrowedObserver(AtomicUsize);
+
+        impl AskReplyObserver for BorrowedObserver {
+            fn reply_claimed(&self, _: Bytes) {
+                panic!("owned reply must use the borrowed observer seam");
+            }
+
+            fn reply_claimed_borrowed(&self, payload: ReplyPayloadRef<'_>) {
+                self.0
+                    .store(payload.payload().as_ptr() as usize, Ordering::Release);
+            }
+        }
+
+        let (io, mut peer) = tokio::io::duplex(4096);
+        let (stream, task, _) = LockFreeStreamHandle::new(
+            io,
+            "127.0.0.1:40695".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let stream = Arc::new(stream);
+        let observer = Arc::new(BorrowedObserver(AtomicUsize::new(0)));
+        let responder =
+            AskResponder::from_stream_handle(73, stream.clone(), Arc::new(AtomicBool::new(false)))
+                .with_reply_observer(observer.clone());
+        let sibling = responder.clone();
+        let payload = crate::ForwardPayload::from(b"owned-reply".to_vec());
+        let pointer = payload.as_ref().as_ptr() as usize;
+        responder.reply_owned(payload).await.unwrap();
+        assert_eq!(observer.0.load(Ordering::Acquire), pointer);
+        let duplicate = sibling
+            .reply_owned(crate::ForwardPayload::from_static(b"duplicate"))
+            .await;
+        assert!(matches!(
+            duplicate,
+            Err(GossipError::Network(error))
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        let mut wire = [0_u8; framing::ASK_RESPONSE_FRAME_HEADER_LEN + b"owned-reply".len()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read_exact(&mut peer, &mut wire),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            &wire[framing::ASK_RESPONSE_FRAME_HEADER_LEN..],
+            b"owned-reply"
+        );
+        stream.shutdown();
+        let _ = task.await;
+    }
 
     #[derive(Default)]
     struct RecordingReplyObserver {
@@ -843,6 +1414,115 @@ mod tests {
         value: u64,
     }
     crate::wire_type!(ObservedTypedReply, "ask_responder::ObservedTypedReply");
+
+    #[tokio::test]
+    async fn owned_deferred_fallback_preserves_claim_and_recovers_after_binding() {
+        let writer = Arc::new(ResponseWriter::new("127.0.0.1:12353".parse().unwrap()));
+        let context = AskContext::from_writer(17, &writer, None);
+        let sibling = context.responder();
+        let fallback = match context
+            .responder()
+            .try_reply_owned_with_fallback(crate::ForwardPayload::from_static(b"first"))
+        {
+            Err(TryReplyError::Enqueue(fallback)) => fallback,
+            Ok(()) => panic!("unbound writer must reject enqueue"),
+            Err(TryReplyError::ClaimUnavailable(error)) => {
+                panic!("first responder must own the claim: {error:?}")
+            }
+        };
+        assert!(is_duplicate(&sibling.try_reply_owned_immediate(
+            crate::ForwardPayload::from_static(b"duplicate")
+        )));
+
+        let (io, mut peer) = tokio::io::duplex(4096);
+        let (handle, writer_task, _) = LockFreeStreamHandle::new(
+            io,
+            "127.0.0.1:12353".parse().unwrap(),
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let handle = Arc::new(handle);
+        writer.bind_stream_handle(Arc::clone(&handle)).unwrap();
+        fallback
+            .try_reply_owned_immediate(crate::ForwardPayload::from_static(b"recovered"))
+            .unwrap();
+        let mut wire = [0_u8; framing::ASK_RESPONSE_FRAME_HEADER_LEN + b"recovered".len()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read_exact(&mut peer, &mut wire),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            &wire[framing::ASK_RESPONSE_FRAME_HEADER_LEN..],
+            b"recovered"
+        );
+        handle.shutdown();
+        let _ = writer_task.await;
+    }
+
+    #[tokio::test]
+    async fn deferred_writer_rebinding_cannot_retarget_an_old_responder() {
+        let address = "127.0.0.1:12355".parse().unwrap();
+        let writer = Arc::new(ResponseWriter::new(address));
+        let context = AskContext::from_writer(19, &writer, None);
+        let old_responder = context.responder();
+        let (first_io, _first_peer) = tokio::io::duplex(4096);
+        let (second_io, _second_peer) = tokio::io::duplex(4096);
+        let (first, first_task, _) = LockFreeStreamHandle::new(
+            first_io,
+            address,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let (second, second_task, _) = LockFreeStreamHandle::new(
+            second_io,
+            address,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let first = Arc::new(first);
+        let second = Arc::new(second);
+        writer.bind_stream_handle(Arc::clone(&first)).unwrap();
+        let rejected = writer.bind_stream_handle(Arc::clone(&second));
+        assert!(matches!(
+            rejected,
+            Err(GossipError::Network(error))
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert!(Arc::ptr_eq(&writer.stream_handle().unwrap(), &first));
+        assert!(Arc::ptr_eq(
+            &old_responder.stream_handle_for_lease().unwrap(),
+            &first
+        ));
+        first.shutdown();
+        second.shutdown();
+        let _ = first_task.await;
+        let _ = second_task.await;
+    }
+
+    #[test]
+    fn owned_fallback_never_confuses_a_duplicate_with_rejected_enqueue() {
+        let writer = Arc::new(ResponseWriter::new("127.0.0.1:12354".parse().unwrap()));
+        let context = AskContext::from_writer(18, &writer, None);
+        let first = context.responder();
+        let second = context.responder();
+        assert!(matches!(
+            first.try_reply_owned_with_fallback(crate::ForwardPayload::from_static(b"first")),
+            Err(TryReplyError::Enqueue(_))
+        ));
+        assert!(matches!(
+            second.try_reply_owned_with_fallback(crate::ForwardPayload::from_static(b"second")),
+            Err(TryReplyError::ClaimUnavailable(_))
+        ));
+    }
 
     #[test]
     fn ask_context_exposes_authenticated_peer_id() {
@@ -875,12 +1555,12 @@ mod tests {
         // need the bytes to replay a side effect whose direct reply was lost.
         let first_result = context
             .responder()
-            .try_reply_bytes(Bytes::from_static(b"reply"));
+            .try_reply_bytes(crate::ForwardPayload::from_static(b"reply"));
         assert!(first_result.is_err());
 
         let duplicate_result = context
             .responder()
-            .try_reply_bytes(Bytes::from_static(b"again"));
+            .try_reply_bytes(crate::ForwardPayload::from_static(b"again"));
         assert!(is_duplicate(&duplicate_result));
 
         let payloads = observer
@@ -935,8 +1615,8 @@ mod tests {
 
         // The first claims the guard (the send itself only fails here because no
         // stream handle is bound in this unit test — the guard is still taken).
-        let first_result = first.try_reply_bytes(Bytes::from_static(b"a"));
-        let second_result = second.try_reply_bytes(Bytes::from_static(b"b"));
+        let first_result = first.try_reply_bytes(crate::ForwardPayload::from_static(b"a"));
+        let second_result = second.try_reply_bytes(crate::ForwardPayload::from_static(b"b"));
 
         assert!(
             !is_duplicate(&first_result),
@@ -951,8 +1631,8 @@ mod tests {
         let ctx2 = AskContext::from_writer(9, &writer, None);
         let responder = ctx2.responder();
         let clone = responder.clone();
-        let _ = responder.try_reply_bytes(Bytes::from_static(b"x"));
-        let clone_result = clone.try_reply_bytes(Bytes::from_static(b"y"));
+        let _ = responder.try_reply_bytes(crate::ForwardPayload::from_static(b"x"));
+        let clone_result = clone.try_reply_bytes(crate::ForwardPayload::from_static(b"y"));
         assert!(
             is_duplicate(&clone_result),
             "a clone must not send a second reply: {clone_result:?}"
@@ -966,13 +1646,14 @@ mod tests {
 
         let immediate = context.responder();
         let sibling = context.responder();
-        let immediate_result = immediate.try_reply_bytes_immediate(Bytes::from_static(b"fast"));
+        let immediate_result =
+            immediate.try_reply_bytes_immediate(crate::ForwardPayload::from_static(b"fast"));
         assert!(
             !is_duplicate(&immediate_result),
             "the owner sees the underlying enqueue failure, not a duplicate"
         );
         assert!(
-            is_duplicate(&sibling.try_reply_bytes(Bytes::from_static(b"sibling"))),
+            is_duplicate(&sibling.try_reply_bytes(crate::ForwardPayload::from_static(b"sibling"))),
             "a rejected immediate enqueue must not release ownership to a sibling"
         );
 
@@ -980,7 +1661,7 @@ mod tests {
         let retry_sibling = retry_context.responder();
         let fallback = match retry_context
             .responder()
-            .try_reply_bytes_immediate_with_fallback(Bytes::from_static(b"fast"))
+            .try_reply_bytes_immediate_with_fallback(crate::ForwardPayload::from_static(b"fast"))
         {
             Ok(()) => panic!("unbound writer must reject immediate enqueue"),
             Err(TryReplyError::ClaimUnavailable(error)) => {
@@ -989,10 +1670,13 @@ mod tests {
             Err(TryReplyError::Enqueue(fallback)) => fallback,
         };
         assert!(
-            is_duplicate(&retry_sibling.try_reply_bytes(Bytes::from_static(b"sibling"))),
+            is_duplicate(
+                &retry_sibling.try_reply_bytes(crate::ForwardPayload::from_static(b"sibling"))
+            ),
             "fallback ownership must remain exclusive to the original responder"
         );
-        let retry_result = fallback.try_reply_bytes(Bytes::from_static(b"fallback"));
+        let retry_result =
+            fallback.try_reply_bytes(crate::ForwardPayload::from_static(b"fallback"));
         assert!(
             !is_duplicate(&retry_result),
             "the original owner may choose a nonblocking fallback path"
@@ -1011,7 +1695,7 @@ mod tests {
             .with_reply_observer(Arc::clone(&observer) as Arc<dyn AskReplyObserver>);
         let fallback = match context
             .responder()
-            .try_reply_bytes_with_fallback(Bytes::from_static(b"first"))
+            .try_reply_bytes_with_fallback(crate::ForwardPayload::from_static(b"first"))
         {
             Err(TryReplyError::Enqueue(fallback)) => fallback,
             Ok(()) => panic!("an unbound writer must reject the initial enqueue"),
@@ -1029,11 +1713,13 @@ mod tests {
             None,
             None,
         );
-        writer.bind_stream_handle(Arc::new(handle));
+        writer.bind_stream_handle(Arc::new(handle)).unwrap();
         let budget =
             crate::ReplyDeliveryBudget::new(1, 32, crate::ReplyPayload::from_static(b"cancelled"))
                 .unwrap();
-        let lease = fallback.try_into_reply_lease(&budget, 9).unwrap();
+        let reply_session = context.reply_session().unwrap();
+        let delivery = budget.bind(&reply_session).unwrap();
+        let lease = fallback.try_into_reply_lease(&delivery, 9).unwrap();
         lease
             .try_reply_bytes(crate::ReplyPayload::from_static(b"second"))
             .unwrap();
@@ -1066,14 +1752,18 @@ mod tests {
         let budget =
             crate::ReplyDeliveryBudget::new(1, 32, crate::ReplyPayload::from_static(b"cancelled"))
                 .expect("valid budget");
+        let reply_session = AskContext::from_stream_handle_with_request_id(0, &handle, None, None)
+            .reply_session()
+            .unwrap();
+        let delivery = budget.bind(&reply_session).unwrap();
         let lease = AskResponder::from_stream_handle(
             17,
             Arc::clone(&handle),
             Arc::new(AtomicBool::new(false)),
         )
-        .try_reply_lease(&budget, 9)
+        .try_reply_lease(&delivery, 9)
         .expect("lease admission");
-        let record = Arc::clone(&lease.record);
+        let record = lease.record.clone();
         {
             let future = lease.reply_bytes(crate::ReplyPayload::from_static(b"reply"));
             tokio::pin!(future);
@@ -1107,9 +1797,9 @@ mod tests {
 
         // First reply claims the shared guard (its send fails only because no
         // stream handle is bound in this unit test).
-        let _ = first.try_reply_bytes_with_fallback(Bytes::from_static(b"first"));
+        let _ = first.try_reply_bytes_with_fallback(crate::ForwardPayload::from_static(b"first"));
 
-        match second.try_reply_bytes_with_fallback(Bytes::from_static(b"second")) {
+        match second.try_reply_bytes_with_fallback(crate::ForwardPayload::from_static(b"second")) {
             Ok(()) => panic!("a claim already held by a sibling must not succeed"),
             Err(TryReplyError::Enqueue(_)) => panic!(
                 "a claim already held by a sibling must not be reported as a \
@@ -1291,10 +1981,8 @@ mod size_gate_tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(3), task).await;
     }
 
-    /// Same gap, the nonblocking `Bytes` reply lane
-    /// (`try_reply_bytes` -> `try_send_response_bytes`): its own
-    /// `reject_oversize_for_nonblocking_lane` pre-check only compares
-    /// against the streaming threshold.
+    /// The complete-owner nonblocking lane must enforce the inline frame limit
+    /// even when the streaming threshold is higher.
     #[tokio::test]
     async fn qa_re_nonblocking_bytes_reply_over_max_message_size_is_rejected() {
         let max_message_size = 64;
@@ -1304,7 +1992,7 @@ mod size_gate_tests {
 
         let payload_len = max_message_size - crate::framing::ASK_RESPONSE_HEADER_LEN + 1;
         let err = responder
-            .try_reply_bytes(Bytes::from(vec![0u8; payload_len]))
+            .try_reply_bytes(crate::ForwardPayload::from(vec![0u8; payload_len]))
             .unwrap_err();
         assert!(
             matches!(err, crate::GossipError::MessageTooLarge { .. }),

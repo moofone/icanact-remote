@@ -145,10 +145,10 @@ impl crate::registry::ActorAskImmediateHandlerSync for QaHiddenOwnerHandler {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.live.fetch_add(1024 * 1024, Ordering::SeqCst);
         Ok(crate::registry::AskDisposition::ImmediateBytes(
-            bytes::Bytes::from_owner(QaHiddenOwner {
+            crate::ForwardPayload::from_test_owner(QaHiddenOwner {
                 data: vec![7; 1024 * 1024],
                 live: self.live.clone(),
-            }),
+            }, 1024 * 1024),
         ))
     }
 }

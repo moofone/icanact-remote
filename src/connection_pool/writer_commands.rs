@@ -1,6 +1,14 @@
 /// Commands for the per-connection writer.
 #[derive(Debug)]
 enum WriteCommand {
+    /// Typed and generic framing was decoded once by producer admission. Only slab
+    /// indices cross the queue; the physical stream owns the fixed storage.
+    Admitted {
+        payload: WritePayload,
+        frames: outcome_window::AdmittedFrames,
+        immediate: bool,
+        ask: bool,
+    },
     /// Queued payload writes (tell/ask/control frames).
     Payload(WritePayload),
     /// Latency-sensitive data-plane write; write and flush as soon as the IO owner sees it.
@@ -10,29 +18,29 @@ enum WriteCommand {
 }
 
 /// Commands for streaming operations.
-// The direct write command remains part of the writer-owned transport command set.
-#[allow(dead_code)]
 enum StreamingCommand {
     /// Direct write bytes for streaming.
+    #[cfg(test)]
     WriteBytes(bytes::Bytes),
     /// Flush the writer.
     Flush,
-    /// Vectored write for header + payload (zero-copy).
-    VectoredWrite(VectoredSendItem),
+    /// Producer-admitted fixed header; its original receipt follows the owner.
+    AdmittedVectored(VectoredSendItem, outcome_window::AdmittedFrames),
     /// Batch of owned chunks for streaming (zero-copy).
-    OwnedChunks(Vec<bytes::Bytes>),
+    OwnedChunks(Vec<bytes::Bytes>, outcome_window::AdmittedFrames),
     /// Pooled streaming response. The command retains the pooled payload and
     /// generates each frame header on demand, so admission never materializes
-    /// a second contiguous payload allocation.
-    PooledResponse(Box<PooledStreamingResponse>),
+    /// a second contiguous payload allocation. Command state is stored inline
+    /// in the preallocated queue, with no per-response Box allocation.
+    PooledResponse(PooledStreamingResponse),
     /// Bytes-backed streaming response. The command retains one ref-counted
     /// payload and generates each frame header lazily instead of expanding a
     /// large response into one queue command per frame.
-    BytesResponse(Box<BytesStreamingResponse>),
+    BytesResponse(BytesStreamingResponse),
     /// A bounded, connection-owned response lease. The slot record carries
     /// cancellation and terminal payload ownership; this command carries only
     /// the IO owner's frame progress.
-    LeasedResponse(Box<LeasedResponse>),
+    LeasedResponse(LeasedResponse),
     /// Abort a partially transmitted stream. This stays on the streaming FIFO
     /// so it cannot overtake data chunks that were already accepted.
     Abort { stream_id: u32, reason: u32 },
@@ -63,15 +71,17 @@ struct PooledStreamingResponse {
     frame_offset: usize,
 }
 
-/// A lazily framed response backed by an already-owned `Bytes` payload.
+/// A leased response stays in the IO owner's local pending/resumed queues.
+/// It must never enter a shared producer queue: the cold writer authority is
+/// dropped after all local stages and releases any abandoned numeric tokens.
 struct LeasedResponse {
     stage: LeasedResponseStage,
-    record: std::sync::Arc<crate::connection_pool::reply_slots::ReplySlotRecord>,
+    record: Option<crate::connection_pool::reply_slots::ReplySlotWriterToken>,
 }
 
 enum LeasedResponseStage {
     Reserved,
-    WritingNormal(Box<BytesStreamingResponse>),
+    WritingNormal(BytesStreamingResponse),
     WritingInline {
         header: [u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN],
         payload: crate::ReplyPayload,
@@ -81,16 +91,31 @@ enum LeasedResponseStage {
     },
     WritingTerminal {
         header: [u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN],
-        payload: std::sync::Arc<crate::ReplyPayload>,
     },
     Flushing,
     Complete,
 }
 
+enum StreamingResponsePayload {
+    Bytes(bytes::Bytes),
+    Owned(crate::ForwardPayload),
+}
+
+impl std::ops::Deref for StreamingResponsePayload {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Bytes(payload) => payload.as_ref(),
+            Self::Owned(payload) => payload.as_ref(),
+        }
+    }
+}
+
 struct BytesStreamingResponse {
     stream_id: u32,
     correlation_id: u32,
-    payload: bytes::Bytes,
+    payload: StreamingResponsePayload,
     payload_len: usize,
     /// Bytes retained by the backing allocation, which can exceed the visible
     /// slice length when a handler returns a sub-slice of a larger `Bytes`.
@@ -106,6 +131,38 @@ impl BytesStreamingResponse {
         stream_id: u32,
         correlation_id: u32,
         payload: bytes::Bytes,
+        retained_bytes: usize,
+        chunk_size: usize,
+    ) -> Self {
+        Self::with_payload(
+            stream_id,
+            correlation_id,
+            StreamingResponsePayload::Bytes(payload),
+            retained_bytes,
+            chunk_size,
+        )
+    }
+
+    fn new_owned(
+        stream_id: u32,
+        correlation_id: u32,
+        payload: crate::ForwardPayload,
+        retained_bytes: usize,
+        chunk_size: usize,
+    ) -> Self {
+        Self::with_payload(
+            stream_id,
+            correlation_id,
+            StreamingResponsePayload::Owned(payload),
+            retained_bytes,
+            chunk_size,
+        )
+    }
+
+    fn with_payload(
+        stream_id: u32,
+        correlation_id: u32,
+        payload: StreamingResponsePayload,
         retained_bytes: usize,
         chunk_size: usize,
     ) -> Self {
@@ -246,6 +303,7 @@ const STREAM_CHUNK_INVARIANT: &str =
 /// socket and having the peer receive them, which is the dominant cost on
 /// this path regardless. If a workload makes this genuinely hot, that is a
 /// measurement to bring back, not a reason to return to estimating.
+#[cfg(test)]
 fn normalize_streaming_payload(payload: bytes::Bytes) -> (bytes::Bytes, usize) {
     let payload_len = payload.len();
     let compact = bytes::Bytes::copy_from_slice(&payload);
@@ -469,7 +527,7 @@ impl LocalStreamingQueue {
             .saturating_add(2)
             .min(STREAMING_RESPONSE_QUEUE_COMMAND_CAP);
         Self {
-            queue: std::collections::VecDeque::new(),
+            queue: std::collections::VecDeque::with_capacity(STREAMING_RESPONSE_QUEUE_COMMAND_CAP),
             queued_bytes: 0,
             response_in_flight: false,
             suspended_response: false,
@@ -481,7 +539,7 @@ impl LocalStreamingQueue {
             deferred: None,
             deferred_bytes: 0,
             wire_blocked: false,
-            pending_ask_nacks: std::collections::VecDeque::new(),
+            pending_ask_nacks: std::collections::VecDeque::with_capacity(PENDING_ASK_NACK_CAP),
         }
     }
 
@@ -489,18 +547,11 @@ impl LocalStreamingQueue {
     /// The read side reserves capacity before dispatch. An invariant violation
     /// is an explicit error, not unbounded growth or eviction of an older reply.
     ///
-    /// Never evicts an already-queued entry to make room for a new one:
-    /// that header is the *only* remaining record that a specific,
-    /// already-consumed ask exists at all. Dropping it silently loses that
-    /// ask's terminal outcome -- no reply, no NACK, just a correlation id
-    /// the requester eventually times out waiting on. That is exactly the
-    /// failure this whole NACK mechanism exists to remove; reintroducing it
-    /// one layer down, inside the queue built to prevent it, defeats the
-    /// point. Bounding growth is the read side's job instead: `io_task`'s
-    /// read-batch loops gate further reads on `has_room_for_ask_nack` (see
-    /// that method), so this is structurally never called while the queue
-    /// is already at `PENDING_ASK_NACK_CAP` -- growth stops at the source
-    /// of new entries, not by discarding existing ones.
+    /// Every admitted request owns a negotiated terminal-window cell until
+    /// its complete reply is written. Therefore even when every outcome is a
+    /// NACK this preallocated lane has room for all admitted requests. Reads
+    /// continue at saturation; a peer exceeding its window is rejected by
+    /// OutcomeStream before dispatch rather than blocking unrelated control.
     fn queue_ask_nack(
         &mut self,
         header: [u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN],
@@ -767,10 +818,11 @@ impl LocalStreamingQueue {
 
 fn streaming_command_bytes(command: &StreamingCommand) -> usize {
     match command {
+        #[cfg(test)]
         StreamingCommand::WriteBytes(data) => data.len(),
         StreamingCommand::Flush => 0,
-        StreamingCommand::VectoredWrite(item) => item.header.len() + item.payload.len(),
-        StreamingCommand::OwnedChunks(chunks) => chunks.iter().map(bytes::Bytes::len).sum(),
+        StreamingCommand::AdmittedVectored(item, _) => item.header.len() + item.payload.len(),
+        StreamingCommand::OwnedChunks(chunks, _) => chunks.iter().map(bytes::Bytes::len).sum(),
         StreamingCommand::PooledResponse(response) => response.retained_len(),
         StreamingCommand::BytesResponse(response) => response.retained_len(),
         StreamingCommand::LeasedResponse(_) => 0,
@@ -863,6 +915,7 @@ struct PendingStreamingCommand {
     /// therefore complete that queue's response/Flush reservation.
     from_local_response_queue: bool,
     yield_after_frame: bool,
+    frame_cursor: outcome_window::AdmittedCursor,
 }
 
 impl PendingStreamingCommand {
@@ -873,6 +926,7 @@ impl PendingStreamingCommand {
             from_shared_queue: true,
             from_local_response_queue: false,
             yield_after_frame: false,
+            frame_cursor: outcome_window::AdmittedCursor::default(),
         }
     }
 
@@ -883,6 +937,7 @@ impl PendingStreamingCommand {
             from_shared_queue: false,
             from_local_response_queue: false,
             yield_after_frame: false,
+            frame_cursor: outcome_window::AdmittedCursor::default(),
         }
     }
 
@@ -893,6 +948,7 @@ impl PendingStreamingCommand {
             from_shared_queue: false,
             from_local_response_queue: true,
             yield_after_frame: false,
+            frame_cursor: outcome_window::AdmittedCursor::default(),
         }
     }
 }
@@ -900,16 +956,17 @@ impl PendingStreamingCommand {
 impl std::fmt::Debug for StreamingCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(test)]
             StreamingCommand::WriteBytes(bytes) => {
                 f.debug_tuple("WriteBytes").field(&bytes.len()).finish()
             }
             StreamingCommand::Flush => f.write_str("Flush"),
-            StreamingCommand::VectoredWrite(item) => f
+            StreamingCommand::AdmittedVectored(item, _) => f
                 .debug_struct("VectoredWrite")
                 .field("header_len", &item.header.len())
                 .field("payload_len", &item.payload.len())
                 .finish(),
-            StreamingCommand::OwnedChunks(chunks) => f
+            StreamingCommand::OwnedChunks(chunks, _) => f
                 .debug_struct("OwnedChunks")
                 .field("chunk_count", &chunks.len())
                 .field("total_len", &chunks.iter().map(|c| c.len()).sum::<usize>())
@@ -926,7 +983,7 @@ impl std::fmt::Debug for StreamingCommand {
                 .finish(),
             StreamingCommand::LeasedResponse(response) => f
                 .debug_struct("LeasedResponse")
-                .field("correlation_id", &response.record.correlation_id())
+                .field("has_reservation", &response.record.is_some())
                 .finish(),
             StreamingCommand::Abort { stream_id, reason } => f
                 .debug_struct("Abort")

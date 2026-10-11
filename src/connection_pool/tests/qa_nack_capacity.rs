@@ -7,16 +7,32 @@ static NACK_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(()
 const ASK_COUNT: u32 = 20_000;
 const BOUND: Duration = Duration::from_secs(15);
 
-fn ask_frames() -> Vec<u8> {
-    let mut frames = Vec::new();
+async fn send_windowed_asks<W: tokio::io::AsyncWrite + Unpin>(
+    sender: &mut W,
+    credits: &tokio::sync::Semaphore,
+) -> std::io::Result<()> {
     for id in 1..=ASK_COUNT {
-        frames.extend_from_slice(&crate::framing::write_direct_ask_header(id, id as u64, 1));
-        frames.push(b'x');
+        credits
+            .acquire()
+            .await
+            .expect("test credit window remains open")
+            .forget();
+        sender
+            .write_all(&crate::framing::write_direct_ask_header(
+                id,
+                u64::from(id),
+                1,
+            ))
+            .await?;
+        sender.write_all(b"x").await?;
     }
-    frames
+    sender.flush().await
 }
 
-async fn verify_all_replies<R: AsyncRead + Unpin>(reader: &mut R) {
+async fn verify_all_replies<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    credits: &tokio::sync::Semaphore,
+) {
     for expected in 1..=ASK_COUNT {
         loop {
             let mut prefix = [0; crate::framing::LENGTH_PREFIX_LEN];
@@ -34,6 +50,7 @@ async fn verify_all_replies<R: AsyncRead + Unpin>(reader: &mut R) {
                 crate::framing::ask_nack_reason(&body),
                 Some(crate::framing::AskNackReason::NoDispatcher),
             );
+            credits.add_permits(1);
             break;
         }
     }
@@ -128,15 +145,12 @@ async fn sustained_direct_asks_bound_nacks_in_primary_and_idle_paths() {
                 .unwrap();
         }
         let (mut reader, mut sender) = tokio::io::split(peer);
-        let frames = ask_frames();
+        let credits = tokio::sync::Semaphore::new(PENDING_ASK_NACK_CAP);
         tokio::time::timeout(BOUND, async {
             tokio::try_join!(
+                async { send_windowed_asks(&mut sender, &credits).await },
                 async {
-                    sender.write_all(&frames).await?;
-                    sender.flush().await
-                },
-                async {
-                    verify_all_replies(&mut reader).await;
+                    verify_all_replies(&mut reader, &credits).await;
                     Ok::<_, std::io::Error>(())
                 },
             )
@@ -203,15 +217,12 @@ async fn sustained_authenticated_tls_direct_asks_bound_nacks_and_deliver_all_rep
     tls.write_all(data.as_ref()).await.unwrap();
     tls.flush().await.unwrap();
     let (mut reader, mut sender) = tokio::io::split(tls);
-    let frames = ask_frames();
+    let credits = tokio::sync::Semaphore::new(PENDING_ASK_NACK_CAP);
     tokio::time::timeout(BOUND, async {
         tokio::try_join!(
+            async { send_windowed_asks(&mut sender, &credits).await },
             async {
-                sender.write_all(&frames).await?;
-                sender.flush().await
-            },
-            async {
-                verify_all_replies(&mut reader).await;
+                verify_all_replies(&mut reader, &credits).await;
                 Ok::<_, std::io::Error>(())
             },
         )
@@ -219,6 +230,99 @@ async fn sustained_authenticated_tls_direct_asks_bound_nacks_and_deliver_all_rep
     })
     .await
     .expect("sustained accepted-peer TLS traffic must receive every ordered NACK");
-    handle.shutdown().await;
+    handle.shutdown().await.unwrap();
     assert_bounded("authenticated TLS");
+}
+
+/// Actual IO-owner regression: 64 accepted NACK outcomes, no outbound space,
+/// then inbound control and a reverse-direction terminal must still progress.
+#[tokio::test(flavor = "current_thread")]
+async fn full_nack_window_keeps_actual_io_owner_duplex_progress() {
+    let _guard = NACK_TEST_LOCK.lock().await;
+    let addr = "127.0.0.1:44371".parse().unwrap();
+    let registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
+        addr,
+        crate::GossipConfig {
+            key_pair: Some(crate::KeyPair::new_for_testing("full-window-duplex")),
+            ..Default::default()
+        },
+    ));
+    let tracker = CorrelationTracker::new();
+    let mut context = super::response_budget_read_context(&registry, addr);
+    context.response_correlation = Some(tracker.clone());
+    let (io, mut peer) = tokio::io::duplex(16);
+    let (writer, task, _) = LockFreeStreamHandle::new(
+        io,
+        addr,
+        ChannelId::TellAsk,
+        BufferConfig::default(),
+        None,
+        Some(context),
+    );
+    let slot = tracker.allocate_for_session(writer.instance_id()).unwrap();
+    let id = slot.id();
+    writer
+        .write_direct_ask_inline(
+            crate::framing::write_direct_ask_header(id, u64::from(id), 0),
+            bytes::Bytes::new(),
+        )
+        .await
+        .unwrap();
+    let mut outbound_ask = [0; 16];
+    peer.read_exact(&mut outbound_ask).await.unwrap();
+    assert_eq!(
+        u32::from_be_bytes(outbound_ask[4..8].try_into().unwrap()),
+        id
+    );
+    // Fill the outbound socket with a non-request frame, then stop draining it.
+    writer
+        .write_trusted_bytes_control(bytes::Bytes::copy_from_slice(
+            &crate::framing::write_ask_nack_header(0, crate::framing::AskNackReason::Backpressure),
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(BOUND, async {
+        while writer.bytes_written() != 32 {
+            tokio::task::yield_now().await;
+        }
+        for request in 1..=64 {
+            peer.write_all(&crate::framing::write_direct_ask_header(
+                request,
+                u64::from(request),
+                0,
+            ))
+            .await
+            .unwrap();
+        }
+        peer.write_all(&crate::framing::write_stream_abort_header(777, 2))
+            .await
+            .unwrap();
+        peer.write_all(&crate::framing::write_ask_nack_header(
+            id,
+            crate::framing::AskNackReason::HandlerError,
+        ))
+        .await
+        .unwrap();
+        let terminal = tracker.wait_for_response_no_timeout(id).await;
+        assert!(matches!(
+            terminal,
+            Err(GossipError::AskNacked(
+                crate::framing::AskNackReason::HandlerError
+            ))
+        ));
+    })
+    .await
+    .expect("full 64-outcome lane must read reverse reply without outbound progress");
+    assert_eq!(
+        writer.bytes_written(),
+        32,
+        "all 64 consumed asks still own their NACKs: no outbound byte freed capacity"
+    );
+    assert!(
+        !writer.exit_flag.load(Ordering::Acquire),
+        "healthy saturation must not close the stream"
+    );
+    drop(peer);
+    writer.shutdown();
+    tokio::time::timeout(BOUND, task).await.unwrap().unwrap();
 }

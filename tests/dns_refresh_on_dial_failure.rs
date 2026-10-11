@@ -18,6 +18,8 @@ struct ScriptedResolver {
     // dns_name -> sequence of results returned on successive lookups
     scripted: Mutex<HashMap<String, Vec<Vec<SocketAddr>>>>,
     calls: AtomicUsize,
+    first_lookup_started: tokio::sync::Notify,
+    first_lookup_release: Option<tokio::sync::Semaphore>,
 }
 
 impl ScriptedResolver {
@@ -27,7 +29,19 @@ impl ScriptedResolver {
         Self {
             scripted: Mutex::new(scripted),
             calls: AtomicUsize::new(0),
+            first_lookup_started: tokio::sync::Notify::new(),
+            first_lookup_release: None,
         }
+    }
+
+    fn gated(dns: &str, script: Vec<Vec<SocketAddr>>) -> Self {
+        let mut resolver = Self::with_script(dns, script);
+        resolver.first_lookup_release = Some(tokio::sync::Semaphore::new(0));
+        resolver
+    }
+
+    fn release_first_lookup(&self) {
+        self.first_lookup_release.as_ref().unwrap().add_permits(1);
     }
 
     fn calls(&self) -> usize {
@@ -38,7 +52,13 @@ impl ScriptedResolver {
 impl DnsResolver for ScriptedResolver {
     fn lookup<'a>(&'a self, dns: &'a str) -> BoxFuture<'a, io::Result<Vec<SocketAddr>>> {
         Box::pin(async move {
-            self.calls.fetch_add(1, Ordering::AcqRel);
+            let call = self.calls.fetch_add(1, Ordering::AcqRel);
+            if call == 0
+                && let Some(release) = self.first_lookup_release.as_ref()
+            {
+                self.first_lookup_started.notify_one();
+                release.acquire().await.unwrap().forget();
+            }
             let mut map = self.scripted.lock().unwrap();
             let Some(seq) = map.get_mut(dns) else {
                 return Ok(vec![]);
@@ -86,11 +106,18 @@ fn key_pair_ordered_for_outbound_a(seed_a: &str, seed_b: &str) -> (KeyPair, KeyP
     }
 }
 
-fn unused_local_addr() -> SocketAddr {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
-    drop(listener);
-    addr
+// Guard the port number against this fixture's IPv4 listeners/ephemeral use,
+// but dial IPv6 loopback, where no socket is bound or listening. On macOS a
+// SYN to a bound, non-listening TCP socket stalls instead of being refused;
+// that would consume the 150ms attempt budget before DNS can be consulted.
+fn reserved_refused_addr() -> (tokio::net::TcpSocket, SocketAddr) {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = socket.local_addr().unwrap().port();
+    (
+        socket,
+        SocketAddr::new(std::net::Ipv6Addr::LOCALHOST.into(), port),
+    )
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -102,15 +129,11 @@ async fn dial_failure_triggers_dns_refresh_and_reconnect_succeeds() -> icanact_r
 
     let a = new_registry_with_keypair("127.0.0.1:0".parse().unwrap(), a_keypair).await?;
 
-    let stale_addr = loop {
-        let candidate = unused_local_addr();
-        if candidate.port() != b_addr.port() {
-            break candidate;
-        }
-    };
+    let (_stale_port_reservation, stale_addr) = reserved_refused_addr();
+    assert_ne!(stale_addr, b_addr);
 
     let dns_name = format!("b.service.invalid:{}", b_addr.port());
-    let resolver = Arc::new(ScriptedResolver::with_script(&dns_name, vec![vec![b_addr]]));
+    let resolver = Arc::new(ScriptedResolver::gated(&dns_name, vec![vec![b_addr]]));
     a.registry.set_dns_resolver(resolver.clone()).await;
 
     // Configure a peer using a stale address + a DNS name that resolves to the live address.
@@ -121,23 +144,42 @@ async fn dial_failure_triggers_dns_refresh_and_reconnect_succeeds() -> icanact_r
             icanact_remote::addr_ownership::ClaimKind::Verified,
         )
         .await;
-    a.registry
-        .configure_peer(b_peer_id.clone(), stale_addr)
-        .await;
+    // Publish DNS metadata before activating the supervisor's route. Otherwise
+    // its first refused dial can precede the name and leave us in retry cooldown.
     a.registry
         .set_peer_dns_name(stale_addr, dns_name.clone())
         .await;
+    a.registry
+        .configure_peer(b_peer_id.clone(), stale_addr)
+        .await;
 
-    // connect_to_peer will dial stale_addr first, fail, refresh DNS, then retry the new address.
-    a.registry.connect_to_peer(&b_peer_id).await?;
+    // Hold the actual failure-triggered lookup until the stale route is
+    // observed. This pins the causal transition even if a supervisor is the
+    // first dialer; it does not add another dial or retry after an error.
+    let mut connect = Box::pin(a.registry.connect_to_peer(&b_peer_id));
+    tokio::select! {
+        result = &mut connect => panic!("dial finished before its DNS lookup: {result:?}"),
+        _ = resolver.first_lookup_started.notified() => {}
+    }
+    assert_eq!(
+        a.registry
+            .connection_pool
+            .get_configured_peer_addr(&b_peer_id),
+        Some(stale_addr)
+    );
+    assert!(!a.registry.connection_pool.has_connection(&stale_addr));
+    assert!(!a.registry.connection_pool.has_connection(&b_addr));
+    resolver.release_first_lookup();
+    connect.await?;
 
     let mapped = a
         .registry
         .connection_pool
-        .peer_id_to_addr
-        .read_sync(&b_peer_id, |_, v| *v)
+        .indexed_route_addr(&b_peer_id)
         .unwrap();
+    assert_ne!(stale_addr, b_addr, "the first dial must use a stale route");
     assert_eq!(mapped, b_addr);
+    assert!(a.registry.connection_pool.has_connection(&b_addr));
     assert!(
         resolver.calls() >= 1,
         "expected resolver to be consulted on failure"
@@ -156,12 +198,8 @@ async fn dial_failure_with_empty_resolution_does_not_update_mapping() -> icanact
 
     let a = new_registry_with_keypair("127.0.0.1:0".parse().unwrap(), a_keypair).await?;
 
-    let stale_addr = loop {
-        let candidate = unused_local_addr();
-        if candidate.port() != b_addr.port() {
-            break candidate;
-        }
-    };
+    let (_stale_port_reservation, stale_addr) = reserved_refused_addr();
+    assert_ne!(stale_addr, b_addr);
 
     let dns_name = format!("b2.service.invalid:{}", b_addr.port());
     let resolver = Arc::new(ScriptedResolver::with_script(&dns_name, vec![vec![]]));
@@ -175,10 +213,10 @@ async fn dial_failure_with_empty_resolution_does_not_update_mapping() -> icanact
         )
         .await;
     a.registry
-        .configure_peer(b_peer_id.clone(), stale_addr)
+        .set_peer_dns_name(stale_addr, dns_name.clone())
         .await;
     a.registry
-        .set_peer_dns_name(stale_addr, dns_name.clone())
+        .configure_peer(b_peer_id.clone(), stale_addr)
         .await;
 
     let err = a.registry.connect_to_peer(&b_peer_id).await.unwrap_err();
@@ -186,8 +224,7 @@ async fn dial_failure_with_empty_resolution_does_not_update_mapping() -> icanact
     let mapped = a
         .registry
         .connection_pool
-        .peer_id_to_addr
-        .read_sync(&b_peer_id, |_, v| *v)
+        .indexed_route_addr(&b_peer_id)
         .unwrap();
     assert_eq!(
         mapped, stale_addr,

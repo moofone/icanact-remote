@@ -27,7 +27,7 @@ async fn test_registry_handle_creation() {
     assert_eq!(stats.known_actors, 0);
     assert_eq!(stats.active_peers, 0);
     
-    handle.shutdown().await;
+    handle.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -65,7 +65,7 @@ async fn test_registry_handle_with_peers() {
     let stats = handle.stats().await;
     assert_eq!(stats.active_peers, 2);
     
-    handle.shutdown().await;
+    handle.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -76,7 +76,7 @@ async fn test_registry_handle_default_config() {
     
     let stats = handle.stats().await;
     
-    handle.shutdown().await;
+    handle.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -102,7 +102,7 @@ async fn test_register_actor() {
     let location = found.unwrap();
     assert_eq!(location.address, actor_addr);
     
-    handle.shutdown().await;
+    handle.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -139,7 +139,7 @@ async fn test_register_multiple_actors() {
         assert_eq!(location.address, addr.parse().unwrap());
     }
     
-    handle.shutdown().await;
+    handle.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -174,7 +174,7 @@ async fn test_unregister_actor() {
     let found = handle.lookup(&actor_name).await;
     assert!(found.is_none());
     
-    handle.shutdown().await;
+    handle.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -188,7 +188,7 @@ async fn test_unregister_nonexistent_actor() {
     assert!(result.is_ok());
     assert!(result.unwrap().is_none());
     
-    handle.shutdown().await;
+    handle.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -201,7 +201,7 @@ async fn test_lookup_nonexistent_actor() {
     let found = handle.lookup("nonexistent").await;
     assert!(found.is_none());
     
-    handle.shutdown().await;
+    handle.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -231,7 +231,7 @@ async fn test_stats_tracking() {
     let stats = handle.stats().await;
     assert_eq!(stats.local_actors, 1);
     
-    handle.shutdown().await;
+    handle.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -249,7 +249,7 @@ async fn test_shutdown() {
     assert!(result.is_ok());
     
     // Shutdown
-    handle.shutdown().await;
+    handle.shutdown().await.unwrap();
     
     // Operations after shutdown should fail
     let result = handle.register(
@@ -293,7 +293,7 @@ async fn test_actor_lifecycle() {
     let found = handle.lookup(&actor_name).await;
     assert!(found.is_some());
     
-    handle.shutdown().await;
+    handle.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -328,7 +328,7 @@ async fn test_concurrent_operations() {
     let stats = handle.stats().await;
     assert_eq!(stats.local_actors, 10);
     
-    handle.shutdown().await;
+    handle.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -387,8 +387,8 @@ async fn test_two_node_communication() {
     let _found = handle2.lookup("node1_actor").await;
     // Note: This might not work in unit tests without proper gossip setup
     
-    handle1.shutdown().await;
-    handle2.shutdown().await;
+    handle1.shutdown().await.unwrap();
+    handle2.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -415,7 +415,7 @@ async fn test_custom_config() {
     ).await;
     assert!(result.is_ok());
     
-    handle.shutdown().await;
+    handle.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -433,7 +433,7 @@ async fn test_error_handling() {
     ).await.unwrap();
     
     // Shutdown the handle
-    handle.shutdown().await;
+    handle.shutdown().await.unwrap();
     
     // Further operations should fail gracefully
     let result = handle.register(
@@ -463,7 +463,7 @@ async fn test_bind_to_specific_address() {
     assert_eq!(actual_addr.ip(), bind_addr.ip());
     // Port might be different (OS-chosen)
     
-    handle.shutdown().await;
+    handle.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -473,9 +473,9 @@ async fn test_repeated_shutdown() {
     let handle = create_handle(bind_addr, None, "unit_repeated_shutdown").await;
     
     // Multiple shutdowns should not panic
-    handle.shutdown().await;
-    handle.shutdown().await;
-    handle.shutdown().await;
+    handle.shutdown().await.unwrap();
+    handle.shutdown().await.unwrap();
+    handle.shutdown().await.unwrap();
 }
 
 // Vector clock test removed

@@ -126,9 +126,9 @@ async fn test_multi_node_gossip_propagation() -> Result<(), Box<dyn std::error::
     assert_eq!(stats2.known_actors, 2);
     assert_eq!(stats3.known_actors, 2);
 
-    node1.shutdown().await;
-    node2.shutdown().await;
-    node3.shutdown().await;
+    node1.shutdown().await.unwrap();
+    node2.shutdown().await.unwrap();
+    node3.shutdown().await.unwrap();
     Ok(())
 }
 
@@ -196,8 +196,8 @@ async fn test_actor_update_propagation() -> Result<(), Box<dyn std::error::Error
         sleep(Duration::from_millis(25)).await;
     }
 
-    node1.shutdown().await;
-    node2.shutdown().await;
+    node1.shutdown().await.unwrap();
+    node2.shutdown().await.unwrap();
     Ok(())
 }
 
@@ -246,7 +246,7 @@ async fn test_actor_removal_propagation() -> Result<(), Box<dyn std::error::Erro
     sleep(Duration::from_millis(400)).await;
     assert!(node2.lookup("actor1").await.is_none());
 
-    node1.shutdown().await;
-    node2.shutdown().await;
+    node1.shutdown().await.unwrap();
+    node2.shutdown().await.unwrap();
     Ok(())
 }

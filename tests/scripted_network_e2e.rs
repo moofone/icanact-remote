@@ -192,7 +192,7 @@ impl ScriptedProxy {
                     }
 
                     let Ok(outbound) = TcpStream::connect(target_addr).await else {
-                        let _ = inbound.shutdown().await;
+                        inbound.shutdown().await.unwrap();
                         return;
                     };
                     let (inbound_read, inbound_write) = inbound.into_split();
@@ -229,7 +229,7 @@ where
     loop {
         let read = reader.read(&mut buf).await?;
         if read == 0 {
-            let _ = writer.shutdown().await;
+            writer.shutdown().await.unwrap();
             return Ok(());
         }
         if first_read {
@@ -546,8 +546,8 @@ async fn connect_preferred_direction(
 
 async fn shutdown_pair(left: TlsHandle, right: TlsHandle) {
     set_transport_lifecycle_recorder(None);
-    left.shutdown().await;
-    right.shutdown().await;
+    left.shutdown().await.unwrap();
+    right.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -654,8 +654,8 @@ async fn inbound_preferred_lookup_waits_for_scripted_inbound() -> icanact_remote
     );
 
     set_transport_lifecycle_recorder(None);
-    local.shutdown().await;
-    remote.shutdown().await;
+    local.shutdown().await.unwrap();
+    remote.shutdown().await.unwrap();
     Ok(())
 }
 

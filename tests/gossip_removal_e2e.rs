@@ -61,7 +61,7 @@ async fn test_actor_removal_propagates_inner() -> Result<(), DynError> {
 
     assert!(removal_propagated, "actor removal should propagate to peer");
 
-    node_a.shutdown().await;
-    node_b.shutdown().await;
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
     Ok(())
 }

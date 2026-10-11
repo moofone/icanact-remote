@@ -298,9 +298,9 @@ async fn test_registry_shutdown_edge_cases() {
     );
     
     // Multiple shutdowns should be idempotent
-    registry.shutdown().await;
-    registry.shutdown().await;
-    registry.shutdown().await;
+    registry.shutdown().await.unwrap();
+    registry.shutdown().await.unwrap();
+    registry.shutdown().await.unwrap();
     
     assert!(registry.is_shutdown().await);
     

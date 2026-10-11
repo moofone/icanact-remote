@@ -71,14 +71,22 @@ async fn wait_until(timeout: Duration, mut check: impl AsyncFnMut() -> bool) -> 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stale_alias_does_not_tear_down_its_identitys_live_connection() -> icanact_remote::Result<()>
 {
-    let a_keys = KeyPair::new_for_testing("alias_liveness_a");
-    let b_keys = KeyPair::new_for_testing("alias_liveness_b");
+    let first = KeyPair::new_for_testing("alias_liveness_a");
+    let second = KeyPair::new_for_testing("alias_liveness_b");
+    // A must prefer the inbound socket so its observed source genuinely
+    // differs from B's listen address; do not rely on accidental key order.
+    let (a_keys, b_keys) = if first.peer_id().to_node_id() > second.peer_id().to_node_id() {
+        (first, second)
+    } else {
+        (second, first)
+    };
     let b_id = b_keys.peer_id();
 
     let a = start_node("127.0.0.1:0".parse().unwrap(), a_keys).await?;
     let a_addr = a.registry.bind_addr;
     let b = start_node("127.0.0.1:0".parse().unwrap(), b_keys).await?;
     let b_addr = b.registry.bind_addr;
+    a.registry.configure_peer(b_id.clone(), b_addr).await;
 
     // Both directions, B first so that A *accepts* a socket and learns B's
     // ephemeral source address, then A dials B's advertised bind address and
@@ -97,6 +105,34 @@ async fn stale_alias_does_not_tear_down_its_identitys_live_connection() -> icana
         .await,
         "the pair never connected, so the observation below would be vacuous"
     );
+
+    let physical = a
+        .registry
+        .connection_pool
+        .get_lock_free_connection(b_addr)
+        .expect("the authenticated inbound physical session must exist");
+    let source = physical.stream_handle.as_ref().unwrap().addr();
+    assert_ne!(
+        source, b_addr,
+        "the inbound source must be a distinct alias"
+    );
+    let instance = physical.stream_handle.as_ref().unwrap().instance_id();
+    // Current admission does not invent exclusive ownership for an
+    // ephemeral wire hint. Retain that actually observed alias explicitly
+    // as non-authoritative history, without a route or ownership claim.
+    let mut alias = icanact_remote::registry::PeerInfo::local(source);
+    alias.node_id = Some(b_id.to_node_id());
+    alias.transport_source_keyed = true;
+    alias.inbound_observed = true;
+    alias.last_success = 0;
+    alias.last_response_received_ms = 0;
+    a.registry
+        .gossip_state
+        .lock()
+        .await
+        .peers
+        .entry(source)
+        .or_insert(alias);
 
     // Confirm the multi-alias precondition actually holds: more than one
     // address in A's peer table resolves to B's identity. Without this the test
@@ -118,10 +154,20 @@ async fn stale_alias_does_not_tear_down_its_identitys_live_connection() -> icana
             "connection to a healthy peer was torn down while both nodes were \
              up and idle and A held {alias_count} address aliases for the identity"
         );
+        let current = a
+            .registry
+            .connection_pool
+            .get_lock_free_connection(b_addr)
+            .expect("healthy physical session must remain published");
+        assert_eq!(
+            current.stream_handle.as_ref().unwrap().instance_id(),
+            instance,
+            "a losing alias must not cause healthy physical-session churn"
+        );
         sleep(Duration::from_millis(50)).await;
     }
 
-    b.shutdown_and_wait().await;
-    a.shutdown_and_wait().await;
+    b.shutdown_and_wait().await.unwrap();
+    a.shutdown_and_wait().await.unwrap();
     Ok(())
 }

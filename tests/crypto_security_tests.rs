@@ -291,8 +291,8 @@ fn test_key_mismatch_connection_rejection() {
         println!("      ✅ PeerId mismatches correctly detected");
 
         // Cleanup
-        server_registry.shutdown().await;
-        client_registry.shutdown().await;
+        server_registry.shutdown().await.unwrap();
+        client_registry.shutdown().await.unwrap();
 
         println!("   ✅ Key mismatch rejection test completed");
     });

@@ -138,7 +138,7 @@ async fn test_node_b_killed_a_detects_immediately() {
     assert!(found.is_some(), "Node A should know about actor on B");
 
     // Kill node B
-    handle_b.shutdown().await;
+    handle_b.shutdown().await.unwrap();
 
     // Give TCP time to detect disconnection and process it
     // The disconnection is detected when the connection pool tries to send gossip
@@ -151,7 +151,7 @@ async fn test_node_b_killed_a_detects_immediately() {
     assert_eq!(stats.active_peers, 0, "Node A should detect B disconnected");
 
     // Clean shutdown of A
-    handle_a.shutdown().await;
+    handle_a.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -287,7 +287,7 @@ async fn test_node_a_killed_b_detects_immediately() {
 
     // Kill node A
     eprintln!("Shutting down node A...");
-    handle_a.shutdown().await;
+    handle_a.shutdown().await.unwrap();
 
     // Give TCP time to detect disconnection
     eprintln!("Waiting for disconnection detection...");
@@ -329,7 +329,7 @@ async fn test_node_a_killed_b_detects_immediately() {
     );
 
     // Clean shutdown of B
-    handle_b.shutdown().await;
+    handle_b.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -455,7 +455,7 @@ async fn test_nat_scenario_bidirectional_communication() {
     );
 
     // Simulate NAT-side outage.
-    handle_a_1.shutdown().await;
+    handle_a_1.shutdown().await.unwrap();
     for _ in 0..50 {
         let stats = handle_b.stats().await;
         if stats.active_peers == 0 {
@@ -514,8 +514,8 @@ async fn test_nat_scenario_bidirectional_communication() {
         "A should receive updates from B after outbound reconnect"
     );
 
-    handle_a_2.shutdown().await;
-    handle_b.shutdown().await;
+    handle_a_2.shutdown().await.unwrap();
+    handle_b.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -580,7 +580,7 @@ async fn test_restart_with_different_identity_is_treated_as_new_peer() {
         "B should discover actor from initial identity"
     );
 
-    handle_a1.shutdown().await;
+    handle_a1.shutdown().await.unwrap();
     for _ in 0..100 {
         if handle_b.stats().await.active_peers == 0 {
             break;
@@ -633,6 +633,6 @@ async fn test_restart_with_different_identity_is_treated_as_new_peer() {
         "B should maintain an active session with the new identity"
     );
 
-    handle_a2.shutdown().await;
-    handle_b.shutdown().await;
+    handle_a2.shutdown().await.unwrap();
+    handle_b.shutdown().await.unwrap();
 }

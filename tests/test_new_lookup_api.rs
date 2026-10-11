@@ -170,8 +170,8 @@ async fn test_new_lookup_api_returns_actor_ref_inner() {
     }
 
     // Cleanup
-    handle_a.shutdown().await;
-    handle_b.shutdown().await;
+    handle_a.shutdown().await.unwrap();
+    handle_b.shutdown().await.unwrap();
 }
 
 #[cfg(feature = "test-helpers")]
@@ -241,8 +241,8 @@ async fn test_old_api_not_accessible_inner() {
 
     println!("✅ Only lookup() API is accessible - get_connection() is private!");
 
-    handle_a.shutdown().await;
-    handle_b.shutdown().await;
+    handle_a.shutdown().await.unwrap();
+    handle_b.shutdown().await.unwrap();
 }
 
 #[test]
@@ -332,8 +332,8 @@ async fn test_multiple_lookups_return_different_refs_inner() {
 
     println!("✅ Both RemoteActorRefs can send messages independently");
 
-    handle_a.shutdown().await;
-    handle_b.shutdown().await;
+    handle_a.shutdown().await.unwrap();
+    handle_b.shutdown().await.unwrap();
 }
 
 #[test]
@@ -404,8 +404,8 @@ async fn test_lookup_caches_connection_for_zero_lookup_sending_inner() {
     );
     println!("   lookup() did the work once, then all tell() calls were direct");
 
-    handle_a.shutdown().await;
-    handle_b.shutdown().await;
+    handle_a.shutdown().await.unwrap();
+    handle_b.shutdown().await.unwrap();
 }
 
 #[test]

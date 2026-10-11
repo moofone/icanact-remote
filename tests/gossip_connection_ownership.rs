@@ -32,8 +32,8 @@ async fn lower_id_seed_only_converges_to_high_id_actor_visibility() {
     assert_probe_visible(&high, &low, "ownership.lower_only.high_probe").await;
     assert_probe_visible(&low, &high, "ownership.lower_only.low_probe").await;
 
-    high.shutdown().await;
-    low.shutdown().await;
+    high.shutdown().await.unwrap();
+    low.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -49,8 +49,8 @@ async fn higher_id_seed_only_converges_instead_of_waiting_forever_for_inbound() 
     assert_probe_visible(&high, &low, "ownership.higher_only.high_probe").await;
     assert_probe_visible(&low, &high, "ownership.higher_only.low_probe").await;
 
-    high.shutdown().await;
-    low.shutdown().await;
+    high.shutdown().await.unwrap();
+    low.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -66,8 +66,8 @@ async fn mutual_seed_converges_to_single_usable_pair_without_blocking_actor_visi
     assert_probe_visible(&high, &low, "ownership.mutual.high_probe").await;
     assert_probe_visible(&low, &high, "ownership.mutual.low_probe").await;
 
-    high.shutdown().await;
-    low.shutdown().await;
+    high.shutdown().await.unwrap();
+    low.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -98,8 +98,8 @@ async fn random_non_empty_seed_subset_chaos_converges_for_actor_visibility() {
         assert_probe_visible(&high, &low, &format!("ownership.chaos.{idx}.high_probe")).await;
         assert_probe_visible(&low, &high, &format!("ownership.chaos.{idx}.low_probe")).await;
 
-        high.shutdown().await;
-        low.shutdown().await;
+        high.shutdown().await.unwrap();
+        low.shutdown().await.unwrap();
     }
 }
 
@@ -144,6 +144,6 @@ async fn configured_peer_id_mismatch_is_reported_as_tls_identity_failure() {
         "client must not publish a session to the configured wrong peer id"
     );
 
-    client.shutdown().await;
-    server.shutdown().await;
+    client.shutdown().await.unwrap();
+    server.shutdown().await.unwrap();
 }

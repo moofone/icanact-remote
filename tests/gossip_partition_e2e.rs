@@ -153,9 +153,9 @@ fn test_partition_heal_flow() -> Result<(), DynError> {
             "actor should propagate after heal"
         );
 
-        node_a.shutdown().await;
-        node_b.shutdown().await;
-        node_c.shutdown().await;
+        node_a.shutdown().await.unwrap();
+        node_b.shutdown().await.unwrap();
+        node_c.shutdown().await.unwrap();
 
         Ok(())
     })

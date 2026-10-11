@@ -105,7 +105,7 @@ fn debug_timing_variations() {
             sleep(Duration::from_millis(10)).await;
         }
 
-        node1.shutdown().await;
-        node2.shutdown().await;
+        node1.shutdown().await.unwrap();
+        node2.shutdown().await.unwrap();
     });
 }

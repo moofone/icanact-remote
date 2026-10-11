@@ -140,8 +140,8 @@ async fn test_remote_actor_ref_detects_shutdown_inner() {
     );
 
     // Shutdown registry
-    handle_a.shutdown().await;
-    handle_b.shutdown().await;
+    handle_a.shutdown().await.unwrap();
+    handle_b.shutdown().await.unwrap();
 
     // Give tasks time to complete shutdown
     sleep(Duration::from_millis(100)).await;
@@ -239,8 +239,8 @@ async fn test_concurrent_remote_actor_ref_usage_inner() {
 
     println!("✅ Concurrent access works correctly (Arc<Mutex>> thread-safe)");
 
-    handle_a.shutdown().await;
-    handle_b.shutdown().await;
+    handle_a.shutdown().await.unwrap();
+    handle_b.shutdown().await.unwrap();
 }
 
 #[test]
@@ -304,8 +304,8 @@ async fn test_weak_registry_ref_prevents_cycles_inner() {
     assert!(remote_actor.is_registry_alive(), "Registry should be alive");
 
     // Shutdown registry
-    handle_a.shutdown().await;
-    handle_b.shutdown().await;
+    handle_a.shutdown().await.unwrap();
+    handle_b.shutdown().await.unwrap();
 
     // Give time for shutdown
     sleep(Duration::from_millis(100)).await;
@@ -401,8 +401,8 @@ async fn test_remote_actor_ref_clone_independence_inner() {
 
     println!("✅ RemoteActorRef clones work independently");
 
-    handle_a.shutdown().await;
-    handle_b.shutdown().await;
+    handle_a.shutdown().await.unwrap();
+    handle_b.shutdown().await.unwrap();
 }
 
 #[test]
@@ -480,8 +480,8 @@ async fn test_remote_actor_ref_location_metadata_inner() {
 
     println!("✅ RemoteActorRef preserves actor metadata");
 
-    handle_a.shutdown().await;
-    handle_b.shutdown().await;
+    handle_a.shutdown().await.unwrap();
+    handle_b.shutdown().await.unwrap();
 }
 
 #[test]
@@ -566,8 +566,8 @@ async fn test_connection_reuse_across_lookups_inner() {
 
     println!("✅ Multiple lookups reuse cached connection");
 
-    handle_a.shutdown().await;
-    handle_b.shutdown().await;
+    handle_a.shutdown().await.unwrap();
+    handle_b.shutdown().await.unwrap();
 }
 
 #[cfg(feature = "test-helpers")]
@@ -641,8 +641,8 @@ async fn test_remote_actor_ref_debug_output_inner() {
     println!("Debug output: {}", debug_str);
     println!("✅ Debug output provides useful information");
 
-    handle_a.shutdown().await;
-    handle_b.shutdown().await;
+    handle_a.shutdown().await.unwrap();
+    handle_b.shutdown().await.unwrap();
 }
 
 #[test]
@@ -720,8 +720,8 @@ async fn test_remote_actor_ref_with_timeout_inner() {
     assert!(result.is_ok(), "ask_with_timeout should succeed");
     println!("✅ ask_with_timeout works through RemoteActorRef");
 
-    handle_a.shutdown().await;
-    handle_b.shutdown().await;
+    handle_a.shutdown().await.unwrap();
+    handle_b.shutdown().await.unwrap();
 }
 
 #[cfg(feature = "test-helpers")]
@@ -802,8 +802,8 @@ async fn test_multiple_remote_actor_refs_same_actor_inner() {
 
     println!("✅ Multiple RemoteActorRefs to same actor work independently");
 
-    handle_a.shutdown().await;
-    handle_b.shutdown().await;
+    handle_a.shutdown().await.unwrap();
+    handle_b.shutdown().await.unwrap();
 }
 
 #[test]

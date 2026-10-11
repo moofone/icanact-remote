@@ -1,9 +1,13 @@
-use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use icanact_remote::{
     GossipConfig, KeyPair, RegistrationPriority, RemoteActorLocation,
     registry::{GossipRegistry, RegistryChange},
 };
-use std::{hint::black_box, net::SocketAddr, time::Duration};
+use std::{
+    hint::black_box,
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 
 async fn make_registry(actor_count: usize, peer_count: usize) -> GossipRegistry<()> {
     let bind_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -18,15 +22,12 @@ async fn make_registry(actor_count: usize, peer_count: usize) -> GossipRegistry<
     for idx in 0..peer_count {
         let peer_addr: SocketAddr = format!("127.0.0.1:{}", 20_000 + idx).parse().unwrap();
         let peer_id = KeyPair::new_for_testing(format!("peer-{idx}")).peer_id();
-        registry
-            .connection_pool
-            .peer_id_to_addr
-            .upsert_sync(peer_id.clone(), peer_addr);
-        registry
-            .connection_pool
-            .addr_to_peer_id
-            .upsert_sync(peer_addr, peer_id.clone());
-        registry.configure_peer(peer_id, peer_addr).await;
+        registry.configure_peer(peer_id.clone(), peer_addr).await;
+        assert_eq!(
+            registry.connection_pool.get_configured_peer_addr(&peer_id),
+            Some(peer_addr),
+            "benchmark peer route must pass normal admission"
+        );
     }
 
     for idx in 0..actor_count {
@@ -74,15 +75,18 @@ fn bench_gossip_round(c: &mut Criterion) {
         group.bench_function(
             format!("prepare_gossip_round_{actors}actors_{peers}peers"),
             |b| {
-                b.to_async(&runtime).iter_batched(
-                    || async move { make_registry(actors, peers).await },
-                    |setup| async move {
-                        let registry = setup.await;
+                b.to_async(&runtime).iter_custom(|iterations| async move {
+                    let mut measured = Duration::ZERO;
+                    for _ in 0..iterations {
+                        let registry = make_registry(actors, peers).await;
+                        // REMOTE-2 evidence: setup and result/registry drops are excluded.
+                        let started = Instant::now();
                         let tasks = registry.prepare_gossip_round().await.unwrap();
+                        measured += started.elapsed();
                         black_box(tasks);
-                    },
-                    BatchSize::SmallInput,
-                );
+                    }
+                    measured
+                });
             },
         );
     }

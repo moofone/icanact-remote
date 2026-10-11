@@ -67,7 +67,7 @@ impl ActorMessageHandler for TestActorHandler {
 }
 
 struct LargeResponseHandler {
-    response: bytes::Bytes,
+    response: icanact_remote::ForwardPayload,
 }
 
 impl ActorMessageHandler for LargeResponseHandler {
@@ -78,10 +78,10 @@ impl ActorMessageHandler for LargeResponseHandler {
         _payload: icanact_remote::AlignedBytes,
         correlation_id: Option<u32>,
     ) -> ActorMessageFuture<'_> {
-        let response = self.response.clone();
+        let response = self.response.shared_clone();
         Box::pin(async move {
             if correlation_id.is_some() {
-                Ok(Some(response.into()))
+                Ok(Some(response?.into()))
             } else {
                 Ok(None)
             }
@@ -349,11 +349,14 @@ fn test_end_to_end_ask_reply() {
             // msg_len = ASK_RESPONSE_HEADER_LEN (12) + payload_len. If payload_len == max_message_size,
             // the receiver will reject the inline frame as MessageTooLarge.
             let payload_len = handle_b.registry.config.max_message_size;
-            let response_bytes = bytes::Bytes::from(vec![b'Z'; payload_len]);
+            let response_bytes =
+                icanact_remote::ForwardPayload::from(vec![b'Z'; payload_len]).into_shared();
             handle_b
                 .registry
                 .set_actor_message_handler(Arc::new(LargeResponseHandler {
-                    response: response_bytes.clone(),
+                    response: response_bytes
+                        .shared_clone()
+                        .expect("explicit shared response"),
                 }))
                 .await;
 
@@ -394,7 +397,7 @@ fn test_end_to_end_ask_reply() {
         }
 
         // Shutdown
-        handle_a.shutdown().await;
-        handle_b.shutdown().await;
+        handle_a.shutdown().await.unwrap();
+        handle_b.shutdown().await.unwrap();
     });
 }

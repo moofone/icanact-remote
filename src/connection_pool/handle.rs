@@ -12,6 +12,10 @@ pub struct ConnectionHandle<T = ()> {
     /// one. Fixed at construction, correct for this handle's whole
     /// lifetime -- a connection's own direction never changes.
     direction: ConnectionDirection,
+    /// Certificate-authenticated identity of the exact connection used to
+    /// construct this handle. Address aliases can change independently.
+    authenticated_peer_id: Option<crate::PeerId>,
+    negotiated_capabilities: Option<crate::handshake::PeerCapabilities>,
     // Stream-based writer path (TCP/TLS/Noise/QUIC stream transports).
     stream_handle: Option<Arc<LockFreeStreamHandle>>,
     schema_hash: Option<u64>,
@@ -149,21 +153,25 @@ impl<T> std::fmt::Debug for ConnectionHandle<T> {
 ///
 /// This is the correct way to "delegate" awaiting a response:
 /// - the request is sent immediately,
-/// - the returned handle can be moved to another task and awaited later,
+/// - the returned handle borrows this exact connection session until awaited,
 /// - dropping the handle cancels the pending slot to keep resources bounded.
-pub(crate) struct PendingAsk {
+pub(crate) struct PendingAsk<'session> {
     correlation_id: u32,
-    correlation: Arc<CorrelationTracker>,
+    correlation: &'session CorrelationTracker,
     deadline: Instant,
     active: bool,
 }
 
-impl PendingAsk {
+impl PendingAsk<'_> {
     pub(crate) fn correlation_id(&self) -> u32 {
         self.correlation_id
     }
 
-    pub(crate) async fn wait(mut self) -> Result<bytes::Bytes> {
+    pub(crate) async fn wait(self) -> Result<crate::AlignedBytes> {
+        self.wait_aligned().await
+    }
+
+    pub(crate) async fn wait_aligned(mut self) -> Result<crate::AlignedBytes> {
         let correlation_id = self.correlation_id;
         let remaining = self.deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -171,16 +179,16 @@ impl PendingAsk {
             self.active = false;
             return Err(crate::GossipError::Timeout);
         }
-        let correlation = Arc::clone(&self.correlation);
-        let result = correlation
+        let result = self
+            .correlation
             .wait_for_response(correlation_id, remaining)
             .await;
         self.active = false;
-        result.map(crate::AlignedBytes::into_bytes)
+        result
     }
 }
 
-impl Drop for PendingAsk {
+impl Drop for PendingAsk<'_> {
     fn drop(&mut self) {
         if self.active {
             self.correlation.cancel(self.correlation_id);
@@ -188,12 +196,164 @@ impl Drop for PendingAsk {
     }
 }
 
-impl std::fmt::Debug for PendingAsk {
+impl std::fmt::Debug for PendingAsk<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PendingAsk")
             .field("correlation_id", &self.correlation_id)
             .field("deadline", &self.deadline)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod scoped_deferred_tests {
+    use super::*;
+
+    fn pending(tracker: &CorrelationTracker, session: u64) -> PendingAsk<'_> {
+        PendingAsk {
+            correlation_id: tracker.allocate_for_session(session).unwrap().disarm(),
+            correlation: tracker,
+            deadline: saturating_deadline(Instant::now(), Duration::from_secs(60)),
+            active: true,
+        }
+    }
+
+    #[test]
+    fn deferred_registration_and_drop_borrow_the_session_without_metadata_cost() {
+        use crate::ask_forwarder::allocation_evidence;
+
+        let tracker = CorrelationTracker::new();
+        let dispatch = tracing::Dispatch::none();
+        let _dispatch = tracing::dispatcher::set_default(&dispatch);
+        drop(pending(&tracker, 71));
+        let owners = Arc::strong_count(&tracker);
+        let (registered, counts) = allocation_evidence::measure(|| {
+            let mut registered = 0;
+            for _ in 0..1024 {
+                let ask = pending(&tracker, 71);
+                assert_eq!(Arc::strong_count(&tracker), owners);
+                let slot = &tracker.pending[CorrelationTracker::slot_index(ask.correlation_id())];
+                assert_eq!(slot.state.load(Ordering::Acquire) & 3, SLOT_WAITING);
+                registered += 1;
+                drop(ask);
+                assert_eq!(slot.state.load(Ordering::Acquire), SLOT_EMPTY);
+            }
+            registered
+        });
+        assert_eq!(registered, 1024);
+        assert_eq!(counts, allocation_evidence::Counts::default());
+        let clone = Arc::clone(&tracker);
+        assert_eq!(Arc::strong_count(&tracker), owners + 1);
+        drop(clone);
+        let (allocation, positive) =
+            allocation_evidence::measure(|| std::hint::black_box(vec![0u8; 17]));
+        assert!(positive.allocations > 0);
+        drop(allocation);
+        assert_eq!(Arc::strong_count(&tracker), owners);
+    }
+
+    #[test]
+    fn deferred_saturation_is_bounded_and_drop_restores_admission() {
+        let tracker = CorrelationTracker::new();
+        let owners = Arc::strong_count(&tracker);
+        let asks: Vec<_> = (0..PENDING_RESPONSES_SIZE)
+            .map(|_| pending(&tracker, 71))
+            .collect();
+        assert_eq!(asks.len(), PENDING_RESPONSES_SIZE);
+        assert_eq!(Arc::strong_count(&tracker), owners);
+        let before = tracker.next_id.load(Ordering::Acquire);
+        assert!(tracker.allocate_for_session(72).is_err());
+        assert_eq!(
+            tracker.next_id.load(Ordering::Acquire) - before,
+            CORRELATION_ADMISSION_PROBES as u32
+        );
+        drop(asks);
+        for slot in &tracker.pending {
+            assert_eq!(slot.state.load(Ordering::Acquire), SLOT_EMPTY);
+        }
+        let successor = pending(&tracker, 72);
+        assert!(successor.correlation_id() > before);
+        assert_eq!(Arc::strong_count(&tracker), owners);
+        drop(successor);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deferred_cancelled_wait_releases_only_its_exact_reservation() {
+        let tracker = CorrelationTracker::new();
+        let ask = pending(&tracker, 11);
+        let id = ask.correlation_id();
+        let successor = pending(&tracker, 12);
+        let successor_id = successor.correlation_id();
+        let foreign = CorrelationTracker::new();
+        let foreign_ask = pending(&foreign, 11);
+        assert_eq!(id, foreign_ask.correlation_id());
+        {
+            let mut wait = std::pin::pin!(ask.wait_aligned());
+            assert!(futures::poll!(&mut wait).is_pending());
+        }
+        assert_eq!(
+            tracker.pending[CorrelationTracker::slot_index(id)]
+                .state
+                .load(Ordering::Acquire),
+            SLOT_EMPTY
+        );
+        assert_eq!(
+            tracker.pending[CorrelationTracker::slot_index(successor_id)]
+                .state
+                .load(Ordering::Acquire)
+                & 3,
+            SLOT_WAITING
+        );
+        assert_eq!(
+            foreign.pending[CorrelationTracker::slot_index(id)]
+                .state
+                .load(Ordering::Acquire)
+                & 3,
+            SLOT_WAITING
+        );
+        drop(successor);
+        drop(foreign_ask);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deferred_stale_drop_and_expiry_preserve_an_aliased_successor() {
+        let tracker = CorrelationTracker::new();
+        let mut stale = pending(&tracker, 11);
+        let id = stale.correlation_id();
+        tracker.cancel_session(11);
+        tracker
+            .next_id
+            .store(id + PENDING_RESPONSES_SIZE as u32, Ordering::Release);
+        let successor = pending(&tracker, 12);
+        let successor_id = successor.correlation_id();
+        assert_eq!(
+            CorrelationTracker::slot_index(id),
+            CorrelationTracker::slot_index(successor_id)
+        );
+        stale.deadline = Instant::now();
+        assert!(matches!(stale.wait_aligned().await, Err(GossipError::Timeout)));
+        let obsolete = PendingAsk {
+            correlation_id: id,
+            correlation: &tracker,
+            deadline: Instant::now(),
+            active: true,
+        };
+        drop(obsolete);
+        let pool = Arc::new(crate::AlignedBytesPool::new(1));
+        let reply = crate::AlignedBytes::from_pooled_slice(b"successor", pool).unwrap();
+        let pointer = reply.as_ref().as_ptr();
+        let mut response = Some(reply);
+        assert!(tracker.complete(successor_id, &mut response));
+        assert!(response.is_none());
+        let received = successor.wait().await.unwrap();
+        assert_eq!(received.as_ref(), b"successor");
+        assert_eq!(received.as_ref().as_ptr(), pointer);
+        assert_eq!(
+            tracker.pending[CorrelationTracker::slot_index(successor_id)]
+                .state
+                .load(Ordering::Acquire),
+            SLOT_EMPTY
+        );
     }
 }
 
@@ -208,6 +368,8 @@ impl<T> ConnectionHandle<T> {
         Self {
             addr,
             direction,
+            authenticated_peer_id: None,
+            negotiated_capabilities: None,
             stream_handle: Some(stream_handle),
             schema_hash,
             correlation,
@@ -224,6 +386,15 @@ impl<T> ConnectionHandle<T> {
         self.direction
     }
 
+    /// Negotiation receipt captured from this exact physical connection.
+    pub fn negotiated_capabilities(&self) -> Option<crate::handshake::PeerCapabilities> {
+        self.negotiated_capabilities
+    }
+
+    pub(crate) fn authenticated_peer_id(&self) -> Option<&crate::PeerId> {
+        self.authenticated_peer_id.as_ref()
+    }
+
     /// Instance id of the specific stream-handle backing this connection
     /// handle, if any. Callers that need to retire *this exact* connection
     /// instance (rather than "whatever is currently indexed for the peer")
@@ -237,13 +408,13 @@ impl<T> ConnectionHandle<T> {
     }
 
     /// One absolute deadline covering queue/gate admission and the response wait.
-    async fn finish_timed_ask(
+    async fn finish_timed_ask_owned(
         &self,
         timeout: Duration,
         correlation_id: u32,
         slot: SlotGuard<'_>,
         write: impl Future<Output = Result<()>>,
-    ) -> Result<bytes::Bytes> {
+    ) -> Result<crate::AlignedBytes> {
         let result = match tokio::time::timeout(timeout, async {
             write.await?;
             self.correlation
@@ -258,7 +429,20 @@ impl<T> ConnectionHandle<T> {
         if result.is_ok() {
             let _ = slot.disarm();
         }
-        result.map(|response| response.into_bytes())
+        result
+    }
+
+    /// Compatibility response promotion; native APIs use the aligned owner.
+    async fn finish_timed_ask(
+        &self,
+        timeout: Duration,
+        correlation_id: u32,
+        slot: SlotGuard<'_>,
+        write: impl Future<Output = Result<()>>,
+    ) -> Result<bytes::Bytes> {
+        self.finish_timed_ask_owned(timeout, correlation_id, slot, write)
+            .await
+            .map(crate::AlignedBytes::into_bytes)
     }
 
     #[inline]
@@ -347,28 +531,28 @@ impl<T> ConnectionHandle<T> {
         }
     }
 
-    async fn write_routed_actor_ask(
+    async fn write_routed_actor_ask_owned(
         &self,
         correlation_id: u32,
         actor_id: u64,
         type_hash: u32,
-        payload: bytes::Bytes,
+        payload: crate::ForwardPayload,
     ) -> Result<()> {
         self.stream_handle()?
-            .write_routed_actor_ask(correlation_id, actor_id, type_hash, payload)
+            .write_routed_actor_ask_owned(correlation_id, actor_id, type_hash, payload)
             .await
     }
 
-    async fn write_routed_actor_ask_with_request_id(
+    async fn write_routed_actor_ask_owned_with_request_id(
         &self,
         correlation_id: u32,
         actor_id: u64,
         type_hash: u32,
-        payload: bytes::Bytes,
+        payload: crate::ForwardPayload,
         request_id: u64,
     ) -> Result<()> {
         self.stream_handle()?
-            .write_routed_actor_ask_with_request_id(
+            .write_routed_actor_ask_owned_with_request_id(
                 correlation_id,
                 actor_id,
                 type_hash,
@@ -480,20 +664,18 @@ impl<T> ConnectionHandle<T> {
         )
     }
 
-    /// Send a response payload with framing, without copying the payload.
+    /// Send a complete response owner inline, charging its entire capacity.
     pub async fn send_response_bytes(
         &self,
         correlation_id: u32,
-        payload: bytes::Bytes,
+        payload: crate::ForwardPayload,
     ) -> Result<()> {
         self.reject_oversize_inline(framing::ASK_RESPONSE_HEADER_LEN, payload.len())?;
-        let header = framing::try_write_ask_response_header(
-            crate::MessageType::Response,
-            correlation_id,
-            payload.len(),
-        )?;
-
-        self.write_header_and_payload_control_inline(header, 16, payload)
+        let Some(stream) = self.stream_handle.as_ref() else {
+            return Err(GossipError::ConnectionClosed(self.addr));
+        };
+        stream
+            .send_response_owned(correlation_id, payload, false)
             .await
     }
 
@@ -590,11 +772,11 @@ impl<T> ConnectionHandle<T> {
         }
     }
 
-    /// Send a response using the inline write queue (never streaming).
+    /// Send a response with complete-owner provenance using the inline queue.
     pub async fn send_response_auto(
         &self,
         correlation_id: u32,
-        payload: bytes::Bytes,
+        payload: crate::ForwardPayload,
     ) -> Result<()> {
         if let Some(stream_handle) = self.stream_handle.as_ref() {
             stream_handle
@@ -605,56 +787,47 @@ impl<T> ConnectionHandle<T> {
         }
     }
 
-    /// Send a response with owned Bytes using the inline write queue (never streaming).
-    ///
-    /// # Arguments
-    /// * `correlation_id` - The correlation ID from the original request
-    /// * `payload` - The response payload as owned Bytes
+    /// Send a response owner without normalizing or copying opaque Bytes.
     pub async fn send_response_auto_bytes(
         &self,
         correlation_id: u32,
-        payload: bytes::Bytes,
+        payload: crate::ForwardPayload,
     ) -> Result<()> {
-        if let Some(stream_handle) = self.stream_handle.as_ref() {
-            stream_handle
-                .send_response_auto_bytes(correlation_id, payload)
-                .await
-        } else {
-            self.send_response_bytes(correlation_id, payload).await
-        }
+        self.send_response_auto(correlation_id, payload).await
     }
 
-    /// Send a response payload using a Buf without copying.
-    pub async fn send_response_buf<B>(
+    /// Send a proven owner after validating the caller-declared wire length.
+    /// Generic Buf values no longer qualify: they cannot prove retained bytes.
+    pub async fn send_response_buf(
         &self,
         correlation_id: u32,
-        mut payload: B,
+        payload: crate::ForwardPayload,
         payload_len: usize,
-    ) -> Result<()>
-    where
-        B: Buf + Send + 'static,
-    {
+    ) -> Result<()> {
         self.reject_oversize_inline(framing::ASK_RESPONSE_HEADER_LEN, payload_len)?;
-        if let Some(stream_handle) = self.stream_handle.as_ref() {
-            let header = framing::try_write_ask_response_header(
-                crate::MessageType::Response,
-                correlation_id,
-                payload_len,
-            )?;
-            // `header` was built from the caller-declared `payload_len`,
-            // not from `payload` itself -- the two can disagree (that
-            // disagreement is exactly the bug `write_buf_control_checked`
-            // guards against), so this must use the checked form, not the
-            // single-argument one that trusts `payload.remaining()` alone.
-            let expected_len = header.len() + payload_len;
-            let buf = bytes::Bytes::copy_from_slice(&header).chain(payload); // ALLOW_COPY
-            stream_handle
-                .write_buf_control_checked(buf, expected_len)
-                .await
-        } else {
-            let bytes = payload.copy_to_bytes(payload.remaining());
-            self.send_response_bytes(correlation_id, bytes).await
+        if payload.len() != payload_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "response payload length does not match declared wire length",
+            )
+            .into());
         }
+        self.send_response_bytes(correlation_id, payload).await
+    }
+
+    /// Send an explicitly owner-accounted response on this captured stream.
+    pub async fn send_response_owned(
+        &self,
+        correlation_id: u32,
+        payload: crate::ForwardPayload,
+    ) -> Result<()> {
+        let Some(stream) = self.stream_handle.as_ref() else {
+            return Err(GossipError::ConnectionClosed(self.addr));
+        };
+        let streaming = stream.should_stream_response(payload.len());
+        stream
+            .send_response_owned(correlation_id, payload, streaming)
+            .await
     }
 
     /// Send a response payload using a pooled payload without dynamic dispatch.
@@ -743,21 +916,13 @@ impl<T> ConnectionHandle<T> {
             .unwrap_or(STREAMING_THRESHOLD)
     }
 
-    /// Tell using owned bytes to avoid payload copies.
+    /// Tell using owned bytes to avoid payload copies or speculative clones.
     pub async fn tell_bytes(&self, data: bytes::Bytes) -> Result<()> {
-        match self.try_tell_bytes(data.clone()) {
-            Ok(()) => Ok(()),
-            Err(GossipError::WriteQueueFull) => {
-                // `try_tell_bytes` already ran `reject_oversize_inline` before
-                // returning `WriteQueueFull`, so `data` is known in-bounds here.
-                let mut header = [0u8; 16];
-                header[..4].copy_from_slice(&(data.len() as u32).to_be_bytes());
-
-                self.write_header_and_payload_control_inline(header, 4, data)
-                    .await
-            }
-            Err(e) => Err(e),
-        }
+        self.reject_oversize_inline(0, data.len())?;
+        let mut header = [0u8; 16];
+        header[..4].copy_from_slice(&(data.len() as u32).to_be_bytes());
+        self.write_header_and_payload_control_inline(header, 4, data)
+            .await
     }
 
     /// Non-blocking tell. Returns `GossipError::WriteQueueFull` on backpressure.
@@ -775,6 +940,76 @@ impl<T> ConnectionHandle<T> {
         let mut header = [0u8; 16];
         header[..4].copy_from_slice(&(data.len() as u32).to_be_bytes());
         self.write_header_and_payload_control_inline_nonblocking(header, 4, data)
+    }
+
+    /// Raw tell preserving a complete native payload owner through admission.
+    pub async fn tell_owned(&self, payload: crate::ForwardPayload) -> Result<()> {
+        self.reject_oversize_inline(0, payload.len())?;
+        let mut header = [0u8; 16];
+        header[..4].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+        self.stream_handle()?
+            .write_pooled_control_inline(
+                header,
+                4,
+                None,
+                0,
+                crate::typed::PooledPayload::from_owned(payload),
+            )
+            .await
+    }
+
+    /// Actor tell preserving the complete owner without Bytes normalization.
+    pub async fn tell_actor_frame_owned(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: crate::ForwardPayload,
+    ) -> Result<()> {
+        self.reject_oversize_inline(framing::ACTOR_TELL_HEADER_LEN, payload.len())?;
+        let header = framing::try_write_actor_tell_header(actor_id, type_hash, payload.len())?;
+        self.stream_handle()?
+            .write_pooled_control_inline(
+                header,
+                16,
+                None,
+                0,
+                crate::typed::PooledPayload::from_owned(payload),
+            )
+            .await
+    }
+
+    /// Raw tell preserving a complete native payload owner through admission.
+    pub fn try_tell_owned(&self, payload: crate::ForwardPayload) -> Result<()> {
+        self.reject_oversize_inline(0, payload.len())?;
+        let mut header = [0u8; 16];
+        header[..4].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+        self.stream_handle()?
+            .write_pooled_control_inline_nonblocking(
+                header,
+                4,
+                None,
+                0,
+                crate::typed::PooledPayload::from_owned(payload),
+            )
+    }
+
+    /// Actor tell preserving the complete owner without Bytes normalization.
+    pub fn try_tell_actor_frame_owned(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: crate::ForwardPayload,
+    ) -> Result<()> {
+        self.reject_oversize_inline(framing::ACTOR_TELL_HEADER_LEN, payload.len())?;
+        let header = framing::try_write_actor_tell_header(actor_id, type_hash, payload.len())?;
+        self.stream_handle()?
+            .write_pooled_control_inline_nonblocking(
+                header,
+                16,
+                None,
+                0,
+                crate::typed::PooledPayload::from_owned(payload),
+            )
     }
 
     /// Tell an actor using the direct actor frame envelope (MessageType::ActorTell).
@@ -806,7 +1041,44 @@ impl<T> ConnectionHandle<T> {
         self.write_header_and_payload_control_inline_nonblocking(header, 16, payload)
     }
 
+    /// Ask with a proven complete owner and retain the aligned reply owner.
+    /// No request normalization or reply-to-Bytes promotion is performed.
+    pub async fn ask_actor_frame_owned(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: crate::ForwardPayload,
+        timeout: Duration,
+    ) -> Result<crate::AlignedBytes> {
+        require_positive_timeout(timeout)?;
+        self.reject_oversize_inline(framing::ROUTED_ACTOR_ASK_HEADER_LEN, payload.len())?;
+        if payload.retained_bytes() > self.stream_handle()?.max_message_size() {
+            return Err(crate::GossipError::WriteQueueFull);
+        }
+        self.ask_actor_frame_outcome_with_optional_request_id(
+            actor_id, type_hash, payload, timeout, None,
+        )
+        .await
+        .and_then(CorrelationOutcome::into_result)
+    }
+
+    /// Explicit copying compatibility path for opaque Bytes owners.
+    /// The returned Bytes may additionally promote a pooled response owner.
+    pub async fn ask_actor_frame_copying(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+        timeout: Duration,
+    ) -> Result<bytes::Bytes> {
+        let reply = self
+            .ask_actor_frame_aligned(actor_id, type_hash, payload, timeout)
+            .await?;
+        Ok(reply.into_bytes())
+    }
+
     /// Ask an actor using the direct actor frame envelope (MessageType::ActorAsk).
+    /// Compatibility alias for [`Self::ask_actor_frame_copying`].
     pub async fn ask_actor_frame(
         &self,
         actor_id: u64,
@@ -814,13 +1086,12 @@ impl<T> ConnectionHandle<T> {
         payload: bytes::Bytes,
         timeout: Duration,
     ) -> Result<bytes::Bytes> {
-        let response = self
-            .ask_actor_frame_aligned(actor_id, type_hash, payload, timeout)
-            .await?;
-        Ok(response.into_bytes())
+        self.ask_actor_frame_copying(actor_id, type_hash, payload, timeout)
+            .await
     }
 
-    /// Ask an actor using the direct actor frame envelope (MessageType::ActorAsk), aligned response.
+    /// Copy an opaque Bytes request and preserve the aligned response owner.
+    /// Use [`Self::ask_actor_frame_owned`] to preserve a proven request owner.
     pub async fn ask_actor_frame_aligned(
         &self,
         actor_id: u64,
@@ -894,6 +1165,9 @@ impl<T> ConnectionHandle<T> {
         payload: bytes::Bytes,
         timeout: Duration,
     ) -> Result<(crate::PeerId, crate::AlignedBytes)> {
+        require_positive_timeout(timeout)?;
+        self.reject_oversize_inline(framing::ROUTED_ACTOR_ASK_HEADER_LEN, payload.len())?;
+        let payload = crate::ForwardPayload::copy_from_slice(&payload);
         self.ask_actor_frame_outcome_with_optional_request_id(
             actor_id, type_hash, payload, timeout, None,
         )
@@ -909,6 +1183,9 @@ impl<T> ConnectionHandle<T> {
         timeout: Duration,
         request_id: Option<u64>,
     ) -> Result<crate::AlignedBytes> {
+        require_positive_timeout(timeout)?;
+        self.reject_oversize_inline(framing::ROUTED_ACTOR_ASK_HEADER_LEN, payload.len())?;
+        let payload = crate::ForwardPayload::copy_from_slice(&payload);
         self.ask_actor_frame_outcome_with_optional_request_id(
             actor_id, type_hash, payload, timeout, request_id,
         )
@@ -922,13 +1199,15 @@ impl<T> ConnectionHandle<T> {
         &self,
         actor_id: u64,
         type_hash: u32,
-        payload: bytes::Bytes,
+        payload: crate::ForwardPayload,
         timeout: Duration,
         request_id: Option<u64>,
     ) -> Result<CorrelationOutcome> {
         require_positive_timeout(timeout)?;
         let started_at = Instant::now();
-        let slot = self.correlation.allocate()?;
+        let slot = self
+            .correlation
+            .allocate_for_session(self.instance_id().unwrap_or(0))?;
         let correlation_id = slot.id();
         // One absolute deadline covers identification, route-bind admission,
         // write-queue admission, and the response wait. Admission used to
@@ -937,7 +1216,7 @@ impl<T> ConnectionHandle<T> {
         let timed = tokio::time::timeout(timeout, async {
             let write_result = match request_id {
                 Some(request_id) => {
-                    self.write_routed_actor_ask_with_request_id(
+                    self.write_routed_actor_ask_owned_with_request_id(
                         correlation_id,
                         actor_id,
                         type_hash,
@@ -947,7 +1226,7 @@ impl<T> ConnectionHandle<T> {
                     .await
                 }
                 None => {
-                    self.write_routed_actor_ask(correlation_id, actor_id, type_hash, payload)
+                    self.write_routed_actor_ask_owned(correlation_id, actor_id, type_hash, payload)
                         .await
                 }
             };
@@ -1013,7 +1292,9 @@ impl<T> ConnectionHandle<T> {
         result
     }
 
-    /// Ask an actor using the direct actor frame envelope without timeout allocation.
+    /// Copy an opaque Bytes request without a timeout wrapper.
+    /// Promotes the response to Bytes; prefer [`Self::ask_actor_frame_no_timeout_owned`]
+    /// when the original request and aligned response owners should be preserved.
     pub async fn ask_actor_frame_no_timeout(
         &self,
         actor_id: u64,
@@ -1026,17 +1307,39 @@ impl<T> ConnectionHandle<T> {
         Ok(response.into_bytes())
     }
 
-    /// Ask an actor using the direct actor frame envelope without timeout allocation, aligned response.
+    /// Copy an opaque Bytes request without a timeout wrapper, retaining the aligned reply.
     pub async fn ask_actor_frame_no_timeout_aligned(
         &self,
         actor_id: u64,
         type_hash: u32,
         payload: bytes::Bytes,
     ) -> Result<crate::AlignedBytes> {
-        let slot = self.correlation.allocate()?;
+        self.reject_oversize_inline(framing::ROUTED_ACTOR_ASK_HEADER_LEN, payload.len())?;
+        self.ask_actor_frame_no_timeout_owned(
+            actor_id,
+            type_hash,
+            crate::ForwardPayload::copy_from_slice(&payload),
+        )
+        .await
+    }
+
+    /// Ask without a deadline, preserving proven request and aligned reply owners.
+    pub async fn ask_actor_frame_no_timeout_owned(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: crate::ForwardPayload,
+    ) -> Result<crate::AlignedBytes> {
+        self.reject_oversize_inline(framing::ROUTED_ACTOR_ASK_HEADER_LEN, payload.len())?;
+        if payload.retained_bytes() > self.stream_handle()?.max_message_size() {
+            return Err(crate::GossipError::WriteQueueFull);
+        }
+        let slot = self
+            .correlation
+            .allocate_for_session(self.instance_id().unwrap_or(0))?;
         let correlation_id = slot.id();
         if let Err(e) = self
-            .write_routed_actor_ask(correlation_id, actor_id, type_hash, payload)
+            .write_routed_actor_ask_owned(correlation_id, actor_id, type_hash, payload)
             .await
         {
             // SlotGuard `slot` will cancel on scope exit; no explicit call needed.
@@ -1060,15 +1363,40 @@ impl<T> ConnectionHandle<T> {
         type_hash: u32,
         payload: bytes::Bytes,
         timeout: Duration,
-    ) -> Result<PendingAsk> {
+    ) -> Result<PendingAsk<'_>> {
         require_positive_timeout(timeout)?;
+        self.reject_oversize_inline(framing::ROUTED_ACTOR_ASK_HEADER_LEN, payload.len())?;
+        self.ask_actor_frame_deferred_owned(
+            actor_id,
+            type_hash,
+            crate::ForwardPayload::copy_from_slice(&payload),
+            timeout,
+        )
+        .await
+    }
+
+    /// Send an actor ask frame and return a deferred handle that can be awaited later.
+    pub(crate) async fn ask_actor_frame_deferred_owned(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: crate::ForwardPayload,
+        timeout: Duration,
+    ) -> Result<PendingAsk<'_>> {
+        require_positive_timeout(timeout)?;
+        self.reject_oversize_inline(framing::ROUTED_ACTOR_ASK_HEADER_LEN, payload.len())?;
+        if payload.retained_bytes() > self.stream_handle()?.max_message_size() {
+            return Err(crate::GossipError::WriteQueueFull);
+        }
         let started_at = Instant::now();
-        let slot = self.correlation.allocate()?;
+        let slot = self
+            .correlation
+            .allocate_for_session(self.instance_id().unwrap_or(0))?;
         let correlation_id = slot.id();
         let _remaining = admit_ask_with_deadline(
             timeout,
             started_at,
-            self.write_routed_actor_ask(correlation_id, actor_id, type_hash, payload),
+            self.write_routed_actor_ask_owned(correlation_id, actor_id, type_hash, payload),
         )
         .await?;
 
@@ -1077,13 +1405,13 @@ impl<T> ConnectionHandle<T> {
             // responsible for cancelling the reservation if the handle is
             // dropped without being awaited.
             correlation_id: slot.disarm(),
-            correlation: self.correlation.clone(),
+            correlation: &self.correlation,
             deadline: saturating_deadline(started_at, timeout),
             active: true,
         })
     }
 
-    /// Tell with typed payload (rkyv) and debug-only type hash verification.
+    /// Tell with typed payload (rkyv) and unconditional type hash verification.
     pub async fn tell_typed<M>(&self, value: &M) -> Result<()>
     where
         M: crate::typed::WireEncode,
@@ -1142,6 +1470,7 @@ impl<T> ConnectionHandle<T> {
 
     /// Ask method for request-response.
     /// Returns response as Bytes.
+    /// Bytes compatibility adapter; native `*_owned` APIs avoid response promotion.
     pub async fn ask(&self, request: bytes::Bytes) -> Result<bytes::Bytes> {
         // Use default timeout of 30 seconds
         self.ask_with_timeout_bytes(request, Duration::from_secs(30))
@@ -1149,12 +1478,13 @@ impl<T> ConnectionHandle<T> {
     }
 
     /// Ask using owned bytes to avoid payload copies. Returns response as Bytes.
+    /// Bytes compatibility adapter; native `*_owned` APIs avoid response promotion.
     pub async fn ask_bytes(&self, request: bytes::Bytes) -> Result<bytes::Bytes> {
         self.ask_with_timeout_bytes(request, Duration::from_secs(30))
             .await
     }
 
-    /// Ask with typed request/response (rkyv) and debug-only type hash verification.
+    /// Ask with typed request/response (rkyv) and unconditional type hash verification.
     pub async fn ask_typed<Req, Resp>(&self, request: &Req) -> Result<Resp>
     where
         Req: crate::typed::WireEncode,
@@ -1229,7 +1559,7 @@ impl<T> ConnectionHandle<T> {
         let response = self
             .ask_with_timeout_pooled(payload, prefix, payload_len, Duration::from_secs(30))
             .await?;
-        crate::typed::decode_typed_archived::<Resp>(response)
+        crate::typed::decode_typed_archived_owned::<Resp>(response)
     }
 
     /// Ask with typed request and custom timeout, returning a zero-copy archived response.
@@ -1258,7 +1588,7 @@ impl<T> ConnectionHandle<T> {
         let response = self
             .ask_with_timeout_pooled(payload, prefix, payload_len, timeout)
             .await?;
-        crate::typed::decode_typed_archived::<Resp>(response)
+        crate::typed::decode_typed_archived_owned::<Resp>(response)
     }
 
     async fn ask_with_timeout_pooled(
@@ -1267,17 +1597,19 @@ impl<T> ConnectionHandle<T> {
         prefix: Option<[u8; 16]>,
         payload_len: usize,
         timeout: Duration,
-    ) -> Result<bytes::Bytes> {
+    ) -> Result<crate::AlignedBytes> {
         require_positive_timeout(timeout)?;
         self.reject_oversize_inline(framing::ASK_RESPONSE_HEADER_LEN, payload_len)?;
-        let slot = self.correlation.allocate()?;
+        let slot = self
+            .correlation
+            .allocate_for_session(self.instance_id().unwrap_or(0))?;
         let correlation_id = slot.id();
         let header = framing::try_write_ask_response_header(
             crate::MessageType::Ask,
             correlation_id,
             payload_len,
         )?;
-        self.finish_timed_ask(timeout, correlation_id, slot, async {
+        self.finish_timed_ask_owned(timeout, correlation_id, slot, async {
             if let Some(stream_handle) = self.stream_handle.as_ref() {
                 let prefix_len = prefix.as_ref().map(|p| p.len()).unwrap_or(0) as u8;
                 stream_handle
@@ -1298,6 +1630,7 @@ impl<T> ConnectionHandle<T> {
     }
 
     /// Ask using owned bytes and custom timeout. Returns response as Bytes.
+    /// Bytes compatibility adapter; native `*_owned` APIs avoid response promotion.
     pub async fn ask_with_timeout_bytes(
         &self,
         request: bytes::Bytes,
@@ -1305,7 +1638,9 @@ impl<T> ConnectionHandle<T> {
     ) -> Result<bytes::Bytes> {
         require_positive_timeout(timeout)?;
         self.reject_oversize_inline(framing::ASK_RESPONSE_HEADER_LEN, request.len())?;
-        let slot = self.correlation.allocate()?;
+        let slot = self
+            .correlation
+            .allocate_for_session(self.instance_id().unwrap_or(0))?;
         let correlation_id = slot.id();
 
         let header = framing::try_write_ask_response_header(
@@ -1319,6 +1654,109 @@ impl<T> ConnectionHandle<T> {
                 .await
         })
         .await
+    }
+
+    /// Raw ask retaining the complete request and aligned response owners.
+    /// One deadline covers writer admission and response delivery.
+    pub async fn ask_owned(
+        &self,
+        request: crate::ForwardPayload,
+        timeout: Duration,
+    ) -> Result<crate::AlignedBytes> {
+        self.ask_owned_inner(request, Some(timeout), None).await
+    }
+
+    /// Raw ask without a timer or response-owner promotion.
+    pub async fn ask_no_timeout_owned(
+        &self,
+        request: crate::ForwardPayload,
+    ) -> Result<crate::AlignedBytes> {
+        self.ask_owned_inner(request, None, None).await
+    }
+
+    /// Direct ask retaining native owners, with the original timeout semantics.
+    pub async fn ask_direct_owned(
+        &self,
+        request: crate::ForwardPayload,
+        timeout: Duration,
+    ) -> Result<crate::AlignedBytes> {
+        self.ask_owned_inner(request, Some(timeout), Some(None)).await
+    }
+
+    /// Direct ask retaining native owners, without introducing a timer.
+    pub async fn ask_direct_no_timeout_owned(
+        &self,
+        request: crate::ForwardPayload,
+    ) -> Result<crate::AlignedBytes> {
+        self.ask_owned_inner(request, None, Some(None)).await
+    }
+
+    /// Direct ask with an explicit nonzero replay/deduplication identity.
+    pub async fn ask_direct_owned_with_id(
+        &self,
+        request_id: u64,
+        request: crate::ForwardPayload,
+        timeout: Duration,
+    ) -> Result<crate::AlignedBytes> {
+        require_positive_timeout(timeout)?;
+        if request_id == 0 {
+            return Err(GossipError::InvalidConfig(
+                "ask_direct_owned_with_id: request_id must be nonzero".to_string(),
+            ));
+        }
+        self.ask_owned_inner(request, Some(timeout), Some(Some(request_id)))
+            .await
+    }
+
+    async fn ask_owned_inner(
+        &self,
+        request: crate::ForwardPayload,
+        timeout: Option<Duration>,
+        direct_request_id: Option<Option<u64>>,
+    ) -> Result<crate::AlignedBytes> {
+        if let Some(timeout) = timeout {
+            require_positive_timeout(timeout)?;
+        }
+        let header_len = if direct_request_id.is_some() {
+            framing::DIRECT_ASK_HEADER_LEN
+        } else {
+            framing::ASK_RESPONSE_HEADER_LEN
+        };
+        self.reject_oversize_inline(header_len, request.len())?;
+        let stream = self.stream_handle()?;
+        let slot = self.correlation.allocate_for_session(stream.instance_id())?;
+        let correlation_id = slot.id();
+        let header = match direct_request_id {
+            Some(request_id) => framing::try_write_direct_ask_header(
+                correlation_id,
+                request_id.unwrap_or(u64::from(correlation_id)),
+                request.len(),
+            )?,
+            None => framing::try_write_ask_response_header(
+                crate::MessageType::Ask,
+                correlation_id,
+                request.len(),
+            )?,
+        };
+        let write = stream.write_pooled_ask_inline(
+            header,
+            16,
+            None,
+            0,
+            crate::typed::PooledPayload::from_owned(request),
+        );
+        if let Some(timeout) = timeout {
+            return self
+                .finish_timed_ask_owned(timeout, correlation_id, slot, write)
+                .await;
+        }
+        write.await?;
+        let response = self
+            .correlation
+            .wait_for_response_no_timeout(correlation_id)
+            .await?;
+        let _ = slot.disarm();
+        Ok(response)
     }
 
     /// Fast-path direct ask that bypasses the actor message handler.
@@ -1336,6 +1774,7 @@ impl<T> ConnectionHandle<T> {
     /// a caller that needs an id stable across reconnects/retries (e.g. to
     /// dedupe a retried ask server-side) must supply its own via
     /// `ask_direct_with_id`.
+    /// Bytes compatibility adapter; native `*_owned` APIs avoid response promotion.
     pub async fn ask_direct(
         &self,
         request: bytes::Bytes,
@@ -1343,7 +1782,9 @@ impl<T> ConnectionHandle<T> {
     ) -> Result<bytes::Bytes> {
         require_positive_timeout(timeout)?;
         self.reject_oversize_inline(framing::DIRECT_ASK_HEADER_LEN, request.len())?;
-        let slot = self.correlation.allocate()?;
+        let slot = self
+            .correlation
+            .allocate_for_session(self.instance_id().unwrap_or(0))?;
         let correlation_id = slot.id();
         self.ask_direct_on_slot(
             correlation_id,
@@ -1362,6 +1803,7 @@ impl<T> ConnectionHandle<T> {
     /// sentinel (see `framing::write_direct_ask_header`) and is rejected
     /// before anything is sent, rather than silently accepted as a
     /// valid-looking id that could collide across independent asks.
+    /// Bytes compatibility adapter; native `*_owned` APIs avoid response promotion.
     pub async fn ask_direct_with_id(
         &self,
         request_id: u64,
@@ -1374,7 +1816,9 @@ impl<T> ConnectionHandle<T> {
                 "ask_direct_with_id: request_id must be nonzero".to_string(),
             ));
         }
-        let slot = self.correlation.allocate()?;
+        let slot = self
+            .correlation
+            .allocate_for_session(self.instance_id().unwrap_or(0))?;
         let correlation_id = slot.id();
         self.ask_direct_on_slot(correlation_id, request_id, request, timeout, slot)
             .await
@@ -1402,9 +1846,12 @@ impl<T> ConnectionHandle<T> {
     ///
     /// See `ask_direct`'s doc for why `correlation_id` doubles as
     /// `request_id` here.
+    /// Bytes compatibility adapter; native `*_owned` APIs avoid response promotion.
     pub async fn ask_direct_no_timeout(&self, request: bytes::Bytes) -> Result<bytes::Bytes> {
         self.reject_oversize_inline(framing::DIRECT_ASK_HEADER_LEN, request.len())?;
-        let slot = self.correlation.allocate()?;
+        let slot = self
+            .correlation
+            .allocate_for_session(self.instance_id().unwrap_or(0))?;
         let correlation_id = slot.id();
 
         // Build DirectAsk header
@@ -1465,7 +1912,9 @@ impl<T> ConnectionHandle<T> {
         // `SlotGuard` cancels this exact correlation slot on every `?` or
         // cancellation path below. Only a successful terminal response calls
         // `disarm`, after `wait_for_response` has removed the waiter.
-        let slot = self.correlation.allocate()?;
+        let slot = self
+            .correlation
+            .allocate_for_session(self.instance_id().unwrap_or(0))?;
         let correlation_id = slot.id();
         let result = match tokio::time::timeout(timeout, async {
             let gate_guard = stream_handle.acquire_streaming_mode().await?;
@@ -1531,12 +1980,48 @@ impl<T> ConnectionHandle<T> {
     /// Send an ask and return a handle that can be awaited later.
     ///
     /// This is useful for:
-    /// - delegating the "wait for response" to another task,
+    /// - awaiting independent responses concurrently within the connection scope,
     /// - checking correlation IDs for diagnostics/tests without misusing `ReplyTo`,
     /// - keeping resources bounded (dropping cancels the pending slot).
-    pub(crate) async fn ask_deferred(&self, request: bytes::Bytes) -> Result<PendingAsk> {
+    pub(crate) async fn ask_deferred(&self, request: bytes::Bytes) -> Result<PendingAsk<'_>> {
         self.ask_deferred_with_timeout_bytes(request, Duration::from_secs(30))
             .await
+    }
+
+    /// Native raw deferred ask with the original 30-second submission deadline.
+    pub(crate) async fn ask_deferred_owned(
+        &self,
+        request: crate::ForwardPayload,
+    ) -> Result<PendingAsk<'_>> {
+        let timeout = Duration::from_secs(30);
+        self.reject_oversize_inline(framing::ASK_RESPONSE_HEADER_LEN, request.len())?;
+        let started_at = Instant::now();
+        let stream = self.stream_handle()?;
+        let slot = self.correlation.allocate_for_session(stream.instance_id())?;
+        let correlation_id = slot.id();
+        let header = framing::try_write_ask_response_header(
+            crate::MessageType::Ask,
+            correlation_id,
+            request.len(),
+        )?;
+        admit_ask_with_deadline(
+            timeout,
+            started_at,
+            stream.write_pooled_ask_inline(
+                header,
+                16,
+                None,
+                0,
+                crate::typed::PooledPayload::from_owned(request),
+            ),
+        )
+        .await?;
+        Ok(PendingAsk {
+            correlation_id: slot.disarm(),
+            correlation: &self.correlation,
+            deadline: saturating_deadline(started_at, timeout),
+            active: true,
+        })
     }
 
     /// Deferred ask using owned bytes and a custom timeout.
@@ -1548,11 +2033,13 @@ impl<T> ConnectionHandle<T> {
         &self,
         request: bytes::Bytes,
         timeout: Duration,
-    ) -> Result<PendingAsk> {
+    ) -> Result<PendingAsk<'_>> {
         require_positive_timeout(timeout)?;
         self.reject_oversize_inline(framing::ASK_RESPONSE_HEADER_LEN, request.len())?;
         let started_at = Instant::now();
-        let slot = self.correlation.allocate()?;
+        let slot = self
+            .correlation
+            .allocate_for_session(self.instance_id().unwrap_or(0))?;
         let correlation_id = slot.id();
 
         let header = framing::try_write_ask_response_header(
@@ -1573,7 +2060,7 @@ impl<T> ConnectionHandle<T> {
             // responsible for cancelling the reservation if the handle is
             // dropped without being awaited.
             correlation_id: slot.disarm(),
-            correlation: self.correlation.clone(),
+            correlation: &self.correlation,
             deadline: saturating_deadline(started_at, timeout),
             active: true,
         })
@@ -1585,7 +2072,7 @@ impl<T> ConnectionHandle<T> {
         &self,
         requests: &[&[u8]],
         timeout: Duration,
-    ) -> Result<Vec<PendingAsk>> {
+    ) -> Result<Vec<PendingAsk<'_>>> {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
@@ -1615,7 +2102,9 @@ impl<T> ConnectionHandle<T> {
         let mut batch_message = bytes::BytesMut::with_capacity(total_size);
 
         for request in requests {
-            let slot = self.correlation.allocate()?;
+            let slot = self
+                .correlation
+                .allocate_for_session(self.instance_id().unwrap_or(0))?;
 
             let header = framing::try_write_ask_response_header(
                 crate::MessageType::Ask,
@@ -1654,7 +2143,7 @@ impl<T> ConnectionHandle<T> {
                 // responsible for cancelling this reservation if the handle
                 // is abandoned without being awaited.
                 correlation_id: slot.disarm(),
-                correlation: self.correlation.clone(),
+                correlation: &self.correlation,
                 deadline: saturating_deadline(started_at, timeout),
                 active: true,
             })
@@ -1817,7 +2306,8 @@ mod pubsub_lane_tests {
 
         let used = Arc::new(AtomicBool::new(false));
         let responder = AskResponder::from_stream_handle(1, stream_handle.clone(), used);
-        let result = responder.try_reply_bytes_immediate(bytes::Bytes::from_static(b"reply"));
+        let result =
+            responder.try_reply_bytes_immediate(crate::ForwardPayload::from_static(b"reply"));
         assert!(
             result.is_ok(),
             "control-plane reply must not be starved by a pubsub burst sharing \
@@ -1928,6 +2418,98 @@ mod oversized_inline_send_gate_tests {
             .expect("subsequent frame must decode as a valid V5 control word");
         assert_eq!(control.kind, crate::framing::WireKind::Gossip);
         assert_eq!(control.body_len, b"still-alive".len());
+    }
+
+    #[tokio::test]
+    async fn owned_actor_ask_rejects_hidden_capacity_before_queue_admission() {
+        let (conn, stream, _task, _peer) = make_handle();
+        let before = conn.sequence_number();
+        let mut backing = Vec::with_capacity(stream.max_message_size() + 1);
+        backing.push(7);
+        let payload = crate::ForwardPayload::from(backing);
+        assert_eq!(payload.len(), 1);
+        let result = conn
+            .ask_actor_frame_owned(7, 9, payload, Duration::from_secs(1))
+            .await;
+        assert!(matches!(result, Err(GossipError::WriteQueueFull)));
+        assert_eq!(conn.sequence_number(), before);
+        stream.shutdown();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn deferred_owned_ask_rejects_hidden_capacity_before_slot_or_write() {
+        let (conn, stream, task, mut peer) = make_handle();
+        let next_id = conn.correlation.next_id.load(Ordering::Acquire);
+        let sequence = conn.sequence_number();
+        let mut backing = Vec::with_capacity(stream.max_message_size() + 1);
+        backing.push(7);
+        let payload = crate::ForwardPayload::from(backing);
+        assert_eq!(payload.len(), 1);
+        assert!(payload.retained_bytes() > stream.max_message_size());
+        let result = conn
+            .ask_actor_frame_deferred_owned(7, 9, payload, Duration::from_secs(5))
+            .await;
+        assert!(matches!(result, Err(GossipError::WriteQueueFull)));
+        assert_eq!(conn.correlation.next_id.load(Ordering::Acquire), next_id);
+        for slot in &conn.correlation.pending {
+            assert_eq!(slot.state.load(Ordering::Acquire), SLOT_EMPTY);
+        }
+        assert_eq!(conn.sequence_number(), sequence);
+        tokio::task::yield_now().await;
+        assert_eq!(conn.bytes_written(), 0);
+
+        // The same endpoint must admit a genuinely bounded owner and preserve
+        // its first wire ID: rejection must not burn an ID or poison routing.
+        let correlation_owners = Arc::strong_count(&conn.correlation);
+        let pending = conn
+            .ask_actor_frame_deferred_owned(
+                7,
+                9,
+                crate::ForwardPayload::from(vec![1, 2]),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("an admissible native owner must be accepted");
+        assert_eq!(Arc::strong_count(&conn.correlation), correlation_owners);
+        assert_eq!(pending.correlation_id(), next_id);
+        assert_eq!(conn.correlation.next_id.load(Ordering::Acquire), next_id + 1);
+        assert!(conn.sequence_number() > sequence);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut bind = [0u8; crate::framing::ROUTE_BIND_FRAME_HEADER_LEN];
+            peer.read_exact(&mut bind).await.unwrap();
+            assert_eq!(
+                crate::framing::decode_control(bind[..4].try_into().unwrap())
+                    .unwrap()
+                    .kind,
+                crate::framing::WireKind::RouteBind
+            );
+            let mut ask = [0u8; crate::framing::ROUTED_ACTOR_ASK_FRAME_HEADER_LEN + 2];
+            peer.read_exact(&mut ask).await.unwrap();
+            assert_eq!(
+                crate::framing::decode_control(ask[..4].try_into().unwrap())
+                    .unwrap()
+                    .kind,
+                crate::framing::WireKind::RoutedActorAsk
+            );
+            assert_eq!(u32::from_be_bytes(ask[4..8].try_into().unwrap()), next_id);
+            assert_eq!(&ask[crate::framing::ROUTED_ACTOR_ASK_FRAME_HEADER_LEN..], &[1, 2]);
+        })
+        .await
+        .expect("the admissible control must reach the wire");
+        let pool = Arc::new(crate::AlignedBytesPool::new(1));
+        let mut response =
+            Some(crate::AlignedBytes::from_pooled_slice(b"accepted", pool).unwrap());
+        assert!(conn.correlation.complete(next_id, &mut response));
+        assert!(response.is_none());
+        assert_eq!(pending.wait_aligned().await.unwrap().as_ref(), b"accepted");
+        for slot in &conn.correlation.pending {
+            assert_eq!(slot.state.load(Ordering::Acquire), SLOT_EMPTY);
+        }
+        stream.shutdown();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the fixture writer must stop")
+            .unwrap();
     }
 
     #[tokio::test]
@@ -2135,7 +2717,7 @@ mod oversized_inline_send_gate_tests {
     #[tokio::test]
     async fn send_response_bytes_body_len_with_header_overhead_over_limit_is_rejected() {
         let (conn, _stream_handle, _task, mut peer) = make_handle();
-        let payload = bytes::Bytes::from(vec![0u8; MASTER_BUFFER_SIZE]);
+        let payload = crate::ForwardPayload::from(vec![0u8; MASTER_BUFFER_SIZE]);
         let err = conn.send_response_bytes(1, payload).await.unwrap_err();
         assert!(matches!(err, GossipError::MessageTooLarge { .. }));
         assert_connection_still_carries_a_normal_message(&conn, &mut peer).await;
@@ -2150,7 +2732,7 @@ mod oversized_inline_send_gate_tests {
     async fn send_response_bytes_over_max_message_size_errors_and_connection_survives() {
         let (conn, _stream_handle, _task, mut peer) = make_handle();
         let err = conn
-            .send_response_bytes(1, bytes::Bytes::from(vec![0u8; OVERSIZED]))
+            .send_response_bytes(1, crate::ForwardPayload::from(vec![0u8; OVERSIZED]))
             .await
             .unwrap_err();
         assert!(matches!(err, GossipError::MessageTooLarge { .. }));
@@ -2160,7 +2742,7 @@ mod oversized_inline_send_gate_tests {
     #[tokio::test]
     async fn send_response_buf_over_max_message_size_errors_and_connection_survives() {
         let (conn, _stream_handle, _task, mut peer) = make_handle();
-        let payload = bytes::Bytes::from(vec![0u8; OVERSIZED]);
+        let payload = crate::ForwardPayload::from(vec![0u8; OVERSIZED]);
         let payload_len = payload.len();
         let err = conn
             .send_response_buf(1, payload, payload_len)
@@ -2189,7 +2771,7 @@ mod oversized_inline_send_gate_tests {
         // Both individually well within max_message_size -- this must not be
         // caught by the size gate, only by the declared-vs-actual mismatch.
         let declared_payload_len = 8;
-        let actual_payload = bytes::Bytes::from(vec![0u8; 4096]);
+        let actual_payload = crate::ForwardPayload::from(vec![0u8; 4096]);
         let err = conn
             .send_response_buf(1, actual_payload, declared_payload_len)
             .await
@@ -2211,7 +2793,7 @@ mod oversized_inline_send_gate_tests {
     async fn send_response_buf_whose_remaining_is_less_than_declared_payload_len_is_rejected() {
         let (conn, _stream_handle, _task, mut peer) = make_handle();
         let declared_payload_len = 4096;
-        let actual_payload = bytes::Bytes::from(vec![0u8; 8]);
+        let actual_payload = crate::ForwardPayload::from(vec![0u8; 8]);
         let err = conn
             .send_response_buf(1, actual_payload, declared_payload_len)
             .await
@@ -2230,9 +2812,9 @@ mod oversized_inline_send_gate_tests {
     #[tokio::test]
     async fn send_response_buf_with_matching_declared_and_actual_length_is_written() {
         let (conn, _stream_handle, _task, mut peer) = make_handle();
-        let payload = bytes::Bytes::from_static(b"consistent");
+        let payload = crate::ForwardPayload::from_static(b"consistent");
         let payload_len = payload.len();
-        conn.send_response_buf(1, payload.clone(), payload_len)
+        conn.send_response_buf(1, payload, payload_len)
             .await
             .expect("a Buf whose remaining() matches the declared length must be sent");
         let mut ctrl = [0u8; crate::framing::LENGTH_PREFIX_LEN];
@@ -2490,5 +3072,338 @@ mod zero_timeout_gate_tests {
             conn.ask_streaming_bytes(bytes::Bytes::from_static(b"stream"), 9, 7, Duration::ZERO),
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod exact_session_endpoint_tests {
+    use super::*;
+    use crate::ask_forwarder::allocation_evidence;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scoped_raw_and_direct_asks_preserve_owners_and_exact_generation() {
+        let addr = "127.0.0.1:45521".parse().unwrap();
+        let (io, mut peer) = tokio::io::duplex(4096);
+        let (stream, writer_task, reader_task) = LockFreeStreamHandle::new(
+            io,
+            addr,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let stream = Arc::new(stream);
+        let tracker = CorrelationTracker::new();
+        let handle = ConnectionHandle::<()>::new_stream(
+            addr,
+            ConnectionDirection::Outbound,
+            stream.clone(),
+            tracker.clone(),
+        );
+        let remote = crate::RemoteActorRef::<()>::with_test_handle(handle);
+        let session = remote.session().await.unwrap();
+        let (other_io, _other_peer) = tokio::io::duplex(4096);
+        let (successor, successor_writer, successor_reader) = LockFreeStreamHandle::new(
+            other_io,
+            addr,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let successor = Arc::new(successor);
+        let foreign_tracker = CorrelationTracker::new();
+        remote.install_test_successor(ConnectionHandle::new_stream(
+            addr,
+            ConnectionDirection::Outbound,
+            successor.clone(),
+            foreign_tracker.clone(),
+        ));
+        assert_ne!(stream.instance_id(), successor.instance_id());
+        assert_eq!(session.instance_id(), Some(stream.instance_id()));
+        assert_eq!(
+            remote.session().await.unwrap().instance_id(),
+            Some(successor.instance_id())
+        );
+        assert!(matches!(
+            session
+                .ask_owned(crate::ForwardPayload::from_static(b"zero"), Duration::ZERO)
+                .await,
+            Err(GossipError::Timeout)
+        ));
+        assert!(matches!(
+            session
+                .ask_direct_owned_with_id(
+                    0,
+                    crate::ForwardPayload::from_static(b"invalid-id"),
+                    Duration::from_secs(1),
+                )
+                .await,
+            Err(GossipError::InvalidConfig(_))
+        ));
+        assert!(stream.write_queue.pop().is_none());
+        assert!(successor.write_queue.pop().is_none());
+        for complete in [false, true] {
+            let mut response = crate::aligned::AlignedBuffer::new();
+            response.extend_from_slice(b"deferred-reply");
+            let pointer = response.as_ptr();
+            let mut response = Some(crate::AlignedBytes::from_aligned_vec(response));
+            let endpoint_owners = session.endpoint_owner_count();
+            let tracker_owners = Arc::strong_count(&tracker);
+            let (_, counts) = allocation_evidence::measure(|| {
+                let future =
+                    session.ask_deferred_owned(crate::ForwardPayload::from_static(b"body"));
+                let mut future = std::pin::pin!(future);
+                let mut context = Context::from_waker(futures::task::noop_waker_ref());
+                let Poll::Ready(Ok(pending)) = future.as_mut().poll(&mut context) else {
+                    panic!("native deferred submission must admit without waiting for response");
+                };
+                let id = pending.correlation_id();
+                assert_eq!(session.endpoint_owner_count(), endpoint_owners);
+                assert_eq!(Arc::strong_count(&tracker), tracker_owners);
+                if complete {
+                    assert!(tracker.complete(id, &mut response));
+                    let wait = pending.wait();
+                    let mut wait = std::pin::pin!(wait);
+                    let Poll::Ready(Ok(reply)) = wait.as_mut().poll(&mut context) else {
+                        panic!("completed native deferred response must be ready");
+                    };
+                    assert_eq!(reply.as_ref().as_ptr(), pointer);
+                } else {
+                    drop(pending);
+                    assert!(!tracker.complete(id, &mut response));
+                    assert!(response.is_some());
+                }
+            });
+            assert_eq!(counts, allocation_evidence::Counts::default());
+            let mut frame = [0u8; 20];
+            tokio::time::timeout(Duration::from_secs(2), peer.read_exact(&mut frame))
+                .await
+                .expect("native deferred request must reach the old session")
+                .unwrap();
+            assert_eq!(&frame[16..], b"body");
+            assert!(successor.write_queue.pop().is_none());
+        }
+        // Every combination uses a real writer command. The operation must
+        // retain the old endpoint even after the locator has a successor.
+        for direct in [false, true] {
+            for timed in [false, true] {
+                for complete in [false, true] {
+                    let mut request = Vec::with_capacity(1024);
+                    request.extend_from_slice(b"body");
+                    let pointer = request.as_ptr();
+                    let retained = request.capacity();
+                    let mut response = crate::aligned::AlignedBuffer::new();
+                    response.extend_from_slice(b"reply");
+                    let response_pointer = response.as_ptr();
+                    let mut response = Some(crate::AlignedBytes::from_aligned_vec(response));
+                    let stream_owners = Arc::strong_count(&stream);
+                    let tracker_owners = Arc::strong_count(&tracker);
+                    let endpoint_owners = session.endpoint_owner_count();
+                    let (_, counts) = allocation_evidence::measure(|| {
+                        let request = crate::ForwardPayload::from(request);
+                        let future = async {
+                            match (direct, timed) {
+                                (false, false) => session.ask_no_timeout_owned(request).await,
+                                (false, true) => {
+                                    session.ask_owned(request, Duration::from_secs(1)).await
+                                }
+                                (true, false) => session.ask_direct_no_timeout_owned(request).await,
+                                (true, true) => {
+                                    session.ask_direct_owned(request, Duration::from_secs(1)).await
+                                }
+                            }
+                        };
+                        let mut future = std::pin::pin!(future);
+                        let mut context = Context::from_waker(futures::task::noop_waker_ref());
+                        assert!(future.as_mut().poll(&mut context).is_pending());
+                        let command = stream.write_queue.pop().expect("old session must admit");
+                        let correlation_id = match &command {
+                            WriteCommand::AskPayload(WritePayload::HeaderInlinePooled {
+                                header,
+                                payload,
+                                ..
+                            })
+                            | WriteCommand::Admitted {
+                                payload: WritePayload::HeaderInlinePooled {
+                                    header,
+                                    payload,
+                                    ..
+                                },
+                                ask: true,
+                                ..
+                            } => {
+                                assert_eq!(payload.as_ref().as_ptr(), pointer);
+                                assert_eq!(payload.retained_bytes(), retained);
+                                assert_eq!(payload.as_ref(), b"body");
+                                u32::from_be_bytes(header[4..8].try_into().unwrap())
+                            }
+                            _ => panic!("native ask must keep its complete owner"),
+                        };
+                        assert!(successor.write_queue.pop().is_none());
+                        assert!(!foreign_tracker.complete(correlation_id, &mut response));
+                        assert!(response.is_some());
+                        if complete {
+                            assert!(tracker.complete(correlation_id, &mut response));
+                            let Poll::Ready(Ok(reply)) = future.as_mut().poll(&mut context) else {
+                                panic!("exact tracker completion must deliver the response");
+                            };
+                            assert_eq!(reply.as_ref().as_ptr(), response_pointer);
+                            assert_eq!(reply.as_ref(), b"reply");
+                        }
+                        assert_eq!(Arc::strong_count(&stream), stream_owners);
+                        assert_eq!(Arc::strong_count(&tracker), tracker_owners);
+                        assert_eq!(session.endpoint_owner_count(), endpoint_owners);
+                        stream
+                            .write_queue
+                            .try_push(&mut Some(command))
+                            .unwrap_or_else(|_| panic!("removed command must retain its slot"));
+                    });
+                    assert_eq!(counts, allocation_evidence::Counts::default());
+                    let mut frame = [0u8; 20];
+                    tokio::time::timeout(Duration::from_secs(2), peer.read_exact(&mut frame))
+                        .await
+                        .expect("cancellation cannot strand an admitted frame")
+                        .unwrap();
+                    assert_eq!(&frame[16..], b"body");
+                    let id = u32::from_be_bytes(frame[4..8].try_into().unwrap());
+                    let mut late = Some(crate::AlignedBytes::from_aligned_vec(
+                        crate::aligned::AlignedBuffer::new(),
+                    ));
+                    assert!(!tracker.complete(id, &mut late));
+                    assert!(late.is_some());
+                    assert!(!session.is_closed());
+                    assert!(!successor.exit_flag.load(Ordering::Acquire));
+                }
+            }
+        }
+        // Both counters have positive controls; neither zero is vacuous.
+        let owners = Arc::strong_count(&stream);
+        let alias = stream.clone();
+        assert_eq!(Arc::strong_count(&stream), owners + 1);
+        drop(alias);
+        let (_, allocating) = allocation_evidence::measure(|| {
+            std::hint::black_box(crate::ForwardPayload::from_static(b"control").into_bytes())
+        });
+        assert!(allocating.allocations > 0);
+        stream.shutdown();
+        successor.shutdown();
+        writer_task.await.unwrap();
+        successor_writer.await.unwrap();
+        if let Some(reader_task) = reader_task {
+            reader_task.abort();
+        }
+        if let Some(successor_reader) = successor_reader {
+            successor_reader.abort();
+        }
+    }
+}
+
+#[cfg(test)]
+mod native_typed_response_tests {
+    use super::*;
+    use crate::ask_forwarder::allocation_evidence;
+
+    #[derive(rkyv::Archive, rkyv::Serialize)]
+    struct TypedReply(u64);
+    crate::wire_type!(TypedReply, "native_typed_response_tests::TypedReply");
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn typed_asks_deliver_native_archives_without_response_promotion() {
+        let addr = "127.0.0.1:45522".parse().unwrap();
+        let (io, mut peer) = tokio::io::duplex(4096);
+        let (stream, writer_task, reader_task) = LockFreeStreamHandle::new(
+            io,
+            addr,
+            ChannelId::TellAsk,
+            BufferConfig::default(),
+            None,
+            None,
+        );
+        let stream = Arc::new(stream);
+        let tracker = CorrelationTracker::new();
+        let handle = ConnectionHandle::<()>::new_stream(
+            addr,
+            ConnectionDirection::Outbound,
+            stream.clone(),
+            tracker.clone(),
+        );
+        for custom_timeout in [false, true] {
+            let payload = crate::typed::encode_typed_pooled(&TypedReply(53)).unwrap();
+            let (payload, prefix, len) = crate::typed::typed_payload_parts::<TypedReply>(payload);
+            let mut storage = crate::aligned::AlignedBuffer::with_capacity(4096);
+            storage.extend_from_slice(&prefix.unwrap());
+            storage.extend_from_slice(payload.as_ref());
+            drop(payload);
+            let pointer = storage.as_ptr();
+            let capacity = storage.capacity();
+            let mut response = Some(crate::AlignedBytes::from_aligned_vec(storage));
+            let request = TypedReply(17);
+            let future = async {
+                if custom_timeout {
+                    handle
+                        .ask_typed_archived_with_timeout::<_, TypedReply>(
+                            &request,
+                            Duration::from_secs(1),
+                        )
+                        .await
+                } else {
+                    handle.ask_typed_archived::<_, TypedReply>(&request).await
+                }
+            };
+            let mut future = std::pin::pin!(future);
+            let mut context = Context::from_waker(futures::task::noop_waker_ref());
+            assert!(future.as_mut().poll(&mut context).is_pending());
+            let command = stream
+                .write_queue
+                .pop()
+                .expect("typed request must be admitted");
+            let correlation_id = match &command {
+                WriteCommand::AskPayload(WritePayload::HeaderInlinePooled { header, .. })
+                | WriteCommand::Admitted {
+                    payload: WritePayload::HeaderInlinePooled { header, .. },
+                    ask: true,
+                    ..
+                } => u32::from_be_bytes(header[4..8].try_into().unwrap()),
+                _ => panic!("typed request must retain its pooled owner"),
+            };
+            assert!(tracker.complete(correlation_id, &mut response));
+            let (archived, counts) = allocation_evidence::measure(|| {
+                let Poll::Ready(Ok(archived)) = future.as_mut().poll(&mut context) else {
+                    panic!("completed typed reply must be ready");
+                };
+                archived
+            });
+            assert_eq!(counts.allocations, 0);
+            assert_eq!(counts.reallocations, 0);
+            assert_eq!(archived.as_bytes().as_ptr(), pointer.wrapping_add(16));
+            assert_eq!(archived.retained_capacity(), Some(capacity));
+            assert_eq!(archived.archived().unwrap().0, 53);
+            let (bytes, counts) = allocation_evidence::measure(|| archived.into_bytes());
+            assert!(
+                counts.allocations > 0,
+                "compatibility promotion is observable"
+            );
+            assert_eq!(bytes.as_ptr(), pointer);
+            stream
+                .write_queue
+                .try_push(&mut Some(command))
+                .unwrap_or_else(|_| panic!("removed command must retain its slot"));
+            let mut frame = vec![0u8; 16 + len];
+            tokio::time::timeout(Duration::from_secs(2), peer.read_exact(&mut frame))
+                .await
+                .expect("native typed request must reach the peer")
+                .unwrap();
+            assert_eq!(
+                u32::from_be_bytes(frame[4..8].try_into().unwrap()),
+                correlation_id
+            );
+            assert!(!stream.exit_flag.load(Ordering::Acquire));
+        }
+        stream.shutdown();
+        writer_task.await.unwrap();
+        if let Some(reader_task) = reader_task {
+            reader_task.abort();
+        }
     }
 }

@@ -134,9 +134,16 @@ async fn publisher_recovers_route_to_live_subscriber_after_socket_close()
     let received = Arc::new(AtomicUsize::new(0));
     let _sub = {
         let received = Arc::clone(&received);
-        pubsub_sub.subscribe_bytes(topic, type_hash, move |_bytes| {
-            received.fetch_add(1, Ordering::SeqCst);
-        })
+        pubsub_sub
+            .subscribe_bytes(
+                topic,
+                type_hash,
+                icanact_remote::pubsub::CooperativeCallback::new(move |_bytes: bytes::Bytes| {
+                    received.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(())
+                }),
+            )
+            .expect("subscription admission")
     };
 
     let interest_name = interest_actor_name(topic, &subscriber_id);
@@ -157,7 +164,7 @@ async fn publisher_recovers_route_to_live_subscriber_after_socket_close()
     let baseline = pubsub_pub.publish_bytes(
         topic,
         type_hash,
-        bytes::Bytes::from_static(b"baseline"),
+        icanact_remote::ForwardPayload::from_static(b"baseline"),
         PubSubScope::ClusterWide,
         PubSubDeliveryPolicy::default(),
     )?;
@@ -191,7 +198,7 @@ async fn publisher_recovers_route_to_live_subscriber_after_socket_close()
             .publish_bytes(
                 topic,
                 type_hash,
-                bytes::Bytes::from_static(b"after-disconnect"),
+                icanact_remote::ForwardPayload::from_static(b"after-disconnect"),
                 PubSubScope::ClusterWide,
                 PubSubDeliveryPolicy::default(),
             )
@@ -203,7 +210,7 @@ async fn publisher_recovers_route_to_live_subscriber_after_socket_close()
     let final_stats = pubsub_pub.publish_bytes(
         topic,
         type_hash,
-        bytes::Bytes::from_static(b"final"),
+        icanact_remote::ForwardPayload::from_static(b"final"),
         PubSubScope::ClusterWide,
         PubSubDeliveryPolicy::default(),
     )?;
@@ -225,7 +232,7 @@ async fn publisher_recovers_route_to_live_subscriber_after_socket_close()
          disconnect message"
     );
 
-    subscriber.shutdown_and_wait().await;
-    publisher.shutdown_and_wait().await;
+    subscriber.shutdown_and_wait().await.unwrap();
+    publisher.shutdown_and_wait().await.unwrap();
     Ok(())
 }

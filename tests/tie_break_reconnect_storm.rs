@@ -203,7 +203,7 @@ async fn pre_handshake_eof_listener() -> (SocketAddr, JoinHandle<()>) {
                 return;
             };
             tokio::spawn(async move {
-                let _ = stream.shutdown().await;
+                stream.shutdown().await.unwrap();
             });
         }
     });
@@ -308,7 +308,7 @@ async fn restart_churn_does_not_produce_unbounded_reconnect_storm() -> icanact_r
             let _ = peer.connect(&hi_addr).await;
         }
         sleep(Duration::from_millis(*up_ms)).await;
-        lo.shutdown_and_wait().await;
+        lo.shutdown_and_wait().await.unwrap();
         sleep(Duration::from_millis(*down_ms)).await;
     }
 
@@ -425,8 +425,8 @@ async fn restart_churn_does_not_produce_unbounded_reconnect_storm() -> icanact_r
     );
 
     set_transport_lifecycle_recorder(None);
-    lo_final.shutdown_and_wait().await;
-    hi.shutdown_and_wait().await;
+    lo_final.shutdown_and_wait().await.unwrap();
+    hi.shutdown_and_wait().await.unwrap();
     Ok(())
 }
 
@@ -492,7 +492,7 @@ async fn pre_handshake_eof_churn_does_not_arm_tie_break_cooldown() -> icanact_re
 
     set_transport_lifecycle_recorder(None);
     bad_listener.abort();
-    node.shutdown_and_wait().await;
+    node.shutdown_and_wait().await.unwrap();
     Ok(())
 }
 
@@ -571,7 +571,7 @@ async fn witness_mesh_restart_and_simultaneous_open_matrix_converges_quietly()
             churn.registry.connect_to_peer(&stable_b.registry.peer_id),
         );
         sleep(Duration::from_millis(if cycle % 3 == 0 { 140 } else { 20 })).await;
-        churn.shutdown_and_wait().await;
+        churn.shutdown_and_wait().await.unwrap();
         sleep(Duration::from_millis(15)).await;
     }
 
@@ -651,9 +651,9 @@ async fn witness_mesh_restart_and_simultaneous_open_matrix_converges_quietly()
     );
 
     set_transport_lifecycle_recorder(None);
-    churn.shutdown_and_wait().await;
-    stable_a.shutdown_and_wait().await;
-    stable_b.shutdown_and_wait().await;
+    churn.shutdown_and_wait().await.unwrap();
+    stable_a.shutdown_and_wait().await.unwrap();
+    stable_b.shutdown_and_wait().await.unwrap();
     Ok(())
 }
 

@@ -20,6 +20,9 @@ TESTS = {
 
 
 def parse(output, workload, minimum_seconds):
+    if (type(minimum_seconds) not in (int, float) or
+            not math.isfinite(minimum_seconds) or minimum_seconds < 0):
+        raise ValueError("minimum duration must be finite and nonnegative")
     summaries = re.findall(r"^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored;", output, re.M)
     if summaries != [("1", "0", "0")]:
         raise ValueError("exactly one executed, passed benchmark required")

@@ -18,6 +18,15 @@ class ConcurrentSampleTests(unittest.TestCase):
                     "throughput": 10, "duration_ns": 10_000_000_000,
                     "p50_ns": 10, "p95_ns": 20, "p99_ns": 30}}
 
+    def test_nonfinite_and_nonnumeric_metrics_are_rejected(self):
+        for field in self.record()["metrics"]:
+            for value in (float("nan"), float("inf"), -float("inf"), True, "1", None):
+                with self.subTest(field=field, value=value):
+                    record = self.record()
+                    record["metrics"][field] = value
+                    with self.assertRaises(ValueError):
+                        SAMPLE.parse(output(record), 8, 10)
+
     def test_fixed_duration_completion_and_percentiles(self):
         record = self.record()
         self.assertEqual(SAMPLE.parse(output(record), 8, 10), record)

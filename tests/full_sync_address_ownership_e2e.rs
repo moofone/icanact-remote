@@ -170,14 +170,8 @@ async fn protected_projection(
     victim_addr: SocketAddr,
     victim_peer_id: &PeerId,
 ) -> ProtectedProjection {
-    let addr_owner = registry
-        .connection_pool
-        .addr_to_peer_id
-        .read_sync(&victim_addr, |_, peer| peer.clone());
-    let victim_route = registry
-        .connection_pool
-        .peer_id_to_addr
-        .read_sync(victim_peer_id, |_, addr| *addr);
+    let addr_owner = registry.connection_pool.get_peer_id_by_addr(&victim_addr);
+    let victim_route = registry.connection_pool.indexed_route_addr(victim_peer_id);
     let victim_actor = registry
         .lookup_actor(VICTIM_ACTOR)
         .await
@@ -307,8 +301,7 @@ async fn run_live_victim_claim(kind: FullSyncKind) -> icanact_remote::Result<()>
     let victim_connection_before = observer
         .registry
         .connection_pool
-        .connections_by_addr
-        .read_sync(&victim_addr, |_, connection| Arc::clone(connection))
+        .get_lock_free_connection(victim_addr)
         .expect("victim address must route to its live connection");
     let full_sync_count_before = observer.registry.get_stats().await.full_sync_exchanges;
 
@@ -373,8 +366,7 @@ async fn run_live_victim_claim(kind: FullSyncKind) -> icanact_remote::Result<()>
     let victim_connection_after = observer
         .registry
         .connection_pool
-        .connections_by_addr
-        .read_sync(&victim_addr, |_, connection| Arc::clone(connection))
+        .get_lock_free_connection(victim_addr)
         .expect("victim address must retain its live connection");
     assert!(
         Arc::ptr_eq(&victim_connection_before, &victim_connection_after),
@@ -386,9 +378,9 @@ async fn run_live_victim_claim(kind: FullSyncKind) -> icanact_remote::Result<()>
         "both authenticated frames apply, rebound to the attacker's verified transport source"
     );
 
-    attacker.shutdown().await;
-    victim.shutdown().await;
-    observer.shutdown().await;
+    attacker.shutdown().await.unwrap();
+    victim.shutdown().await.unwrap();
+    observer.shutdown().await.unwrap();
     Ok(())
 }
 
@@ -424,13 +416,11 @@ async fn run_local_address_claim(kind: FullSyncKind) -> icanact_remote::Result<(
     let owner_before = observer
         .registry
         .connection_pool
-        .addr_to_peer_id
-        .read_sync(&local_addr, |_, peer| peer.clone());
+        .get_peer_id_by_addr(&local_addr);
     let connection_before = observer
         .registry
         .connection_pool
-        .connections_by_addr
-        .read_sync(&local_addr, |_, connection| Arc::clone(connection));
+        .get_lock_free_connection(local_addr);
 
     let malicious = full_sync_message(
         kind,
@@ -459,24 +449,22 @@ async fn run_local_address_claim(kind: FullSyncKind) -> icanact_remote::Result<(
         observer
             .registry
             .connection_pool
-            .addr_to_peer_id
-            .read_sync(&local_addr, |_, peer| peer.clone()),
+            .get_peer_id_by_addr(&local_addr),
         owner_before,
         "a remote peer must never own this registry's local address"
     );
     let connection_after = observer
         .registry
         .connection_pool
-        .connections_by_addr
-        .read_sync(&local_addr, |_, connection| Arc::clone(connection));
+        .get_lock_free_connection(local_addr);
     match (connection_before, connection_after) {
         (None, None) => {}
         (Some(before), Some(after)) => assert!(Arc::ptr_eq(&before, &after)),
         _ => panic!("a rejected local-address claim changed the local connection index"),
     }
 
-    attacker.shutdown().await;
-    observer.shutdown().await;
+    attacker.shutdown().await.unwrap();
+    observer.shutdown().await.unwrap();
     Ok(())
 }
 
@@ -548,8 +536,7 @@ async fn provisional_self_reports_never_publish_exclusive_aliases() -> icanact_r
         observer
             .registry
             .connection_pool
-            .addr_to_peer_id
-            .read_sync(&claimed_addr, |_, peer| peer.clone()),
+            .get_peer_id_by_addr(&claimed_addr),
         None,
         "a first provisional self-report must not own a previously-unowned alias"
     );
@@ -586,8 +573,7 @@ async fn provisional_self_reports_never_publish_exclusive_aliases() -> icanact_r
         observer
             .registry
             .connection_pool
-            .addr_to_peer_id
-            .read_sync(&claimed_addr, |_, peer| peer.clone()),
+            .get_peer_id_by_addr(&claimed_addr),
         None,
         "no provisional claimant may publish the alias"
     );
@@ -595,9 +581,9 @@ async fn provisional_self_reports_never_publish_exclusive_aliases() -> icanact_r
     // actor, so actor presence is intentionally not used as evidence here.
     // The address route is the durable security boundary under test.
 
-    second.shutdown().await;
-    first.shutdown().await;
-    observer.shutdown().await;
+    second.shutdown().await.unwrap();
+    first.shutdown().await.unwrap();
+    observer.shutdown().await.unwrap();
     Ok(())
 }
 
@@ -690,7 +676,7 @@ async fn nat_inbound_full_sync_binds_identity_to_observed_transport() -> icanact
         "owned actor repair must preserve the advertised service port while anchoring the verified IP"
     );
 
-    sender.shutdown().await;
-    observer.shutdown().await;
+    sender.shutdown().await.unwrap();
+    observer.shutdown().await.unwrap();
     Ok(())
 }

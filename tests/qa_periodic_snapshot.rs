@@ -114,8 +114,8 @@ async fn accepted_registrations_converge_over_existing_connection() {
         accepted.len(),
         a.registry.config.max_message_size
     );
-    a.shutdown().await;
-    b.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
     assert_eq!(
         observed,
         accepted.len(),

@@ -162,8 +162,8 @@ async fn test_ask_response_with_correlation() {
     }
     
     // Shutdown
-    handle_a.shutdown().await;
-    handle_b.shutdown().await;
+    handle_a.shutdown().await.unwrap();
+    handle_b.shutdown().await.unwrap();
     
     info!("\nAll tests completed successfully!");
 }
@@ -205,7 +205,7 @@ async fn test_ask_error_cases() {
     }
     
     // Shutdown
-    handle.shutdown().await;
+    handle.shutdown().await.unwrap();
     
     info!("\nError handling tests completed!");
 }
@@ -270,7 +270,7 @@ async fn test_ask_performance() {
             
             // Simulate immediate reply
             reply_to
-                .reply(bytes::Bytes::from_static(b"ok"))
+                .reply(icanact_remote::ForwardPayload::from_static(b"ok"))
                 .await
                 .unwrap();
         });
@@ -304,8 +304,8 @@ async fn test_ask_performance() {
     assert!(latency_us < 50.0, "Average latency should be under 50μs");
     
     // Shutdown
-    handle_a.shutdown().await;
-    handle_b.shutdown().await;
+    handle_a.shutdown().await.unwrap();
+    handle_b.shutdown().await.unwrap();
     
     info!("\nPerformance test completed!");
 }

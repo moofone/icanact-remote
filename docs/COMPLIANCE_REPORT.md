@@ -16,7 +16,7 @@ This document is a lightweight status note for the current repository state. It 
 
 ## Copy-sensitive paths
 
-- The codebase includes `tell_bytes` and `ask_deferred` on `RemoteActorRef` and related low-copy helpers on `RemoteConnection`.
+- The codebase includes exact-session `tell_bytes` and scoped `ask_deferred` on `RemoteActorSession`, acquired through `RemoteActorRef::session()`, and related native-owner helpers on `RemoteConnection`. Deferred waits preserve `AlignedBytes`; `wait_bytes` is an explicit compatibility promotion.
 - Alignment-aware deserialization exists in the registry message path.
 - Guard scripts still check for forbidden `rkyv::from_bytes` usage and for selected copy patterns.
 

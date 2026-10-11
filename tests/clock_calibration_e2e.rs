@@ -77,7 +77,7 @@ async fn tls_gossip_clock_calibration_exposes_peer_timing_snapshots() -> Result<
         );
     }
 
-    node_a.shutdown().await;
-    node_b.shutdown().await;
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
     Ok(())
 }

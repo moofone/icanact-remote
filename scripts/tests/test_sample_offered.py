@@ -35,6 +35,15 @@ class OfferedSampleTests(unittest.TestCase):
             },
         }
 
+    def test_nonfinite_and_nonnumeric_metrics_are_rejected(self):
+        for field in self.record()["metrics"]:
+            for value in (float("nan"), float("inf"), -float("inf"), True, "1", None):
+                with self.subTest(field=field, value=value):
+                    record = self.record()
+                    record["metrics"][field] = value
+                    with self.assertRaises(ValueError):
+                        SAMPLE.parse(output(record), 1000, 10, 64)
+
     def test_exact_window_and_percentiles(self):
         record = self.record()
         self.assertEqual(SAMPLE.parse(output(record), 1000, 10, 64), record)

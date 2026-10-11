@@ -16,7 +16,7 @@ async fn wait_for_peer_mapping(
     let start = Instant::now();
     while start.elapsed() < timeout {
         let pool = &node.registry.connection_pool;
-        if pool.peer_id_to_addr.contains_sync(peer_id) && pool.connection_count() >= 1 {
+        if pool.indexed_route_addr(peer_id).is_some() && pool.connection_count() >= 1 {
             return true;
         }
         sleep(Duration::from_millis(50)).await;
@@ -125,7 +125,7 @@ fn test_node_name_based_connections() {
         );
 
         // Clean shutdown
-        node_a.shutdown().await;
-        node_b.shutdown().await;
+        node_a.shutdown().await.unwrap();
+        node_b.shutdown().await.unwrap();
     });
 }

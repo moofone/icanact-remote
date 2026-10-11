@@ -7,7 +7,7 @@
 //! variable inside `ask_actor_frame`'s Timeout-retry branch, which was never
 //! written back. These tests hold this claim to its word.
 
-use icanact_remote::registry::{ActorMessageFuture, ActorMessageHandler};
+use icanact_remote::registry::{ActorAskHandlerSync, ActorResponse, AskDisposition};
 use icanact_remote::{ConnectionRecoveryPolicy, GossipConfig, GossipRegistryHandle, KeyPair};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -115,7 +115,7 @@ fn held_ref_recovers_after_peer_restart() {
             .expect("tell() should work before restart");
 
         // Kill B - this is the "old TCP connection dies" scenario the doc block describes.
-        handle_b.shutdown().await;
+        handle_b.shutdown().await.unwrap();
         sleep(Duration::from_secs(2)).await;
 
         // Restart B with the SAME identity at the SAME address (pod restart onto the
@@ -153,8 +153,8 @@ fn held_ref_recovers_after_peer_restart() {
             tell_result
         );
 
-        handle_a.shutdown().await;
-        handle_b2.shutdown().await;
+        handle_a.shutdown().await.unwrap();
+        handle_b2.shutdown().await.unwrap();
     });
 }
 
@@ -165,49 +165,47 @@ fn held_ref_recovers_after_peer_restart() {
 struct DelayFirstThenFastHandler {
     calls: Arc<AtomicU64>,
     first_call_delay: Duration,
+    first_reply: std::sync::Mutex<
+        Option<(
+            icanact_remote::ReplySession,
+            icanact_remote::ForwardReplyToken,
+            tokio::time::Instant,
+        )>,
+    >,
 }
 
-impl ActorMessageHandler for DelayFirstThenFastHandler {
-    fn handle_actor_message(
+impl ActorAskHandlerSync for DelayFirstThenFastHandler {
+    fn handle_actor_ask_sync(
         &self,
         _actor_id: u64,
         _type_hash: u32,
         _payload: icanact_remote::AlignedBytes,
-        correlation_id: Option<u32>,
-    ) -> ActorMessageFuture<'_> {
-        let calls = self.calls.clone();
-        let first_call_delay = self.first_call_delay;
-        Box::pin(async move {
-            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                sleep(first_call_delay).await;
-            }
-            if correlation_id.is_some() {
-                Ok(Some(b"pong".to_vec().into()))
-            } else {
-                Ok(None)
-            }
-        })
+        context: icanact_remote::AskContext<'_>,
+    ) -> icanact_remote::Result<AskDisposition> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            // Exactly one bounded deferred reply; do not sleep inside the
+            // transport's inline callback and block its retry reader.
+            let session = context.reply_session()?;
+            let token = context.into_forward_reply(&session)?;
+            *self.first_reply.lock().unwrap() = Some((
+                session,
+                token,
+                tokio::time::Instant::now() + self.first_call_delay,
+            ));
+            Ok(AskDisposition::Deferred)
+        } else {
+            Ok(AskDisposition::Immediate(ActorResponse::Bytes(
+                icanact_remote::ForwardPayload::from_static(b"pong"),
+            )))
+        }
     }
 }
 
-/// `ask_actor_frame`'s Timeout branch must actually retry a timed-out ask on
-/// the connection `recover_connection_after_actor_ask_timeout` just healed,
-/// and that healed connection must then be the one persisted into the ref -
-/// not merely reachable in principle. This exercises
-/// `evict_peer_on_ask_timeout = true` together with
-/// `retry_actor_ask_once_after_timeout = true`
-/// (`aggressive_ask_timeout_recovery()`) against a peer that stays
-/// continuously alive (never restarted): a peer-restart topology reliably
-/// produces a transport-class failure on the stale connection instead
-/// (`ConnectionClosed`/`ConnectionReset`), which is caught by
-/// `is_transport_failure` and routed through the ambiguous-failure path
-/// (`preserve_ambiguous_ask_error`, which never replays), so it can never
-/// enter the `Err(GossipError::Timeout)` arm this test is named for. Forcing
-/// a genuine `Timeout` instead requires the connection itself to stay
-/// healthy while only the response is late, which is exactly what
-/// `DelayFirstThenFastHandler` is for.
+/// Explicit timeout replay may re-send an idempotent request, but cannot evict
+/// the healthy session. The first actor response is late while the transport
+/// remains live; a second request and unrelated subsequent traffic still work.
 #[test]
-fn timeout_retry_persists_recovered_connection() {
+fn timeout_retry_preserves_healthy_connection() {
     run_async_test("timeout-retry-persists-connection", async {
         let addr_a: SocketAddr = "127.0.0.1:28475".parse().unwrap();
         let addr_b: SocketAddr = "127.0.0.1:28476".parse().unwrap();
@@ -246,12 +244,14 @@ fn timeout_retry_persists_recovered_connection() {
         .await
         .unwrap();
         let calls = Arc::new(AtomicU64::new(0));
+        let handler = Arc::new(DelayFirstThenFastHandler {
+            calls: calls.clone(),
+            first_call_delay: Duration::from_millis(1_500),
+            first_reply: std::sync::Mutex::new(None),
+        });
         handle_b
             .registry
-            .set_actor_message_handler(Arc::new(DelayFirstThenFastHandler {
-                calls: calls.clone(),
-                first_call_delay: Duration::from_millis(1_500),
-            }))
+            .set_actor_ask_handler_sync(handler.clone())
             .await;
 
         let peer_b = handle_a.add_peer(&peer_id_b).await;
@@ -263,12 +263,16 @@ fn timeout_retry_persists_recovered_connection() {
             .await
             .expect("initial lookup_peer should succeed");
 
-        // Keep our own handle to the pre-timeout connection so we can prove,
-        // via its *public* `is_closed()`, that it was actually evicted - and
-        // that the ref itself no longer points at it afterwards.
+        // Retain the original handle: timeout must leave this exact transport
+        // open, not merely install some other usable replacement.
         let before_conn = remote_actor
             .connection_ref()
             .expect("connection should be cached");
+        let before_physical = handle_a
+            .registry
+            .connection_pool
+            .get_lock_free_connection(addr_b)
+            .unwrap();
 
         // B is still fully alive throughout - only its first response is
         // late. The ask's own budget (600ms) is comfortably shorter than
@@ -286,7 +290,7 @@ fn timeout_retry_persists_recovered_connection() {
             retried.as_deref().ok(),
             Some(b"pong".as_slice()),
             "with retry_actor_ask_once_after_timeout enabled, the timed-out ask must be \
-             retried on the recovered connection and succeed, got: {:?}",
+             retried on the healthy connection and succeed, got: {:?}",
             retried
         );
         assert!(
@@ -296,21 +300,41 @@ fn timeout_retry_persists_recovered_connection() {
         );
 
         assert!(
-            before_conn.is_closed(),
-            "the timed-out connection instance should have been evicted/closed"
+            !before_conn.is_closed(),
+            "an actor timeout must not evict the healthy transport"
         );
         let after_conn = remote_actor
             .connection_ref()
             .expect("connection should still be cached");
         assert!(
             !after_conn.is_closed(),
-            "the connection the retry actually succeeded on must be persisted into the ref \
-             (found the ref still pointing at the closed pre-timeout connection)"
+            "the original healthy transport must remain available after replay"
         );
 
-        // The real assertion: a subsequent, unrelated call on the SAME ref
-        // must use the healed connection, not the original (now-evicted)
-        // instance.
+        assert!(
+            Arc::ptr_eq(
+                &before_physical,
+                &handle_a
+                    .registry
+                    .connection_pool
+                    .get_lock_free_connection(addr_b)
+                    .unwrap()
+            ),
+            "timeout replay must preserve the exact physical generation"
+        );
+
+        // Drive the original response late, without spawning a task. Its
+        // distinguishable body must not satisfy the retry or a later ask.
+        let (session, token, ready_at) = handler.first_reply.lock().unwrap().take().unwrap();
+        tokio::time::sleep_until(ready_at).await;
+        session
+            .try_reply_owned(
+                token,
+                icanact_remote::ForwardPayload::from_static(b"late-original"),
+            )
+            .unwrap();
+
+        // Subsequent, unrelated calls on the same ref remain usable.
         let follow_up = remote_actor
             .ask(bytes::Bytes::from_static(b"ECHO:after-timeout-retry"))
             .await;
@@ -330,8 +354,8 @@ fn timeout_retry_persists_recovered_connection() {
             tell_result
         );
 
-        handle_a.shutdown().await;
-        handle_b.shutdown().await;
+        handle_a.shutdown().await.unwrap();
+        handle_b.shutdown().await.unwrap();
     });
 }
 
@@ -341,31 +365,22 @@ fn timeout_retry_persists_recovered_connection() {
 /// healthy - never a transport-class failure.
 struct NeverRespondsHandler;
 
-impl ActorMessageHandler for NeverRespondsHandler {
-    fn handle_actor_message(
+impl ActorAskHandlerSync for NeverRespondsHandler {
+    fn handle_actor_ask_sync(
         &self,
         _actor_id: u64,
         _type_hash: u32,
         _payload: icanact_remote::AlignedBytes,
-        _correlation_id: Option<u32>,
-    ) -> ActorMessageFuture<'_> {
-        Box::pin(async move {
-            sleep(Duration::from_secs(30)).await;
-            Ok(None)
-        })
+        _context: icanact_remote::AskContext<'_>,
+    ) -> icanact_remote::Result<AskDisposition> {
+        Ok(AskDisposition::Deferred)
     }
 }
 
-/// Evicting on ask timeout and persisting a healed replacement are two
-/// independent decisions from replaying the timed-out request onto it - the
-/// policy combination that evicts but never replays
-/// (`evict_peer_on_ask_timeout = true`, `retry_actor_ask_once_after_timeout
-/// = false`) is exactly the one nothing else here covers, and exactly the
-/// one where conflating "dial a replacement" with "replay onto it" used to
-/// leave the ref's own slot stuck holding the connection instance that was
-/// just evicted underneath it.
+/// Legacy eviction flags are inert. Without explicit replay the caller gets
+/// Timeout, while the same healthy cached transport remains usable.
 #[test]
-fn timeout_without_replay_still_heals_the_cached_slot() {
+fn timeout_without_replay_preserves_healthy_connection() {
     run_async_test("timeout-without-replay-heals-slot", async {
         let addr_a: SocketAddr = "127.0.0.1:28477".parse().unwrap();
         let addr_b: SocketAddr = "127.0.0.1:28478".parse().unwrap();
@@ -410,7 +425,7 @@ fn timeout_without_replay_still_heals_the_cached_slot() {
         .unwrap();
         handle_b
             .registry
-            .set_actor_message_handler(Arc::new(NeverRespondsHandler))
+            .set_actor_ask_handler_sync(Arc::new(NeverRespondsHandler))
             .await;
 
         let peer_b = handle_a.add_peer(&peer_id_b).await;
@@ -425,6 +440,11 @@ fn timeout_without_replay_still_heals_the_cached_slot() {
         let before_conn = remote_actor
             .connection_ref()
             .expect("connection should be cached");
+        let before_physical = handle_a
+            .registry
+            .connection_pool
+            .get_lock_free_connection(addr_b)
+            .unwrap();
 
         let timed_out = remote_actor
             .ask_actor_frame(
@@ -441,25 +461,30 @@ fn timeout_without_replay_still_heals_the_cached_slot() {
         );
 
         assert!(
-            before_conn.is_closed(),
-            "the timed-out connection instance should have been evicted/closed \
-             synchronously before ask_actor_frame returned"
+            !before_conn.is_closed(),
+            "an actor timeout must not evict the healthy transport"
         );
 
-        // The real assertion: even with replay disabled (this specific
-        // timed-out ask is never retried), the ref's own cached slot must
-        // not be left pointing at the connection instance that was just
-        // evicted underneath it - a follow-up call must not inherit the
-        // dead handle.
+        // Replay disabled still preserves the healthy cached slot.
         let after_conn = remote_actor
             .connection_ref()
             .expect("connection should still be cached after the timeout");
         assert!(
             !after_conn.is_closed(),
-            "the slot must be healed even when replay is disabled, found the ref still \
-             pointing at the closed evicted connection"
+            "the original healthy slot remains available with replay disabled"
         );
 
+        assert!(
+            Arc::ptr_eq(
+                &before_physical,
+                &handle_a
+                    .registry
+                    .connection_pool
+                    .get_lock_free_connection(addr_b)
+                    .unwrap()
+            ),
+            "a timeout without replay must preserve the exact physical generation"
+        );
         let follow_up = remote_actor
             .ask(bytes::Bytes::from_static(b"ECHO:no-replay-heal"))
             .await;
@@ -470,8 +495,8 @@ fn timeout_without_replay_still_heals_the_cached_slot() {
         );
         assert_eq!(follow_up.unwrap().as_ref(), b"ECHOED:no-replay-heal");
 
-        handle_a.shutdown().await;
-        handle_b.shutdown().await;
+        handle_a.shutdown().await.unwrap();
+        handle_b.shutdown().await.unwrap();
     });
 }
 
@@ -522,7 +547,7 @@ fn concurrent_asks_survive_connection_swap_race() {
                 .expect("initial lookup_peer should succeed"),
         );
 
-        handle_b.shutdown().await;
+        handle_b.shutdown().await.unwrap();
         sleep(Duration::from_secs(2)).await;
 
         let handle_b2 = GossipRegistryHandle::new_with_transport_stack(
@@ -571,7 +596,7 @@ fn concurrent_asks_survive_connection_swap_race() {
             "the connection left in the slot after the race must be usable"
         );
 
-        handle_a.shutdown().await;
-        handle_b2.shutdown().await;
+        handle_a.shutdown().await.unwrap();
+        handle_b2.shutdown().await.unwrap();
     });
 }

@@ -95,46 +95,35 @@ pub struct TcpKeepaliveConfig {
     pub retries: Option<u32>,
 }
 
-/// Domain-specific recovery behavior for cached peer connections.
+/// Actor replay preference. Application deadlines and cancellation never classify
+/// peer liveness or evict a transport (REMOTE-1).
 ///
-/// Defaults are intentionally conservative for general actor traffic: a slow actor handler should
-/// not normally cause a transport session to be torn down. Latency-sensitive domains can opt in
-/// through their `RegistryTransportBootstrap`.
+/// Legacy eviction fields remain accepted for source compatibility but are inert.
+/// New code should only opt into replay for idempotent actor operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ConnectionRecoveryPolicy {
-    /// On actor-ask timeout, evict the cached transport session for the target peer.
+    /// Ignored compatibility field: actor timeouts never evict a transport.
     pub evict_peer_on_ask_timeout: bool,
-    /// On actor-ask cancellation, evict the cached transport session for the target peer.
+    /// Ignored compatibility field: cancellation never evicts a transport.
     pub evict_peer_on_ask_cancel: bool,
-    /// After evicting on timeout, reconnect and retry the actor ask once.
+    /// Explicitly replay a timed-out actor ask once on the same session.
     pub retry_actor_ask_once_after_timeout: bool,
-    /// Number of *consecutive* ask outcomes a consumer classifies as
-    /// streak-timeouts (via the `note_peer_ask_*` mechanism) before the cached
-    /// transport session is evicted. `0` disables the streak mechanism.
-    ///
-    /// This is the single, generic eviction mechanism: the consumer supplies
-    /// the domain classification (which errors count, which RPCs participate)
-    /// and icanact-remote owns the per-peer counter, the threshold, the
-    /// reset-on-success, and the instance-guarded teardown. It lets
-    /// latency-sensitive consumers ride over transient transport blips
-    /// instead of evicting on the first timeout.
+    /// Ignored compatibility field: timeout streaks are not transport evidence.
     pub consecutive_timeout_threshold: u8,
 }
 
 impl ConnectionRecoveryPolicy {
     pub const fn aggressive_ask_timeout_recovery() -> Self {
         Self {
-            evict_peer_on_ask_timeout: true,
-            evict_peer_on_ask_cancel: true,
+            evict_peer_on_ask_timeout: false,
+            evict_peer_on_ask_cancel: false,
             retry_actor_ask_once_after_timeout: true,
             consecutive_timeout_threshold: 0,
         }
     }
 
-    /// Streak-based recovery: evict only after `threshold` consecutive
-    /// consumer-classified streak-timeouts (hard transport faults still evict
-    /// immediately). Rides over transient blips shorter than the streak. Used
-    /// by latency-sensitive consumers such as consensus layers.
+    /// Compatibility constructor. The threshold is retained as configuration
+    /// data only; no number of application timeouts evicts a transport.
     pub const fn streak_ask_timeout_recovery(threshold: u8) -> Self {
         Self {
             evict_peer_on_ask_timeout: false,
@@ -192,6 +181,9 @@ pub struct GossipConfig {
     pub max_delta_history: usize,
     /// Force full sync after this many delta exchanges
     pub full_sync_interval: u64,
+    /// Global simultaneous non-blocking bootstrap dials; excess batches return
+    /// `WriteQueueFull` before any task is started (default: 64).
+    pub max_bootstrap_dials: u32,
     /// Maximum number of pooled connections
     pub max_pooled_connections: usize,
     /// How often to run vector clock garbage collection
@@ -362,7 +354,8 @@ impl Default for GossipConfig {
             peer_supervisor_interval: Duration::from_secs(DEFAULT_PEER_SUPERVISOR_SECONDS),
             preferred_inbound_wait: Duration::from_millis(DEFAULT_PREFERRED_INBOUND_WAIT_MS),
             max_delta_history: 100,
-            full_sync_interval: 50,     // Force full sync every 50 deltas
+            full_sync_interval: 50, // Force full sync every 50 deltas
+            max_bootstrap_dials: 64,
             max_pooled_connections: 20, // Allow up to 20 pooled connections
             vector_clock_gc_frequency: Duration::from_secs(300), // 5 minutes
             vector_clock_retention_period: Duration::from_secs(7200), // 2 hours (was 1 hour)
@@ -649,8 +642,8 @@ mod tests {
     fn test_aggressive_connection_recovery_policy() {
         let policy = ConnectionRecoveryPolicy::aggressive_ask_timeout_recovery();
 
-        assert!(policy.evict_peer_on_ask_timeout);
-        assert!(policy.evict_peer_on_ask_cancel);
+        assert!(!policy.evict_peer_on_ask_timeout);
+        assert!(!policy.evict_peer_on_ask_cancel);
         assert!(policy.retry_actor_ask_once_after_timeout);
     }
 

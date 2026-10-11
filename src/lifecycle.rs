@@ -19,6 +19,13 @@ pub enum SessionRemovalReason {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportLifecycleEvent {
+    /// Test-only acknowledged pause immediately before a setup await.
+    #[cfg(test)]
+    InboundInitializationPending {
+        peer: PeerId,
+        addr: SocketAddr,
+        stage: u8,
+    },
     /// Test-only seam after an inbound candidate has sampled pre-claim
     /// ownership/peer state but before it submits its serialized claim.
     #[cfg(test)]

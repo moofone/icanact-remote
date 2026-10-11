@@ -169,15 +169,29 @@ fn test_mesh_formation_3_nodes() -> Result<(), DynError> {
         let node_c = create_tls_node(config.clone()).await?;
         let addr_c = node_c.registry.bind_addr;
 
-        // Add peers manually to track them
-        node_a.registry.add_peer(addr_b).await;
-        node_a.registry.add_peer(addr_c).await;
-        node_b.registry.add_peer(addr_a).await;
-        node_c.registry.add_peer(addr_a).await;
+        // Known listening routes are operator intent, not bare hints. Keep
+        // randomized socket ownership without counting ephemeral inbound
+        // sources as dialable discovery candidates.
+        node_a
+            .registry
+            .configure_peer(node_b.registry.peer_id.clone(), addr_b)
+            .await;
+        node_a
+            .registry
+            .configure_peer(node_c.registry.peer_id.clone(), addr_c)
+            .await;
+        node_b
+            .registry
+            .configure_peer(node_a.registry.peer_id.clone(), addr_a)
+            .await;
+        node_c
+            .registry
+            .configure_peer(node_a.registry.peer_id.clone(), addr_a)
+            .await;
 
         // Bootstrap connections non-blocking
         connect_preferred(&node_a, &node_b).await?;
-        node_c.bootstrap_non_blocking(vec![addr_a]).await;
+        node_c.bootstrap_non_blocking(vec![addr_a]).await.unwrap();
 
         // A should be able to reach both peers; deterministic connection ownership
         // may keep one direct handle on the other side.
@@ -213,9 +227,9 @@ fn test_mesh_formation_3_nodes() -> Result<(), DynError> {
         );
 
         // Clean shutdown
-        node_a.shutdown().await;
-        node_b.shutdown().await;
-        node_c.shutdown().await;
+        node_a.shutdown().await.unwrap();
+        node_b.shutdown().await.unwrap();
+        node_c.shutdown().await.unwrap();
 
         Ok(())
     })
@@ -273,8 +287,8 @@ fn test_local_connection_wins() -> Result<(), DynError> {
         );
 
         // Clean shutdown
-        node_a.shutdown().await;
-        node_b.shutdown().await;
+        node_a.shutdown().await.unwrap();
+        node_b.shutdown().await.unwrap();
 
         Ok(())
     })
@@ -322,8 +336,8 @@ fn test_feature_flag_disabled_no_discovery() -> Result<(), DynError> {
         );
 
         // Clean shutdown
-        node_a.shutdown().await;
-        node_b.shutdown().await;
+        node_a.shutdown().await.unwrap();
+        node_b.shutdown().await.unwrap();
 
         Ok(())
     })
@@ -344,7 +358,7 @@ fn test_manual_peer_registration_is_inactive_until_observed() -> Result<(), DynE
         assert_eq!(stats.active_peers, 0, "unobserved peer is not active");
         assert_eq!(stats.failed_peers, 1, "unobserved peer remains tracked");
 
-        node_a.shutdown().await;
+        node_a.shutdown().await.unwrap();
         Ok(())
     })
 }
@@ -394,7 +408,7 @@ fn test_peer_list_ttl_cleanup() -> Result<(), DynError> {
             "stale peer should be pruned after TTL"
         );
 
-        node.shutdown().await;
+        node.shutdown().await.unwrap();
         Ok(())
     })
 }
@@ -424,7 +438,7 @@ fn test_connect_on_demand_soft_cap() -> Result<(), DynError> {
             node.registry.add_peer(addr_a).await;
 
             // Bootstrap connection
-            node.bootstrap_non_blocking(vec![addr_a]).await;
+            node.bootstrap_non_blocking(vec![addr_a]).await.unwrap();
 
             node_addrs.push(addr);
             nodes.push(node);
@@ -447,9 +461,9 @@ fn test_connect_on_demand_soft_cap() -> Result<(), DynError> {
         );
 
         // Clean shutdown
-        node_a.shutdown().await;
+        node_a.shutdown().await.unwrap();
         for node in nodes {
-            node.shutdown().await;
+            node.shutdown().await.unwrap();
         }
 
         Ok(())
@@ -486,7 +500,7 @@ fn test_known_peers_no_amnesia() -> Result<(), DynError> {
         let _discovered_before = stats_b_before.discovered_peers;
 
         // Shutdown A (simulating disconnect)
-        node_a.shutdown().await;
+        node_a.shutdown().await.unwrap();
 
         assert!(
             common::wait_for_condition(Duration::from_secs(5), || async {
@@ -502,7 +516,7 @@ fn test_known_peers_no_amnesia() -> Result<(), DynError> {
         // but the peer info should persist for reconnection
 
         // Clean shutdown
-        node_b.shutdown().await;
+        node_b.shutdown().await.unwrap();
 
         Ok(())
     })
@@ -542,7 +556,7 @@ fn test_resource_exhaustion_protection() -> Result<(), DynError> {
             "oversized peer list should be rejected"
         );
 
-        node.shutdown().await;
+        node.shutdown().await.unwrap();
 
         Ok(())
     })
@@ -587,8 +601,8 @@ fn test_peer_discovery_metrics() -> Result<(), DynError> {
         // mesh_formation_time_ms is Option<u64>, can be None
 
         // Clean shutdown
-        node_a.shutdown().await;
-        node_b.shutdown().await;
+        node_a.shutdown().await.unwrap();
+        node_b.shutdown().await.unwrap();
 
         Ok(())
     })
@@ -613,11 +627,25 @@ fn test_failure_recovery_backoff() -> Result<(), DynError> {
         let node_c = create_tls_node(config.clone()).await?;
         let addr_c = node_c.registry.bind_addr;
 
-        // Setup mesh
-        node_a.registry.add_peer(addr_b).await;
-        node_a.registry.add_peer(addr_c).await;
-        node_b.registry.add_peer(addr_a).await;
-        node_c.registry.add_peer(addr_a).await;
+        // These are known listening endpoints, not bare discovery hints.
+        // Pin the fixture's operator routes so an inbound-preferred hub does
+        // not ask an ephemeral, non-dialable source to occupy discovery slots.
+        node_a
+            .registry
+            .configure_peer(node_b.registry.peer_id.clone(), addr_b)
+            .await;
+        node_a
+            .registry
+            .configure_peer(node_c.registry.peer_id.clone(), addr_c)
+            .await;
+        node_b
+            .registry
+            .configure_peer(node_a.registry.peer_id.clone(), addr_a)
+            .await;
+        node_c
+            .registry
+            .configure_peer(node_a.registry.peer_id.clone(), addr_a)
+            .await;
 
         connect_preferred(&node_a, &node_b).await?;
         connect_preferred(&node_a, &node_c).await?;
@@ -663,7 +691,7 @@ fn test_failure_recovery_backoff() -> Result<(), DynError> {
         let stats_a = node_a.stats().await;
 
         // Kill node C (simulating failure)
-        node_c.shutdown().await;
+        node_c.shutdown().await.unwrap();
 
         // A and B should still be connected; the deterministic connection owner
         // can be either side, so check pair lookup instead of A's local peer count.
@@ -679,8 +707,8 @@ fn test_failure_recovery_backoff() -> Result<(), DynError> {
         );
 
         // Cleanup
-        node_a.shutdown().await;
-        node_b.shutdown().await;
+        node_a.shutdown().await.unwrap();
+        node_b.shutdown().await.unwrap();
 
         Ok(())
     })
@@ -706,7 +734,7 @@ fn test_simultaneous_dial_tiebreaker() -> Result<(), DynError> {
         node_b.registry.add_peer(addr_a).await;
 
         // Both try to bootstrap to each other simultaneously
-        node_a.bootstrap_non_blocking(vec![addr_b]).await;
+        node_a.bootstrap_non_blocking(vec![addr_b]).await.unwrap();
         connect_preferred(&node_a, &node_b).await?;
 
         // Wait for connection race to resolve (using robust wait)
@@ -722,8 +750,8 @@ fn test_simultaneous_dial_tiebreaker() -> Result<(), DynError> {
         );
 
         // Cleanup
-        node_a.shutdown().await;
-        node_b.shutdown().await;
+        node_a.shutdown().await.unwrap();
+        node_b.shutdown().await.unwrap();
 
         Ok(())
     })
@@ -753,8 +781,8 @@ fn test_advertised_address_routing() -> Result<(), DynError> {
         );
 
         // Cleanup
-        node_a.shutdown().await;
-        node_b.shutdown().await;
+        node_a.shutdown().await.unwrap();
+        node_b.shutdown().await.unwrap();
 
         Ok(())
     })
@@ -804,7 +832,7 @@ fn test_ssrf_bogon_filtering() -> Result<(), DynError> {
         );
 
         // Cleanup
-        node_a.shutdown().await;
+        node_a.shutdown().await.unwrap();
 
         Ok(())
     })
@@ -893,8 +921,8 @@ fn test_version_negotiation_v3_capabilities() -> Result<(), DynError> {
             "Node B should negotiate peer discovery with node A"
         );
 
-        node_a.shutdown().await;
-        node_b.shutdown().await;
+        node_a.shutdown().await.unwrap();
+        node_b.shutdown().await.unwrap();
 
         Ok(())
     })
@@ -920,11 +948,23 @@ fn test_partition_heal_behavior() -> Result<(), DynError> {
         let node_d = create_tls_node(config.clone()).await?;
         let addr_d = node_d.registry.bind_addr;
 
-        // Create initial mesh: A-B and C-D (two partitions)
-        node_a.registry.add_peer(addr_b).await;
-        node_b.registry.add_peer(addr_a).await;
-        node_c.registry.add_peer(addr_d).await;
-        node_d.registry.add_peer(addr_c).await;
+        // Explicit operator routes form only the two partition edges.
+        node_a
+            .registry
+            .configure_peer(node_b.registry.peer_id.clone(), addr_b)
+            .await;
+        node_b
+            .registry
+            .configure_peer(node_a.registry.peer_id.clone(), addr_a)
+            .await;
+        node_c
+            .registry
+            .configure_peer(node_d.registry.peer_id.clone(), addr_d)
+            .await;
+        node_d
+            .registry
+            .configure_peer(node_c.registry.peer_id.clone(), addr_c)
+            .await;
 
         connect_preferred(&node_a, &node_b).await?;
         connect_preferred(&node_c, &node_d).await?;
@@ -938,9 +978,15 @@ fn test_partition_heal_behavior() -> Result<(), DynError> {
             "C/D partition edge should form before heal"
         );
 
-        // Heal partition by connecting B to C
-        node_b.registry.add_peer(addr_c).await;
-        node_c.registry.add_peer(addr_b).await;
+        // Heal by adding only the known B/C listening routes.
+        node_b
+            .registry
+            .configure_peer(node_c.registry.peer_id.clone(), addr_c)
+            .await;
+        node_c
+            .registry
+            .configure_peer(node_b.registry.peer_id.clone(), addr_b)
+            .await;
         connect_preferred(&node_b, &node_c).await?;
 
         // Verify both partition edges remain reachable. The physical socket owner is selected by
@@ -964,10 +1010,10 @@ fn test_partition_heal_behavior() -> Result<(), DynError> {
         );
 
         // Cleanup
-        node_a.shutdown().await;
-        node_b.shutdown().await;
-        node_c.shutdown().await;
-        node_d.shutdown().await;
+        node_a.shutdown().await.unwrap();
+        node_b.shutdown().await.unwrap();
+        node_c.shutdown().await.unwrap();
+        node_d.shutdown().await.unwrap();
 
         Ok(())
     })
@@ -1001,8 +1047,8 @@ fn test_identity_tls_verification() -> Result<(), DynError> {
         // not via gossip. This is ensured by the TLS layer.
 
         // Cleanup
-        node_a.shutdown().await;
-        node_b.shutdown().await;
+        node_a.shutdown().await.unwrap();
+        node_b.shutdown().await.unwrap();
 
         Ok(())
     })
@@ -1037,7 +1083,7 @@ fn test_known_peers_lru_capacity() -> Result<(), DynError> {
         // This test verifies the LRU capacity is enforced internally
 
         // Cleanup
-        node_a.shutdown().await;
+        node_a.shutdown().await.unwrap();
 
         Ok(())
     })

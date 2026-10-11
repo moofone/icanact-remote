@@ -149,7 +149,7 @@ async fn seed_only_peer_reconnects_after_peer_restart_past_dead_peer_timeout()
     );
 
     // The peer goes away entirely, freeing its port.
-    b.shutdown_and_wait().await;
+    b.shutdown_and_wait().await.unwrap();
 
     // Surface the close to the dialer the way the transport does in
     // production. A pooled connection to a process that has exited is not

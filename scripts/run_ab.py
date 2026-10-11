@@ -45,6 +45,10 @@ def snapshot(root):
             "lock_sha256": digest(lock.read_bytes()) if lock.exists() else None}
 
 
+def positive_finite_number(value):
+    return (type(value) in (int, float) and math.isfinite(value) and value > 0)
+
+
 def validate(config):
     if config.get("mode") not in ("pilot", "acceptance"):
         raise ValueError("mode must be pilot or acceptance")
@@ -71,12 +75,12 @@ def validate(config):
             raise ValueError("unknown completion policy")
         if policy == "fixed_duration" and (
             work.get("duration_metric") not in work.get("metrics", {}) or
-            work.get("minimum_duration", 0) <= 0
+            not positive_finite_number(work.get("minimum_duration"))
         ):
             raise ValueError("fixed-duration workloads require a declared duration metric and minimum")
         if not work.get("hypothesis") or not work.get("correctness_oracle"):
             raise ValueError("hypothesis and correctness oracle required")
-        if not work.get("metrics") or work.get("timeout_seconds", 0) <= 0:
+        if not work.get("metrics") or not positive_finite_number(work.get("timeout_seconds")):
             raise ValueError("metrics and positive timeout required")
         for spec in work["metrics"].values():
             if spec.get("direction") not in ("lower", "higher") or not spec.get("unit"):
@@ -87,7 +91,10 @@ def validate(config):
             cap = 0.05 if spec.get("category") == "memory" else 0.03
             if not isinstance(limit, (int, float)) or not 0 <= limit <= cap:
                 raise ValueError("regression cap is 3% (5% for explicit memory metrics)")
-            if spec["goal"] == "improve" and spec.get("min_improvement", 0) < 0.05:
+            if spec["goal"] == "improve" and (
+                not positive_finite_number(spec.get("min_improvement")) or
+                spec["min_improvement"] < 0.05
+            ):
                 raise ValueError("timing improvement threshold must be at least 5%")
             if spec["goal"] == "reduce" and spec["direction"] != "lower":
                 raise ValueError("reduce is only valid for lower-is-better counters")

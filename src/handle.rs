@@ -12,7 +12,7 @@ use tokio::{
 use tracing::{debug, error, info, instrument, warn};
 
 use crate::{
-    GossipConfig, GossipError, GossipNodeId, RegistrationPriority, RemoteActorLocation, Result,
+    GossipConfig, GossipError, RegistrationPriority, RemoteActorLocation, Result,
     registry::{GossipRegistry, GossipResult, GossipTask, RegistryMessage, RegistryStats},
     transport::{RegistryTransportBootstrap, TransportWireKind},
 };
@@ -44,6 +44,14 @@ fn decode_registry_message(
             <RegistryMessage as rkyv::Archive>::Archived,
             rkyv::rancor::Error,
         >(bytes)?;
+        if !registry_archive_within_clock_budget(archived) {
+            return Err(<rkyv::rancor::Error as rkyv::rancor::Source>::new(
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "registry archive exceeds vector clock ingress budget",
+                ),
+            ));
+        }
         let mut pool = rkyv::de::Pool::new();
         let deserializer = rkyv::rancor::Strategy::wrap(&mut pool);
         rkyv::Deserialize::deserialize(archived, deserializer)
@@ -56,6 +64,47 @@ fn decode_registry_message(
         let mut aligned = RegistryAlignedVec::with_capacity(payload.len());
         aligned.extend_from_slice(payload);
         decode_from_aligned_bytes(aligned.as_ref())
+    }
+}
+
+/// Inspect archived lengths before materializing outer actor/change vectors or
+/// any clock Vec/BTreeMap. Frame size already bounds structural traversal.
+fn registry_archive_within_clock_budget(message: &rkyv::Archived<RegistryMessage>) -> bool {
+    use crate::registry::{ArchivedRegistryChange, ArchivedRegistryMessage};
+    let mut remaining = crate::MAX_INGRESS_REGISTRY_CLOCK_ENTRIES;
+    let mut admit = |entries: usize| {
+        if entries > crate::MAX_INGRESS_VECTOR_CLOCK_ENTRIES || entries > remaining {
+            return false;
+        }
+        remaining -= entries;
+        true
+    };
+    match message {
+        ArchivedRegistryMessage::DeltaGossip { delta, .. }
+        | ArchivedRegistryMessage::DeltaGossipResponse { delta, .. } => {
+            delta.changes.iter().all(|change| match change {
+                ArchivedRegistryChange::ActorAdded { location, .. } => {
+                    admit(location.vector_clock.clocks.len())
+                }
+                ArchivedRegistryChange::ActorRemoved { vector_clock, .. } => {
+                    admit(vector_clock.clocks.len())
+                }
+            })
+        }
+        ArchivedRegistryMessage::FullSync {
+            local_actors,
+            known_actors,
+            ..
+        }
+        | ArchivedRegistryMessage::FullSyncResponse {
+            local_actors,
+            known_actors,
+            ..
+        } => local_actors
+            .iter()
+            .chain(known_actors.iter())
+            .all(|entry| admit(entry.1.vector_clock.clocks.len())),
+        _ => true,
     }
 }
 
@@ -116,10 +165,11 @@ fn inbound_addr_claim_kind(
 /// attribution for this authenticated connection. The observed-source entry
 /// is safe to associate when any claim succeeds, but a fully rejected
 /// handshake must not mutate the capability projections of an existing owner.
+#[cfg(test)]
 async fn associate_inbound_capabilities_after_claim(
     registry: &GossipRegistry,
     observed_addr: SocketAddr,
-    node_id: GossipNodeId,
+    node_id: crate::GossipNodeId,
     effective_addr: Option<SocketAddr>,
 ) {
     let Some(effective_addr) = effective_addr else {
@@ -135,41 +185,13 @@ async fn associate_inbound_capabilities_after_claim(
     }
 }
 
-/// Undo ownership created solely for an inbound candidate that subsequently
-/// loses the connection tie-break. The owner actor's claim receipt proves
-/// that this exact command created ownership from an unowned address; the
-/// generation-pinned release cannot withdraw an incumbent or a later refresh.
-async fn rollback_rejected_inbound_claim(
-    registry: &GossipRegistry,
-    addr: SocketAddr,
-    peer_id: &crate::PeerId,
-    claim_generation: crate::registry_owner::CommitSeq,
-    prior_projection: crate::registry::InboundClaimProjectionSnapshot,
-) {
-    let Some(release_seq) = registry
-        .registry_owner
-        .release(addr, peer_id.clone(), claim_generation)
-        .await
-    else {
-        return;
-    };
-
-    {
-        let mut state = registry.gossip_state.lock().await;
-        state.tombstone_ownership_projection(addr, release_seq);
-    }
-
-    let _ = registry
-        .restore_inbound_claim_projection(addr, peer_id, &prior_projection)
-        .await;
-}
-
 /// Main API for the gossip registry with vector clocks and separated locks
 pub struct GossipRegistryHandle<T = crate::BuilderTlsBootstrap> {
     pub registry: Arc<GossipRegistry>,
     _server_handle: Option<tokio::task::JoinHandle<()>>,
     _timer_handle: Option<tokio::task::JoinHandle<()>>,
     _monitor_handle: Option<tokio::task::JoinHandle<()>>,
+    bootstrap_admission: Arc<tokio::sync::Semaphore>,
     _marker: PhantomData<fn() -> T>,
 }
 
@@ -189,6 +211,7 @@ impl<T> Drop for GossipRegistryHandle<T> {
         // Owner drop must break handler -> client/router/pubsub -> registry cycles
         // even when the caller never awaits `shutdown()`. Aborting the accept/
         // timer/monitor tasks alone leaves those strong refs installed.
+        self.bootstrap_admission.close();
         self.registry.begin_drop_retirement();
         if let Some(handle) = self._server_handle.take() {
             handle.abort();
@@ -310,6 +333,9 @@ impl<T> GossipRegistryHandle<T> {
             _server_handle: Some(server_handle),
             _timer_handle: Some(timer_handle),
             _monitor_handle: monitor_handle,
+            bootstrap_admission: Arc::new(tokio::sync::Semaphore::new(
+                (config.max_bootstrap_dials as usize).min(tokio::sync::Semaphore::MAX_PERMITS),
+            )),
             _marker: PhantomData,
         })
     }
@@ -403,7 +429,8 @@ impl<T> GossipRegistryHandle<T> {
     ///     return Ok(());
     /// };
     ///
-    /// // Step 2: tell/ask use cached connection - ZERO lookups, just pointer deref
+    /// // Step 2: acquire one exact session before repeated messaging
+    /// let remote_actor = remote_actor.session().await?;
     /// remote_actor.tell(Bytes::from_static(b"message")).await?;
     /// let _response = remote_actor.ask(Bytes::from_static(b"request")).await?;
     /// # Ok(())
@@ -545,13 +572,9 @@ impl<T> GossipRegistryHandle<T> {
         // The returned connection is authoritative. Its address route can
         // already have been retired, or the live session can be indexed at
         // a different address than the one requested.
-        let peer_id = self
-            .registry
-            .connection_pool
-            .peer_id_for_connected_addr(&addr, conn.addr)
-            .ok_or_else(|| {
-                crate::GossipError::ActorNotFound(format!("No peer ID found for {}", addr))
-            })?;
+        let peer_id = conn.authenticated_peer_id().cloned().ok_or_else(|| {
+            crate::GossipError::ActorNotFound(format!("No peer ID found for {}", addr))
+        })?;
 
         let location = crate::RemoteActorLocation::new_with_peer(addr, peer_id);
 
@@ -600,13 +623,24 @@ impl<T> GossipRegistryHandle<T> {
     /// Dials seed peers asynchronously - doesn't block startup on gossip propagation.
     /// Failed connections are logged but don't prevent the node from starting.
     /// This is the recommended way to bootstrap a node with seed peers.
-    pub async fn bootstrap_non_blocking(&self, seeds: Vec<SocketAddr>) {
+    /// A batch atomically reserves `max_bootstrap_dials` capacity shared with
+    /// earlier calls. Saturation returns `WriteQueueFull` without starting any
+    /// dial. Each admitted task retains one address and ends at connection_timeout.
+    pub async fn bootstrap_non_blocking(&self, seeds: Vec<SocketAddr>) -> Result<()> {
         let seed_count = seeds.len();
+        let count = u32::try_from(seed_count).map_err(|_| GossipError::WriteQueueFull)?;
+        let mut permits = Arc::clone(&self.bootstrap_admission)
+            .try_acquire_many_owned(count)
+            .map_err(|_| GossipError::WriteQueueFull)?;
         let registry_weak = Arc::downgrade(&self.registry);
 
         for seed in seeds {
+            // All-or-nothing admission before spawning; split cannot fail because
+            // exactly seeds.len() permits were reserved above.
+            let permit = permits.split(1).expect("reserved bootstrap permit");
             let registry_weak = registry_weak.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 let Some(registry) = registry_weak.upgrade() else {
                     return;
                 };
@@ -618,8 +652,7 @@ impl<T> GossipRegistryHandle<T> {
                 match tokio::time::timeout(connect_timeout, registry.get_connection(seed)).await {
                     Ok(Ok(_conn)) => {
                         debug!(seed = %seed, "bootstrap connection established");
-                        // Mark peer as connected
-                        registry.mark_peer_connected(seed).await;
+                        // The authenticated finalizer owns session bookkeeping.
                     }
                     Ok(Err(e)) => {
                         warn!(seed = %seed, error = %e, "bootstrap peer unavailable");
@@ -636,6 +669,7 @@ impl<T> GossipRegistryHandle<T> {
             seed_count = seed_count,
             "initiated non-blocking bootstrap for seed peers"
         );
+        Ok(())
     }
 
     /// Shutdown the registry.
@@ -644,7 +678,9 @@ impl<T> GossipRegistryHandle<T> {
     /// 1.5s in total, without waiting for peers' replies); sessions that cannot
     /// close in time, or have a frame partially written, are dropped abruptly.
     /// Dropping the handle without calling this always drops them abruptly.
-    pub async fn shutdown(&self) {
+    /// An incomplete cleanup is returned explicitly; release caller-held gossip
+    /// guards and retry through this handle or a retained registry `Arc`.
+    pub async fn shutdown(&self) -> std::result::Result<(), crate::RegistryShutdownIncomplete> {
         // Signal shutdown first, then abort background tasks so we don't get stuck
         // waiting on locks held by long-running timer/server work.
         self.registry
@@ -663,12 +699,17 @@ impl<T> GossipRegistryHandle<T> {
         }
 
         // Now do full cleanup (closes connections, clears state).
-        self.registry.shutdown().await;
+        self.registry.shutdown().await
     }
 
     /// Shutdown and wait for owned task handles to observe cancellation.
     /// Prefer this in binaries that want deterministic single-Ctrl+C termination.
-    pub async fn shutdown_and_wait(mut self) {
+    /// The existing task-cancellation waits add at most 300 ms to the registry's
+    /// 1.5 s shutdown budget. Retain a registry `Arc` before consuming this handle
+    /// if an incomplete cleanup will need to be retried.
+    pub async fn shutdown_and_wait(
+        mut self,
+    ) -> std::result::Result<(), crate::RegistryShutdownIncomplete> {
         // Signal shutdown immediately, then abort background tasks first to reduce lock contention
         // during registry cleanup (and to make Ctrl+C return promptly).
         self.registry.shutdown.store(true, Ordering::Release);
@@ -688,7 +729,7 @@ impl<T> GossipRegistryHandle<T> {
         }
 
         // Final cleanup after all background tasks are canceled.
-        self.registry.shutdown().await;
+        self.registry.shutdown().await
     }
 
     /// Drop the bootstrap type parameter marker.
@@ -708,6 +749,7 @@ impl<T> GossipRegistryHandle<T> {
                 _server_handle: std::ptr::read(&this._server_handle),
                 _timer_handle: std::ptr::read(&this._timer_handle),
                 _monitor_handle: std::ptr::read(&this._monitor_handle),
+                bootstrap_admission: std::ptr::read(&this.bootstrap_admission),
                 _marker: PhantomData,
             }
         }
@@ -793,13 +835,9 @@ impl<T> GossipClient<T> {
     /// when a static peer address is the reconnect source of truth.
     pub async fn lookup_address(&self, addr: SocketAddr) -> Result<crate::RemoteActorRef> {
         let conn = self.registry.connection_pool.get_connection(addr).await?;
-        let peer_id = self
-            .registry
-            .connection_pool
-            .peer_id_for_connected_addr(&addr, conn.addr)
-            .ok_or_else(|| {
-                crate::GossipError::ActorNotFound(format!("No peer ID found for {}", addr))
-            })?;
+        let peer_id = conn.authenticated_peer_id().cloned().ok_or_else(|| {
+            crate::GossipError::ActorNotFound(format!("No peer ID found for {}", addr))
+        })?;
         let location = crate::RemoteActorLocation::new_with_peer(addr, peer_id);
         Ok(crate::RemoteActorRef::with_registry(
             location,
@@ -818,17 +856,13 @@ impl<T> GossipClient<T> {
             .current_peer_connection_instance(peer_id)
     }
 
-    /// Report a healthy ask outcome: resets the peer's consecutive-timeout streak.
-    ///
-    /// Consumer side of the single eviction mechanism: the consumer classifies
-    /// the outcome (domain-specific) and icanact-remote owns the streak
-    /// counter, threshold, and instance-guarded teardown.
+    /// Compatibility notification. Application outcomes do not classify transport health.
     pub fn note_peer_ask_success(&self, peer_id: &crate::PeerId) {
         self.registry.connection_pool.note_peer_ask_success(peer_id);
     }
 
-    /// Report a streak-timeout. Evicts (instance-guarded) once the configured
-    /// `consecutive_timeout_threshold` is reached. Returns whether evicted.
+    /// Compatibility notification. Always returns false: an application timeout
+    /// cannot evict a transport regardless of configured legacy threshold.
     pub fn note_peer_ask_streak_timeout(
         &self,
         peer_id: &crate::PeerId,
@@ -1013,7 +1047,7 @@ mod tests {
                 assert_eq!(location.peer_id, handle.registry.peer_id);
             }
         }
-        handle.shutdown_and_wait().await;
+        handle.shutdown_and_wait().await.unwrap();
         Ok(())
     }
 
@@ -1071,7 +1105,8 @@ mod tests {
         let observed: SocketAddr = "10.90.0.8:49002".parse().unwrap();
         registry
             .connection_pool
-            .set_discovered_peer_addr(&claimant, claimed);
+            .set_discovered_peer_addr(&claimant, claimed)
+            .unwrap();
         let cached_route = registry.connection_pool.get_configured_peer_addr(&claimant);
         assert_eq!(cached_route, Some(claimed));
         let required_route = registry.connection_pool.get_required_peer_addr(&claimant);
@@ -1193,6 +1228,101 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_shutdown_and_wait_during_each_join_retires_live_transport() {
+        for join_index in [0, 1, 2] {
+            let registry = Arc::new(GossipRegistry::<()>::new(
+                "127.0.0.1:41010".parse().unwrap(),
+                GossipConfig {
+                    key_pair: Some(KeyPair::new_for_testing("cancel-shutdown-local")),
+                    ..test_cfg()
+                },
+            ));
+            let peer = KeyPair::new_for_testing("cancel-shutdown-live-peer").peer_id();
+            let addr = "127.0.0.1:41011".parse().unwrap();
+            let (io, _remote) = tokio::io::duplex(1024);
+            let (stream, writer, reader) = crate::connection_pool::LockFreeStreamHandle::new(
+                io,
+                addr,
+                crate::connection_pool::ChannelId::Global,
+                crate::connection_pool::BufferConfig::default(),
+                registry.config.schema_hash,
+                None,
+            );
+            let mut connection = crate::connection_pool::LockFreeConnection::new(
+                addr,
+                crate::connection_pool::ConnectionDirection::Outbound,
+            );
+            connection.stream_handle = Some(Arc::new(stream));
+            connection.set_state(crate::connection_pool::ConnectionState::Connected);
+            connection.task_tracker.set_writer(writer.abort_handle());
+            if let Some(reader) = reader.as_ref() {
+                connection.task_tracker.set_reader(reader.abort_handle());
+            }
+            let connection = Arc::new(connection);
+            assert!(registry.connection_pool.add_connection_by_peer_id(
+                peer.clone(),
+                addr,
+                connection.clone(),
+            ));
+            assert!(connection.has_live_stream());
+            assert!(Arc::ptr_eq(
+                &registry
+                    .connection_pool
+                    .peer_current_connection_snapshot(&peer)
+                    .unwrap(),
+                &connection,
+            ));
+
+            let (started, ready) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                started.send(()).unwrap();
+                std::future::pending::<()>().await;
+            });
+            ready.await.unwrap();
+            let mut tasks = [None, None, None];
+            tasks[join_index] = Some(task);
+            let [server, timer, monitor] = tasks;
+            let bootstrap_admission = Arc::new(tokio::sync::Semaphore::new(1));
+            let handle = GossipRegistryHandle::<()> {
+                registry: registry.clone(),
+                _server_handle: server,
+                _timer_handle: timer,
+                _monitor_handle: monitor,
+                bootstrap_admission: bootstrap_admission.clone(),
+                _marker: PhantomData,
+            };
+            let gossip = registry.gossip_state.lock().await;
+            let mut shutdown = Box::pin(handle.shutdown_and_wait());
+            // On the single-thread runtime, the aborted task cannot be polled
+            // while this test is polling the join. Cancellation lands before
+            // registry.shutdown (and its transport-drop guard) is entered.
+            assert!(futures::poll!(&mut shutdown).is_pending());
+            assert!(registry.registry_owner.reserve_speculative_claim().is_ok());
+            assert!(connection.has_live_stream());
+            drop(shutdown);
+            assert!(bootstrap_admission.is_closed());
+            assert!(registry.registry_owner.reserve_speculative_claim().is_err());
+            assert!(!connection.has_live_stream());
+            assert!(
+                registry
+                    .connection_pool
+                    .peer_current_connection_snapshot(&peer)
+                    .is_none()
+            );
+            let _ = tokio::time::timeout(Duration::from_secs(1), writer)
+                .await
+                .expect("retired writer must observe cancellation");
+            if let Some(reader) = reader {
+                let _ = tokio::time::timeout(Duration::from_secs(1), reader)
+                    .await
+                    .expect("retired reader must observe cancellation");
+            }
+            drop(gossip);
+            registry.shutdown().await.unwrap();
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_and_wait_breaks_callback_registry_cycle() -> crate::Result<()> {
         use futures::future::BoxFuture;
@@ -1227,7 +1357,7 @@ mod tests {
             }))
             .await;
 
-        handle.shutdown_and_wait().await;
+        handle.shutdown_and_wait().await.unwrap();
 
         assert!(
             weak.upgrade().is_none(),
@@ -1309,6 +1439,7 @@ mod tests {
             Some(Arc::downgrade(&handle.registry)),
             Some(remote_keypair.peer_id().to_node_id()),
             None,
+            None,
         )
         .await;
 
@@ -1335,7 +1466,159 @@ mod tests {
             "rejected duplicate must not be indexed by its ephemeral address"
         );
 
-        handle.shutdown_and_wait().await;
+        handle.shutdown_and_wait().await.unwrap();
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inbound_initialization_cancel_at_each_await_retires_only_exact_candidate()
+    -> crate::Result<()> {
+        // Serialize with existing lifecycle-race fixtures, including the
+        // test-only single acknowledged pause slot below.
+        let _recorder =
+            crate::lifecycle::TransportLifecycleRecorderGuard::install(Arc::new(|_| {}));
+        for stage in 1..=4 {
+            for install_successor in [false, true] {
+                let (remote_keypair, local_keypair) = ordered_keypairs(
+                    "initialization-cancel-remote-lower",
+                    "initialization-cancel-local-higher",
+                );
+                let peer = remote_keypair.peer_id();
+                let mut config = test_cfg();
+                config.key_pair = Some(local_keypair.clone());
+                let mut handle = GossipRegistryHandle::new_with_transport_stack(
+                    "127.0.0.1:0".parse().unwrap(),
+                    local_keypair.to_secret_key(),
+                    Some(config),
+                    TestNoopBootstrap,
+                )
+                .await?;
+                if let Some(timer) = handle._timer_handle.take() {
+                    timer.abort();
+                    assert!(timer.await.unwrap_err().is_cancelled());
+                }
+                let address: SocketAddr = "127.0.0.1:42990".parse().unwrap();
+                let entered = Arc::new(tokio::sync::Notify::new());
+                *INBOUND_INITIALIZATION_PAUSE.lock().unwrap() = Some(InboundInitializationPause {
+                    peer: peer.clone(),
+                    stage,
+                    entered: entered.clone(),
+                    resume: Arc::new(tokio::sync::Notify::new()),
+                });
+                let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+                write_initial_gossip(
+                    &mut writer,
+                    &crate::registry::RegistryMessage::FullSyncRequest {
+                        sender_peer_id: peer.clone(),
+                        sender_bind_addr: Some(address.to_string()),
+                        sequence: 1,
+                        wall_clock_time: crate::current_timestamp(),
+                    },
+                )
+                .await;
+                let mut incoming = Box::pin(handle_incoming_connection_tls(
+                    reader,
+                    address,
+                    handle.registry.clone(),
+                    Some(Arc::downgrade(&handle.registry)),
+                    Some(peer.to_node_id()),
+                    None,
+                    None,
+                ));
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    tokio::select! {
+                        _ = &mut incoming => {
+                            panic!("handler ended before acknowledged stage {stage}");
+                        },
+                        _ = entered.notified() => {}
+                    }
+                })
+                .await
+                .expect("the real accept path must reach its pending setup await");
+                let candidate = handle
+                    .registry
+                    .connection_pool
+                    .peer_current_connection_snapshot(&peer)
+                    .unwrap();
+                assert!(candidate.has_live_stream());
+                assert_eq!(
+                    handle.registry.registry_owner.routes_to(&address),
+                    Some(peer.clone())
+                );
+                let (successor_io, _successor_peer) = tokio::io::duplex(1024);
+                let (stream, _, _) = crate::connection_pool::LockFreeStreamHandle::new(
+                    successor_io,
+                    address,
+                    crate::connection_pool::ChannelId::Global,
+                    crate::connection_pool::BufferConfig::default(),
+                    handle.registry.config.schema_hash,
+                    None,
+                );
+                let mut successor = crate::connection_pool::LockFreeConnection::new(
+                    address,
+                    crate::connection_pool::ConnectionDirection::Inbound,
+                );
+                successor.embedded_peer_id = Some(peer.clone());
+                successor.stream_handle = Some(Arc::new(stream));
+                successor.set_state(crate::connection_pool::ConnectionState::Connected);
+                let successor = Arc::new(successor);
+                if install_successor {
+                    assert!(handle.registry.connection_pool.add_connection_by_peer_id(
+                        peer.clone(),
+                        address,
+                        successor.clone(),
+                    ));
+                    handle
+                        .registry
+                        .add_connection_scoped_peer_claim_with_instance(
+                            address,
+                            peer.to_node_id(),
+                            crate::addr_ownership::ClaimKind::Verified,
+                            address,
+                            Some(successor.stream_handle.as_ref().unwrap().instance_id()),
+                        )
+                        .await;
+                }
+                drop(incoming);
+                *INBOUND_INITIALIZATION_PAUSE.lock().unwrap() = None;
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    candidate.stream_handle.as_ref().unwrap().wait_for_exit(),
+                )
+                .await
+                .expect("canceled incomplete candidate must exit");
+                if install_successor {
+                    let current = handle
+                        .registry
+                        .connection_pool
+                        .peer_current_connection_snapshot(&peer)
+                        .unwrap();
+                    assert!(Arc::ptr_eq(&current, &successor));
+                    assert!(successor.has_live_stream());
+                    assert_eq!(
+                        handle.registry.registry_owner.routes_to(&address),
+                        Some(peer.clone())
+                    );
+                } else {
+                    assert!(
+                        handle
+                            .registry
+                            .connection_pool
+                            .peer_current_connection_snapshot(&peer)
+                            .is_none()
+                    );
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while handle.registry.registry_owner.routes_to(&address).is_some() {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("the stream ExitGuard must release its exact owner receipt");
+                }
+                successor.stream_handle.as_ref().unwrap().shutdown();
+                handle.shutdown_and_wait().await.unwrap();
+            }
+        }
         Ok(())
     }
 
@@ -1382,7 +1665,8 @@ mod tests {
         handle
             .registry
             .connection_pool
-            .set_configured_peer_addr(&remote_peer_id, shared_addr);
+            .set_configured_peer_addr(&remote_peer_id, shared_addr)
+            .unwrap();
 
         let survivor_addr: SocketAddr = "127.0.0.1:42101".parse().unwrap();
         let (survivor_io, _survivor_peer) = tokio::io::duplex(1024);
@@ -1473,6 +1757,7 @@ mod tests {
             Some(Arc::downgrade(&handle.registry)),
             Some(remote_node_id),
             None,
+            None,
         )
         .await;
 
@@ -1495,7 +1780,7 @@ mod tests {
             "a rejected refresh must not rollback ownership created by the concurrent survivor"
         );
 
-        handle.shutdown_and_wait().await;
+        handle.shutdown_and_wait().await.unwrap();
         Ok(())
     }
 
@@ -1551,7 +1836,8 @@ mod tests {
         handle
             .registry
             .connection_pool
-            .set_configured_peer_addr(&remote_peer_id, bind_addr);
+            .set_configured_peer_addr(&remote_peer_id, bind_addr)
+            .unwrap();
 
         let existing_addr: SocketAddr = "127.0.0.1:42002".parse().unwrap();
         let (existing_io, _existing_peer) = tokio::io::duplex(1024);
@@ -1569,6 +1855,7 @@ mod tests {
             crate::connection_pool::ConnectionDirection::Outbound,
         );
         existing.stream_handle = Some(Arc::new(existing_stream_handle));
+        existing.embedded_peer_id = Some(remote_peer_id.clone());
         existing.set_state(crate::connection_pool::ConnectionState::Connected);
         let existing = Arc::new(existing);
         assert!(
@@ -1646,6 +1933,7 @@ mod tests {
             Some(Arc::downgrade(&handle.registry)),
             Some(remote_node_id),
             None,
+            None,
         )
         .await;
 
@@ -1713,7 +2001,7 @@ mod tests {
              be accepted, not dropped by the from_current_session gate"
         );
 
-        handle.shutdown_and_wait().await;
+        handle.shutdown_and_wait().await.unwrap();
         Ok(())
     }
 
@@ -1757,7 +2045,8 @@ mod tests {
         handle
             .registry
             .connection_pool
-            .set_configured_peer_addr(&remote_peer_id, bind_addr);
+            .set_configured_peer_addr(&remote_peer_id, bind_addr)
+            .unwrap();
         handle
             .registry
             .add_peer_with_node_id(
@@ -1785,6 +2074,7 @@ mod tests {
             crate::connection_pool::ConnectionDirection::Inbound,
         );
         stale_conn.stream_handle = Some(Arc::new(stale_sh));
+        stale_conn.embedded_peer_id = Some(remote_peer_id.clone());
         stale_conn.set_state(crate::connection_pool::ConnectionState::Connected);
         let stale = Arc::new(stale_conn);
         assert!(handle.registry.connection_pool.add_connection_by_peer_id(
@@ -1811,6 +2101,7 @@ mod tests {
             crate::connection_pool::ConnectionDirection::Inbound,
         );
         newer_conn.stream_handle = Some(Arc::new(newer_sh));
+        newer_conn.embedded_peer_id = Some(remote_peer_id.clone());
         newer_conn.set_state(crate::connection_pool::ConnectionState::Connected);
         let newer = Arc::new(newer_conn);
         assert!(handle.registry.connection_pool.add_connection_by_peer_id(
@@ -1894,7 +2185,7 @@ mod tests {
              still be accepted after the stale arm attempt"
         );
 
-        handle.shutdown_and_wait().await;
+        handle.shutdown_and_wait().await.unwrap();
         Ok(())
     }
 
@@ -2071,6 +2362,7 @@ mod tests {
             Some(Arc::downgrade(&handle.registry)),
             Some(remote_keypair.peer_id().to_node_id()),
             None,
+            None,
         )
         .await;
 
@@ -2111,7 +2403,7 @@ mod tests {
              re-resolution must never be counted, so the total stays exactly where it started"
         );
 
-        handle.shutdown_and_wait().await;
+        handle.shutdown_and_wait().await.unwrap();
         Ok(())
     }
 
@@ -2245,6 +2537,7 @@ mod tests {
             Some(Arc::downgrade(&handle.registry)),
             Some(remote_keypair.peer_id().to_node_id()),
             None,
+            None,
         )
         .await;
 
@@ -2290,7 +2583,7 @@ mod tests {
              one live session is ever counted for this peer's first contact"
         );
 
-        handle.shutdown_and_wait().await;
+        handle.shutdown_and_wait().await.unwrap();
         Ok(())
     }
 
@@ -2450,6 +2743,7 @@ mod tests {
                 Some(Arc::downgrade(&handle.registry)),
                 Some(remote_keypair.peer_id().to_node_id()),
                 None,
+                None,
             ),
         )
         .await
@@ -2509,7 +2803,7 @@ mod tests {
              evicted before `finish_indexing_accepted_connection` ever durably indexed it"
         );
 
-        handle.shutdown_and_wait().await;
+        handle.shutdown_and_wait().await.unwrap();
         Ok(())
     }
 
@@ -2694,6 +2988,7 @@ mod tests {
                 Some(Arc::downgrade(&handle.registry)),
                 Some(remote_keypair.peer_id().to_node_id()),
                 None,
+                None,
             ),
         )
         .await
@@ -2732,16 +3027,27 @@ mod tests {
                 "connections_by_addr[{addr}] must not retain a stale alias for an instance \
                  evicted before this indexing was ever fully, durably completed"
             );
-            assert!(
-                handle
-                    .registry
-                    .connection_pool
-                    .addr_to_peer_id
-                    .read_sync(&addr, |_, _| ())
-                    .is_none(),
-                "addr_to_peer_id[{addr}] must not retain a stale alias for an instance evicted \
-                 before this indexing was ever fully, durably completed"
-            );
+            let route = handle
+                .registry
+                .connection_pool
+                .addr_to_peer_id
+                .read_sync(&addr, |_, peer| peer.clone());
+            if addr == advertised_bind_addr {
+                assert_eq!(
+                    route,
+                    Some(remote_peer_id.clone()),
+                    "physical eviction must not revoke the independently configured operator route"
+                );
+                assert_eq!(
+                    handle.registry.registry_owner.pin_owner(&addr),
+                    Some(remote_peer_id.clone())
+                );
+            } else {
+                assert!(
+                    route.is_none(),
+                    "the uncommitted ephemeral alias must not survive its physical instance"
+                );
+            }
         }
 
         // `connection_counter` must reflect only the eviction of the
@@ -2755,7 +3061,7 @@ mod tests {
              mid-window, before its ephemeral alias was ever durably indexed"
         );
 
-        handle.shutdown_and_wait().await;
+        handle.shutdown_and_wait().await.unwrap();
         Ok(())
     }
 
@@ -2833,6 +3139,7 @@ mod tests {
             Some(Arc::downgrade(&handle.registry)),
             Some(remote_keypair.peer_id().to_node_id()),
             None,
+            None,
         ));
 
         let published = tokio::time::timeout(Duration::from_secs(5), async {
@@ -2861,7 +3168,7 @@ mod tests {
         );
 
         drop(writer);
-        handle.shutdown_and_wait().await;
+        handle.shutdown_and_wait().await.unwrap();
         Ok(())
     }
 
@@ -2898,12 +3205,13 @@ mod tests {
             Some(Arc::downgrade(&handle.registry)),
             Some(imposter_keypair.peer_id().to_node_id()),
             None,
+            None,
         )
         .await;
 
         assert!(matches!(
             outcome,
-            ConnectionCloseOutcome::Normal { node_id: None }
+            ConnectionCloseOutcome::Normal { node_id: None, .. }
         ));
         assert!(
             !handle
@@ -2913,7 +3221,7 @@ mod tests {
             "a gossip sender that does not match the TLS client certificate must not be registered"
         );
 
-        handle.shutdown_and_wait().await;
+        handle.shutdown_and_wait().await.unwrap();
         Ok(())
     }
 
@@ -2954,7 +3262,7 @@ mod tests {
         let b = snap.iter().find(|(n, _)| n == "b_local").unwrap();
         assert_eq!(b.1.address, bind.to_string());
 
-        h.shutdown_and_wait().await;
+        h.shutdown_and_wait().await.unwrap();
         Ok(())
     }
 
@@ -2971,7 +3279,7 @@ mod tests {
             TestTlsBootstrap,
         )
         .await?;
-        handle.shutdown_and_wait().await;
+        handle.shutdown_and_wait().await.unwrap();
         Ok(())
     }
 
@@ -3001,7 +3309,7 @@ mod tests {
             "manual add_peer().connect() peers must be supervised as required peers"
         );
 
-        handle.shutdown_and_wait().await;
+        handle.shutdown_and_wait().await.unwrap();
         Ok(())
     }
 
@@ -3042,7 +3350,7 @@ mod tests {
             "discovered route must not be supervised as a required peer"
         );
 
-        handle.shutdown_and_wait().await;
+        handle.shutdown_and_wait().await.unwrap();
         Ok(())
     }
 
@@ -3065,7 +3373,7 @@ mod tests {
             crate::ConnectionRecoveryPolicy::aggressive_ask_timeout_recovery()
         );
 
-        handle.shutdown_and_wait().await;
+        handle.shutdown_and_wait().await.unwrap();
         Ok(())
     }
 
@@ -3411,7 +3719,10 @@ async fn send_peer_list_gossip_round(registry: Arc<GossipRegistry>, immediate: b
     for task in tasks {
         let registry_clone = registry.clone();
         let future = tokio::spawn(async move {
-            if let Err(err) = send_gossip_message_zero_copy(task, registry_clone).await {
+            let mut session = None;
+            if let Err(err) =
+                send_gossip_message_zero_copy(task, registry_clone, &mut session).await
+            {
                 warn!(error = %err, immediate, "peer list gossip send failed");
             }
         });
@@ -3523,10 +3834,17 @@ async fn start_gossip_timer(registry: Arc<GossipRegistry>) {
                         let sent_sequence = task.current_sequence;
                         let future = tokio::spawn(async move {
                             // Send the message using zero-copy persistent connections
-                            let outcome = send_gossip_message_zero_copy(task, registry_clone).await;
+                            let mut session = None;
+                            let outcome = send_gossip_message_zero_copy(
+                                task,
+                                registry_clone,
+                                &mut session,
+                            )
+                            .await;
                             GossipResult {
                                 peer_addr,
                                 sent_sequence,
+                                session,
                                 outcome: gossip_send_outcome_to_result(outcome),
                             }
                         });
@@ -3785,42 +4103,35 @@ async fn handle_connection(
                 }
             };
 
-            registry.set_peer_capabilities(peer_addr, capabilities);
-            // REMOTE-3: the role is bound to the TLS-authenticated identity.
-            let client_only_session = peer_node_id.and_then(|node_id| {
-                registry.note_remote_role(&node_id.to_peer_id(), capabilities.remote_client_only)
-            });
-            if let Some(node_id) = registry.lookup_node_id(&peer_addr).await {
-                registry
-                    .associate_peer_capabilities_with_node(peer_addr, node_id)
-                    .await;
-            }
-
             let registry_weak = Arc::downgrade(&registry);
-            let registry_for_release = client_only_session.map(|_| Arc::clone(&registry));
-            match handle_incoming_connection_tls(
+            let registry_for_release = Arc::clone(&registry);
+            let client_only_session = match handle_incoming_connection_tls(
                 tls_stream,
                 peer_addr,
                 registry,
                 Some(registry_weak),
                 peer_node_id,
                 Some(handshake_permit),
+                Some(capabilities),
             )
             .await
             {
-                ConnectionCloseOutcome::Normal { node_id } => {
+                ConnectionCloseOutcome::Normal {
+                    node_id,
+                    client_only_session,
+                } => {
                     debug!(peer = %peer_addr, ?node_id, "stream connection closed");
+                    client_only_session
                 }
                 ConnectionCloseOutcome::DroppedByTieBreaker => {
                     debug!(peer = %peer_addr, "stream connection dropped by tie-breaker");
+                    None
                 }
-            }
+            };
             // Session over: drop the client-only peer's dial state, fenced by
             // this exact session's receipt (REMOTE-4).
-            if let (Some(registry), Some(session), Some(node_id)) =
-                (registry_for_release, client_only_session, peer_node_id)
-            {
-                registry
+            if let (Some(session), Some(node_id)) = (client_only_session, peer_node_id) {
+                registry_for_release
                     .release_client_only_session(&node_id.to_peer_id(), session)
                     .await;
             }
@@ -3830,8 +4141,81 @@ async fn handle_connection(
 
 #[allow(dead_code)]
 enum ConnectionCloseOutcome {
-    Normal { node_id: Option<String> },
+    Normal {
+        node_id: Option<String>,
+        client_only_session: Option<crate::client_only::ClientOnlySession>,
+    },
     DroppedByTieBreaker,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct InboundInitializationPause {
+    peer: crate::PeerId,
+    stage: u8,
+    entered: Arc<tokio::sync::Notify>,
+    resume: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+static INBOUND_INITIALIZATION_PAUSE: std::sync::Mutex<Option<InboundInitializationPause>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+async fn pause_inbound_initialization(peer: &crate::PeerId, addr: SocketAddr, stage: u8) {
+    crate::lifecycle::record_transport_event(
+        crate::lifecycle::TransportLifecycleEvent::InboundInitializationPending {
+            peer: peer.clone(),
+            addr,
+            stage,
+        },
+    );
+    let pause = INBOUND_INITIALIZATION_PAUSE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|pause| pause.peer == *peer && pause.stage == stage)
+        .cloned();
+    if let Some(pause) = pause {
+        pause.entered.notify_one();
+        pause.resume.notified().await;
+    }
+}
+
+/// Until the initial frame reaches the IO task, this candidate is not a
+/// usable transport. Cancellation or an observer panic must retire only that
+/// exact instance. The guard is disarmed before waiting on the healthy stream.
+struct InboundInitializationGuard {
+    pool: Arc<crate::connection_pool::ConnectionPool>,
+    peer: crate::PeerId,
+    connection: std::sync::Weak<crate::connection_pool::LockFreeConnection>,
+    armed: bool,
+}
+
+impl Drop for InboundInitializationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(connection) = self.connection.upgrade() else {
+            return;
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.pool
+                .disconnect_connection_instance(&self.peer, &connection);
+        }));
+        // Always wake the stream's existing exact-receipt ExitGuard, including
+        // when a user lifecycle observer panics while observing removal.
+        if let Some(stream) = connection.stream_handle.as_ref() {
+            stream.shutdown();
+        }
+        if result.is_err() {
+            warn!(
+                peer = %self.peer,
+                "lifecycle observer panicked during incomplete inbound cleanup"
+            );
+        }
+    }
 }
 
 fn inbound_tls_sender_is_authenticated(
@@ -3854,10 +4238,12 @@ async fn handle_incoming_connection_tls<S>(
     // the lifetime of the established connection. `None` for non-admission
     // call paths (tests).
     mut handshake_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    peer_caps: Option<crate::handshake::PeerCapabilities>,
 ) -> ConnectionCloseOutcome
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let mut client_only_session = None;
     let max_message_size = registry.config.max_message_size;
     let aligned_pool = registry.connection_pool.aligned_bytes_pool();
     // Allocate the physical connection identity before the first
@@ -3888,7 +4274,10 @@ where
                 timeout_ms = connection_timeout.as_millis(),
                 "⚠️ Inbound first-read timed out before any frame arrived - dropping connection"
             );
-            return ConnectionCloseOutcome::Normal { node_id: None };
+            return ConnectionCloseOutcome::Normal {
+                node_id: None,
+                client_only_session,
+            };
         }
     };
     let known_node_id = match peer_node_id {
@@ -3899,7 +4288,10 @@ where
     let (sender_node_id, _initial_correlation_id, sender_bind_addr_opt) = match &msg_result {
         Ok(MessageReadResult::RouteBound) => {
             warn!(peer_addr = %peer_addr, "RouteBind arrived before connection setup");
-            return ConnectionCloseOutcome::Normal { node_id: None };
+            return ConnectionCloseOutcome::Normal {
+                node_id: None,
+                client_only_session,
+            };
         }
         Ok(MessageReadResult::Gossip(msg, correlation_id)) => {
             let (node_id, bind_addr) = match msg {
@@ -3934,7 +4326,10 @@ where
                     peer_addr = %peer_addr,
                     "Ask request arrived before peer GossipNodeId is known"
                 );
-                return ConnectionCloseOutcome::Normal { node_id: None };
+                return ConnectionCloseOutcome::Normal {
+                    node_id: None,
+                    client_only_session,
+                };
             }
         }
         Ok(MessageReadResult::Response { .. }) => {
@@ -3945,7 +4340,10 @@ where
                     peer_addr = %peer_addr,
                     "Response arrived before peer GossipNodeId is known"
                 );
-                return ConnectionCloseOutcome::Normal { node_id: None };
+                return ConnectionCloseOutcome::Normal {
+                    node_id: None,
+                    client_only_session,
+                };
             }
         }
         Ok(MessageReadResult::AskNack { .. }) => {
@@ -3956,7 +4354,10 @@ where
                     peer_addr = %peer_addr,
                     "AskNack arrived before peer GossipNodeId is known"
                 );
-                return ConnectionCloseOutcome::Normal { node_id: None };
+                return ConnectionCloseOutcome::Normal {
+                    node_id: None,
+                    client_only_session,
+                };
             }
         }
         Ok(MessageReadResult::DirectAsk { correlation_id, .. }) => {
@@ -3967,7 +4368,10 @@ where
                     peer_addr = %peer_addr,
                     "DirectAsk arrived before peer GossipNodeId is known"
                 );
-                return ConnectionCloseOutcome::Normal { node_id: None };
+                return ConnectionCloseOutcome::Normal {
+                    node_id: None,
+                    client_only_session,
+                };
             }
         }
         Ok(MessageReadResult::DirectResponse { .. }) => {
@@ -3978,7 +4382,10 @@ where
                     peer_addr = %peer_addr,
                     "Response arrived before peer GossipNodeId is known"
                 );
-                return ConnectionCloseOutcome::Normal { node_id: None };
+                return ConnectionCloseOutcome::Normal {
+                    node_id: None,
+                    client_only_session,
+                };
             }
         }
         Ok(MessageReadResult::PubSub { .. }) => {
@@ -3989,7 +4396,10 @@ where
                     peer_addr = %peer_addr,
                     "PubSub frame arrived before peer GossipNodeId is known"
                 );
-                return ConnectionCloseOutcome::Normal { node_id: None };
+                return ConnectionCloseOutcome::Normal {
+                    node_id: None,
+                    client_only_session,
+                };
             }
         }
         Ok(MessageReadResult::Actor { .. }) => {
@@ -4000,7 +4410,10 @@ where
                     peer_addr = %peer_addr,
                     "Actor frame arrived before peer GossipNodeId is known"
                 );
-                return ConnectionCloseOutcome::Normal { node_id: None };
+                return ConnectionCloseOutcome::Normal {
+                    node_id: None,
+                    client_only_session,
+                };
             }
         }
         Ok(MessageReadResult::Streaming { .. }) => {
@@ -4011,7 +4424,10 @@ where
                     peer_addr = %peer_addr,
                     "Streaming frame arrived before peer GossipNodeId is known"
                 );
-                return ConnectionCloseOutcome::Normal { node_id: None };
+                return ConnectionCloseOutcome::Normal {
+                    node_id: None,
+                    client_only_session,
+                };
             }
         }
         Ok(MessageReadResult::StreamAbort { .. }) => {
@@ -4019,7 +4435,10 @@ where
                 (node_id.to_peer_id().to_hex(), None, None)
             } else {
                 warn!(peer_addr = %peer_addr, "StreamAbort arrived before peer GossipNodeId is known");
-                return ConnectionCloseOutcome::Normal { node_id: None };
+                return ConnectionCloseOutcome::Normal {
+                    node_id: None,
+                    client_only_session,
+                };
             }
         }
         Ok(MessageReadResult::Raw(_)) => {
@@ -4030,7 +4449,10 @@ where
                     peer_addr = %peer_addr,
                     "Raw message arrived before peer GossipNodeId is known"
                 );
-                return ConnectionCloseOutcome::Normal { node_id: None };
+                return ConnectionCloseOutcome::Normal {
+                    node_id: None,
+                    client_only_session,
+                };
             }
         }
         Err(e) => {
@@ -4039,7 +4461,10 @@ where
             } else {
                 warn!(error = %e, peer_addr = %peer_addr, "⚠️ Failed to read initial message from TLS stream - early exit");
             }
-            return ConnectionCloseOutcome::Normal { node_id: None };
+            return ConnectionCloseOutcome::Normal {
+                node_id: None,
+                client_only_session,
+            };
         }
     };
 
@@ -4073,7 +4498,10 @@ where
                 error = %err,
                 "Invalid peer id in first message; dropping connection"
             );
-            return ConnectionCloseOutcome::Normal { node_id: None };
+            return ConnectionCloseOutcome::Normal {
+                node_id: None,
+                client_only_session,
+            };
         }
     };
     if peer_id == registry.peer_id {
@@ -4082,7 +4510,10 @@ where
             peer_id = %peer_id,
             "dropping inbound connection from local registry identity"
         );
-        return ConnectionCloseOutcome::Normal { node_id: None };
+        return ConnectionCloseOutcome::Normal {
+            node_id: None,
+            client_only_session,
+        };
     }
     let sender_node_id_from_message = peer_id.to_node_id();
     if !inbound_tls_sender_is_authenticated(peer_node_id, sender_node_id_from_message) {
@@ -4105,7 +4536,10 @@ where
                 );
             }
         }
-        return ConnectionCloseOutcome::Normal { node_id: None };
+        return ConnectionCloseOutcome::Normal {
+            node_id: None,
+            client_only_session,
+        };
     }
     let node_id_opt = Some(sender_node_id_from_message);
 
@@ -4125,30 +4559,7 @@ where
     };
     let mut peer_state_addr =
         resolve_inbound_peer_state_addr(sender_bind_addr, peer_addr, route_addr);
-    let inbound_claim_projection = registry
-        .snapshot_inbound_claim_projection(peer_state_addr, peer_addr, &peer_id)
-        .await;
-    let observed_claim_projection = if peer_state_addr != peer_addr {
-        Some(
-            registry
-                .snapshot_inbound_claim_projection(peer_addr, peer_state_addr, &peer_id)
-                .await,
-        )
-    } else {
-        None
-    };
-    #[cfg(test)]
-    crate::lifecycle::record_transport_event(
-        crate::lifecycle::TransportLifecycleEvent::InboundOwnershipSnapshotTaken {
-            peer: peer_id.clone(),
-            addr: peer_state_addr,
-        },
-    );
-    let mut rollback_claim: Option<(
-        SocketAddr,
-        crate::registry_owner::CommitSeq,
-        crate::registry::InboundClaimProjectionSnapshot,
-    )> = None;
+    let mut rollback_claim: Option<crate::registry::InboundClaimTransaction> = None;
 
     if let Some(node_id) = node_id_opt {
         // TLS authenticates `node_id`, but that alone does not prove
@@ -4163,15 +4574,23 @@ where
         // claim for the same address (see `addr_ownership::arbitrate`).
         let addr_claim_kind = inbound_addr_claim_kind(peer_state_addr, peer_addr, required_addr);
 
-        let (claim_outcome, claim_receipt) = registry
-            .add_connection_scoped_peer_claim_with_instance(
+        let (claim_outcome, claim_receipt, transaction) = match registry
+            .add_speculative_inbound_claim(
                 peer_state_addr,
+                peer_addr,
                 node_id,
                 addr_claim_kind,
-                peer_addr,
-                Some(connection_instance_id),
+                connection_instance_id,
             )
-            .await;
+            .await
+        {
+            Ok(claim) => claim,
+            Err(error) => {
+                warn!(%error, %peer_addr, "inbound claim journal admission rejected");
+                return ConnectionCloseOutcome::DroppedByTieBreaker;
+            }
+        };
+        rollback_claim = Some(transaction);
 
         // The address this connection is actually attributed to after
         // arbitration. On rejection, fall back to the raw observed TCP
@@ -4205,15 +4624,26 @@ where
                     "rejecting claimed advertised address for inbound peer; falling back to observed source"
                 );
                 fell_back_to_observed_source = true;
-                let (fallback_outcome, fallback_receipt) = registry
-                    .add_connection_scoped_peer_claim_with_instance(
+                if let Some(transaction) = rollback_claim.take() {
+                    transaction.rollback().await;
+                }
+                let (fallback_outcome, fallback_receipt, transaction) = match registry
+                    .add_speculative_inbound_claim(
                         peer_addr,
+                        peer_state_addr,
                         node_id,
                         crate::addr_ownership::ClaimKind::Verified,
-                        peer_addr,
-                        Some(connection_instance_id),
+                        connection_instance_id,
                     )
-                    .await;
+                    .await
+                {
+                    Ok(claim) => claim,
+                    Err(error) => {
+                        warn!(%error, %peer_addr, "inbound fallback journal admission rejected");
+                        return ConnectionCloseOutcome::DroppedByTieBreaker;
+                    }
+                };
+                rollback_claim = Some(transaction);
                 match fallback_outcome {
                     crate::addr_ownership::AddrClaimOutcome::Accepted => {
                         fallback_receipt.map(|receipt| (peer_addr, receipt))
@@ -4223,7 +4653,7 @@ where
             }
         };
 
-        let Some((effective_addr, claim_receipt)) = effective_claim else {
+        let Some((effective_addr, _claim_receipt)) = effective_claim else {
             warn!(
                 peer_addr = %peer_addr,
                 peer_state_addr = %peer_state_addr,
@@ -4232,73 +4662,19 @@ where
             );
             return ConnectionCloseOutcome::Normal {
                 node_id: Some(sender_node_id),
+                client_only_session,
             };
         };
-        if claim_receipt.created_ownership() {
-            let rollback_projection = if effective_addr == peer_state_addr {
-                inbound_claim_projection.clone()
-            } else {
-                observed_claim_projection
-                    .clone()
-                    .expect("observed address projection captured when fallback is possible")
-            };
-            rollback_claim = Some((
-                effective_addr,
-                claim_receipt.generation(),
-                rollback_projection,
-            ));
-        }
         peer_state_addr = effective_addr;
 
-        associate_inbound_capabilities_after_claim(
-            &registry,
-            peer_addr,
-            node_id,
-            Some(effective_addr),
-        )
-        .await;
-
-        if effective_addr != peer_addr {
-            let mut gossip_state = registry.gossip_state.lock().await;
-            if let Some(peer_info) = gossip_state.peers.get_mut(&effective_addr) {
-                peer_info.peer_address = Some(peer_addr);
-            }
-        } else if fell_back_to_observed_source {
-            // Set BEFORE `mark_peer_connected` below: that call's discovery
-            // notification (`record_peer_discovery_connected`) reads this
-            // flag off the existing entry to decide whether to admit a
-            // `PeerDiscovery` slot, so the flag must already be in place
-            // the first time discovery is notified, not only after the
-            // second, idempotent post-publish re-mark.
-            //
-            // Goes through `mark_transport_source_keyed_fallback` rather
-            // than a direct assignment, passing `claim_receipt`'s own
-            // `created_ownership()` -- the authoritative fact of whether
-            // THIS fallback claim is what brought `effective_addr` under
-            // ownership. A peer that legitimately connects from its own
-            // advertised listen port has its entry created by the
-            // `Accepted` arm above instead, never by the fallback; a
-            // LATER, unrelated claim falling back to that SAME
-            // already-owned address is a same-node refresh
-            // (`created_ownership() == false`) and must not reclassify it.
-            let mut gossip_state = registry.gossip_state.lock().await;
-            if let Some(peer_info) = gossip_state.peers.get_mut(&effective_addr) {
-                peer_info.mark_transport_source_keyed_fallback(claim_receipt.created_ownership());
-            }
+        if fell_back_to_observed_source && let Some(transaction) = rollback_claim.as_mut() {
+            transaction.mark_observed_source_fallback();
         }
+        // Address/session metadata is published only after the candidate wins,
+        // under the transaction's pre-acquired gossip guard.
 
-        // Notify peer discovery that a connection is established (incoming)
-        registry.mark_peer_connected(effective_addr).await;
-        // Attribute liveness to the address arbitration accepted and retain
-        // the raw TCP source in `PeerInfo::peer_address`. Creating a separate
-        // PeerInfo at the ephemeral source would let the first FullSync
-        // migration overwrite this identity-bearing entry. Does not
-        // (cannot) touch `transport_source_keyed`; that was already set
-        // above, before `mark_peer_connected`, from this function's own
-        // first-hand knowledge of whether the claim fell back.
-        registry
-            .mark_inbound_connection_observed(effective_addr, peer_addr)
-            .await;
+        // Health bookkeeping is deferred until the authenticated candidate wins
+        // publication; rejected or stale candidates cannot mark a successor.
 
         debug!(
             peer_addr = %peer_addr,
@@ -4314,17 +4690,33 @@ where
     // inherits the state (a fresh state would split a multi-chunk StreamStart
     // that began as the first frame and tear the connection down on chunk 2).
     let streaming_state_handoff = Arc::new(crate::connection_pool::StreamingStateHandoff {
+        initial_outcome: msg_result
+            .as_ref()
+            .ok()
+            .and_then(crate::connection_pool::InitialOutcome::from_read),
         cell: std::sync::Mutex::new(None),
         ready: tokio::sync::Notify::new(),
     });
 
+    // This guard spans every post-publication await until initial-frame handoff.
+    let mut _inbound_initialization;
     // Register the TLS stream with the connection pool before handling the first message so responses work
     let (response_correlation, response_connection) = {
         let buffer_config = crate::connection_pool::BufferConfig::default()
             .with_ask_window(registry.config.ask_window);
-        let correlation_tracker = registry
+        let correlation_tracker = match registry
             .connection_pool
-            .get_or_create_correlation_tracker(&peer_id);
+            .get_or_create_correlation_tracker(&peer_id)
+        {
+            Ok(tracker) => tracker,
+            Err(err) => {
+                warn!(peer = %peer_addr, error = %err, "inbound identity admission rejected");
+                if let Some(transaction) = rollback_claim.take() {
+                    transaction.rollback().await;
+                }
+                return ConnectionCloseOutcome::DroppedByTieBreaker;
+            }
+        };
         let response_writer = Arc::new(crate::ask_responder::ResponseWriter::new(peer_addr));
         let read_context = crate::connection_pool::ReadContext {
             // `peer_id` was verified above to equal the TLS client
@@ -4362,7 +4754,11 @@ where
                 false,
             );
         let stream_handle = Arc::new(stream_handle);
-        response_writer.bind_stream_handle(stream_handle.clone());
+        if let Err(error) = response_writer.bind_stream_handle(stream_handle.clone()) {
+            warn!(%error, %peer_addr, "inbound response writer binding rejected");
+            stream_handle.shutdown();
+            return ConnectionCloseOutcome::DroppedByTieBreaker;
+        }
 
         let mut connection = crate::connection_pool::LockFreeConnection::new(
             peer_state_addr,
@@ -4403,9 +4799,7 @@ where
         // CRITICAL: Set embedded_peer_id so responses can find the shared correlation tracker
         // even after addr_to_peer_id mapping is migrated from ephemeral to bind address
         connection.embedded_peer_id = Some(peer_id.clone());
-        connection.peer_capabilities = registry
-            .peer_capabilities
-            .read_sync(&peer_addr, |_, caps| *caps);
+        connection.peer_capabilities = peer_caps;
         connection.remote_boot_id = connection.peer_capabilities.map(|caps| caps.remote_boot_id);
 
         let connection_arc = Arc::new(connection);
@@ -4445,296 +4839,350 @@ where
         // could be silently erased before this decision even runs — the
         // exact same defect the outbound-finalize `existing_before` snapshot
         // had. A pure read can never trigger that clear.
+        _inbound_initialization = InboundInitializationGuard {
+            pool: registry.connection_pool.clone(),
+            peer: peer_id.clone(),
+            connection: Arc::downgrade(&connection_arc),
+            armed: true,
+        };
+        if let Some(transaction) = rollback_claim.as_mut()
+            && !transaction.begin_publication().await
+        {
+            if let Some(handle) = connection_arc.stream_handle.as_ref() {
+                handle.shutdown();
+            }
+            return ConnectionCloseOutcome::DroppedByTieBreaker;
+        }
         let keep_connection = {
-            let pool = &registry.connection_pool;
-            let registry_weak = Arc::downgrade(&registry);
+            use crate::connection_pool::ConnectionConflictDecision;
+            use crate::lifecycle::{TransportDirection, TransportLifecycleEvent};
 
-            match pool.peer_current_connection_snapshot(&peer_id) {
-                None => {
-                    let accepted = if pool.publish_inbound_or_reresolve(
-                        &peer_id,
-                        &connection_arc,
-                        None,
-                        &registry_weak,
-                    ) {
-                        let ephemeral_addr = (peer_addr != peer_state_addr).then_some(peer_addr);
-                        pool.finish_indexing_accepted_connection(
-                            &peer_id,
-                            peer_state_addr,
-                            ephemeral_addr,
-                            &connection_arc,
-                        )
-                    } else {
-                        false
-                    };
-                    if accepted {
-                        info!(
-                            target: "icanact_remote_lifecycle",
-                            peer_id = %peer_id,
-                            peer_addr = %peer_addr,
-                            peer_state_addr = %peer_state_addr,
-                            "inbound_connection_accepted"
-                        );
-                    } else {
-                        // Lost the re-resolved tie-break against a
-                        // concurrently published rival (or a mid-window
-                        // evict raced this candidate out before it was
-                        // durably indexed): never indexed, never counted,
-                        // rejected exactly like the existing-connection
-                        // reject arms below.
-                        registry.clear_peer_capabilities(&peer_addr);
-                    }
-                    accepted
-                }
-                Some(existing_conn) => {
-                    let existing_usable = existing_conn.has_live_stream();
-                    let duplicate_process = crate::connection_pool::has_conflicting_remote_boot(
-                        &existing_conn,
-                        &connection_arc,
-                    );
-                    let keep_existing = existing_usable
-                        && registry.should_keep_connection(
-                            &peer_id,
-                            existing_conn.direction
-                                == crate::connection_pool::ConnectionDirection::Outbound,
-                        );
-                    let keep_new_inbound = registry.should_keep_connection(&peer_id, false);
+            let _ownership = registry.registry_owner.projection_guard();
+            let publication_current = rollback_claim
+                .as_ref()
+                .is_none_or(crate::registry::InboundClaimTransaction::publication_is_current);
+            let mut keep_connection = if publication_current {
+                let pool = &registry.connection_pool;
+                let registry_weak = Arc::downgrade(&registry);
 
-                    match crate::connection_pool::resolve_authenticated_connection_conflict(
-                        &existing_conn,
-                        &connection_arc,
-                        keep_existing,
-                        keep_new_inbound,
-                        crate::connection_pool::incoming_session_is_newer(
+                match pool.peer_current_connection_snapshot(&peer_id) {
+                    None => {
+                        let accepted = if pool.publish_inbound_or_reresolve(
+                            &peer_id,
                             &connection_arc,
-                            &existing_conn,
-                        ),
-                    ) {
-                        crate::connection_pool::ConnectionConflictDecision::AcceptIncoming => {
+                            None,
+                            &registry_weak,
+                        ) {
+                            let ephemeral_addr =
+                                (peer_addr != peer_state_addr).then_some(peer_addr);
+                            pool.finish_indexing_accepted_connection(
+                                &peer_id,
+                                peer_state_addr,
+                                ephemeral_addr,
+                                &connection_arc,
+                            )
+                        } else {
+                            false
+                        };
+                        if accepted {
                             info!(
                                 target: "icanact_remote_lifecycle",
                                 peer_id = %peer_id,
-                                addr = %existing_conn.addr,
+                                peer_addr = %peer_addr,
                                 peer_state_addr = %peer_state_addr,
-                                "inbound_tiebreak_evict_stale"
+                                "inbound_connection_accepted"
                             );
-                            // Instance-scoped: only ever tears down the exact
-                            // `existing_conn` this decision was computed
-                            // about. A peer-wide `disconnect_connection_by_peer_id`
-                            // here would tear down whatever is currently
-                            // indexed for the peer — including a fresh
-                            // replacement a concurrent accept/finalize
-                            // published between the decision above and this
-                            // call — reproducing the tie-break reconnect
-                            // thrash from the inbound-accept side.
-                            //
-                            // The follow-up publish must NOT be unconditional
-                            // either: `disconnect_connection_instance` above
-                            // can decline (a fresh session already superseded
-                            // `existing_conn`), and an unconditional
-                            // `add_connection_by_peer_id` afterward would
-                            // still clobber that fresh session — the exact
-                            // reviewer finding this closes. Route through the
-                            // same compare-and-publish + bounded re-resolve
-                            // `finalize_new_outbound_connection` uses, with
-                            // `expected` derived from the eviction's own
-                            // outcome. A `false` return means the candidate
-                            // lost its re-resolved tie-break: it must not be
-                            // indexed, counted, or accepted, mirroring the
-                            // `RejectIncoming`/`EvictStaleRejectIncoming` arms
-                            // below.
-                            let evicted =
-                                pool.disconnect_connection_instance(&peer_id, &existing_conn);
-                            let expected = if evicted {
-                                None
-                            } else {
-                                Some(existing_conn.clone())
-                            };
-                            if pool.publish_inbound_or_reresolve(
+                        } else {
+                            // Lost the re-resolved tie-break against a
+                            // concurrently published rival (or a mid-window
+                            // evict raced this candidate out before it was
+                            // durably indexed): never indexed, never counted,
+                            // rejected exactly like the existing-connection
+                            // reject arms below.
+                        }
+                        accepted
+                    }
+                    Some(existing_conn) => {
+                        let existing_usable = existing_conn.has_live_stream();
+                        let duplicate_process = crate::connection_pool::has_conflicting_remote_boot(
+                            &existing_conn,
+                            &connection_arc,
+                        );
+                        let keep_existing = existing_usable
+                            && registry.should_keep_connection(
                                 &peer_id,
+                                existing_conn.direction
+                                    == crate::connection_pool::ConnectionDirection::Outbound,
+                            );
+                        let keep_new_inbound = registry.should_keep_connection(&peer_id, false);
+
+                        match crate::connection_pool::resolve_authenticated_connection_conflict(
+                            &existing_conn,
+                            &connection_arc,
+                            keep_existing,
+                            keep_new_inbound,
+                            crate::connection_pool::incoming_session_is_newer(
                                 &connection_arc,
-                                expected.as_ref(),
-                                &registry_weak,
-                            ) {
-                                // A `false` return here means a concurrent
-                                // evict/supersede raced this connection out
-                                // of the peer session in the window before it
-                                // was durably indexed — `finish_indexing_accepted_connection`
-                                // has already undone its own writes, so this
-                                // gets the IDENTICAL treatment as the
-                                // re-resolved tie-break reject arms below.
-                                let ephemeral_addr =
-                                    (peer_addr != peer_state_addr).then_some(peer_addr);
-                                if pool.finish_indexing_accepted_connection(
-                                    &peer_id,
-                                    peer_state_addr,
-                                    ephemeral_addr,
-                                    &connection_arc,
-                                ) {
-                                    true
+                                &existing_conn,
+                            ),
+                        ) {
+                            ConnectionConflictDecision::AcceptIncoming => {
+                                info!(
+                                    target: "icanact_remote_lifecycle",
+                                    peer_id = %peer_id,
+                                    addr = %existing_conn.addr,
+                                    peer_state_addr = %peer_state_addr,
+                                    "inbound_tiebreak_evict_stale"
+                                );
+                                // Instance-scoped: only ever tears down the exact
+                                // `existing_conn` this decision was computed
+                                // about. A peer-wide `disconnect_connection_by_peer_id`
+                                // here would tear down whatever is currently
+                                // indexed for the peer — including a fresh
+                                // replacement a concurrent accept/finalize
+                                // published between the decision above and this
+                                // call — reproducing the tie-break reconnect
+                                // thrash from the inbound-accept side.
+                                //
+                                // The follow-up publish must NOT be unconditional
+                                // either: `disconnect_connection_instance` above
+                                // can decline (a fresh session already superseded
+                                // `existing_conn`), and an unconditional
+                                // `add_connection_by_peer_id` afterward would
+                                // still clobber that fresh session — the exact
+                                // reviewer finding this closes. Route through the
+                                // same compare-and-publish + bounded re-resolve
+                                // `finalize_new_outbound_connection` uses, with
+                                // `expected` derived from the eviction's own
+                                // outcome. A `false` return means the candidate
+                                // lost its re-resolved tie-break: it must not be
+                                // indexed, counted, or accepted, mirroring the
+                                // `RejectIncoming`/`EvictStaleRejectIncoming` arms
+                                // below.
+                                let evicted =
+                                    pool.disconnect_connection_instance(&peer_id, &existing_conn);
+                                let expected = if evicted {
+                                    None
                                 } else {
-                                    registry.clear_peer_capabilities(&peer_addr);
+                                    Some(existing_conn.clone())
+                                };
+                                if pool.publish_inbound_or_reresolve(
+                                    &peer_id,
+                                    &connection_arc,
+                                    expected.as_ref(),
+                                    &registry_weak,
+                                ) {
+                                    // A `false` return here means a concurrent
+                                    // evict/supersede raced this connection out
+                                    // of the peer session in the window before it
+                                    // was durably indexed — `finish_indexing_accepted_connection`
+                                    // has already undone its own writes, so this
+                                    // gets the IDENTICAL treatment as the
+                                    // re-resolved tie-break reject arms below.
+                                    let ephemeral_addr =
+                                        (peer_addr != peer_state_addr).then_some(peer_addr);
+                                    if pool.finish_indexing_accepted_connection(
+                                        &peer_id,
+                                        peer_state_addr,
+                                        ephemeral_addr,
+                                        &connection_arc,
+                                    ) {
+                                        true
+                                    } else {
+                                        registry.note_tie_break_eviction(&peer_id);
+                                        false
+                                    }
+                                } else {
                                     registry.note_tie_break_eviction(&peer_id);
                                     false
                                 }
-                            } else {
-                                registry.clear_peer_capabilities(&peer_addr);
+                            }
+                            ConnectionConflictDecision::EvictStaleRejectIncoming => {
+                                info!(
+                                    target: "icanact_remote_lifecycle",
+                                    peer_id = %peer_id,
+                                    addr = %existing_conn.addr,
+                                    peer_state_addr = %peer_state_addr,
+                                    "inbound_tiebreak_evict_stale"
+                                );
+                                // Instance-scoped for the same reason as the
+                                // `AcceptIncoming` arm above.
+                                let _ =
+                                    pool.disconnect_connection_instance(&peer_id, &existing_conn);
+                                info!(
+                                    target: "icanact_remote_lifecycle",
+                                    peer_id = %peer_id,
+                                    peer_state_addr = %peer_state_addr,
+                                    "inbound_tiebreak_reject_non_preferred_inbound"
+                                );
+                                // Direct, local evidence of a duplicate-connection
+                                // conflict for this peer — arm the storm-prevention
+                                // cooldown (narrow: not on generic socket failures).
                                 registry.note_tie_break_eviction(&peer_id);
                                 false
                             }
-                        }
-                        crate::connection_pool::ConnectionConflictDecision::EvictStaleRejectIncoming => {
-                            info!(
-                                target: "icanact_remote_lifecycle",
-                                peer_id = %peer_id,
-                                addr = %existing_conn.addr,
-                                peer_state_addr = %peer_state_addr,
-                                "inbound_tiebreak_evict_stale"
-                            );
-                            // Instance-scoped for the same reason as the
-                            // `AcceptIncoming` arm above.
-                            let _ = pool.disconnect_connection_instance(&peer_id, &existing_conn);
-                            info!(
-                                target: "icanact_remote_lifecycle",
-                                peer_id = %peer_id,
-                                peer_state_addr = %peer_state_addr,
-                                "inbound_tiebreak_reject_non_preferred_inbound"
-                            );
-                            registry.clear_peer_capabilities(&peer_addr);
-                            // Direct, local evidence of a duplicate-connection
-                            // conflict for this peer — arm the storm-prevention
-                            // cooldown (narrow: not on generic socket failures).
-                            registry.note_tie_break_eviction(&peer_id);
-                            false
-                        }
-                        crate::connection_pool::ConnectionConflictDecision::ReplaceExisting => {
-                            if existing_conn.direction
-                                == crate::connection_pool::ConnectionDirection::Inbound
-                            {
-                                info!(
-                                    target: "icanact_remote_lifecycle",
-                                    peer_id = %peer_id,
-                                    old_addr = %existing_conn.addr,
-                                    new_addr = %peer_state_addr,
-                                    old_session_epoch = ?existing_conn
-                                        .stream_handle
-                                        .as_ref()
-                                        .map(|handle| handle.instance_id()),
-                                    new_session_epoch = ?connection_arc
-                                        .stream_handle
-                                        .as_ref()
-                                        .map(|handle| handle.instance_id()),
-                                    "inbound_authenticated_session_supersedes_older_epoch"
-                                );
-                            } else {
-                                info!(
-                                    target: "icanact_remote_lifecycle",
-                                    peer_id = %peer_id,
-                                    addr = %existing_conn.addr,
-                                    peer_state_addr = %peer_state_addr,
-                                    existing_direction = ?existing_conn.direction,
-                                    "inbound_tiebreak_replace_wrong_direction"
-                                );
-                                crate::lifecycle::record_transport_event(
-                                    crate::lifecycle::TransportLifecycleEvent::WrongDirectionEvicted {
-                                        peer: peer_id.clone(),
-                                        addr: existing_conn.addr,
-                                        direction: crate::lifecycle::TransportDirection::Outbound,
-                                    },
-                                );
-                            }
-                            // Instance-scoped for the same reason as the
-                            // `AcceptIncoming` arm above; the follow-up
-                            // publish is compare-and-publish + bounded
-                            // re-resolve for the identical reason — see the
-                            // `AcceptIncoming` arm's comment above for the
-                            // full race this closes.
-                            let evicted =
-                                pool.disconnect_connection_instance(&peer_id, &existing_conn);
-                            let expected = if evicted {
-                                None
-                            } else {
-                                Some(existing_conn.clone())
-                            };
-                            let mut accepted = pool.publish_inbound_or_reresolve(
-                                &peer_id,
-                                &connection_arc,
-                                expected.as_ref(),
-                                &registry_weak,
-                            );
-                            if accepted {
-                                // A `false` return here means a concurrent
-                                // evict/supersede raced this connection out
-                                // of the peer session in the window before it
-                                // was durably indexed — treat it exactly like
-                                // the re-resolved tie-break reject case below.
-                                let ephemeral_addr =
-                                    (peer_addr != peer_state_addr).then_some(peer_addr);
-                                accepted = pool.finish_indexing_accepted_connection(
-                                    &peer_id,
-                                    peer_state_addr,
-                                    ephemeral_addr,
-                                    &connection_arc,
-                                );
-                                if !accepted {
-                                    registry.clear_peer_capabilities(&peer_addr);
+                            ConnectionConflictDecision::ReplaceExisting => {
+                                if existing_conn.direction
+                                    == crate::connection_pool::ConnectionDirection::Inbound
+                                {
+                                    info!(
+                                        target: "icanact_remote_lifecycle",
+                                        peer_id = %peer_id,
+                                        old_addr = %existing_conn.addr,
+                                        new_addr = %peer_state_addr,
+                                        old_session_epoch = ?existing_conn
+                                            .stream_handle
+                                            .as_ref()
+                                            .map(|handle| handle.instance_id()),
+                                        new_session_epoch = ?connection_arc
+                                            .stream_handle
+                                            .as_ref()
+                                            .map(|handle| handle.instance_id()),
+                                        "inbound_authenticated_session_supersedes_older_epoch"
+                                    );
+                                } else {
+                                    info!(
+                                        target: "icanact_remote_lifecycle",
+                                        peer_id = %peer_id,
+                                        addr = %existing_conn.addr,
+                                        peer_state_addr = %peer_state_addr,
+                                        existing_direction = ?existing_conn.direction,
+                                        "inbound_tiebreak_replace_wrong_direction"
+                                    );
+                                    crate::lifecycle::record_transport_event(
+                                        TransportLifecycleEvent::WrongDirectionEvicted {
+                                            peer: peer_id.clone(),
+                                            addr: existing_conn.addr,
+                                            direction: TransportDirection::Outbound,
+                                        },
+                                    );
                                 }
-                            } else {
-                                registry.clear_peer_capabilities(&peer_addr);
-                            }
-                            // Direct, local evidence of a duplicate-connection
-                            // conflict for this peer — arm the storm-prevention
-                            // cooldown (narrow: not on generic socket failures)
-                            // regardless of whether the re-resolve ultimately
-                            // accepted or rejected this candidate: a live
-                            // wrong-direction rival was observed and evicted
-                            // either way.
-                            registry.note_tie_break_eviction(&peer_id);
-                            accepted
-                        }
-                        crate::connection_pool::ConnectionConflictDecision::RejectIncoming => {
-                            if duplicate_process {
-                                let incumbent_boot_id = existing_conn
-                                    .remote_boot_id
-                                    .expect("boot conflict requires incumbent boot id");
-                                let rejected_boot_id = connection_arc
-                                    .remote_boot_id
-                                    .expect("boot conflict requires candidate boot id");
-                                warn!(
-                                    target: "icanact_remote_lifecycle",
-                                    peer_id = %peer_id,
-                                    addr = %existing_conn.addr,
-                                    incumbent_boot_id = ?incumbent_boot_id.as_bytes(),
-                                    rejected_boot_id = ?rejected_boot_id.as_bytes(),
-                                    "duplicate_peer_identity_rejected"
+                                // Instance-scoped for the same reason as the
+                                // `AcceptIncoming` arm above; the follow-up
+                                // publish is compare-and-publish + bounded
+                                // re-resolve for the identical reason — see the
+                                // `AcceptIncoming` arm's comment above for the
+                                // full race this closes.
+                                let evicted =
+                                    pool.disconnect_connection_instance(&peer_id, &existing_conn);
+                                let expected = if evicted {
+                                    None
+                                } else {
+                                    Some(existing_conn.clone())
+                                };
+                                let mut accepted = pool.publish_inbound_or_reresolve(
+                                    &peer_id,
+                                    &connection_arc,
+                                    expected.as_ref(),
+                                    &registry_weak,
                                 );
-                                crate::lifecycle::record_transport_event(
-                                    crate::lifecycle::TransportLifecycleEvent::DuplicateIdentityRejected {
-                                        peer: peer_id.clone(),
-                                        addr: existing_conn.addr,
-                                        incumbent_boot_id,
-                                        rejected_boot_id,
-                                    },
-                                );
-                            } else {
-                                info!(
-                                    target: "icanact_remote_lifecycle",
-                                    peer_id = %peer_id,
-                                    addr = %existing_conn.addr,
-                                    peer_state_addr = %peer_state_addr,
-                                    existing_direction = ?existing_conn.direction,
-                                    "inbound_tiebreak_reject_live_duplicate"
-                                );
+                                if accepted {
+                                    // A `false` return here means a concurrent
+                                    // evict/supersede raced this connection out
+                                    // of the peer session in the window before it
+                                    // was durably indexed — treat it exactly like
+                                    // the re-resolved tie-break reject case below.
+                                    let ephemeral_addr =
+                                        (peer_addr != peer_state_addr).then_some(peer_addr);
+                                    accepted = pool.finish_indexing_accepted_connection(
+                                        &peer_id,
+                                        peer_state_addr,
+                                        ephemeral_addr,
+                                        &connection_arc,
+                                    );
+                                }
+                                // Direct, local evidence of a duplicate-connection
+                                // conflict for this peer — arm the storm-prevention
+                                // cooldown (narrow: not on generic socket failures)
+                                // regardless of whether the re-resolve ultimately
+                                // accepted or rejected this candidate: a live
+                                // wrong-direction rival was observed and evicted
+                                // either way.
                                 registry.note_tie_break_eviction(&peer_id);
+                                accepted
                             }
-                            registry.clear_peer_capabilities(&peer_addr);
-                            false
+                            ConnectionConflictDecision::RejectIncoming => {
+                                if duplicate_process {
+                                    let incumbent_boot_id = existing_conn
+                                        .remote_boot_id
+                                        .expect("boot conflict requires incumbent boot id");
+                                    let rejected_boot_id = connection_arc
+                                        .remote_boot_id
+                                        .expect("boot conflict requires candidate boot id");
+                                    warn!(
+                                        target: "icanact_remote_lifecycle",
+                                        peer_id = %peer_id,
+                                        addr = %existing_conn.addr,
+                                        incumbent_boot_id = ?incumbent_boot_id.as_bytes(),
+                                        rejected_boot_id = ?rejected_boot_id.as_bytes(),
+                                        "duplicate_peer_identity_rejected"
+                                    );
+                                    crate::lifecycle::record_transport_event(
+                                        TransportLifecycleEvent::DuplicateIdentityRejected {
+                                            peer: peer_id.clone(),
+                                            addr: existing_conn.addr,
+                                            incumbent_boot_id,
+                                            rejected_boot_id,
+                                        },
+                                    );
+                                } else {
+                                    info!(
+                                        target: "icanact_remote_lifecycle",
+                                        peer_id = %peer_id,
+                                        addr = %existing_conn.addr,
+                                        peer_state_addr = %peer_state_addr,
+                                        existing_direction = ?existing_conn.direction,
+                                        "inbound_tiebreak_reject_live_duplicate"
+                                    );
+                                    registry.note_tie_break_eviction(&peer_id);
+                                }
+                                false
+                            }
+                        }
+                    }
+                }
+            } else {
+                false
+            };
+            if keep_connection {
+                let _publication = registry.connection_pool.session_publication_guard();
+                let current = registry
+                    .connection_pool
+                    .committed_peer_connection_snapshot(&peer_id);
+                keep_connection = current
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &connection_arc));
+                if keep_connection && let Some(caps) = peer_caps {
+                    match registry.note_remote_role_for_connection(
+                        &peer_id,
+                        caps.remote_client_only,
+                        &connection_arc,
+                    ) {
+                        Ok(session) => client_only_session = session,
+                        Err(err) => {
+                            warn!(
+                                peer = %peer_addr,
+                                error = %err,
+                                "inbound role admission rejected"
+                            );
+                            keep_connection = false;
                         }
                     }
                 }
             }
+            if keep_connection && let Some(transaction) = rollback_claim.take() {
+                keep_connection = transaction.commit_in_publication();
+            }
+            keep_connection
         };
         if keep_connection {
+            #[cfg(test)]
+            pause_inbound_initialization(&peer_id, peer_state_addr, 1).await;
+            let receipt =
+                crate::registry::SessionReceipt::new(peer_id.clone(), connection_instance_id);
+            registry
+                .mark_peer_connected_with_receipt(peer_state_addr, &receipt)
+                .await;
             crate::lifecycle::record_transport_event(
                 crate::lifecycle::TransportLifecycleEvent::InboundReady {
                     peer: peer_id.clone(),
@@ -4744,48 +5192,21 @@ where
         }
 
         if !keep_connection {
+            registry
+                .connection_pool
+                .disconnect_connection_instance(&peer_id, &connection_arc);
             if let Some(handle) = connection_arc.stream_handle.as_ref() {
                 handle.shutdown();
             }
-            if let Some((claimed_addr, claim_generation, prior_projection)) = rollback_claim {
-                rollback_rejected_inbound_claim(
-                    &registry,
-                    claimed_addr,
-                    &peer_id,
-                    claim_generation,
-                    prior_projection,
-                )
-                .await;
+            if let Some(transaction) = rollback_claim.take() {
+                transaction.rollback().await;
             }
             return ConnectionCloseOutcome::DroppedByTieBreaker;
         }
 
-        // Guaranteed POST-publication discovery mark. The earlier
-        // `mark_peer_connected`/`mark_inbound_connection_observed` call
-        // above (right after the first frame identifies `node_id`) runs
-        // BEFORE `connection_arc` is even constructed, let alone published
-        // into `connection_pool` -- necessarily, since publication itself
-        // depends on the tie-break resolution just above, which needs
-        // `connection_arc` to exist first. The discovery-clear guard
-        // (`GossipRegistry::clear_discovery_state_if_no_live_connection`)
-        // checks `connection_pool.has_connection` directly, so a stale
-        // teardown clear landing in that pre-publish window would see no
-        // published connection yet, clear discovery's `Connected` state,
-        // and leave this connection permanently uncounted even though it
-        // is about to become (or already is) the peer's live session.
-        //
-        // Reached only when `keep_connection` is true, i.e. `connection_arc`
-        // has already been durably published (`finish_indexing_accepted_connection`
-        // succeeded above) -- so this re-mark is exactly what closes that
-        // window: after it, discovery `Connected` for this address is
-        // guaranteed to correspond to a connection `connection_pool` can
-        // actually see. Liveness-gated (`mark_peer_connected_if_live`), not
-        // the plain unconditional mark: this connection's own I/O task can
-        // already have failed and torn itself down (removing the pool
-        // entry and clearing discovery) in the time between publish
-        // returning and this `.await` acquiring the lock, and an
-        // unconditional re-mark would resurrect `Connected` for a session
-        // that is already dead, with nothing left to clear it again later.
+        // Test instrumentation may pause after publication. Revalidate the
+        // original receipt again after that gap; a successor's live address
+        // is never enough to apply this session's completion.
         #[cfg(feature = "test-helpers")]
         crate::lifecycle::record_test_helper_event(|sequence| {
             crate::lifecycle::TransportTestHelperEvent::PreRemark {
@@ -4800,7 +5221,15 @@ where
                 sequence,
             }
         });
-        registry.mark_peer_connected_if_live(peer_state_addr).await;
+        #[cfg(test)]
+        pause_inbound_initialization(&peer_id, peer_state_addr, 2).await;
+        let receipt = crate::registry::SessionReceipt::new(peer_id.clone(), connection_instance_id);
+        registry
+            .mark_peer_connected_with_receipt(peer_state_addr, &receipt)
+            .await;
+        registry
+            .notify_session_ready(peer_state_addr, &receipt)
+            .await;
 
         // R-11: this is a new TLS-authenticated session for `node_id`, which is
         // the only evidence we accept that the peer may have restarted. Allow
@@ -4832,6 +5261,8 @@ where
         // it is still the peer's current connection immediately before
         // mutating shared state, and decline to arm otherwise.
         if let Some(node_id) = node_id_opt {
+            #[cfg(test)]
+            pause_inbound_initialization(&peer_id, peer_state_addr, 3).await;
             registry
                 .arm_sequence_reset_for_new_session(
                     peer_state_addr,
@@ -4867,6 +5298,9 @@ where
 
     let mut streaming_state = crate::protocol::StreamingState::new();
 
+    #[cfg(test)]
+    pause_inbound_initialization(&peer_id, peer_state_addr, 4).await;
+
     // Process the initial message with correlation ID if present
     // We can safely unwrap here because the error case was handled by the match block above (returning early)
     if let Err(e) = crate::protocol::process_read_result_with_instance(
@@ -4889,7 +5323,10 @@ where
         // path (no first-frame state to hand; it falls back to a fresh state
         // and exits via the connection close).
         streaming_state_handoff.ready.notify_one();
-        return ConnectionCloseOutcome::Normal { node_id: None };
+        return ConnectionCloseOutcome::Normal {
+            node_id: None,
+            client_only_session,
+        };
     }
 
     // R-6: hand the first-frame StreamingState to the IO task so a multi-chunk
@@ -4903,6 +5340,8 @@ where
         *cell = Some(streaming_state);
     }
     streaming_state_handoff.ready.notify_one();
+
+    _inbound_initialization.armed = false;
 
     // Continue processing via the IO task; wait for it to exit.
     if let Some(handle) = response_connection.stream_handle.as_ref() {
@@ -4922,6 +5361,7 @@ where
     }
     ConnectionCloseOutcome::Normal {
         node_id: Some(sender_node_id),
+        client_only_session,
     }
 }
 
@@ -5014,6 +5454,7 @@ pub(crate) async fn handle_raw_ask_request(
     peer_addr: SocketAddr,
     correlation_id: u32,
     payload: &[u8],
+    response_connection: Option<&Arc<crate::connection_pool::LockFreeConnection>>,
 ) {
     #[cfg(any(test, feature = "test-helpers"))]
     {
@@ -5023,29 +5464,14 @@ pub(crate) async fn handle_raw_ask_request(
             crate::connection_pool::process_mock_request_payload(payload)
         };
 
-        let conn = {
-            let pool = &registry.connection_pool;
-            pool.get_connection_by_addr(&peer_addr)
-        };
-
-        if let Some(conn) = conn {
+        let _ = registry;
+        if let Some(conn) = response_connection {
             if let Some(ref stream_handle) = conn.stream_handle {
-                let header = match crate::framing::try_write_ask_response_header(
-                    crate::MessageType::Response,
-                    correlation_id,
-                    response.len(),
-                ) {
-                    Ok(header) => header,
-                    Err(e) => {
-                        warn!(peer = %peer_addr, error = %e, "Ask response too large to frame");
-                        return;
-                    }
-                };
-
                 if let Err(e) = stream_handle
-                    .write_header_and_payload_control(
-                        bytes::Bytes::copy_from_slice(&header),
-                        bytes::Bytes::from(response),
+                    .send_response_owned(
+                        correlation_id,
+                        crate::ForwardPayload::from(response),
+                        false,
                     )
                     .await
                 {
@@ -5063,7 +5489,8 @@ pub(crate) async fn handle_raw_ask_request(
     #[cfg(not(any(test, feature = "test-helpers")))]
     {
         let _ = payload;
-        handle_raw_ask_no_dispatcher(registry, peer_addr, correlation_id).await;
+        handle_raw_ask_no_dispatcher(registry, peer_addr, correlation_id, response_connection)
+            .await;
     }
 }
 
@@ -5089,172 +5516,43 @@ pub(crate) async fn handle_raw_ask_no_dispatcher(
     registry: &Arc<GossipRegistry>,
     peer_addr: SocketAddr,
     correlation_id: u32,
+    response_connection: Option<&Arc<crate::connection_pool::LockFreeConnection>>,
 ) {
     send_ask_nack(
         registry,
         peer_addr,
         correlation_id,
         crate::framing::AskNackReason::NoDispatcher,
+        response_connection,
     )
     .await;
 }
 
-/// Send a response back to the peer for a streaming ask request.
-/// This is called after handle_actor_message returns with a response.
-/// Uses send_response_auto_bytes to preserve zero-copy streaming for large responses.
-pub(crate) async fn send_streaming_response(
-    registry: &Arc<GossipRegistry>,
-    peer_addr: SocketAddr,
-    correlation_id: u32,
-    response: bytes::Bytes,
-) {
-    let pool = &registry.connection_pool;
-
-    // IMPORTANT: Look up by peer_id first, then fall back to peer_addr
-    // For responses, we prefer OUTBOUND connection, but will use INBOUND if that's all we have
-    // (both connections use the same TCP wire - responses go back on the same connection)
-    let mut conn_opt: Option<Arc<crate::connection_pool::LockFreeConnection>> = None;
-    if let Some(peer_id) = pool.get_peer_id_by_addr(&peer_addr) {
-        // Get connection by peer_id - this returns the best available connection
-        let conn = pool.get_connection_by_peer_id(&peer_id);
-
-        // For responses, we prefer OUTBOUND connection over INBOUND
-        // because we typically have an outbound connection for ongoing communication
-        if let Some(ref c) = conn {
-            if c.direction == crate::connection_pool::ConnectionDirection::Outbound {
-                conn_opt = Some(c.clone());
-            } else {
-                // We only have an inbound connection
-                // That's OK! The inbound connection is the same TCP wire, just from the peer's perspective
-                // Responses will go back on the same TCP connection
-                conn_opt = Some(c.clone());
-            }
-        }
-    } else {
-        conn_opt = pool.get_connection_by_addr(&peer_addr);
-    };
-
-    if let Some(conn) = conn_opt {
-        if let Some(ref stream_handle) = conn.stream_handle {
-            // Streaming responses always use the streaming protocol.
-            if let Err(e) = stream_handle
-                .stream_response_bytes(response, correlation_id)
-                .await
-            {
-                warn!(peer = %peer_addr, error = %e, correlation_id = correlation_id, "Failed to send streaming response");
-            } else {
-                // Intentionally quiet: this is the hot-path and can spam logs in benchmarks.
-            }
-        } else {
-            // No stream writer available on this connection; fall back to inline response.
-            send_inline_response(registry, peer_addr, correlation_id, response).await;
-        }
-    } else {
-        warn!(peer = %peer_addr, correlation_id = correlation_id, "No connection found for streaming response");
-    }
-}
-
-/// Send a response back to the peer for a non-streaming ask request.
-/// Always uses the inline write queue (never streaming).
-pub(crate) async fn send_inline_response(
-    registry: &Arc<GossipRegistry>,
-    peer_addr: SocketAddr,
-    correlation_id: u32,
-    response: bytes::Bytes,
-) {
-    let pool = &registry.connection_pool;
-    if let Some(conn) = pool.get_existing_connection(peer_addr) {
-        if let Err(e) = conn.send_response_bytes(correlation_id, response).await {
-            warn!(
-                peer = %peer_addr,
-                error = %e,
-                correlation_id = correlation_id,
-                "Failed to send inline response"
-            );
-        }
-    } else {
-        warn!(
-            peer = %peer_addr,
-            correlation_id = correlation_id,
-            "No connection found for inline response"
-        );
-    }
-}
-
-/// Send an ask NACK back to the peer: the ask could not be answered with
-/// data (see `crate::framing::AskNackReason`). Same connection lookup as
-/// `send_inline_response`, so a NACK is delivered on whatever connection a
-/// real response would have used.
+/// Send a NACK only on the captured receiving stream. An address is diagnostic
+/// metadata, never authority to select a successor for an old request.
 pub(crate) async fn send_ask_nack(
-    registry: &Arc<GossipRegistry>,
+    _registry: &Arc<GossipRegistry>,
     peer_addr: SocketAddr,
     correlation_id: u32,
     reason: crate::framing::AskNackReason,
+    response_connection: Option<&Arc<crate::connection_pool::LockFreeConnection>>,
 ) {
-    let pool = &registry.connection_pool;
-    if let Some(conn) = pool.get_existing_connection(peer_addr) {
-        if let Err(e) = conn.send_ask_nack(correlation_id, reason).await {
-            warn!(
-                peer = %peer_addr,
-                error = %e,
-                correlation_id = correlation_id,
-                "Failed to send ask NACK"
-            );
-        }
-    } else {
-        warn!(
-            peer = %peer_addr,
-            correlation_id = correlation_id,
-            "No connection found for ask NACK"
-        );
-    }
-}
-
-/// Send a response back to the peer for a non-streaming ask request using aligned bytes.
-pub(crate) async fn send_inline_response_aligned(
-    registry: &Arc<GossipRegistry>,
-    peer_addr: SocketAddr,
-    correlation_id: u32,
-    response: crate::AlignedBytes,
-) {
-    send_inline_response(registry, peer_addr, correlation_id, response.into_bytes()).await;
-}
-
-/// Send a pooled response back to the peer for an ask request.
-/// This keeps rkyv payloads zero-copy by writing the pooled buffer directly.
-pub(crate) async fn send_pooled_response(
-    registry: &Arc<GossipRegistry>,
-    peer_addr: SocketAddr,
-    correlation_id: u32,
-    payload: crate::typed::PooledPayload,
-    prefix: Option<[u8; 16]>,
-    payload_len: usize,
-) {
-    let pool = &registry.connection_pool;
-    if let Some(conn) = pool.get_existing_connection(peer_addr) {
-        if let Err(e) = conn
-            .send_response_pooled(correlation_id, payload, prefix, payload_len)
-            .await
-        {
-            warn!(
-                peer = %peer_addr,
-                error = %e,
-                correlation_id = correlation_id,
-                "Failed to send pooled response"
-            );
-        }
-    } else {
-        warn!(
-            peer = %peer_addr,
-            correlation_id = correlation_id,
-            "No connection found for pooled response"
-        );
+    let Some(stream) = response_connection.and_then(|conn| conn.stream_handle.as_ref()) else {
+        warn!(peer = %peer_addr, correlation_id, "NACK missing receiving-stream provenance");
+        return;
+    };
+    let header = crate::framing::write_ask_nack_header(correlation_id, reason);
+    if let Err(err) = stream
+        .write_header_and_payload_control_inline(header, 16, bytes::Bytes::new())
+        .await
+    {
+        warn!(peer = %peer_addr, correlation_id, error = %err, "Failed to send ask NACK");
     }
 }
 
 pub(crate) async fn handle_response_message(
     registry: &Arc<GossipRegistry>,
-    peer_addr: SocketAddr,
+    _peer_addr: SocketAddr,
     correlation_id: u32,
     payload: crate::AlignedBytes,
     response_correlation: Option<&crate::connection_pool::CorrelationTracker>,
@@ -5262,75 +5560,46 @@ pub(crate) async fn handle_response_message(
     let mut payload = Some(payload);
 
     if let Some(correlation) = response_correlation {
-        if correlation.complete(correlation_id, &mut payload) {
-            return;
+        // REMOTE-3/4: this is the tracker captured by the receiving stream.
+        // It is already shared across supported bidirectional peer streams.
+        // Rejection proves a stale/unmatched request, not permission to look
+        // up whichever different tracker now occupies a mutable address.
+        if !correlation.complete(correlation_id, &mut payload) {
+            registry.note_unmatched_response();
         }
+        return;
     }
 
-    let pool = &registry.connection_pool;
-
-    // First, try to deliver via connection's embedded correlation tracker
-    if let Some(conn) = pool.get_connection_by_addr(&peer_addr) {
-        if let Some(ref correlation) = conn.correlation {
-            if correlation.complete(correlation_id, &mut payload) {
-                return;
-            }
-        }
-    }
-
-    // FALLBACK: Use shared correlation tracker by peer_id.
-    if let Some(peer_id) = pool.get_peer_id_by_addr(&peer_addr) {
-        if let Some(correlation) = pool.get_shared_correlation_tracker(&peer_id) {
-            if correlation.complete(correlation_id, &mut payload) {
-                return;
-            }
-        }
-    }
-
-    // No tier claimed this correlation_id -- the ask it was meant for has
-    // already timed out and been evicted, or this is spurious traffic.
+    // Missing receiving-stream provenance is not permission to resolve a
+    // mutable address/peer projection. Initial-handshake or legacy callers
+    // without a captured tracker cannot complete an in-flight request.
     registry.note_unmatched_response();
 }
 
-/// Deliver an ask NACK to whichever correlation tracker is waiting on
-/// `correlation_id`. Mirrors `handle_response_message`'s three-tier lookup
-/// (connection-scoped tracker, then the connection's embedded tracker, then
-/// the shared-by-peer-id fallback) exactly, but completes the slot with
-/// `complete_nack` so the waiter resolves to `Err(GossipError::AskNacked)`
-/// immediately instead of the response payload path.
+/// Deliver an ask NACK to the receiving stream's authoritative tracker.
+/// Missing or rejected provenance is unmatched; neither may fall through to
+/// mutable address or peer projections.
+/// Completes the slot with `complete_nack` so its waiter resolves immediately
+/// to `Err(GossipError::AskNacked)` rather than a response payload.
 pub(crate) async fn handle_response_nack_message(
     registry: &Arc<GossipRegistry>,
-    peer_addr: SocketAddr,
+    _peer_addr: SocketAddr,
     correlation_id: u32,
     reason: crate::framing::AskNackReason,
     response_correlation: Option<&crate::connection_pool::CorrelationTracker>,
 ) {
     if let Some(correlation) = response_correlation {
-        if correlation.complete_nack(correlation_id, reason) {
-            return;
+        // The receiving stream's tracker is authoritative, just as for a
+        // successful response. Never widen its rejection to a successor.
+        if !correlation.complete_nack(correlation_id, reason) {
+            registry.note_unmatched_response();
         }
+        return;
     }
 
-    let pool = &registry.connection_pool;
-
-    if let Some(conn) = pool.get_connection_by_addr(&peer_addr) {
-        if let Some(ref correlation) = conn.correlation {
-            if correlation.complete_nack(correlation_id, reason) {
-                return;
-            }
-        }
-    }
-
-    if let Some(peer_id) = pool.get_peer_id_by_addr(&peer_addr) {
-        if let Some(correlation) = pool.get_shared_correlation_tracker(&peer_id) {
-            if correlation.complete_nack(correlation_id, reason) {
-                return;
-            }
-        }
-    }
-
-    // No tier claimed this correlation_id -- the ask it was meant for has
-    // already timed out and been evicted, or this is spurious traffic.
+    // Missing receiving-stream provenance is not permission to resolve a
+    // mutable address/peer projection. Initial-handshake or legacy callers
+    // without a captured tracker cannot complete an in-flight request.
     registry.note_unmatched_response();
 }
 
@@ -5697,7 +5966,7 @@ where
     let mut buffer = crate::PooledAlignedBuffer::with_len(
         crate::framing::LENGTH_PREFIX_LEN + decoded.body_len,
         pool,
-    );
+    )?;
     buffer.as_mut_slice()[..crate::framing::LENGTH_PREFIX_LEN].copy_from_slice(&control);
     reader
         .read_exact(&mut buffer.as_mut_slice()[crate::framing::LENGTH_PREFIX_LEN..])
@@ -5755,7 +6024,7 @@ mod framing_tests {
         let mut buffer = crate::PooledAlignedBuffer::with_len(
             frame.len(),
             std::sync::Arc::new(crate::AlignedBytesPool::default()),
-        );
+        )?;
         buffer.as_mut_slice().copy_from_slice(frame);
         parse_message_from_pooled_buffer_with_routes(
             buffer,
@@ -5992,7 +6261,11 @@ mod framing_tests {
         );
 
         let registry = std::sync::Arc::new(registry);
-        handle_raw_ask_no_dispatcher(&registry, addr, 555).await;
+        let response_connection = registry
+            .connection_pool
+            .get_connection_by_addr(&addr)
+            .unwrap();
+        handle_raw_ask_no_dispatcher(&registry, addr, 555, Some(&response_connection)).await;
 
         let mut frame = [0u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN];
         tokio::time::timeout(
@@ -6254,7 +6527,7 @@ mod keepalive_apply_tests {
         )
         .await
         .unwrap();
-        handle.shutdown_and_wait().await;
+        handle.shutdown_and_wait().await.unwrap();
     }
 }
 
@@ -6317,6 +6590,7 @@ mod gossip_send_outcome_tests {
 async fn send_gossip_message_zero_copy(
     mut task: GossipTask,
     registry: Arc<GossipRegistry>,
+    session: &mut Option<crate::registry::SessionReceipt>,
 ) -> Result<()> {
     let mut conn = registry
         .connection_pool
@@ -6392,10 +6666,16 @@ async fn send_gossip_message_zero_copy(
         }
     };
 
+    // Capture the selected authenticated stream before any asynchronous send.
+    // Completion must never look up whichever session is current by address.
+    *session = crate::registry::SessionReceipt::from_handle(&conn);
+
     if matches!(
         task.message,
         crate::registry::RegistryMessage::PeerListGossip { .. }
-    ) && !registry.peer_supports_peer_list(&task.peer_addr).await
+    ) && !conn
+        .negotiated_capabilities()
+        .is_some_and(|caps| caps.can_send_peer_list())
     {
         debug!(
             peer = %task.peer_addr,
@@ -6413,14 +6693,22 @@ async fn send_gossip_message_zero_copy(
     match &mut task.message {
         crate::registry::RegistryMessage::DeltaGossip { delta, extensions } => {
             delta.precise_timing_nanos = current_time_nanos;
-            *extensions = registry
-                .gossip_extensions_for_outbound(task.peer_addr, current_time_nanos)
-                .await;
+            *extensions = session.as_ref().and_then(|receipt| {
+                registry.gossip_extensions_for_outbound_session(
+                    task.peer_addr,
+                    current_time_nanos,
+                    receipt,
+                )
+            });
         }
         crate::registry::RegistryMessage::FullSync { extensions, .. } => {
-            *extensions = registry
-                .gossip_extensions_for_outbound(task.peer_addr, current_time_nanos)
-                .await;
+            *extensions = session.as_ref().and_then(|receipt| {
+                registry.gossip_extensions_for_outbound_session(
+                    task.peer_addr,
+                    current_time_nanos,
+                    receipt,
+                )
+            });
         }
         _ => {}
     }
@@ -6435,6 +6723,117 @@ async fn send_gossip_message_zero_copy(
     }
     Ok(())
 }
+#[cfg(test)]
+mod bounded_admission_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bootstrap_batch_rejects_before_spawning_when_capacity_is_exhausted() {
+        let registry = Arc::new(GossipRegistry::<()>::new(
+            "127.0.0.1:0".parse().unwrap(),
+            GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing("bootstrap-admission-local")),
+                ..Default::default()
+            },
+        ));
+        let admission = Arc::new(tokio::sync::Semaphore::new(2));
+        let handle = GossipRegistryHandle::<()> {
+            registry,
+            _server_handle: None,
+            _timer_handle: None,
+            _monitor_handle: None,
+            bootstrap_admission: admission.clone(),
+            _marker: PhantomData,
+        };
+        let held = admission.clone().try_acquire_many_owned(2).unwrap();
+        assert!(matches!(
+            handle
+                .bootstrap_non_blocking(vec!["127.0.0.1:9".parse().unwrap()])
+                .await,
+            Err(GossipError::WriteQueueFull),
+        ));
+        assert_eq!(
+            handle.registry.connection_pool.outbound_tcp_dial_attempts(),
+            0
+        );
+        drop(held);
+        assert_eq!(admission.available_permits(), 2);
+        assert!(handle.bootstrap_non_blocking(Vec::new()).await.is_ok());
+        let recovered = admission.try_acquire_many_owned(2).unwrap();
+        assert_eq!(recovered.num_permits(), 2);
+    }
+
+    fn clock_with_entries(count: usize) -> crate::VectorClock {
+        let clocks = (0..count)
+            .map(|index| {
+                let key = crate::KeyPair::new_for_testing(format!("clock-budget-{index}"));
+                (key.peer_id().to_node_id(), 1)
+            })
+            .collect();
+        crate::VectorClock::from(crate::VectorClockData { clocks })
+    }
+
+    #[test]
+    fn archived_clock_budget_rejects_before_registry_materialization() {
+        let peer = crate::KeyPair::new_for_testing("clock-ingress-budget").peer_id();
+        for count in [
+            crate::MAX_INGRESS_VECTOR_CLOCK_ENTRIES,
+            crate::MAX_INGRESS_VECTOR_CLOCK_ENTRIES + 1,
+        ] {
+            let clock = clock_with_entries(count);
+            assert_eq!(clock.len(), count, "fixture must contain distinct entries");
+            let mut location =
+                RemoteActorLocation::new_with_peer("127.0.0.1:9000".parse().unwrap(), peer.clone());
+            location.vector_clock = clock.clone();
+            let messages = [
+                RegistryMessage::DeltaGossip {
+                    delta: crate::registry::RegistryDelta {
+                        since_sequence: 0,
+                        current_sequence: 1,
+                        changes: vec![crate::registry::RegistryChange::ActorRemoved {
+                            name: "actor".to_string(),
+                            vector_clock: clock,
+                            removing_node_id: peer.to_node_id(),
+                            priority: crate::RegistrationPriority::Normal,
+                        }],
+                        sender_peer_id: peer.clone(),
+                        wall_clock_time: 1,
+                        precise_timing_nanos: 0,
+                    },
+                    extensions: None,
+                },
+                RegistryMessage::FullSync {
+                    local_actors: vec![("actor".to_string(), location.clone())],
+                    known_actors: Vec::new(),
+                    sender_peer_id: peer.clone(),
+                    sender_bind_addr: None,
+                    sequence: 1,
+                    wall_clock_time: 1,
+                    extensions: None,
+                },
+                RegistryMessage::FullSyncResponse {
+                    local_actors: Vec::new(),
+                    known_actors: vec![("actor".to_string(), location)],
+                    sender_peer_id: peer.clone(),
+                    sender_bind_addr: None,
+                    sequence: 1,
+                    wall_clock_time: 1,
+                    extensions: None,
+                },
+            ];
+            for message in messages {
+                let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&message).unwrap();
+                let archived =
+                    rkyv::access::<rkyv::Archived<RegistryMessage>, rkyv::rancor::Error>(&bytes)
+                        .unwrap();
+                let accepted = count == crate::MAX_INGRESS_VECTOR_CLOCK_ENTRIES;
+                assert_eq!(registry_archive_within_clock_budget(archived), accepted);
+                assert_eq!(decode_registry_message(&bytes).is_ok(), accepted);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod inbound_tls_identity_tests {
     use super::inbound_tls_sender_is_authenticated;

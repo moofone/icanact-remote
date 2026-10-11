@@ -130,6 +130,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         sleep(args.interval).await;
     }
 
-    handle.shutdown().await;
+    handle.shutdown().await?;
     Ok(())
 }

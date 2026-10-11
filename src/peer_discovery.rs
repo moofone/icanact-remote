@@ -266,7 +266,15 @@ impl PeerDiscovery {
         let connected_count = self.connected_peer_count();
         let pending_count = self.pending_peer_count();
         let current_count = connected_count + pending_count;
-        let remaining_slots = self.config.max_peers.saturating_sub(current_count);
+        // A pending generation is never reissued, including at exhaustion.
+        // Saturation admits no new dial; existing claims still complete.
+        let remaining_generations =
+            usize::try_from(u64::MAX - self.next_claim_generation).unwrap_or(usize::MAX);
+        let remaining_slots = self
+            .config
+            .max_peers
+            .saturating_sub(current_count)
+            .min(remaining_generations);
 
         if remaining_slots == 0 {
             debug!(
@@ -592,6 +600,7 @@ impl PeerDiscovery {
     /// Address ownership arbitration happens before the connection tie-break;
     /// a candidate that loses that later tie-break must put discovery back
     /// exactly as it found it, including pending/failed retry state.
+    #[cfg(test)]
     pub(crate) fn restore_peer_state(&mut self, addr: SocketAddr, state: Option<PeerState>) {
         match state {
             Some(state) => {
@@ -1703,5 +1712,41 @@ mod tests {
         let stats = discovery.cleanup_expired(now + 2);
         assert_eq!(stats.failed_removed, 1);
         assert!(discovery.get_peer_state(&failed_peer).is_none());
+    }
+
+    #[test]
+    fn pending_generation_exhaustion_never_reissues_a_receipt() {
+        let mut discovery = PeerDiscovery::new(
+            test_addr(8080),
+            PeerDiscoveryConfig {
+                allow_loopback_discovery: true,
+                max_peers: 4,
+                ..Default::default()
+            },
+        );
+        discovery.next_claim_generation = u64::MAX - 1;
+        let addr = test_addr(9181);
+        let hint = PeerInfoGossip {
+            address: addr.to_string(),
+            peer_address: None,
+            node_id: None,
+            failures: 0,
+            last_attempt: 0,
+            last_success: 0,
+            dns_name: None,
+        };
+        assert_eq!(
+            discovery.on_peer_list_gossip(std::slice::from_ref(&hint)),
+            vec![addr]
+        );
+        assert_eq!(
+            discovery
+                .get_peer_state(&addr)
+                .and_then(PeerState::pending_claim_generation),
+            Some(u64::MAX)
+        );
+        discovery.clear_pending_if_generation(&addr, u64::MAX);
+        assert!(discovery.on_peer_list_gossip(&[hint]).is_empty());
+        assert_eq!(discovery.next_claim_generation, u64::MAX);
     }
 }

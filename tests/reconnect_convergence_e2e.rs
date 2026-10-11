@@ -231,9 +231,9 @@ async fn concurrent_same_identity_process_does_not_replace_live_incumbent()
         "a concurrent process clone must not receive incumbent traffic"
     );
 
-    clone.shutdown_and_wait().await;
-    old_replica.shutdown_and_wait().await;
-    observer.shutdown_and_wait().await;
+    clone.shutdown_and_wait().await.unwrap();
+    old_replica.shutdown_and_wait().await.unwrap();
+    observer.shutdown_and_wait().await.unwrap();
     Ok(())
 }
 
@@ -528,9 +528,9 @@ async fn isolated_static_peer_reconnect_converges_under_500ms() -> icanact_remot
         "peer C should handle heal and quorum-stability asks"
     );
 
-    node_a.shutdown().await;
-    node_b.shutdown().await;
-    node_c.shutdown().await;
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
+    node_c.shutdown().await.unwrap();
     Ok(())
 }
 
@@ -639,8 +639,8 @@ async fn cached_ref_self_heals_after_disconnect_bare_connection_fails_closed()
     a_to_b.expect("fresh lookup should reconnect after stale cached handles fail");
     b_to_a.expect("reverse fresh lookup should reconnect after stale cached handles fail");
 
-    node_a.shutdown().await;
-    node_b.shutdown().await;
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
     Ok(())
 }
 
@@ -714,8 +714,8 @@ async fn in_flight_ask_drop_does_not_poison_static_peer_reconnect() -> icanact_r
     wait_active_peers(&node_a, 1, Duration::from_secs(2)).await?;
     wait_active_peers(&node_b, 1, Duration::from_secs(2)).await?;
 
-    node_a.shutdown().await;
-    node_b.shutdown().await;
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
     Ok(())
 }
 
@@ -797,7 +797,7 @@ async fn repeated_symmetric_reconnects_do_not_churn_live_streams() -> icanact_re
         "node B should handle every reconnect and stability ask"
     );
 
-    node_a.shutdown().await;
-    node_b.shutdown().await;
+    node_a.shutdown().await.unwrap();
+    node_b.shutdown().await.unwrap();
     Ok(())
 }

@@ -105,8 +105,8 @@ async fn connect_pair(a: &GossipRegistryHandle, b: &GossipRegistryHandle) {
         )
         .await;
 
-    a.bootstrap_non_blocking(vec![addr_b]).await;
-    b.bootstrap_non_blocking(vec![addr_a]).await;
+    a.bootstrap_non_blocking(vec![addr_b]).await.unwrap();
+    b.bootstrap_non_blocking(vec![addr_a]).await.unwrap();
 }
 
 async fn wait_for_actor(
@@ -159,6 +159,35 @@ async fn seed_known_actor_for_synthetic_peer(
     }
 
     Ok((peer_addr, peer_id))
+}
+
+// Result tests model an actual sending stream. Retain a silent endpoint only
+// for synthetic peers; tests with live TLS peers must capture their real handle.
+async fn capture_gossip_session(
+    node: &GossipRegistryHandle,
+    addr: std::net::SocketAddr,
+    synthetic: bool,
+) -> (
+    Option<icanact_remote::test_helpers::SilentPooledConnection>,
+    icanact_remote::registry::SessionReceipt,
+) {
+    let fixture = if synthetic {
+        let peer = node.registry.gossip_state.lock().await.peers[&addr]
+            .node_id
+            .expect("synthetic authenticated peer")
+            .to_peer_id();
+        Some(icanact_remote::test_helpers::install_silent_pooled_connection(node, peer, addr))
+    } else {
+        None
+    };
+    let handle = node
+        .registry
+        .connection_pool
+        .get_existing_connection(addr)
+        .expect("test must retain an actual current sending stream");
+    let receipt = icanact_remote::registry::SessionReceipt::from_handle(&handle)
+        .expect("sending stream must carry authenticated identity and instance");
+    (fixture, receipt)
 }
 
 async fn diagnose_peer(node: &GossipRegistryHandle, addr: std::net::SocketAddr) -> String {
@@ -291,7 +320,7 @@ fn known_actors_owned_by_dropped_peer_are_retained() -> Result<(), DynError> {
         assert_eq!(loc.peer_id, subscriber.registry.peer_id);
 
         // Subscriber goes offline ungracefully (port becomes refused).
-        subscriber.shutdown().await;
+        subscriber.shutdown().await.unwrap();
 
         // Wait for publisher's gossip to mark subscriber as dead via
         // failure threshold. With 100 ms gossip interval and threshold
@@ -306,7 +335,7 @@ fn known_actors_owned_by_dropped_peer_are_retained() -> Result<(), DynError> {
 
         assert_transport_failure_retains_actor(&publisher, sub_addr, DEAD_ACTOR_NAME).await;
 
-        publisher.shutdown().await;
+        publisher.shutdown().await.unwrap();
         Ok(())
     })
 }
@@ -350,10 +379,13 @@ fn fire_and_forget_success_is_neutral_even_when_response_timestamp_is_stale() ->
                 icanact_remote::current_timestamp_millis().saturating_sub(stale_cutoff * 1000);
         }
 
+        let (_session_fixture, session) = capture_gossip_session(&publisher, sub_addr, true).await;
+
         for sequence in 0..config.max_peer_failures {
             publisher
                 .registry
                 .apply_gossip_results(vec![icanact_remote::registry::GossipResult {
+                    session: Some(session.clone()),
                     peer_addr: sub_addr,
                     sent_sequence: sequence as u64,
                     outcome: Ok(None),
@@ -370,7 +402,7 @@ fn fire_and_forget_success_is_neutral_even_when_response_timestamp_is_stale() ->
 
         assert_transport_failure_retains_actor(&publisher, sub_addr, DEAD_ACTOR_NAME).await;
 
-        publisher.shutdown().await;
+        publisher.shutdown().await.unwrap();
         Ok(())
     })
 }
@@ -393,9 +425,12 @@ fn fire_and_forget_success_clears_transport_send_failure_streak() -> Result<(), 
         let (peer_addr, _) =
             seed_known_actor_for_synthetic_peer(&publisher, DEAD_ACTOR_NAME).await?;
 
+        let (_session_fixture, session) = capture_gossip_session(&publisher, peer_addr, true).await;
+
         publisher
             .registry
             .apply_gossip_results(vec![icanact_remote::registry::GossipResult {
+                session: Some(session.clone()),
                 peer_addr,
                 sent_sequence: 1,
                 outcome: Err(icanact_remote::GossipError::Network(std::io::Error::new(
@@ -415,6 +450,7 @@ fn fire_and_forget_success_clears_transport_send_failure_streak() -> Result<(), 
         publisher
             .registry
             .apply_gossip_results(vec![icanact_remote::registry::GossipResult {
+                session: Some(session.clone()),
                 peer_addr,
                 sent_sequence: 2,
                 outcome: Ok(None),
@@ -431,7 +467,7 @@ fn fire_and_forget_success_clears_transport_send_failure_streak() -> Result<(), 
         assert!(peer.last_failure_instant.is_none());
         drop(state);
 
-        publisher.shutdown().await;
+        publisher.shutdown().await.unwrap();
         Ok(())
     })
 }
@@ -488,10 +524,13 @@ fn fire_and_forget_success_does_not_disconnect_a_healthy_pooled_peer() -> Result
                 .last_response_received_ms = 0;
         }
 
+        let (_session_fixture, session) = capture_gossip_session(&observer, peer_addr, false).await;
+
         for sequence in 0..config.max_peer_failures {
             observer
                 .registry
                 .apply_gossip_results(vec![icanact_remote::registry::GossipResult {
+                    session: Some(session.clone()),
                     peer_addr,
                     sent_sequence: sequence as u64,
                     outcome: Ok(None),
@@ -510,8 +549,8 @@ fn fire_and_forget_success_does_not_disconnect_a_healthy_pooled_peer() -> Result
              application-level liveness"
         );
 
-        observer.shutdown().await;
-        peer.shutdown().await;
+        observer.shutdown().await.unwrap();
+        peer.shutdown().await.unwrap();
         Ok(())
     })
 }
@@ -561,9 +600,12 @@ fn address_scoped_hard_error_does_not_disconnect_the_current_peer_session() -> R
             "test precondition: a current peer session must be published"
         );
 
+        let (_session_fixture, session) = capture_gossip_session(&observer, peer_addr, false).await;
+
         observer
             .registry
             .apply_gossip_results(vec![icanact_remote::registry::GossipResult {
+                session: Some(session.clone()),
                 peer_addr,
                 sent_sequence: 0,
                 outcome: Err(icanact_remote::GossipError::Network(std::io::Error::new(
@@ -587,7 +629,7 @@ fn address_scoped_hard_error_does_not_disconnect_the_current_peer_session() -> R
              session; the failed instance's IO owner performs exact-instance teardown"
         );
 
-        observer.shutdown().await;
+        observer.shutdown().await.unwrap();
         Ok(())
     })
 }
@@ -622,9 +664,12 @@ fn liveness_window_does_not_turn_fire_and_forget_success_into_a_probe() -> Resul
                 icanact_remote::current_timestamp_millis().saturating_sub(600);
         }
 
+        let (_session_fixture, session) = capture_gossip_session(&publisher, sub_addr, true).await;
+
         publisher
             .registry
             .apply_gossip_results(vec![icanact_remote::registry::GossipResult {
+                session: Some(session.clone()),
                 peer_addr: sub_addr,
                 sent_sequence: 0,
                 outcome: Ok(None),
@@ -638,7 +683,7 @@ fn liveness_window_does_not_turn_fire_and_forget_success_into_a_probe() -> Resul
              probe: periodic gossip never requested a response"
         );
 
-        publisher.shutdown().await;
+        publisher.shutdown().await.unwrap();
         Ok(())
     })
 }
@@ -705,8 +750,8 @@ fn required_peer_connects_within_one_second_without_waiting_for_discovery_gossip
              without waiting for periodic peer-discovery gossip"
         );
 
-        peer_a.shutdown().await;
-        peer_b.shutdown().await;
+        peer_a.shutdown().await.unwrap();
+        peer_b.shutdown().await.unwrap();
         Ok(())
     })
 }
@@ -757,10 +802,13 @@ fn configured_peer_live_connection_is_not_failed_by_peer_gossip_cadence_gap() ->
                 icanact_remote::current_timestamp_millis().saturating_sub(600);
         }
 
+        let (_session_fixture, session) = capture_gossip_session(&peer_a, addr_b, false).await;
+
         for sequence in 0..config.max_peer_failures {
             peer_a
                 .registry
                 .apply_gossip_results(vec![icanact_remote::registry::GossipResult {
+                    session: Some(session.clone()),
                     peer_addr: addr_b,
                     sent_sequence: sequence as u64,
                     outcome: Ok(None),
@@ -778,8 +826,8 @@ fn configured_peer_live_connection_is_not_failed_by_peer_gossip_cadence_gap() ->
              below the peer_gossip_interval cadence; failures={failures}, \
              lookup_peer_error={lookup_error:?}"
         );
-        peer_a.shutdown().await;
-        peer_b.shutdown().await;
+        peer_a.shutdown().await.unwrap();
+        peer_b.shutdown().await.unwrap();
         Ok(())
     })
 }
@@ -814,10 +862,13 @@ fn discovered_peer_fire_and_forget_success_is_not_liveness_evidence() -> Result<
                 icanact_remote::current_timestamp_millis().saturating_sub(600);
         }
 
+        let (_session_fixture, session) = capture_gossip_session(&publisher, peer_addr, true).await;
+
         for sequence in 0..config.max_peer_failures {
             publisher
                 .registry
                 .apply_gossip_results(vec![icanact_remote::registry::GossipResult {
+                    session: Some(session.clone()),
                     peer_addr,
                     sent_sequence: sequence as u64,
                     outcome: Ok(None),
@@ -832,7 +883,7 @@ fn discovered_peer_fire_and_forget_success_is_not_liveness_evidence() -> Result<
              no response was requested, not that a liveness probe failed"
         );
 
-        publisher.shutdown().await;
+        publisher.shutdown().await.unwrap();
         Ok(())
     })
 }
@@ -904,7 +955,7 @@ fn disconnect_handler_retains_actors_after_transport_failure() -> Result<(), Dyn
         );
         assert_transport_failure_retains_actor(&publisher, sub_addr, DEAD_ACTOR_NAME).await;
 
-        publisher.shutdown().await;
+        publisher.shutdown().await.unwrap();
         Ok(())
     })
 }
@@ -928,7 +979,7 @@ fn disconnect_handler_canonicalizes_ephemeral_source_addr_before_cleanup() -> Re
         publisher
             .registry
             .connection_pool
-            .add_addr_to_peer_id(ephemeral_source_addr, sub_peer_id);
+            .add_addr_to_peer_id(ephemeral_source_addr, sub_peer_id)?;
         {
             let mut state = publisher.registry.gossip_state.lock().await;
             let peer = state
@@ -952,7 +1003,7 @@ fn disconnect_handler_canonicalizes_ephemeral_source_addr_before_cleanup() -> Re
         );
         assert_transport_failure_retains_actor(&publisher, sub_addr, DEAD_ACTOR_NAME).await;
 
-        publisher.shutdown().await;
+        publisher.shutdown().await.unwrap();
         Ok(())
     })
 }
@@ -989,7 +1040,10 @@ fn hard_socket_error_in_apply_gossip_results_triggers_cleanup() -> Result<(), Dy
         // The `apply_gossip_results` hard-error fast path should jump
         // failures straight to `max_peer_failures` on the same call,
         // but it should not publish an actor-removal verdict.
+        let (_session_fixture, session) = capture_gossip_session(&publisher, sub_addr, true).await;
+
         let hard_err = icanact_remote::registry::GossipResult {
+            session: Some(session.clone()),
             peer_addr: sub_addr,
             sent_sequence: 0,
             outcome: Err(icanact_remote::GossipError::Network(std::io::Error::new(
@@ -1010,7 +1064,7 @@ fn hard_socket_error_in_apply_gossip_results_triggers_cleanup() -> Result<(), Dy
         );
         assert_transport_failure_retains_actor(&publisher, sub_addr, DEAD_ACTOR_NAME).await;
 
-        publisher.shutdown().await;
+        publisher.shutdown().await.unwrap();
         Ok(())
     })
 }
@@ -1034,7 +1088,10 @@ fn hard_socket_error_does_not_enqueue_actor_removed_gossip() -> Result<(), DynEr
             seed_known_actor_for_synthetic_peer(&publisher, DEAD_ACTOR_NAME).await?;
 
         // Drive the apply_gossip_results hard-error fast path.
+        let (_session_fixture, session) = capture_gossip_session(&publisher, sub_addr, true).await;
+
         let hard_err = icanact_remote::registry::GossipResult {
+            session: Some(session.clone()),
             peer_addr: sub_addr,
             sent_sequence: 0,
             outcome: Err(icanact_remote::GossipError::Network(std::io::Error::new(
@@ -1076,7 +1133,7 @@ fn hard_socket_error_does_not_enqueue_actor_removed_gossip() -> Result<(), DynEr
         );
         drop(state);
 
-        publisher.shutdown().await;
+        publisher.shutdown().await.unwrap();
         Ok(())
     })
 }
@@ -1137,7 +1194,7 @@ fn socket_close_does_not_trigger_actor_removed_broadcast() -> Result<(), DynErro
         );
         drop(state);
 
-        publisher.shutdown().await;
+        publisher.shutdown().await.unwrap();
         Ok(())
     })
 }
@@ -1212,10 +1269,13 @@ fn no_response_result_does_not_tear_down_a_silent_pooled_connection() -> Result<
 
         // The duplex endpoint remains open, but no task refreshes the legacy
         // registry-response timestamp.
+        let (_session_fixture, session) = capture_gossip_session(&publisher, sub_addr, false).await;
+
         for sequence in 0..config.max_peer_failures {
             publisher
                 .registry
                 .apply_gossip_results(vec![icanact_remote::registry::GossipResult {
+                    session: Some(session.clone()),
                     peer_addr: sub_addr,
                     sent_sequence: sequence as u64,
                     outcome: Ok(None),
@@ -1238,7 +1298,7 @@ fn no_response_result_does_not_tear_down_a_silent_pooled_connection() -> Result<
         // Neutral registry results also leave actor routing untouched.
         assert_transport_failure_retains_actor(&publisher, sub_addr, DEAD_ACTOR_NAME).await;
 
-        publisher.shutdown().await;
+        publisher.shutdown().await.unwrap();
         Ok(())
     })
 }
@@ -1261,7 +1321,10 @@ fn transport_peer_death_retains_actor_without_gossip_tombstone() -> Result<(), D
             seed_known_actor_for_synthetic_peer(&publisher, DEAD_ACTOR_NAME).await?;
         assert_eq!(peer_failures(&publisher, sub_addr).await, 0);
 
+        let (_session_fixture, session) = capture_gossip_session(&publisher, sub_addr, true).await;
+
         let hard_err = icanact_remote::registry::GossipResult {
+            session: Some(session.clone()),
             peer_addr: sub_addr,
             sent_sequence: 0,
             outcome: Err(icanact_remote::GossipError::Network(std::io::Error::new(
@@ -1296,7 +1359,7 @@ fn transport_peer_death_retains_actor_without_gossip_tombstone() -> Result<(), D
         );
         drop(state);
 
-        publisher.shutdown().await;
+        publisher.shutdown().await.unwrap();
         Ok(())
     })
 }

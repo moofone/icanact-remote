@@ -134,6 +134,7 @@ async fn run_test_basic_ask_correlation() {
         info!("Test 1: Testing ask() with processed response");
         info!("Getting connection from {} to {}", addr_a, addr_b);
         let conn = handle_a.lookup_peer(&peer_id_b).await.unwrap();
+        let conn = conn.session().await.unwrap();
         info!("Got connection handle");
 
         // Test ECHO command
@@ -142,13 +143,25 @@ async fn run_test_basic_ask_correlation() {
             "Sending ask request: {:?}",
             String::from_utf8_lossy(request)
         );
-        let response = conn.ask(bytes::Bytes::from_static(request)).await.unwrap();
+        let response = conn
+            .ask_owned(
+                icanact_remote::ForwardPayload::from_static(request),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.as_ref(), b"ECHOED:Hello from Node A");
         info!("ECHO test passed: {:?}", String::from_utf8_lossy(&response));
 
         // Test REVERSE command
         let request = b"REVERSE:12345";
-        let response = conn.ask(bytes::Bytes::from_static(request)).await.unwrap();
+        let response = conn
+            .ask_owned(
+                icanact_remote::ForwardPayload::from_static(request),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.as_ref(), b"REVERSED:54321");
         info!(
             "REVERSE test passed: {:?}",
@@ -157,7 +170,13 @@ async fn run_test_basic_ask_correlation() {
 
         // Test COUNT command
         let request = b"COUNT:Hello World";
-        let response = conn.ask(bytes::Bytes::from_static(request)).await.unwrap();
+        let response = conn
+            .ask_owned(
+                icanact_remote::ForwardPayload::from_static(request),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
         assert_eq!(response.as_ref(), b"COUNTED:11 chars");
         info!(
             "COUNT test passed: {:?}",
@@ -166,14 +185,26 @@ async fn run_test_basic_ask_correlation() {
 
         // Test HASH command
         let request = b"HASH:test";
-        let response = conn.ask(bytes::Bytes::from_static(request)).await.unwrap();
+        let response = conn
+            .ask_owned(
+                icanact_remote::ForwardPayload::from_static(request),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
         let response_str = String::from_utf8_lossy(&response);
         assert!(response_str.starts_with("HASHED:"));
         info!("HASH test passed: {}", response_str);
 
         // Test default processing
         let request = b"Just a plain message";
-        let response = conn.ask(bytes::Bytes::from_static(request)).await.unwrap();
+        let response = conn
+            .ask_owned(
+                icanact_remote::ForwardPayload::from_static(request),
+                Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
         let expected = b"RECEIVED:20 bytes, content: 'Just a plain message'";
         assert_eq!(response.as_ref(), expected.as_slice());
         info!(
@@ -186,6 +217,7 @@ async fn run_test_basic_ask_correlation() {
     {
         info!("Test 2: Testing multiple concurrent asks");
         let conn = handle_a.lookup_peer(&peer_id_b).await.unwrap();
+        let conn = conn.session().await.unwrap();
 
         // Send multiple asks concurrently with different commands
         let mut futures = Vec::new();
@@ -203,19 +235,24 @@ async fn run_test_basic_ask_correlation() {
         ];
 
         for (i, (request, expected_prefix)) in requests.iter().enumerate() {
-            let conn_clone = conn.clone();
+            let conn_clone = &conn;
             let request = request.to_string().into_bytes();
             let expected_prefix = expected_prefix.to_string();
-            let future = tokio::spawn(async move {
-                let response = conn_clone.ask(bytes::Bytes::from(request)).await.unwrap();
+            let future = async move {
+                let response = conn_clone
+                    .ask_owned(
+                        icanact_remote::ForwardPayload::from(request),
+                        Duration::from_secs(30),
+                    )
+                    .await
+                    .unwrap();
                 (i, response, expected_prefix)
-            });
+            };
             futures.push(future);
         }
 
         // Verify all responses match their requests
-        for future in futures {
-            let (i, response, expected_prefix) = future.await.unwrap();
+        for (i, response, expected_prefix) in futures::future::join_all(futures).await {
             let response_str = String::from_utf8_lossy(&response);
 
             if expected_prefix == "HASHED:" {
@@ -229,8 +266,8 @@ async fn run_test_basic_ask_correlation() {
     }
 
     // Shutdown
-    handle_a.shutdown().await;
-    handle_b.shutdown().await;
+    handle_a.shutdown().await.unwrap();
+    handle_b.shutdown().await.unwrap();
 }
 
 /// Test high throughput ask operations
@@ -302,6 +339,7 @@ async fn run_test_ask_high_throughput() {
 
     // Get connection
     let conn = handle_a.lookup_peer(&peer_id_b).await.unwrap();
+    let conn = conn.session().await.unwrap();
 
     let num_requests = 1000;
     let start = std::time::Instant::now();
@@ -311,12 +349,17 @@ async fn run_test_ask_high_throughput() {
     let mut next_request = 0usize;
 
     while next_request < num_requests && pending.len() < max_in_flight {
-        let conn_clone = conn.clone();
+        let conn_clone = &conn;
         let request_id = next_request;
         pending.push(
             async move {
                 let request = format!("ECHO:High throughput request {}", request_id).into_bytes();
-                let response = conn_clone.ask(bytes::Bytes::from(request)).await?;
+                let response = conn_clone
+                    .ask_owned(
+                        icanact_remote::ForwardPayload::from(request),
+                        Duration::from_secs(30),
+                    )
+                    .await?;
                 Ok::<_, icanact_remote::GossipError>((request_id, response))
             }
             .boxed(),
@@ -327,16 +370,21 @@ async fn run_test_ask_high_throughput() {
     while let Some(result) = pending.next().await {
         let (request_id, response) = result.unwrap();
         let expected = format!("ECHOED:High throughput request {}", request_id).into_bytes();
-        assert_eq!(response, expected);
+        assert_eq!(response.as_ref(), expected.as_slice());
 
         if next_request < num_requests {
-            let conn_clone = conn.clone();
+            let conn_clone = &conn;
             let request_id = next_request;
             pending.push(
                 async move {
                     let request =
                         format!("ECHO:High throughput request {}", request_id).into_bytes();
-                    let response = conn_clone.ask(bytes::Bytes::from(request)).await?;
+                    let response = conn_clone
+                        .ask_owned(
+                            icanact_remote::ForwardPayload::from(request),
+                            Duration::from_secs(30),
+                        )
+                        .await?;
                     Ok::<_, icanact_remote::GossipError>((request_id, response))
                 }
                 .boxed(),
@@ -354,6 +402,6 @@ async fn run_test_ask_high_throughput() {
     assert!(throughput > 2000.0, "Throughput should exceed 2k req/sec");
 
     // Shutdown
-    handle_a.shutdown().await;
-    handle_b.shutdown().await;
+    handle_a.shutdown().await.unwrap();
+    handle_b.shutdown().await.unwrap();
 }

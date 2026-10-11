@@ -87,8 +87,8 @@ async fn qa_accepted_registry_can_bootstrap_after_snapshot_exceeds_frame_limit()
         b.lookup(&rejected_name).await.is_none(),
         "rejected name must not appear on the bootstrapped peer"
     );
-    a.shutdown().await;
-    b.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -110,7 +110,7 @@ async fn qa_drop_handle_releases_installed_pubsub_and_registry() {
     let retained_registry = weak_registry.strong_count();
     let retained_pubsub = weak_pubsub.strong_count();
     if let Some(registry) = weak_registry.upgrade() {
-        registry.shutdown().await;
+        registry.shutdown().await.unwrap();
     }
     tokio::time::sleep(Duration::from_millis(1100)).await;
     assert_eq!(

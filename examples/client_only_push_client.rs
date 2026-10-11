@@ -72,7 +72,7 @@ async fn main() -> Result<()> {
     println!("waiting for pushes (Ctrl+C to quit)");
 
     let _ = tokio::signal::ctrl_c().await;
-    client.shutdown_and_wait().await;
+    client.shutdown_and_wait().await?;
     Ok(())
 }
 

@@ -215,8 +215,8 @@ fn wire_v5_e2e_zero_copy_proof() {
         info!("✅ Streaming request test passed");
 
         // Cleanup
-        handle_a.shutdown().await;
-        handle_b.shutdown().await;
+        handle_a.shutdown().await.unwrap();
+        handle_b.shutdown().await.unwrap();
     });
 }
 
@@ -322,8 +322,8 @@ fn bench_ask_latency_and_throughput_under_large_stream() {
             "ask starved behind stream: max latency {max:?}"
         );
 
-        handle_a.shutdown().await;
-        handle_b.shutdown().await;
+        handle_a.shutdown().await.unwrap();
+        handle_b.shutdown().await.unwrap();
     });
 }
 
@@ -397,8 +397,8 @@ fn test_streaming_request_zero_copy() {
 
         info!("✅ Zero-copy streaming request test passed");
 
-        handle_a.shutdown().await;
-        handle_b.shutdown().await;
+        handle_a.shutdown().await.unwrap();
+        handle_b.shutdown().await.unwrap();
     });
 }
 
@@ -466,8 +466,8 @@ fn test_streaming_response_auto() {
 
         info!("✅ Streaming response test passed");
 
-        handle_a.shutdown().await;
-        handle_b.shutdown().await;
+        handle_a.shutdown().await.unwrap();
+        handle_b.shutdown().await.unwrap();
     });
 }
 
@@ -535,8 +535,8 @@ fn test_small_payload_uses_write_queue() {
 
         info!("✅ Small payload write queue test passed");
 
-        handle_a.shutdown().await;
-        handle_b.shutdown().await;
+        handle_a.shutdown().await.unwrap();
+        handle_b.shutdown().await.unwrap();
     });
 }
 
@@ -629,8 +629,8 @@ fn test_streaming_threshold_boundary() {
 
         info!("✅ Streaming threshold boundary test passed");
 
-        handle_a.shutdown().await;
-        handle_b.shutdown().await;
+        handle_a.shutdown().await.unwrap();
+        handle_b.shutdown().await.unwrap();
     });
 }
 
@@ -719,8 +719,8 @@ fn test_concurrent_streaming_requests() {
 
         info!("✅ Concurrent streaming requests test passed");
 
-        handle_a.shutdown().await;
-        handle_b.shutdown().await;
+        handle_a.shutdown().await.unwrap();
+        handle_b.shutdown().await.unwrap();
     });
 }
 
@@ -865,8 +865,8 @@ fn test_streaming_gate_released_before_awaiting_response() {
 
         info!("✅ Fast streaming ask completed while slow ask awaited its response");
 
-        handle_a.shutdown().await;
-        handle_b.shutdown().await;
+        handle_a.shutdown().await.unwrap();
+        handle_b.shutdown().await.unwrap();
     });
 }
 
@@ -1044,7 +1044,7 @@ fn test_streaming_tell_no_response() {
         info!("   - correlation_id was None: true (fire-and-forget)");
         info!("   - No response sent (tell semantics)");
 
-        handle_a.shutdown().await;
-        handle_b.shutdown().await;
+        handle_a.shutdown().await.unwrap();
+        handle_b.shutdown().await.unwrap();
     });
 }

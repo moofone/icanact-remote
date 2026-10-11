@@ -12,7 +12,7 @@ use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tracing::warn;
 
-use crate::{GossipError, PeerId, RegistrationPriority, RemoteActorLocation, Result};
+use crate::{GossipError, PeerId, RemoteActorLocation, Result};
 
 const CONTROL_PLANE_FALLBACK_INTERVAL: Duration = Duration::from_secs(1);
 const DEFAULT_TTL: u8 = 8;
@@ -26,6 +26,157 @@ const FAST_FRAME_POOL_BUFFER_CAPACITY: usize = 4096;
 /// A subscriber must not be able to stall transport ingress.  A full queue
 /// drops that subscriber's newest delivery rather than blocking the reader.
 const SUBSCRIBER_QUEUE_CAPACITY: usize = 64;
+/// Best-effort subscriber queues reject larger deliveries before retaining
+/// them. Each admitted worker holds at most 64 queued plus one active payload.
+const SUBSCRIBER_MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
+const CONTROL_PLANE_REFRESH_ATTEMPTS: usize = 4;
+const CALLBACK_MAX_DURATION: Duration = Duration::from_secs(30);
+const PROVIDER_MAX_DURATION: Duration = Duration::from_millis(5);
+
+/// Explicit cooperative callback contract. The constructor and each future poll
+/// and cancellation destructors must return promptly, never block a thread,
+/// and perform bounded work/memory
+/// allocation. Use asynchronous waits; do not spawn detached or blocking work.
+/// Captures and application-retained output are the application's memory budget.
+/// The engine owns and drops the active future on unsubscribe, shutdown, or the
+/// 30-second delivery deadline. Violating the poll contract cannot be safely
+/// preempted by Rust and is outside this API's guarantees.
+///
+/// A finite synchronous operation can return `std::future::ready(())`. Borrowed
+/// subscription input may only be used during invocation; pending work must own
+/// its inputs. Each worker retains at most one callback future.
+pub struct CooperativeCallback<F>(F);
+
+impl<F> CooperativeCallback<F> {
+    pub fn new(callback: F) -> Self {
+        Self(callback)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PubSubRouteError {
+    BudgetExhausted,
+    InvalidDestination,
+    DuplicateDestination,
+    MissingDestination,
+}
+
+/// Library-owned, pre-admitted route output. Providers cannot add destinations,
+/// allocate an output map, or partially publish a rejected result. Every input
+/// index must receive exactly one next hop. `step` also charges provider-side
+/// traversal: call it before every bounded unit of work in a variable-size loop.
+pub struct PubSubRouteSink {
+    next_hops: Vec<Option<PeerId>>,
+    remaining_steps: usize,
+    deadline: std::time::Instant,
+    failure: Option<PubSubRouteError>,
+}
+
+impl PubSubRouteSink {
+    fn new(destinations: usize) -> Self {
+        Self {
+            next_hops: vec![None; destinations],
+            remaining_steps: destinations.saturating_mul(8).max(1),
+            deadline: std::time::Instant::now() + PROVIDER_MAX_DURATION,
+            failure: None,
+        }
+    }
+
+    pub fn step(&mut self) -> std::result::Result<(), PubSubRouteError> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        if self.remaining_steps == 0 || std::time::Instant::now() >= self.deadline {
+            self.failure = Some(PubSubRouteError::BudgetExhausted);
+            return Err(PubSubRouteError::BudgetExhausted);
+        }
+        self.remaining_steps -= 1;
+        Ok(())
+    }
+
+    pub fn route(
+        &mut self,
+        destination_index: usize,
+        next_hop: PeerId,
+    ) -> std::result::Result<(), PubSubRouteError> {
+        self.step()?;
+        let Some(entry) = self.next_hops.get_mut(destination_index) else {
+            self.failure = Some(PubSubRouteError::InvalidDestination);
+            return Err(PubSubRouteError::InvalidDestination);
+        };
+        if entry.is_some() {
+            self.failure = Some(PubSubRouteError::DuplicateDestination);
+            return Err(PubSubRouteError::DuplicateDestination);
+        }
+        *entry = Some(next_hop);
+        Ok(())
+    }
+
+    fn finish(self, destinations: &[PeerId]) -> std::result::Result<RouteGroups, PubSubRouteError> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        if std::time::Instant::now() >= self.deadline {
+            return Err(PubSubRouteError::BudgetExhausted);
+        }
+        if self.next_hops.iter().any(Option::is_none) {
+            return Err(PubSubRouteError::MissingDestination);
+        }
+        let mut groups: HashMap<PeerId, Vec<PeerId>> = HashMap::new();
+        for (next_hop, destination) in self.next_hops.into_iter().zip(destinations) {
+            groups
+                .entry(next_hop.expect("validated complete route"))
+                .or_default()
+                .push(destination.clone());
+        }
+        Ok(groups
+            .into_iter()
+            .map(|(hop, peers)| (hop, Arc::from(peers)))
+            .collect())
+    }
+}
+
+/// Control-plane subscription admission limits. A worker retains its permit
+/// through any running callback, even after its subscription is removed.
+#[derive(Clone, Copy, Debug)]
+pub struct PubSubLimits {
+    pub subscribers: NonZeroUsize,
+    pub subscribers_per_topic: NonZeroUsize,
+    /// Bounds live topic identities, including canceled dispatches waiting
+    /// for registry cleanup. Churn cannot bypass this bound by unsubscribing.
+    pub topics: NonZeroUsize,
+    /// Maximum actor-owner records inspected and total destinations retained.
+    pub routing_records: NonZeroUsize,
+}
+
+impl Default for PubSubLimits {
+    fn default() -> Self {
+        Self {
+            subscribers: NonZeroUsize::new(256).unwrap(),
+            subscribers_per_topic: NonZeroUsize::new(64).unwrap(),
+            topics: NonZeroUsize::new(256).unwrap(),
+            routing_records: NonZeroUsize::new(4096).unwrap(),
+        }
+    }
+}
+
+/// Admission failed without creating a task or publishing subscription state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PubSubAdmissionError {
+    SubscriberCapacity,
+    TopicCapacity,
+    TopicSubscriberCapacity,
+    WorkerUnavailable,
+}
+
+impl std::fmt::Display for PubSubAdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "pubsub admission rejected: {self:?}")
+    }
+}
+
+impl std::error::Error for PubSubAdmissionError {}
+
 #[cfg(test)]
 const UDP_MAX_DATAGRAM_SIZE: usize = 65_507;
 
@@ -98,145 +249,238 @@ struct HotRouteEntry {
 struct SubscriberWorker<T> {
     sender: mpsc::Sender<T>,
     abort: Option<tokio::task::AbortHandle>,
+    cancel: tokio::sync::watch::Sender<bool>,
 }
 
 impl<T> Drop for SubscriberWorker<T> {
     fn drop(&mut self) {
+        let _ = self.cancel.send(true);
         if let Some(abort) = &self.abort {
             abort.abort();
         }
     }
 }
 
-fn spawn_pubsub_background<F>(runtime: Option<&tokio::runtime::Handle>, future: F)
+struct PubSubBackgroundTask {
+    cancel: tokio::sync::watch::Sender<bool>,
+    abort: Option<tokio::task::AbortHandle>,
+}
+
+impl Drop for PubSubBackgroundTask {
+    fn drop(&mut self) {
+        let _ = self.cancel.send(true);
+        if let Some(abort) = &self.abort {
+            abort.abort();
+        }
+    }
+}
+
+fn spawn_pubsub_background<F>(
+    runtime: Option<&tokio::runtime::Handle>,
+    future: F,
+) -> std::result::Result<PubSubBackgroundTask, PubSubAdmissionError>
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    if let Some(runtime) = runtime {
-        runtime.spawn(future);
-    } else if std::thread::Builder::new()
-        .name("icanact-pubsub-background".into())
-        .spawn(move || {
-            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                warn!("failed to create fallback pubsub background runtime");
-                return;
-            };
-            runtime.block_on(future);
-        })
-        .is_err()
+    let (cancel, mut canceled) = tokio::sync::watch::channel(false);
+    let work = async move {
+        tokio::select! {
+            biased;
+            _ = canceled.changed() => {},
+            _ = future => {},
+        }
+    };
+    let abort = if let Some(runtime) = runtime {
+        Some(runtime.spawn(work).abort_handle())
+    } else {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| PubSubAdmissionError::WorkerUnavailable)?;
+        std::thread::Builder::new()
+            .name("icanact-pubsub-background".into())
+            .spawn(move || runtime.block_on(work))
+            .map_err(|_| PubSubAdmissionError::WorkerUnavailable)?;
+        None
+    };
+    Ok(PubSubBackgroundTask { cancel, abort })
+}
+
+// Declaration order is intentional: callback captures must be destroyed before
+// its admission permit. Keeping both behind a method call also prevents precise
+// async capture from splitting them into independently dropped upvars.
+struct SubscriberResources<F> {
+    deliver: F,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl<F> SubscriberResources<F> {
+    fn call<T, Fut>(&self, message: T) -> Fut
+    where
+        F: Fn(T) -> Fut,
     {
-        warn!("failed to spawn fallback pubsub background worker");
+        (self.deliver)(message)
     }
 }
 
-fn spawn_subscriber_worker<T, F>(
+fn spawn_subscriber_worker<T, F, Fut>(
     runtime: Option<&tokio::runtime::Handle>,
     deliver: F,
-) -> Arc<SubscriberWorker<T>>
+    permit: tokio::sync::OwnedSemaphorePermit,
+    expirations: Arc<AtomicU64>,
+) -> std::result::Result<Arc<SubscriberWorker<T>>, PubSubAdmissionError>
 where
     T: Send + 'static,
-    F: Fn(T) + Send + Sync + 'static,
+    F: Fn(T) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
 {
-    async fn drain<T, F>(mut receiver: mpsc::Receiver<T>, deliver: Arc<F>)
-    where
-        T: Send + 'static,
-        F: Fn(T) + Send + Sync + 'static,
-    {
-        while let Some(message) = receiver.recv().await {
-            let deliver = Arc::clone(&deliver);
-            let _ = tokio::task::spawn_blocking(move || deliver(message)).await;
+    let (sender, mut receiver) = mpsc::channel(SUBSCRIBER_QUEUE_CAPACITY);
+    let (cancel, mut canceled) = tokio::sync::watch::channel(false);
+    let resources = SubscriberResources {
+        deliver,
+        _permit: permit,
+    };
+    let drain = async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = canceled.changed() => return,
+                message = receiver.recv() => {
+                    let Some(message) = message else {
+                        return;
+                    };
+                    let delivery = resources.call(message);
+                    tokio::select! {
+                        biased;
+                        _ = canceled.changed() => return,
+                        result = tokio::time::timeout(CALLBACK_MAX_DURATION, delivery) => {
+                            if result.is_err() {
+                                expirations.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+            }
         }
-    }
-
-    let (sender, receiver) = mpsc::channel(SUBSCRIBER_QUEUE_CAPACITY);
-    let deliver = Arc::new(deliver);
+    };
     let abort = if let Some(runtime) = runtime {
-        Some(runtime.spawn(drain(receiver, deliver)).abort_handle())
+        Some(runtime.spawn(drain).abort_handle())
     } else {
-        if std::thread::Builder::new()
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| PubSubAdmissionError::WorkerUnavailable)?;
+        std::thread::Builder::new()
             .name("icanact-pubsub-delivery".into())
-            .spawn(move || {
-                let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                else {
-                    warn!("failed to create fallback pubsub delivery runtime");
-                    return;
-                };
-                runtime.block_on(drain(receiver, deliver));
-            })
-            .is_err()
-        {
-            warn!("failed to spawn fallback pubsub delivery worker");
-        }
+            .spawn(move || runtime.block_on(drain))
+            .map_err(|_| PubSubAdmissionError::WorkerUnavailable)?;
         None
     };
-    Arc::new(SubscriberWorker { sender, abort })
+    Ok(Arc::new(SubscriberWorker {
+        sender,
+        abort,
+        cancel,
+    }))
 }
 
 impl SubscriberEntry {
-    fn new<F>(id: u64, runtime: Option<&tokio::runtime::Handle>, deliver: F) -> Self
+    fn new<F, Fut>(
+        id: u64,
+        runtime: Option<&tokio::runtime::Handle>,
+        deliver: F,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        expirations: Arc<AtomicU64>,
+    ) -> std::result::Result<Self, PubSubAdmissionError>
     where
-        F: Fn(Bytes) + Send + Sync + 'static,
+        F: Fn(Bytes) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
     {
-        let worker = spawn_subscriber_worker(runtime, deliver);
-        Self { id, worker }
+        let worker = spawn_subscriber_worker(runtime, deliver, permit, expirations)?;
+        Ok(Self { id, worker })
     }
 
     #[inline]
     fn enqueue(&self, payload: Bytes) -> bool {
-        self.worker.sender.try_send(payload).is_ok()
+        payload.len() <= SUBSCRIBER_MAX_PAYLOAD_BYTES
+            && self.worker.sender.try_send(payload).is_ok()
     }
 }
 
 impl BorrowedSubscriberEntry {
-    fn new<F>(id: u64, runtime: Option<&tokio::runtime::Handle>, deliver: F) -> Self
+    fn new<F, Fut>(
+        id: u64,
+        runtime: Option<&tokio::runtime::Handle>,
+        deliver: F,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        expirations: Arc<AtomicU64>,
+    ) -> std::result::Result<Self, PubSubAdmissionError>
     where
-        F: Fn(&[u8]) + Send + Sync + 'static,
+        F: Fn(&[u8]) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
     {
         let worker = spawn_subscriber_worker(
             runtime,
             move |(payload, _metadata): (Bytes, PubSubFrameMetadata)| deliver(payload.as_ref()),
-        );
-        Self { id, worker }
+            permit,
+            expirations,
+        )?;
+        Ok(Self { id, worker })
     }
 
-    fn new_with_metadata<F>(id: u64, runtime: Option<&tokio::runtime::Handle>, deliver: F) -> Self
+    fn new_with_metadata<F, Fut>(
+        id: u64,
+        runtime: Option<&tokio::runtime::Handle>,
+        deliver: F,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        expirations: Arc<AtomicU64>,
+    ) -> std::result::Result<Self, PubSubAdmissionError>
     where
-        F: Fn(&[u8], PubSubFrameMetadata) + Send + Sync + 'static,
+        F: Fn(&[u8], PubSubFrameMetadata) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
     {
         let worker = spawn_subscriber_worker(
             runtime,
             move |(payload, metadata): (Bytes, PubSubFrameMetadata)| {
                 deliver(payload.as_ref(), metadata)
             },
-        );
-        Self { id, worker }
+            permit,
+            expirations,
+        )?;
+        Ok(Self { id, worker })
     }
 
     #[inline]
     fn enqueue(&self, payload: Bytes, metadata: PubSubFrameMetadata) -> bool {
-        self.worker.sender.try_send((payload, metadata)).is_ok()
+        payload.len() <= SUBSCRIBER_MAX_PAYLOAD_BYTES
+            && self.worker.sender.try_send((payload, metadata)).is_ok()
     }
 }
 
 impl TypeSubscriberEntry {
-    fn new<F>(id: u64, runtime: Option<&tokio::runtime::Handle>, deliver: F) -> Self
+    fn new<F, Fut>(
+        id: u64,
+        runtime: Option<&tokio::runtime::Handle>,
+        deliver: F,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        expirations: Arc<AtomicU64>,
+    ) -> std::result::Result<Self, PubSubAdmissionError>
     where
-        F: Fn(u64, Bytes) + Send + Sync + 'static,
+        F: Fn(u64, Bytes) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
     {
-        let worker = spawn_subscriber_worker(runtime, move |(topic_key, payload)| {
-            deliver(topic_key, payload)
-        });
-        Self { id, worker }
+        let worker = spawn_subscriber_worker(
+            runtime,
+            move |(topic_key, payload)| deliver(topic_key, payload),
+            permit,
+            expirations,
+        )?;
+        Ok(Self { id, worker })
     }
 
     #[inline]
     fn enqueue(&self, topic_key: u64, payload: Bytes) -> bool {
-        self.worker.sender.try_send((topic_key, payload)).is_ok()
+        payload.len() <= SUBSCRIBER_MAX_PAYLOAD_BYTES
+            && self.worker.sender.try_send((topic_key, payload)).is_ok()
     }
 }
 
@@ -318,6 +562,8 @@ pub struct PubSubIngressStats {
     pub decode_drops: u64,
     pub queue_full_drops: u64,
     pub subscriber_queue_drops: u64,
+    pub callback_expirations: u64,
+    pub refresh_budget_rejections: u64,
 }
 
 #[derive(Default)]
@@ -332,6 +578,8 @@ struct PubSubIngressCounters {
     decode_drops: AtomicU64,
     queue_full_drops: AtomicU64,
     subscriber_queue_drops: AtomicU64,
+    callback_expirations: Arc<AtomicU64>,
+    refresh_budget_rejections: AtomicU64,
 }
 
 impl PubSubIngressCounters {
@@ -347,6 +595,8 @@ impl PubSubIngressCounters {
             decode_drops: self.decode_drops.load(Ordering::Relaxed),
             queue_full_drops: self.queue_full_drops.load(Ordering::Relaxed),
             subscriber_queue_drops: self.subscriber_queue_drops.load(Ordering::Relaxed),
+            callback_expirations: self.callback_expirations.load(Ordering::Relaxed),
+            refresh_budget_rejections: self.refresh_budget_rejections.load(Ordering::Relaxed),
         }
     }
 }
@@ -368,17 +618,23 @@ pub trait PubSubIngressHandler: Send + Sync {
             crate::AlignedBytes::from_pooled_slice(
                 payload,
                 Arc::new(crate::AlignedBytesPool::default()),
-            ),
+            )?,
         )
     }
 }
 
+/// Cooperatively bounded routing. Return within the sink's work/time budget;
+/// never block, spawn detached work, or allocate variable-size temporary output.
+/// Charge variable traversal with `routes.step()` and propagate errors. Fixed-size
+/// next-hop decisions go through `routes.route(index, hop)`. This cooperative
+/// contract is mandatory; Rust cannot preempt a deliberately non-returning call.
 pub trait PubSubRouteProvider: Send + Sync {
     fn group_destinations(
         &self,
         topic_key: u64,
         destinations: &[PeerId],
-    ) -> HashMap<PeerId, Arc<[PeerId]>>;
+        routes: &mut PubSubRouteSink,
+    ) -> std::result::Result<(), PubSubRouteError>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -447,6 +703,8 @@ struct InterestState {
     /// one registry call for a topic in flight at a time, and the last one
     /// dispatched is always for the most recent generation.
     dispatch_in_flight: HashSet<TopicKey>,
+    dispatch_tasks: HashMap<TopicKey, PubSubBackgroundTask>,
+    dispatch_receipts: HashMap<TopicKey, Arc<crate::registry::PubSubInterestDispatch>>,
 }
 
 pub struct RoutedPubSub {
@@ -471,9 +729,11 @@ pub struct RoutedPubSub {
     /// delivery loss — or a dropped subscription keeps its stale entry).
     /// Holding the guard across `refresh_hot_borrowed_subscriber` also
     /// linearizes the hot-cache with the map. Readers stay lock-free
-    /// (`ArcSwap::load`); the guard is always released before
-    /// `note_interest`, which locks `interest_state` internally.
+    /// (`ArcSwap::load`). Writers take interest_state only while holding this
+    /// guard; interest workers never take the subscriber lock.
     subscriber_write_lock: Mutex<()>,
+    limits: PubSubLimits,
+    subscriber_permits: Arc<tokio::sync::Semaphore>,
     interest_state: Arc<Mutex<InterestState>>,
     route_groups: ArcSwap<TopicRouteGroups>,
     hot_route_groups: ArcSwapOption<HotRouteGroups>,
@@ -494,6 +754,12 @@ pub struct RoutedPubSub {
     last_route_provider_revision: AtomicU64,
     #[cfg(test)]
     control_plane_refreshes: AtomicU64,
+    #[cfg(test)]
+    control_plane_snapshot_hook_enabled: AtomicBool,
+    #[cfg(test)]
+    control_plane_snapshot_hook_entered: Arc<tokio::sync::Notify>,
+    #[cfg(test)]
+    control_plane_snapshot_hook_release: Arc<tokio::sync::Notify>,
     /// Test-only gate for opening the exact gap between the revision check and
     /// construction of the control-plane select. A provider notification can
     /// be consumed in this window, so the provider wait future itself must
@@ -504,6 +770,21 @@ pub struct RoutedPubSub {
     control_plane_wait_hook_entered: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     control_plane_wait_hook_release: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for RoutedPubSub {
+    fn drop(&mut self) {
+        let mut state = self
+            .interest_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for receipt in state.dispatch_receipts.values() {
+            receipt.cancel();
+        }
+        state.dispatch_receipts.clear();
+        state.dispatch_tasks.clear();
+        state.dispatch_in_flight.clear();
+    }
 }
 
 /// Fires the test-only subscriber-map RMW hook (see
@@ -532,6 +813,25 @@ async fn interest_dispatch_hook(_topic_key: u64, _present: bool) {}
 
 impl RoutedPubSub {
     pub async fn install(registry: Arc<crate::registry::GossipRegistry>) -> Arc<Self> {
+        Self::install_inner(registry, PubSubLimits::default()).await
+    }
+
+    pub async fn install_with_limits(
+        registry: Arc<crate::registry::GossipRegistry>,
+        limits: PubSubLimits,
+    ) -> Result<Arc<Self>> {
+        if limits.subscribers.get() > tokio::sync::Semaphore::MAX_PERMITS {
+            return Err(GossipError::InvalidConfig(
+                "pubsub subscriber capacity exceeds semaphore maximum".into(),
+            ));
+        }
+        Ok(Self::install_inner(registry, limits).await)
+    }
+
+    async fn install_inner(
+        registry: Arc<crate::registry::GossipRegistry>,
+        limits: PubSubLimits,
+    ) -> Arc<Self> {
         crate::typed::prewarm_pooled_byte_buffers(
             FAST_FRAME_POOL_BUFFERS,
             FAST_FRAME_POOL_BUFFER_CAPACITY,
@@ -547,6 +847,8 @@ impl RoutedPubSub {
             hot_borrowed_subscriber: ArcSwapOption::empty(),
             type_subscribers: ArcSwap::from_pointee(HashMap::new()),
             subscriber_write_lock: Mutex::new(()),
+            limits,
+            subscriber_permits: Arc::new(tokio::sync::Semaphore::new(limits.subscribers.get())),
             interest_state: Arc::new(Mutex::new(InterestState::default())),
             route_groups: ArcSwap::from_pointee(HashMap::new()),
             hot_route_groups: ArcSwapOption::empty(),
@@ -566,6 +868,12 @@ impl RoutedPubSub {
             #[cfg(test)]
             control_plane_refreshes: AtomicU64::new(0),
             #[cfg(test)]
+            control_plane_snapshot_hook_enabled: AtomicBool::new(false),
+            #[cfg(test)]
+            control_plane_snapshot_hook_entered: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            control_plane_snapshot_hook_release: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
             control_plane_wait_hook_enabled: AtomicBool::new(false),
             #[cfg(test)]
             control_plane_wait_hook_entered: Arc::new(tokio::sync::Notify::new()),
@@ -583,6 +891,25 @@ impl RoutedPubSub {
         self.route_provider.store(Arc::new(Some(provider)));
         self.route_provider_revision.fetch_add(1, Ordering::AcqRel);
         self.route_provider_change_notify.notify_one();
+    }
+
+    fn group_destinations_bounded(
+        &self,
+        topic: u64,
+        destinations: &[PeerId],
+    ) -> std::result::Result<RouteGroups, PubSubRouteError> {
+        if destinations.len() > self.limits.routing_records.get() {
+            return Err(PubSubRouteError::BudgetExhausted);
+        }
+        let mut routes = PubSubRouteSink::new(destinations.len());
+        if let Some(provider) = self.route_provider.load().as_ref() {
+            provider.group_destinations(topic, destinations, &mut routes)?;
+        } else {
+            for (index, peer) in destinations.iter().enumerate() {
+                routes.route(index, peer.clone())?;
+            }
+        }
+        routes.finish(destinations)
     }
 
     fn next_msg_id(&self) -> u128 {
@@ -605,98 +932,181 @@ impl RoutedPubSub {
         }
     }
 
-    pub fn subscribe_bytes(
+    fn admit_subscriber(
+        &self,
+        topic: Option<u64>,
+        type_hash: u64,
+    ) -> std::result::Result<tokio::sync::OwnedSemaphorePermit, PubSubAdmissionError> {
+        let count = if let Some(topic) = topic {
+            let state = self
+                .interest_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !state.generations.contains_key(&topic)
+                && state.generations.len() >= self.limits.topics.get()
+            {
+                return Err(PubSubAdmissionError::TopicCapacity);
+            }
+            self.subscribers
+                .load()
+                .iter()
+                .filter(|((key, _), _)| *key == topic)
+                .map(|(_, entries)| entries.len())
+                .sum::<usize>()
+                + self
+                    .borrowed_subscribers
+                    .load()
+                    .iter()
+                    .filter(|((key, _), _)| *key == topic)
+                    .map(|(_, entries)| entries.len())
+                    .sum::<usize>()
+        } else {
+            self.type_subscribers
+                .load()
+                .get(&type_hash)
+                .map_or(0, |entries| entries.len())
+        };
+        if count >= self.limits.subscribers_per_topic.get() {
+            return Err(PubSubAdmissionError::TopicSubscriberCapacity);
+        }
+        Arc::clone(&self.subscriber_permits)
+            .try_acquire_owned()
+            .map_err(|_| PubSubAdmissionError::SubscriberCapacity)
+    }
+
+    /// Register a best-effort callback. Saturation returns a typed admission
+    /// error before publication. The explicit cooperative callback is owned by
+    /// its worker and canceled before its admission permit is released.
+    pub fn subscribe_bytes<F, Fut>(
         &self,
         topic_key: u64,
         type_hash: u64,
-        deliver: impl Fn(Bytes) + Send + Sync + 'static,
-    ) -> PubSubSubscription {
+        deliver: CooperativeCallback<F>,
+    ) -> std::result::Result<PubSubSubscription, PubSubAdmissionError>
+    where
+        F: Fn(Bytes) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
         let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
         let key = (topic_key, type_hash);
         let write_guard = self.lock_subscriber_writes();
+        let permit = self.admit_subscriber(Some(topic_key), type_hash)?;
         let mut next = (*self.subscribers.load_full()).clone();
         subscriber_rmw_window_hook();
         let mut topic_subs = next.get(&key).map(|subs| subs.to_vec()).unwrap_or_default();
         let runtime = tokio::runtime::Handle::try_current().ok();
-        topic_subs.push(SubscriberEntry::new(id, runtime.as_ref(), deliver));
+        topic_subs.push(SubscriberEntry::new(
+            id,
+            runtime.as_ref(),
+            deliver.0,
+            permit,
+            Arc::clone(&self.counters.callback_expirations),
+        )?);
         next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
+        self.note_interest(topic_key, true)?;
         self.subscribers.store(Arc::new(next));
         drop(write_guard);
-        self.note_interest(topic_key, true);
-        self.make_handle(
+        Ok(self.make_handle(
             SubscriptionKind::Owned {
                 topic_key,
                 type_hash,
             },
             id,
-        )
+        ))
     }
 
-    pub fn subscribe_borrowed_bytes(
+    pub fn subscribe_borrowed_bytes<F, Fut>(
         &self,
         topic_key: u64,
         type_hash: u64,
-        deliver: impl Fn(&[u8]) + Send + Sync + 'static,
-    ) -> PubSubSubscription {
+        deliver: CooperativeCallback<F>,
+    ) -> std::result::Result<PubSubSubscription, PubSubAdmissionError>
+    where
+        F: Fn(&[u8]) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
         let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
         let key = (topic_key, type_hash);
         let write_guard = self.lock_subscriber_writes();
+        let permit = self.admit_subscriber(Some(topic_key), type_hash)?;
         let mut next = (*self.borrowed_subscribers.load_full()).clone();
         subscriber_rmw_window_hook();
         let mut topic_subs = next.get(&key).map(|subs| subs.to_vec()).unwrap_or_default();
         let runtime = tokio::runtime::Handle::try_current().ok();
-        let entry = BorrowedSubscriberEntry::new(id, runtime.as_ref(), deliver);
+        let entry = BorrowedSubscriberEntry::new(
+            id,
+            runtime.as_ref(),
+            deliver.0,
+            permit,
+            Arc::clone(&self.counters.callback_expirations),
+        )?;
         topic_subs.push(entry);
+        self.note_interest(topic_key, true)?;
         self.refresh_hot_borrowed_subscriber(key, &topic_subs);
         next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
         self.borrowed_subscribers.store(Arc::new(next));
         drop(write_guard);
-        self.note_interest(topic_key, true);
-        self.make_handle(
+        Ok(self.make_handle(
             SubscriptionKind::Borrowed {
                 topic_key,
                 type_hash,
             },
             id,
-        )
+        ))
     }
 
-    pub fn subscribe_borrowed_bytes_with_metadata(
+    pub fn subscribe_borrowed_bytes_with_metadata<F, Fut>(
         &self,
         topic_key: u64,
         type_hash: u64,
-        deliver: impl Fn(&[u8], PubSubFrameMetadata) + Send + Sync + 'static,
-    ) -> PubSubSubscription {
+        deliver: CooperativeCallback<F>,
+    ) -> std::result::Result<PubSubSubscription, PubSubAdmissionError>
+    where
+        F: Fn(&[u8], PubSubFrameMetadata) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
         let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
         let key = (topic_key, type_hash);
         let write_guard = self.lock_subscriber_writes();
+        let permit = self.admit_subscriber(Some(topic_key), type_hash)?;
         let mut next = (*self.borrowed_subscribers.load_full()).clone();
         subscriber_rmw_window_hook();
         let mut topic_subs = next.get(&key).map(|subs| subs.to_vec()).unwrap_or_default();
         let runtime = tokio::runtime::Handle::try_current().ok();
-        let entry = BorrowedSubscriberEntry::new_with_metadata(id, runtime.as_ref(), deliver);
+        let entry = BorrowedSubscriberEntry::new_with_metadata(
+            id,
+            runtime.as_ref(),
+            deliver.0,
+            permit,
+            Arc::clone(&self.counters.callback_expirations),
+        )?;
         topic_subs.push(entry);
+        self.note_interest(topic_key, true)?;
         self.refresh_hot_borrowed_subscriber(key, &topic_subs);
         next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
         self.borrowed_subscribers.store(Arc::new(next));
         drop(write_guard);
-        self.note_interest(topic_key, true);
-        self.make_handle(
+        Ok(self.make_handle(
             SubscriptionKind::Borrowed {
                 topic_key,
                 type_hash,
             },
             id,
-        )
+        ))
     }
 
-    pub fn subscribe_type_bytes(
+    pub fn subscribe_type_bytes<F, Fut>(
         &self,
         type_hash: u64,
-        deliver: impl Fn(u64, Bytes) + Send + Sync + 'static,
-    ) -> PubSubSubscription {
+        deliver: CooperativeCallback<F>,
+    ) -> std::result::Result<PubSubSubscription, PubSubAdmissionError>
+    where
+        F: Fn(u64, Bytes) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
         let id = self.next_sub_id.fetch_add(1, Ordering::Relaxed);
         let _write_guard = self.lock_subscriber_writes();
+        let permit = self.admit_subscriber(None, type_hash)?;
         let mut next = (*self.type_subscribers.load_full()).clone();
         subscriber_rmw_window_hook();
         let mut subs = next
@@ -704,10 +1114,16 @@ impl RoutedPubSub {
             .map(|subs| subs.to_vec())
             .unwrap_or_default();
         let runtime = tokio::runtime::Handle::try_current().ok();
-        subs.push(TypeSubscriberEntry::new(id, runtime.as_ref(), deliver));
+        subs.push(TypeSubscriberEntry::new(
+            id,
+            runtime.as_ref(),
+            deliver.0,
+            permit,
+            Arc::clone(&self.counters.callback_expirations),
+        )?);
         next.insert(type_hash, Arc::from(subs.into_boxed_slice()));
         self.type_subscribers.store(Arc::new(next));
-        self.make_handle(SubscriptionKind::Type { type_hash }, id)
+        Ok(self.make_handle(SubscriptionKind::Type { type_hash }, id))
     }
 
     fn make_handle(&self, kind: SubscriptionKind, id: u64) -> PubSubSubscription {
@@ -764,8 +1180,8 @@ impl RoutedPubSub {
             next.insert(key, Arc::from(topic_subs.into_boxed_slice()));
         }
         self.subscribers.store(Arc::new(next));
+        let _ = self.note_interest(topic_key, false);
         drop(write_guard);
-        self.note_interest(topic_key, false);
         true
     }
 
@@ -796,8 +1212,8 @@ impl RoutedPubSub {
             self.refresh_hot_borrowed_subscriber(key, &[]);
         }
         self.borrowed_subscribers.store(Arc::new(next));
+        let _ = self.note_interest(topic_key, false);
         drop(write_guard);
-        self.note_interest(topic_key, false);
         true
     }
 
@@ -833,22 +1249,39 @@ impl RoutedPubSub {
     where
         M: crate::WireEncode + crate::WireType,
     {
-        let payload = crate::encode_typed(msg)?;
+        let payload = crate::typed::encode_typed_owned(msg)?;
         self.publish_bytes(topic_key, M::TYPE_HASH, payload, scope, policy)
     }
 
+    /// Publish a payload whose complete backing allocation is known. Admission
+    /// charges retained capacity, so a small view cannot hide an oversized owner.
+    /// Arbitrary Bytes require explicit ForwardPayload::copy_from_slice at the
+    /// caller; Vec, boxed slice and pooled payload ownership moves without copy.
     pub fn publish_bytes(
         &self,
         topic_key: u64,
         type_hash: u64,
-        payload: Bytes,
+        payload: crate::ForwardPayload,
         scope: PubSubScope,
         policy: PubSubDeliveryPolicy,
     ) -> Result<PubSubPublishStats> {
         Self::validate_delivery_mode(policy.mode)?;
+        if payload.retained_bytes() > SUBSCRIBER_MAX_PAYLOAD_BYTES {
+            return Err(GossipError::WriteQueueFull);
+        }
+        let payload = payload.into_bytes();
         let mut stats = PubSubPublishStats::default();
-        stats.local_delivered = self.deliver_local(topic_key, type_hash, Bytes::clone(&payload));
-        self.publish_remote_bytes_inner(topic_key, type_hash, payload, scope, policy, &mut stats)?;
+        // Provider admission must succeed before any local callback is queued:
+        // returning overload after local delivery would make a retry duplicate it.
+        self.publish_remote_bytes_inner(
+            topic_key,
+            type_hash,
+            Bytes::clone(&payload),
+            scope,
+            policy,
+            &mut stats,
+        )?;
+        stats.local_delivered = self.deliver_local(topic_key, type_hash, payload);
         Ok(stats)
     }
 
@@ -971,15 +1404,16 @@ impl RoutedPubSub {
                 Ok(())
             }
             PubSubScope::SelectedPeers(peers) => {
-                let groups = if let Some(provider) = self.route_provider.load().as_ref() {
-                    provider.group_destinations(topic_key, &peers)
-                } else {
-                    peers
-                        .into_iter()
-                        .filter(|peer| peer != &self.local_peer_id)
-                        .map(|peer| (peer.clone(), Arc::from(vec![peer].into_boxed_slice())))
-                        .collect()
-                };
+                if peers.len() > self.limits.routing_records.get() {
+                    return Err(GossipError::WriteQueueFull);
+                }
+                let peers: Vec<_> = peers
+                    .into_iter()
+                    .filter(|peer| peer != &self.local_peer_id)
+                    .collect();
+                let groups = self
+                    .group_destinations_bounded(topic_key, &peers)
+                    .map_err(|_| GossipError::WriteQueueFull)?;
                 for (next_hop, destinations) in &groups {
                     self.publish_frame_to_next_hop(
                         next_hop,
@@ -1089,6 +1523,9 @@ impl RoutedPubSub {
         }
     }
 
+    /// Rebuild a complete bounded route snapshot. Concurrent requests coalesce;
+    /// excess records or four changing snapshots retain the previous revision,
+    /// increment `refresh_budget_rejections`, and impose a one-second cooldown.
     pub async fn refresh_control_plane(&self) {
         self.refresh_control_plane_inner().await;
     }
@@ -1098,7 +1535,11 @@ impl RoutedPubSub {
     }
 
     async fn refresh_control_plane_inner(&self) {
-        let _refresh_guard = self.control_plane_refresh_lock.lock().await;
+        // Concurrent refresh requests coalesce; never retain an unbounded
+        // queue of lock waiters behind one provider or route rebuild.
+        let Ok(_refresh_guard) = self.control_plane_refresh_lock.try_lock() else {
+            return;
+        };
         #[cfg(test)]
         self.control_plane_refreshes.fetch_add(1, Ordering::Relaxed);
 
@@ -1108,7 +1549,7 @@ impl RoutedPubSub {
         // Publishing the route map with a revision captured before a concurrent
         // mutation would acknowledge that mutation without incorporating it;
         // the control-plane loop could then park until the fallback timer.
-        loop {
+        for _ in 0..CONTROL_PLANE_REFRESH_ATTEMPTS {
             let actor_revision = self.registry.actor_state.pubsub_routing_revision();
             let connection_revision = self.registry.connection_pool.routing_revision();
             let provider_revision = self.route_provider_revision.load(Ordering::Acquire);
@@ -1129,15 +1570,26 @@ impl RoutedPubSub {
                 return;
             }
 
+            let Some(actors) = self
+                .registry
+                .try_snapshot_actor_owners(self.limits.routing_records.get(), 256)
+            else {
+                self.reject_refresh_budget().await;
+                return;
+            };
             let mut interests: HashMap<TopicKey, HashSet<PeerId>> = HashMap::new();
-            for (name, _) in self.registry.snapshot_known_actors() {
+            for (name, actor_owner) in actors {
                 if let Some((topic, peer)) = parse_interest_name(&name) {
-                    interests.entry(topic).or_default().insert(peer);
+                    // REMOTE-3: a name cannot widen an actor owner's claim
+                    // into a subscription on behalf of another identity.
+                    if peer == actor_owner {
+                        interests.entry(topic).or_default().insert(peer);
+                    }
                 }
             }
 
-            let provider = self.route_provider.load_full();
             let mut next_routes = HashMap::new();
+            let mut route_records = 0usize;
             let mut next_conns = (*self.conns.load_full()).clone();
             for (topic, peers) in interests {
                 let peers: Vec<PeerId> = peers
@@ -1147,14 +1599,23 @@ impl RoutedPubSub {
                 if peers.is_empty() {
                     continue;
                 }
-                let grouped = if let Some(provider) = provider.as_ref() {
-                    provider.group_destinations(topic, &peers)
-                } else {
-                    peers
-                        .into_iter()
-                        .map(|peer| (peer.clone(), Arc::from(vec![peer].into_boxed_slice())))
-                        .collect()
+                let grouped = match self.group_destinations_bounded(topic, &peers) {
+                    Ok(groups) => groups,
+                    Err(_) => {
+                        self.reject_refresh_budget().await;
+                        return;
+                    }
                 };
+
+                // A provider may regroup destinations, but cannot amplify
+                // retained route state beyond the configured record budget.
+                for destinations in grouped.values() {
+                    route_records = route_records.saturating_add(destinations.len().max(1));
+                    if route_records > self.limits.routing_records.get() {
+                        self.reject_refresh_budget().await;
+                        return;
+                    }
+                }
 
                 // Subscriptions are gated on the pool already holding a live
                 // connection to each next-hop. We deliberately do NOT call
@@ -1224,6 +1685,15 @@ impl RoutedPubSub {
                 .collect();
             next_conns.retain(|next_hop, _| live_next_hops.contains(next_hop));
 
+            #[cfg(test)]
+            if self
+                .control_plane_snapshot_hook_enabled
+                .swap(false, Ordering::AcqRel)
+            {
+                self.control_plane_snapshot_hook_entered.notify_one();
+                self.control_plane_snapshot_hook_release.notified().await;
+            }
+
             // Do not acknowledge a revision that changed while the snapshot
             // was being built. The next pass incorporates that mutation before
             // this refresh publishes any state or baseline.
@@ -1234,6 +1704,7 @@ impl RoutedPubSub {
                 || connection_after != connection_revision
                 || provider_after != provider_revision
             {
+                tokio::task::yield_now().await;
                 continue;
             }
 
@@ -1248,6 +1719,16 @@ impl RoutedPubSub {
                 .store(provider_revision, Ordering::Release);
             return;
         }
+        self.reject_refresh_budget().await;
+    }
+
+    async fn reject_refresh_budget(&self) {
+        self.counters
+            .refresh_budget_rejections
+            .fetch_add(1, Ordering::Relaxed);
+        // Retain the last complete snapshot without acknowledging revisions.
+        // A one-second cooldown prevents continuous churn from busy-spinning.
+        tokio::time::sleep(CONTROL_PLANE_FALLBACK_INTERVAL).await;
     }
 
     fn refresh_hot_route_groups(
@@ -1331,6 +1812,12 @@ impl RoutedPubSub {
         payload: &[u8],
         metadata: PubSubFrameMetadata,
     ) -> u32 {
+        if payload.len() > SUBSCRIBER_MAX_PAYLOAD_BYTES {
+            self.counters
+                .subscriber_queue_drops
+                .fetch_add(1, Ordering::Relaxed);
+            return 0;
+        }
         let hot_subscriber = self.hot_borrowed_subscriber.load();
         if let Some(hot) = hot_subscriber.as_ref()
             && hot.key == (topic_key, type_hash)
@@ -1452,76 +1939,78 @@ impl RoutedPubSub {
             .try_pubsub_frame_pooled(frame, prefix, payload_len)
     }
 
-    fn note_interest(&self, topic_key: u64, present: bool) {
-        let should_spawn = {
-            let mut state = match self.interest_state.lock() {
-                Ok(g) => g,
-                Err(e) => e.into_inner(),
-            };
-            let prev = state.local_counts.get(&topic_key).copied().unwrap_or(0);
-            let next = if present {
-                prev.saturating_add(1)
-            } else {
-                prev.saturating_sub(1)
-            };
-            if next == 0 {
-                state.local_counts.remove(&topic_key);
-            } else {
-                state.local_counts.insert(topic_key, next);
-            }
-
-            let is_transition = (present && prev == 0) || (!present && prev == 1);
-            if is_transition {
-                let next_generation = state
-                    .generations
-                    .get(&topic_key)
-                    .copied()
-                    .unwrap_or(0)
-                    .saturating_add(1);
-                state.generations.insert(topic_key, next_generation);
-            }
-
-            // Single-flight per topic: if a dispatch loop is already
-            // running for this topic, do not spawn a second, independent
-            // task that would race the first on the registry call. The
-            // generation bump above is enough — the in-flight loop
-            // re-reads `local_counts`/`generations` after every registry
-            // `.await` and keeps dispatching until it observes no change,
-            // so it will pick up this transition itself. This is what
-            // makes the last dispatched registry call always correspond
-            // to the most recent desired state (R6a fix).
-            is_transition && state.dispatch_in_flight.insert(topic_key)
+    fn note_interest(
+        &self,
+        topic_key: u64,
+        present: bool,
+    ) -> std::result::Result<(), PubSubAdmissionError> {
+        let mut state = self
+            .interest_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let previous = state.local_counts.get(&topic_key).copied().unwrap_or(0);
+        let next = if present {
+            previous.saturating_add(1)
+        } else {
+            previous.saturating_sub(1)
         };
-
-        if should_spawn {
+        let transition = (present && previous == 0) || (!present && previous == 1);
+        if transition && !state.dispatch_in_flight.contains(&topic_key) {
             let registry = Arc::clone(&self.registry);
             let peer = self.local_peer_id.clone();
             let interest_state = Arc::clone(&self.interest_state);
             let runtime = tokio::runtime::Handle::try_current().ok();
-            spawn_pubsub_background(runtime.as_ref(), async move {
+            match spawn_pubsub_background(runtime.as_ref(), async move {
                 Self::drive_interest_dispatch(interest_state, registry, peer, topic_key).await;
-            });
+            }) {
+                Ok(task) => {
+                    state.dispatch_tasks.insert(topic_key, task);
+                    state.dispatch_in_flight.insert(topic_key);
+                }
+                Err(error) if present => return Err(error),
+                Err(_) => {
+                    // Cleanup does not depend on task creation. The receipt's
+                    // pre-reserved registry queue owns lossless removal gossip.
+                    if let Some(receipt) = state.dispatch_receipts.remove(&topic_key) {
+                        receipt.cancel();
+                    }
+                    state.local_counts.remove(&topic_key);
+                    state.generations.remove(&topic_key);
+                    return Ok(());
+                }
+            }
         }
+        if next == 0 {
+            state.local_counts.remove(&topic_key);
+        } else {
+            state.local_counts.insert(topic_key, next);
+        }
+        if transition {
+            let generation = state
+                .generations
+                .get(&topic_key)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(1);
+            state.generations.insert(topic_key, generation);
+            if let Some(receipt) = state.dispatch_receipts.remove(&topic_key) {
+                receipt.cancel();
+            }
+            if present {
+                state.dispatch_receipts.insert(
+                    topic_key,
+                    Arc::new(crate::registry::PubSubInterestDispatch::default()),
+                );
+            }
+        }
+        Ok(())
     }
 
-    /// Single-flight interest-dispatch loop for `topic_key`. Only one of
-    /// these ever runs per topic at a time (enforced by
-    /// `InterestState::dispatch_in_flight` in `note_interest`). Each
-    /// iteration reads the *current* desired state under the lock,
-    /// releases the lock, performs the (slow) registry call, then
-    /// re-locks and compares generations: if the generation is unchanged
-    /// the desired state did not move during the `.await` and the loop
-    /// converged; if it changed, another `note_interest` transition raced
-    /// in while we were awaiting and we loop again to dispatch the latest
-    /// state. This removes the TOCTOU entirely — the registry is never
-    /// called from two concurrently in-flight tasks for the same topic —
-    /// and it is last-write-wins by construction rather than by
-    /// whichever `.await` happens to resolve first (R6a).
-    ///
-    /// `generations` and `local_counts` share one lifecycle: the
-    /// `generations` entry for a topic is only removed once this loop
-    /// converges on the "absent" state, which prevents it from growing
-    /// without bound under topic churn (R6b).
+    /// One cancellation-owned task per admitted topic. Changing desired state
+    /// cancels the old receipt before the next operation can publish. Failed
+    /// admission remains pending and retries at a bounded rate; it is never
+    /// acknowledged as a completed registration. Registry cleanup is reserved
+    /// before publication and survives task cancellation without detached work.
     async fn drive_interest_dispatch(
         interest_state: Arc<Mutex<InterestState>>,
         registry: Arc<crate::registry::GossipRegistry>,
@@ -1529,79 +2018,101 @@ impl RoutedPubSub {
         topic_key: u64,
     ) {
         loop {
-            let (want_present, generation) = {
-                let state = match interest_state.lock() {
-                    Ok(g) => g,
-                    Err(e) => e.into_inner(),
-                };
+            let (want_present, generation, receipt) = {
+                let state = interest_state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
                 (
                     state.local_counts.get(&topic_key).copied().unwrap_or(0) > 0,
                     state.generations.get(&topic_key).copied().unwrap_or(0),
+                    state.dispatch_receipts.get(&topic_key).cloned(),
                 )
             };
-
             interest_dispatch_hook(topic_key, want_present).await;
-
-            let name = interest_name(topic_key, &peer);
-            let result = if want_present {
-                // Advertise through `advertised_addr()`, never the raw
-                // `bind_addr` — a node bound to a wildcard address
-                // (`0.0.0.0:<port>`, a normal deployment pattern) would
-                // otherwise gossip an undialable interest-actor
-                // location, starving peers of a route to it (the
-                // wildcard-advertise reconnect-storm class of bug; see
-                // `tests/wildcard_advertise_interest_storm.rs`). When
-                // no `GossipConfig::advertise_address` override is
-                // configured this can still resolve to an unspecified
-                // IP; that is deliberately not rejected here.
-                // Registration proceeds and the receiving side's
-                // `validate_remote_actor_addr` (`registry.rs`) rewrites
-                // an unspecified advertised IP using the gossiping
-                // peer's own verified address — the same trust anchor
-                // `resolve_peer_addr_checked` already uses for peer
-                // bind-address resolution — so wildcard-bound nodes
-                // work correctly with zero required configuration,
-                // exactly like peer addresses already do.
-                let advertised = registry.advertised_addr();
-                let mut location = RemoteActorLocation::new_with_peer(advertised, peer.clone());
-                location.priority = RegistrationPriority::Immediate;
-                registry
-                    .register_actor_with_priority(name, location, RegistrationPriority::Immediate)
-                    .await
-            } else {
-                registry.unregister_actor(&name).await.map(|_| ())
-            };
-            if let Err(err) = result {
-                warn!(
-                    topic_key,
-                    present = want_present,
-                    generation,
-                    error = %err,
-                    "failed to update pubsub interest actor"
-                );
-            }
-
-            let mut state = match interest_state.lock() {
-                Ok(g) => g,
-                Err(e) => e.into_inner(),
-            };
-            let current_generation = state.generations.get(&topic_key).copied().unwrap_or(0);
-            if current_generation == generation {
-                // Converged: nothing changed while we were awaiting the
-                // registry call. Release single-flight ownership.
-                state.dispatch_in_flight.remove(&topic_key);
-                if !want_present {
-                    // The last dispatched (and now converged) state is
-                    // "absent" — fold the generation bookkeeping's
-                    // lifecycle into `local_counts`'s so this map does not
-                    // grow without bound under topic churn (R6b).
-                    state.generations.remove(&topic_key);
+            let completed = if want_present {
+                let Some(receipt) = receipt.as_ref() else {
+                    return;
+                };
+                let location =
+                    RemoteActorLocation::new_with_peer(registry.advertised_addr(), peer.clone());
+                tokio::select! {
+                    biased;
+                    _ = receipt.cancelled() => false,
+                    result = tokio::time::timeout(
+                        CALLBACK_MAX_DURATION,
+                        registry.register_pubsub_interest(
+                            interest_name(topic_key, &peer), location, &receipt,
+                        ),
+                    ) => {
+                        match result {
+                            Ok(Ok(())) => true,
+                            Ok(Err(error)) => {
+                                warn!(
+                                    topic_key,
+                                    %error,
+                                    "pubsub interest registration remains pending"
+                                );
+                                false
+                            }
+                            Err(_) => false,
+                        }
+                    }
                 }
-                break;
+            } else {
+                // `note_interest(false)` already canceled the exact receipt
+                // synchronously. Only its lossless gossip journal needs flush.
+                tokio::time::timeout(
+                    CALLBACK_MAX_DURATION,
+                    registry.flush_pubsub_interest_cleanup(),
+                )
+                .await
+                .is_ok()
+            };
+            if completed {
+                // Fanout futures are scoped to this call. Regular pending
+                // gossip remains authoritative if this best-latency attempt is
+                // canceled, times out, or fails to reach a peer.
+                if let Some(receipt) = receipt.as_ref() {
+                    tokio::select! {
+                        biased;
+                        _ = receipt.cancelled() => {},
+                        _ = tokio::time::timeout(
+                            CALLBACK_MAX_DURATION,
+                            registry.trigger_immediate_gossip(),
+                        ) => {},
+                    }
+                } else {
+                    let _ = tokio::time::timeout(
+                        CALLBACK_MAX_DURATION,
+                        registry.trigger_immediate_gossip(),
+                    )
+                    .await;
+                }
             }
-            // The desired state moved during the `.await` above (another
-            // `note_interest` call bumped the generation). Loop again and
-            // dispatch the latest state instead of returning.
+            let (converged, changed) = {
+                let mut state = interest_state
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let current = state.generations.get(&topic_key).copied().unwrap_or(0);
+                if current == generation && completed {
+                    state.dispatch_in_flight.remove(&topic_key);
+                    state.dispatch_tasks.remove(&topic_key);
+                    if !want_present {
+                        state.generations.remove(&topic_key);
+                    }
+                    (true, false)
+                } else {
+                    (false, current != generation)
+                }
+            };
+            if converged {
+                return;
+            }
+            if completed || changed {
+                tokio::task::yield_now().await;
+            } else {
+                tokio::time::sleep(CONTROL_PLANE_FALLBACK_INTERVAL).await;
+            }
         }
     }
 
@@ -1774,6 +2285,13 @@ impl RoutedPubSub {
         }
         self.counters.accepted.fetch_add(1, Ordering::Relaxed);
 
+        if decoded.destination_count > self.limits.routing_records.get() {
+            self.counters
+                .queue_full_drops
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(GossipError::WriteQueueFull);
+        }
+
         let mut should_deliver_local = false;
         let mut has_remaining = false;
         for index in 0..decoded.destination_count {
@@ -1815,13 +2333,14 @@ impl RoutedPubSub {
             .destination_peer_iter()
             .filter(|peer| peer.as_bytes() != local_peer_id)
             .collect();
-        let grouped = if let Some(provider) = self.route_provider.load().as_ref() {
-            provider.group_destinations(decoded.topic_key, &remaining)
-        } else {
-            remaining
-                .into_iter()
-                .map(|peer| (peer.clone(), Arc::from(vec![peer].into_boxed_slice())))
-                .collect()
+        let grouped = match self.group_destinations_bounded(decoded.topic_key, &remaining) {
+            Ok(groups) => groups,
+            Err(_) => {
+                self.counters
+                    .queue_full_drops
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(GossipError::WriteQueueFull);
+            }
         };
         for (next_hop, peers) in grouped {
             let Some((encoded, prefix, payload_len)) = encode_fast_frame_pooled(
@@ -2007,7 +2526,8 @@ fn encode_fast_frame_pooled(
             destination_peers,
             payload,
         );
-    })?;
+    })
+    .ok()?;
     Some((pooled, None, payload_len))
 }
 
@@ -2046,6 +2566,7 @@ fn encode_fast_pubsub_datagram_pooled(
             payload,
         );
     })
+    .ok()
 }
 
 fn fast_frame_len(destination_peers: &[PeerId], payload: &[u8]) -> usize {
@@ -2053,14 +2574,37 @@ fn fast_frame_len(destination_peers: &[PeerId], payload: &[u8]) -> usize {
         .saturating_add(
             destination_peers
                 .len()
+                .min(u16::MAX as usize)
                 .saturating_mul(FAST_FRAME_DEST_PEER_LEN),
         )
         .saturating_add(payload.len())
 }
 
+// Statically dispatched bulk writes preserve the existing one-copy-per-slice
+// frame assembly; generic Extend<u8> would add a capacity branch per byte.
+trait FastFrameBuffer {
+    fn extend_from_slice(&mut self, bytes: &[u8]);
+
+    fn push(&mut self, byte: u8) {
+        self.extend_from_slice(&[byte]);
+    }
+}
+
+impl FastFrameBuffer for Vec<u8> {
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        Vec::extend_from_slice(self, bytes);
+    }
+}
+
+impl FastFrameBuffer for crate::typed::BoundedByteWriter {
+    fn extend_from_slice(&mut self, bytes: &[u8]) {
+        crate::typed::BoundedByteWriter::extend_from_slice(self, bytes);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn write_fast_frame(
-    out: &mut Vec<u8>,
+    out: &mut impl FastFrameBuffer,
     topic_key: u64,
     type_hash: u64,
     msg_id: u128,
@@ -2130,6 +2674,33 @@ mod tests {
     use super::*;
     use bytes::Buf;
 
+    #[test]
+    fn fast_frame_length_matches_encoded_destination_cap() {
+        let peer = crate::KeyPair::new_for_testing("qa-fast-frame-count").peer_id();
+        let destinations = vec![peer.clone(); u16::MAX as usize + 1];
+        let payload = b"payload after destinations";
+        for count in [1, u16::MAX as usize, u16::MAX as usize + 1] {
+            let (encoded, prefix, declared_len) = encode_fast_frame_pooled(
+                1,
+                2,
+                3,
+                &peer,
+                &peer,
+                4,
+                PubSubDeliveryMode::AtMostOnce,
+                PubSubFrameMetadata::default(),
+                &destinations[..count],
+                payload,
+            )
+            .expect("bounded frame must encode");
+            assert!(prefix.is_none());
+            assert_eq!(declared_len, encoded.remaining());
+            let parsed = FastFrameView::parse(encoded.chunk()).expect("valid fast frame");
+            assert_eq!(parsed.destination_count, count.min(u16::MAX as usize));
+            assert_eq!(parsed.payload, payload);
+        }
+    }
+
     fn test_pubsub(registry_peer_seed: &str) -> Arc<RoutedPubSub> {
         crate::typed::prewarm_pooled_byte_buffers(
             FAST_FRAME_POOL_BUFFERS,
@@ -2152,6 +2723,10 @@ mod tests {
             hot_borrowed_subscriber: ArcSwapOption::empty(),
             type_subscribers: ArcSwap::from_pointee(HashMap::new()),
             subscriber_write_lock: Mutex::new(()),
+            limits: PubSubLimits::default(),
+            subscriber_permits: Arc::new(tokio::sync::Semaphore::new(
+                PubSubLimits::default().subscribers.get(),
+            )),
             interest_state: Arc::new(Mutex::new(InterestState::default())),
             route_groups: ArcSwap::from_pointee(HashMap::new()),
             hot_route_groups: ArcSwapOption::empty(),
@@ -2169,6 +2744,12 @@ mod tests {
             last_connection_routing_revision: AtomicU64::new(u64::MAX),
             last_route_provider_revision: AtomicU64::new(u64::MAX),
             control_plane_refreshes: AtomicU64::new(0),
+            #[cfg(test)]
+            control_plane_snapshot_hook_enabled: AtomicBool::new(false),
+            #[cfg(test)]
+            control_plane_snapshot_hook_entered: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            control_plane_snapshot_hook_release: Arc::new(tokio::sync::Notify::new()),
             control_plane_wait_hook_enabled: AtomicBool::new(false),
             control_plane_wait_hook_entered: Arc::new(tokio::sync::Notify::new()),
             control_plane_wait_hook_release: Arc::new(tokio::sync::Notify::new()),
@@ -2183,11 +2764,21 @@ mod tests {
         next.insert(
             (topic, type_hash),
             Arc::from(
-                vec![SubscriberEntry::new(
-                    1,
-                    tokio::runtime::Handle::try_current().ok().as_ref(),
-                    deliver,
-                )]
+                vec![
+                    SubscriberEntry::new(
+                        1,
+                        tokio::runtime::Handle::try_current().ok().as_ref(),
+                        move |message| {
+                            deliver(message);
+                            std::future::ready(())
+                        },
+                        Arc::clone(&pubsub.subscriber_permits)
+                            .try_acquire_owned()
+                            .unwrap(),
+                        Arc::clone(&pubsub.counters.callback_expirations),
+                    )
+                    .expect("test subscriber worker"),
+                ]
                 .into_boxed_slice(),
             ),
         );
@@ -2292,13 +2883,13 @@ mod tests {
             &self,
             _topic_key: u64,
             destinations: &[PeerId],
-        ) -> HashMap<PeerId, Arc<[PeerId]>> {
+            routes: &mut PubSubRouteSink,
+        ) -> std::result::Result<(), PubSubRouteError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            destinations
-                .iter()
-                .cloned()
-                .map(|peer| (peer.clone(), Arc::from(vec![peer].into_boxed_slice())))
-                .collect()
+            for (index, peer) in destinations.iter().enumerate() {
+                routes.route(index, peer.clone())?;
+            }
+            Ok(())
         }
     }
 
@@ -2312,44 +2903,51 @@ mod tests {
             &self,
             _topic_key: u64,
             destinations: &[PeerId],
-        ) -> HashMap<PeerId, Arc<[PeerId]>> {
+            routes: &mut PubSubRouteSink,
+        ) -> std::result::Result<(), PubSubRouteError> {
             self.calls.fetch_add(1, Ordering::AcqRel);
             self.called.notify_one();
-            destinations
-                .iter()
-                .cloned()
-                .map(|peer| (peer.clone(), Arc::from(vec![peer].into_boxed_slice())))
-                .collect()
-        }
-    }
-
-    struct BlockingRouteProvider {
-        calls: AtomicU64,
-        first_call_started: Arc<std::sync::Barrier>,
-        first_call_release: Arc<(Mutex<bool>, std::sync::Condvar)>,
-    }
-
-    impl PubSubRouteProvider for BlockingRouteProvider {
-        fn group_destinations(
-            &self,
-            _topic_key: u64,
-            destinations: &[PeerId],
-        ) -> HashMap<PeerId, Arc<[PeerId]>> {
-            let call = self.calls.fetch_add(1, Ordering::AcqRel);
-            if call == 0 {
-                self.first_call_started.wait();
-                let (release_lock, release_notify) = &*self.first_call_release;
-                let mut released = release_lock.lock().unwrap();
-                while !*released {
-                    released = release_notify.wait(released).unwrap();
-                }
+            for (index, peer) in destinations.iter().enumerate() {
+                routes.route(index, peer.clone())?;
             }
-            destinations
-                .iter()
-                .cloned()
-                .map(|peer| (peer.clone(), Arc::from(vec![peer].into_boxed_slice())))
-                .collect()
+            Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn interest_name_cannot_claim_a_different_location_owner() {
+        let pubsub = test_pubsub("pubsub-interest-owner");
+        let provider = Arc::new(CountingRouteProvider {
+            calls: AtomicU64::new(0),
+        });
+        pubsub.set_route_provider(provider.clone());
+        let claimed_peer = crate::KeyPair::new_for_testing("pubsub-claimed-peer").peer_id();
+        let topic = topic_key("interest-owner");
+        let name = interest_name(topic, &claimed_peer);
+        let addr = "127.0.0.1:19009".parse().unwrap();
+        pubsub
+            .registry
+            .register_actor(
+                name.clone(),
+                RemoteActorLocation::new_with_peer(addr, pubsub.local_peer_id.clone()),
+            )
+            .await
+            .unwrap();
+        let snapshot = pubsub.registry.snapshot_known_actors();
+        assert!(snapshot.iter().any(|(actor, location)| {
+            actor == &name && location.peer_id == pubsub.local_peer_id
+        }));
+        pubsub.refresh_control_plane().await;
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
+
+        pubsub.registry.unregister_actor(&name).await.unwrap();
+        pubsub
+            .registry
+            .register_actor(name, RemoteActorLocation::new_with_peer(addr, claimed_peer))
+            .await
+            .unwrap();
+        pubsub.refresh_control_plane().await;
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -2474,14 +3072,13 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_control_plane_refreshes_are_serialized() {
+    async fn concurrent_control_plane_refreshes_coalesce_without_waiter_backlog() {
         let pubsub = test_pubsub("pubsub-serialized-control-plane-refresh");
-        let first_call_started = Arc::new(std::sync::Barrier::new(2));
-        let first_call_release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
-        let provider = Arc::new(BlockingRouteProvider {
+        pubsub
+            .control_plane_snapshot_hook_enabled
+            .store(true, Ordering::Release);
+        let provider = Arc::new(CountingRouteProvider {
             calls: AtomicU64::new(0),
-            first_call_started: Arc::clone(&first_call_started),
-            first_call_release: Arc::clone(&first_call_release),
         });
         pubsub.set_route_provider(provider.clone());
         let interested_peer =
@@ -2500,34 +3097,37 @@ mod tests {
 
         let first_pubsub = Arc::clone(&pubsub);
         let first = tokio::spawn(async move { first_pubsub.refresh_control_plane().await });
-        first_call_started.wait();
+        pubsub.control_plane_snapshot_hook_entered.notified().await;
 
         let second_pubsub = Arc::clone(&pubsub);
         let second = tokio::spawn(async move { second_pubsub.refresh_control_plane().await });
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::timeout(Duration::from_secs(5), second)
+            .await
+            .expect("coalesced refresh must not queue behind the provider")
+            .unwrap();
         assert_eq!(
             provider.calls.load(Ordering::Acquire),
             1,
             "a second refresh must not evaluate or publish ahead of an in-flight snapshot"
         );
 
-        let (release_lock, release_notify) = &*first_call_release;
-        *release_lock.lock().unwrap() = true;
-        release_notify.notify_all();
+        pubsub.control_plane_snapshot_hook_release.notify_one();
         first.await.unwrap();
-        second.await.unwrap();
+        assert_eq!(provider.calls.load(Ordering::Acquire), 1);
+        // A concurrent request coalesces, but an independent later request
+        // still re-evaluates a stateful provider.
+        pubsub.refresh_control_plane().await;
         assert_eq!(provider.calls.load(Ordering::Acquire), 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn refresh_retries_when_actor_revision_changes_during_snapshot() {
         let pubsub = test_pubsub("pubsub-refresh-retries-on-actor-change");
-        let first_call_started = Arc::new(std::sync::Barrier::new(2));
-        let first_call_release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
-        let provider = Arc::new(BlockingRouteProvider {
+        pubsub
+            .control_plane_snapshot_hook_enabled
+            .store(true, Ordering::Release);
+        let provider = Arc::new(CountingRouteProvider {
             calls: AtomicU64::new(0),
-            first_call_started: Arc::clone(&first_call_started),
-            first_call_release: Arc::clone(&first_call_release),
         });
         pubsub.set_route_provider(provider.clone());
         let first_peer = crate::KeyPair::new_for_testing("pubsub-refresh-first-peer").peer_id();
@@ -2544,7 +3144,7 @@ mod tests {
         let refresh = tokio::spawn(async move {
             refresh_pubsub.refresh_control_plane().await;
         });
-        first_call_started.wait();
+        pubsub.control_plane_snapshot_hook_entered.notified().await;
 
         let second_peer = crate::KeyPair::new_for_testing("pubsub-refresh-second-peer").peer_id();
         pubsub
@@ -2559,9 +3159,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (release_lock, release_notify) = &*first_call_release;
-        *release_lock.lock().unwrap() = true;
-        release_notify.notify_all();
+        pubsub.control_plane_snapshot_hook_release.notify_one();
         refresh.await.unwrap();
 
         assert_eq!(
@@ -2871,20 +3469,34 @@ mod tests {
         let delivered = Arc::new(Mutex::new(Vec::new()));
 
         let delivered_first = Arc::clone(&delivered);
-        let first = pubsub.subscribe_bytes(topic, type_hash, move |_| {
-            delivered_first.lock().unwrap().push("first");
-        });
+        let first = pubsub
+            .subscribe_bytes(
+                topic,
+                type_hash,
+                CooperativeCallback::new(move |_: bytes::Bytes| {
+                    delivered_first.lock().unwrap().push("first");
+                    std::future::ready(())
+                }),
+            )
+            .expect("subscription admission");
         let delivered_second = Arc::clone(&delivered);
-        let second = pubsub.subscribe_bytes(topic, type_hash, move |_| {
-            delivered_second.lock().unwrap().push("second");
-        });
+        let second = pubsub
+            .subscribe_bytes(
+                topic,
+                type_hash,
+                CooperativeCallback::new(move |_: bytes::Bytes| {
+                    delivered_second.lock().unwrap().push("second");
+                    std::future::ready(())
+                }),
+            )
+            .expect("subscription admission");
 
         assert!(pubsub.unsubscribe(first));
         pubsub
             .publish_bytes(
                 topic,
                 type_hash,
-                Bytes::from_static(b"payload"),
+                crate::ForwardPayload::from_static(b"payload"),
                 PubSubScope::LocalOnly,
                 PubSubDeliveryPolicy::default(),
             )
@@ -2921,9 +3533,16 @@ mod tests {
         let type_hash = 206;
         let delivered = Arc::new(AtomicU64::new(0));
         let delivered_for_subscriber = Arc::clone(&delivered);
-        let _subscription = pubsub.subscribe_bytes(topic, type_hash, move |_| {
-            delivered_for_subscriber.fetch_add(1, Ordering::Relaxed);
-        });
+        let _subscription = pubsub
+            .subscribe_bytes(
+                topic,
+                type_hash,
+                CooperativeCallback::new(move |_: bytes::Bytes| {
+                    delivered_for_subscriber.fetch_add(1, Ordering::Relaxed);
+                    std::future::ready(())
+                }),
+            )
+            .expect("subscription admission");
         let policy = PubSubDeliveryPolicy {
             mode: PubSubDeliveryMode::AtLeastOnceHopAck,
             ..PubSubDeliveryPolicy::default()
@@ -2933,7 +3552,7 @@ mod tests {
             .publish_bytes(
                 topic,
                 type_hash,
-                Bytes::from_static(b"must-not-deliver"),
+                crate::ForwardPayload::from_static(b"must-not-deliver"),
                 PubSubScope::LocalOnly,
                 policy,
             )
@@ -2954,9 +3573,16 @@ mod tests {
         let captured = Arc::new(());
         let weak = Arc::downgrade(&captured);
         let captured_by_callback = Arc::clone(&captured);
-        let subscription = pubsub.subscribe_bytes(77, 205, move |_| {
-            let _keepalive = &captured_by_callback;
-        });
+        let subscription = pubsub
+            .subscribe_bytes(
+                77,
+                205,
+                CooperativeCallback::new(move |_: bytes::Bytes| {
+                    let _keepalive = &captured_by_callback;
+                    std::future::ready(())
+                }),
+            )
+            .expect("subscription admission");
         drop(captured);
 
         assert!(pubsub.unsubscribe(subscription));
@@ -2978,18 +3604,27 @@ mod tests {
         let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let started_for_subscriber = Arc::clone(&started);
         let release_for_subscriber = Arc::clone(&release);
-        let _subscription = pubsub.subscribe_bytes(topic, type_hash, move |_| {
-            started_for_subscriber.store(true, Ordering::Release);
-            while !release_for_subscriber.load(Ordering::Acquire) {
-                std::thread::park_timeout(Duration::from_millis(1));
-            }
-        });
+        let _subscription = pubsub
+            .subscribe_bytes(
+                topic,
+                type_hash,
+                CooperativeCallback::new(move |_: bytes::Bytes| {
+                    started_for_subscriber.store(true, Ordering::Release);
+                    let release = Arc::clone(&release_for_subscriber);
+                    async move {
+                        while !release.load(Ordering::Acquire) {
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                }),
+            )
+            .expect("subscription admission");
 
         pubsub
             .publish_bytes(
                 topic,
                 type_hash,
-                Bytes::from_static(b"first"),
+                crate::ForwardPayload::from_static(b"first"),
                 PubSubScope::LocalOnly,
                 PubSubDeliveryPolicy::default(),
             )
@@ -3008,7 +3643,7 @@ mod tests {
                 .publish_bytes(
                     topic,
                     type_hash,
-                    Bytes::from_static(b"queued"),
+                    crate::ForwardPayload::from_static(b"queued"),
                     PubSubScope::LocalOnly,
                     PubSubDeliveryPolicy::default(),
                 )
@@ -3032,15 +3667,22 @@ mod tests {
         let type_hash = 204;
         let delivered = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let delivered_for_subscriber = Arc::clone(&delivered);
-        let _subscription = pubsub.subscribe_bytes(topic, type_hash, move |_| {
-            delivered_for_subscriber.store(true, Ordering::Release);
-        });
+        let _subscription = pubsub
+            .subscribe_bytes(
+                topic,
+                type_hash,
+                CooperativeCallback::new(move |_: bytes::Bytes| {
+                    delivered_for_subscriber.store(true, Ordering::Release);
+                    std::future::ready(())
+                }),
+            )
+            .expect("subscription admission");
 
         pubsub
             .publish_bytes(
                 topic,
                 type_hash,
-                Bytes::from_static(b"fallback"),
+                crate::ForwardPayload::from_static(b"fallback"),
                 PubSubScope::LocalOnly,
                 PubSubDeliveryPolicy::default(),
             )
@@ -3071,9 +3713,16 @@ mod tests {
         let captured = Arc::new(());
         let weak_callback = Arc::downgrade(&captured);
         let captured_by_callback = Arc::clone(&captured);
-        let subscription = pubsub.subscribe_bytes(topic, type_hash, move |_| {
-            let _keepalive = &captured_by_callback;
-        });
+        let subscription = pubsub
+            .subscribe_bytes(
+                topic,
+                type_hash,
+                CooperativeCallback::new(move |_: bytes::Bytes| {
+                    let _keepalive = &captured_by_callback;
+                    std::future::ready(())
+                }),
+            )
+            .expect("subscription admission");
         drop(captured);
         assert!(pubsub.subscribers.load().contains_key(&(topic, type_hash)));
 
@@ -3106,10 +3755,28 @@ mod tests {
         let topic = topic_key("raii-all-variants");
         let type_hash = 302;
 
-        let borrowed = pubsub.subscribe_borrowed_bytes(topic, type_hash, |_| {});
-        let borrowed_meta =
-            pubsub.subscribe_borrowed_bytes_with_metadata(topic, type_hash, |_, _| {});
-        let typed = pubsub.subscribe_type_bytes(type_hash, |_, _| {});
+        let borrowed = pubsub
+            .subscribe_borrowed_bytes(
+                topic,
+                type_hash,
+                CooperativeCallback::new(|_: &[u8]| std::future::ready(())),
+            )
+            .expect("subscription admission");
+        let borrowed_meta = pubsub
+            .subscribe_borrowed_bytes_with_metadata(
+                topic,
+                type_hash,
+                CooperativeCallback::new(|_: &[u8], _: crate::pubsub::PubSubFrameMetadata| {
+                    std::future::ready(())
+                }),
+            )
+            .expect("subscription admission");
+        let typed = pubsub
+            .subscribe_type_bytes(
+                type_hash,
+                CooperativeCallback::new(|_: u64, _: bytes::Bytes| std::future::ready(())),
+            )
+            .expect("subscription admission");
         assert_eq!(
             pubsub
                 .borrowed_subscribers
@@ -3145,12 +3812,24 @@ mod tests {
         let pubsub = test_pubsub("pubsub-raii-idempotent");
         let topic = topic_key("raii-idempotent");
         let type_hash = 303;
-        let subscription = pubsub.subscribe_bytes(topic, type_hash, |_| {});
+        let subscription = pubsub
+            .subscribe_bytes(
+                topic,
+                type_hash,
+                CooperativeCallback::new(|_: bytes::Bytes| std::future::ready(())),
+            )
+            .expect("subscription admission");
         assert!(pubsub.unsubscribe(subscription));
         // `unsubscribe` consumed the handle; its Drop ran after release() had
         // already fired and must not have removed anything twice. A fresh
         // subscription proves the interest counter did not underflow.
-        let second = pubsub.subscribe_bytes(topic, type_hash, |_| {});
+        let second = pubsub
+            .subscribe_bytes(
+                topic,
+                type_hash,
+                CooperativeCallback::new(|_: bytes::Bytes| std::future::ready(())),
+            )
+            .expect("subscription admission");
         assert_eq!(
             pubsub
                 .interest_state
@@ -3167,7 +3846,13 @@ mod tests {
     async fn subscription_handle_does_not_keep_pubsub_alive() {
         let pubsub = test_pubsub("pubsub-raii-weak");
         let weak = Arc::downgrade(&pubsub);
-        let subscription = pubsub.subscribe_bytes(topic_key("raii-weak"), 304, |_| {});
+        let subscription = pubsub
+            .subscribe_bytes(
+                topic_key("raii-weak"),
+                304,
+                CooperativeCallback::new(|_: bytes::Bytes| std::future::ready(())),
+            )
+            .expect("subscription admission");
         drop(pubsub);
         assert!(
             weak.upgrade().is_none(),
@@ -3228,9 +3913,16 @@ mod tests {
             armed_for_a
                 .set(std::thread::current().id())
                 .expect("armed thread id set once");
-            pubsub_for_a.subscribe_bytes(topic_a, type_hash, move |_| {
-                delivered_a_cb.store(true, Ordering::Release);
-            })
+            pubsub_for_a
+                .subscribe_bytes(
+                    topic_a,
+                    type_hash,
+                    CooperativeCallback::new(move |_: bytes::Bytes| {
+                        delivered_a_cb.store(true, Ordering::Release);
+                        std::future::ready(())
+                    }),
+                )
+                .expect("subscription admission")
         });
         entered_rx
             .recv_timeout(Duration::from_secs(5))
@@ -3238,9 +3930,16 @@ mod tests {
 
         // Thread B: full subscribe while A is parked inside its window.
         let delivered_b_cb = Arc::clone(&delivered_b);
-        let _sub_b = pubsub.subscribe_bytes(topic_b, type_hash, move |_| {
-            delivered_b_cb.store(true, Ordering::Release);
-        });
+        let _sub_b = pubsub
+            .subscribe_bytes(
+                topic_b,
+                type_hash,
+                CooperativeCallback::new(move |_: bytes::Bytes| {
+                    delivered_b_cb.store(true, Ordering::Release);
+                    std::future::ready(())
+                }),
+            )
+            .expect("subscription admission");
         let _sub_a = thread_a.join().expect("thread A subscribe must not panic");
 
         for (topic, payload) in [(topic_a, &b"to-a"[..]), (topic_b, &b"to-b"[..])] {
@@ -3248,7 +3947,7 @@ mod tests {
                 .publish_bytes(
                     topic,
                     type_hash,
-                    Bytes::from_static(payload),
+                    crate::ForwardPayload::from_static(payload),
                     PubSubScope::LocalOnly,
                     PubSubDeliveryPolicy::default(),
                 )
@@ -3298,7 +3997,15 @@ mod tests {
                     let (topic, type_hash) = keys[worker];
                     for iteration in 0..ITERATIONS {
                         barrier.wait();
-                        let sub = pubsub.subscribe_bytes(topic, type_hash, |_| {});
+                        let sub = pubsub
+                            .subscribe_bytes(
+                                topic,
+                                type_hash,
+                                CooperativeCallback::new(|_: bytes::Bytes| {
+                                    std::future::ready(())
+                                }),
+                            )
+                            .expect("subscription admission");
                         barrier.wait();
                         if worker == 0 {
                             let map = pubsub.subscribers.load();
@@ -3321,6 +4028,23 @@ mod tests {
                                 "iteration {iteration}: concurrent unsubscribes left a stale \
                                  subscriber-map entry (delivery into a dropped subscription)"
                             ));
+                        }
+                        if worker == 0 {
+                            // This is a map-RMW stress test, not worker-admission
+                            // saturation: finish each generation's shutdown
+                            // before creating the next pair of workers.
+                            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                            while pubsub.subscriber_permits.available_permits()
+                                != pubsub.limits.subscribers.get()
+                            {
+                                if std::time::Instant::now() >= deadline {
+                                    *failure.lock().unwrap() = Some(format!(
+                                        "iteration {iteration}: idle workers did not release admission"
+                                    ));
+                                    break;
+                                }
+                                std::thread::yield_now();
+                            }
                         }
                         barrier.wait();
                         if failure.lock().unwrap().is_some() {
@@ -3416,7 +4140,7 @@ mod tests {
         // is the subscribe/unsubscribe side effect under test here and is
         // independent of the `subscribers` delivery map, so driving it
         // directly is a faithful, minimal reproduction.
-        pubsub.note_interest(topic, true);
+        pubsub.note_interest(topic, true).unwrap();
         assert!(
             poll_until(
                 || async { pubsub.registry.lookup_actor(&name).await.is_some() },
@@ -3460,14 +4184,14 @@ mod tests {
 
         // Last subscriber leaves: spawns/coalesces the unregister dispatch
         // (generation g+1). It will park just before calling the registry.
-        pubsub.note_interest(topic, false);
+        pubsub.note_interest(topic, false).unwrap();
         reached_unregister.notified().await;
 
         // A new subscriber arrives immediately after: spawns/coalesces the
         // register dispatch (generation g+2). `present=true` is never
         // delayed by the hook, so this runs to completion right away,
         // *before* the stale unregister is released.
-        pubsub.note_interest(topic, true);
+        pubsub.note_interest(topic, true).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Now let the stale unregister complete last.
@@ -3515,8 +4239,8 @@ mod tests {
         const CHURN_TOPICS: u64 = 64;
         for i in 0..CHURN_TOPICS {
             let topic = topic_key(&format!("ephemeral-generations-churn-{i}"));
-            pubsub.note_interest(topic, true);
-            pubsub.note_interest(topic, false);
+            pubsub.note_interest(topic, true).unwrap();
+            pubsub.note_interest(topic, false).unwrap();
         }
 
         // Let any spawned register/unregister dispatch tasks settle.
@@ -3541,6 +4265,620 @@ mod tests {
             final_len, baseline_len,
             "generations map must return to its baseline size once every churned \
              topic has 0 local subscribers again, not grow by {CHURN_TOPICS} entries"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscriber_admission_is_global_and_preserves_existing_delivery() {
+        let pubsub = test_pubsub("subscriber-admission-global");
+        let held = Arc::clone(&pubsub.subscriber_permits)
+            .try_acquire_many_owned((pubsub.limits.subscribers.get() - 1) as u32)
+            .unwrap();
+        let (delivered, received) = tokio::sync::oneshot::channel();
+        let delivered = Mutex::new(Some(delivered));
+        let subscription = pubsub
+            .subscribe_bytes(
+                1,
+                2,
+                CooperativeCallback::new(move |_: bytes::Bytes| {
+                    if let Some(delivered) = delivered.lock().unwrap().take() {
+                        let _ = delivered.send(());
+                    }
+                    std::future::ready(())
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            pubsub
+                .subscribe_type_bytes(
+                    3,
+                    CooperativeCallback::new(|_: u64, _: bytes::Bytes| { std::future::ready(()) }),
+                )
+                .unwrap_err(),
+            PubSubAdmissionError::SubscriberCapacity
+        );
+        assert_eq!(pubsub.deliver_local(1, 2, Bytes::from_static(b"live")), 1);
+        received.await.unwrap();
+        assert_eq!(pubsub.subscribers.load().len(), 1);
+        assert!(pubsub.type_subscribers.load().is_empty());
+        drop(subscription);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn subscriber_topic_budget_combines_owned_and_borrowed_entries() {
+        let pubsub = test_pubsub("subscriber-admission-topic");
+        let mut subscriptions = Vec::new();
+        for hash in 0..pubsub.limits.subscribers_per_topic.get() {
+            subscriptions.push(
+                pubsub
+                    .subscribe_bytes(
+                        9,
+                        hash as u64,
+                        CooperativeCallback::new(|_: bytes::Bytes| std::future::ready(())),
+                    )
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            pubsub
+                .subscribe_borrowed_bytes(
+                    9,
+                    500,
+                    CooperativeCallback::new(|_: &[u8]| { std::future::ready(()) }),
+                )
+                .unwrap_err(),
+            PubSubAdmissionError::TopicSubscriberCapacity
+        );
+        let other = pubsub
+            .subscribe_bytes(
+                10,
+                500,
+                CooperativeCallback::new(|_: bytes::Bytes| std::future::ready(())),
+            )
+            .unwrap();
+        assert_eq!(
+            pubsub.deliver_local(10, 500, Bytes::from_static(b"other")),
+            1
+        );
+        drop(other);
+        drop(subscriptions);
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_cancels_pending_callback_before_reusing_its_permit() {
+        struct DropProbe(Arc<AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        struct CaptureDropProbe {
+            permits: Arc<tokio::sync::Semaphore>,
+            observed: Arc<AtomicU64>,
+        }
+        impl Drop for CaptureDropProbe {
+            fn drop(&mut self) {
+                self.observed
+                    .store(self.permits.available_permits() as u64, Ordering::Release);
+            }
+        }
+        let pubsub = test_pubsub("subscriber-admission-cancel");
+        let held = Arc::clone(&pubsub.subscriber_permits)
+            .try_acquire_many_owned((pubsub.limits.subscribers.get() - 1) as u32)
+            .unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let started_callback = Arc::clone(&started);
+        let dropped_callback = Arc::clone(&dropped);
+        let observed_at_capture_drop = Arc::new(AtomicU64::new(u64::MAX));
+        let capture = CaptureDropProbe {
+            permits: Arc::clone(&pubsub.subscriber_permits),
+            observed: Arc::clone(&observed_at_capture_drop),
+        };
+        let subscription = pubsub
+            .subscribe_bytes(
+                1,
+                2,
+                CooperativeCallback::new(move |_: bytes::Bytes| {
+                    let _capture = &capture;
+                    let started = Arc::clone(&started_callback);
+                    let probe = DropProbe(Arc::clone(&dropped_callback));
+                    async move {
+                        let _probe = probe;
+                        started.notify_one();
+                        std::future::pending::<()>().await;
+                    }
+                }),
+            )
+            .unwrap();
+        assert_eq!(pubsub.deliver_local(1, 2, Bytes::from_static(b"held")), 1);
+        started.notified().await;
+        assert_eq!(
+            pubsub
+                .subscribe_bytes(
+                    3,
+                    4,
+                    CooperativeCallback::new(|_: bytes::Bytes| std::future::ready(())),
+                )
+                .unwrap_err(),
+            PubSubAdmissionError::SubscriberCapacity
+        );
+        drop(subscription);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pubsub.subscriber_permits.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cooperative cancellation releases the worker permit");
+        assert!(dropped.load(Ordering::Acquire));
+        assert_eq!(
+            observed_at_capture_drop.load(Ordering::Acquire),
+            0,
+            "the callback capture must drop before the worker releases admission"
+        );
+        let successor = pubsub
+            .subscribe_bytes(
+                3,
+                4,
+                CooperativeCallback::new(|_: bytes::Bytes| std::future::ready(())),
+            )
+            .unwrap();
+        drop(successor);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn subscriber_queue_rejects_oversized_visible_payload() {
+        let pubsub = test_pubsub("subscriber-payload-budget");
+        let subscription = pubsub
+            .subscribe_bytes(
+                1,
+                2,
+                CooperativeCallback::new(|_: bytes::Bytes| std::future::ready(())),
+            )
+            .unwrap();
+        let oversized = Bytes::from(vec![0; SUBSCRIBER_MAX_PAYLOAD_BYTES + 1]);
+        assert_eq!(pubsub.deliver_local(1, 2, oversized), 0);
+        assert_eq!(pubsub.stats().subscriber_queue_drops, 1);
+        assert_eq!(pubsub.deliver_local(1, 2, Bytes::from_static(b"valid")), 1);
+        drop(subscription);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn revision_churn_has_a_finite_refresh_budget_and_recovers() {
+        struct ChurningProvider {
+            revision: Arc<AtomicU64>,
+            calls: AtomicU64,
+            churn: AtomicBool,
+        }
+        impl PubSubRouteProvider for ChurningProvider {
+            fn group_destinations(
+                &self,
+                _topic_key: u64,
+                destinations: &[PeerId],
+                routes: &mut PubSubRouteSink,
+            ) -> std::result::Result<(), PubSubRouteError> {
+                let call = self.calls.fetch_add(1, Ordering::Relaxed) + 1;
+                // Stop changing after the budget, so the pre-fix loop returns
+                // a fifth attempt and fails the count oracle rather than hangs.
+                if self.churn.load(Ordering::Relaxed)
+                    && call <= CONTROL_PLANE_REFRESH_ATTEMPTS as u64
+                {
+                    self.revision.fetch_add(1, Ordering::AcqRel);
+                }
+                for (index, peer) in destinations.iter().enumerate() {
+                    routes.route(index, peer.clone())?;
+                }
+                Ok(())
+            }
+        }
+        let pubsub = test_pubsub("refresh-budget");
+        let interested = crate::KeyPair::new_for_testing("refresh-budget-peer").peer_id();
+        pubsub
+            .registry
+            .register_actor(
+                interest_name(33, &interested),
+                RemoteActorLocation::new_with_peer("127.0.0.1:19222".parse().unwrap(), interested),
+            )
+            .await
+            .unwrap();
+        let provider = Arc::new(ChurningProvider {
+            revision: Arc::clone(&pubsub.route_provider_revision),
+            calls: AtomicU64::new(0),
+            churn: AtomicBool::new(true),
+        });
+        pubsub.set_route_provider(provider.clone());
+        pubsub.refresh_control_plane().await;
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 4);
+        assert_eq!(pubsub.stats().refresh_budget_rejections, 1);
+        assert_eq!(
+            pubsub.last_route_provider_revision.load(Ordering::Acquire),
+            u64::MAX,
+            "an incomplete snapshot must not acknowledge a newer revision"
+        );
+        provider.churn.store(false, Ordering::Relaxed);
+        pubsub.refresh_control_plane().await;
+        assert_eq!(provider.calls.load(Ordering::Relaxed), 5);
+        assert_eq!(
+            pubsub.last_route_provider_revision.load(Ordering::Acquire),
+            pubsub.route_provider_revision.load(Ordering::Acquire)
+        );
+    }
+
+    #[tokio::test]
+    async fn outstanding_interest_topics_share_subscription_admission_budget() {
+        let pubsub = test_pubsub("interest-admission-budget");
+        {
+            let mut state = pubsub.interest_state.lock().unwrap();
+            for topic in 0..pubsub.limits.topics.get() {
+                state.generations.insert(topic as u64, 1);
+                state.dispatch_in_flight.insert(topic as u64);
+            }
+        }
+        assert_eq!(
+            pubsub
+                .subscribe_bytes(
+                    u64::MAX,
+                    1,
+                    CooperativeCallback::new(|_: bytes::Bytes| { std::future::ready(()) }),
+                )
+                .unwrap_err(),
+            PubSubAdmissionError::TopicCapacity
+        );
+        assert!(pubsub.subscribers.load().is_empty());
+        assert_eq!(
+            pubsub.subscriber_permits.available_permits(),
+            pubsub.limits.subscribers.get()
+        );
+        // An existing outstanding topic does not consume a second topic slot.
+        let admitted = pubsub
+            .subscribe_bytes(
+                0,
+                1,
+                CooperativeCallback::new(|_: bytes::Bytes| std::future::ready(())),
+            )
+            .unwrap();
+        assert_eq!(pubsub.subscribers.load().len(), 1);
+        drop(admitted);
+    }
+
+    #[tokio::test]
+    async fn publication_rejects_tiny_payload_with_oversized_backing_owner() {
+        let pubsub = test_pubsub("pubsub-retained-owner");
+        let subscription = pubsub
+            .subscribe_bytes(
+                1,
+                2,
+                CooperativeCallback::new(|_: bytes::Bytes| std::future::ready(())),
+            )
+            .unwrap();
+        let mut backing = Vec::with_capacity(SUBSCRIBER_MAX_PAYLOAD_BYTES + 1);
+        backing.push(7);
+        let payload = crate::ForwardPayload::from(backing);
+        assert_eq!(payload.len(), 1);
+        assert!(payload.retained_bytes() > SUBSCRIBER_MAX_PAYLOAD_BYTES);
+        assert!(matches!(
+            pubsub.publish_bytes(
+                1,
+                2,
+                payload,
+                PubSubScope::LocalOnly,
+                PubSubDeliveryPolicy::default(),
+            ),
+            Err(GossipError::WriteQueueFull)
+        ));
+        let stats = pubsub
+            .publish_bytes(
+                1,
+                2,
+                crate::ForwardPayload::from_static(b"admitted"),
+                PubSubScope::LocalOnly,
+                PubSubDeliveryPolicy::default(),
+            )
+            .unwrap();
+        assert_eq!(stats.local_delivered, 1);
+        drop(subscription);
+    }
+
+    #[test]
+    fn bounded_route_sink_is_complete_non_amplifying_and_sticky() {
+        let first = crate::KeyPair::new_for_testing("route-sink-first").peer_id();
+        let second = crate::KeyPair::new_for_testing("route-sink-second").peer_id();
+        let destinations = [first.clone(), second.clone()];
+        let mut routes = PubSubRouteSink::new(2);
+        routes.deadline = std::time::Instant::now() + Duration::from_secs(60);
+        routes.route(0, first.clone()).unwrap();
+        routes.route(1, first.clone()).unwrap();
+        let grouped = routes.finish(&destinations).unwrap();
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[&first].as_ref(), &destinations);
+
+        let mut duplicate = PubSubRouteSink::new(2);
+        duplicate.deadline = std::time::Instant::now() + Duration::from_secs(60);
+        duplicate.route(0, first.clone()).unwrap();
+        assert_eq!(
+            duplicate.route(0, second.clone()),
+            Err(PubSubRouteError::DuplicateDestination)
+        );
+        // Ignoring an insertion failure cannot turn a partial map into success.
+        assert_eq!(
+            duplicate.route(1, second.clone()),
+            Err(PubSubRouteError::DuplicateDestination)
+        );
+        assert_eq!(
+            duplicate.finish(&destinations).unwrap_err(),
+            PubSubRouteError::DuplicateDestination
+        );
+
+        let mut missing = PubSubRouteSink::new(2);
+        missing.deadline = std::time::Instant::now() + Duration::from_secs(60);
+        missing.route(0, first.clone()).unwrap();
+        assert_eq!(
+            missing.finish(&destinations).unwrap_err(),
+            PubSubRouteError::MissingDestination
+        );
+
+        let mut exhausted = PubSubRouteSink::new(1);
+        exhausted.deadline = std::time::Instant::now() + Duration::from_secs(60);
+        for _ in 0..8 {
+            exhausted.step().unwrap();
+        }
+        assert_eq!(
+            exhausted.route(0, first.clone()),
+            Err(PubSubRouteError::BudgetExhausted)
+        );
+        assert_eq!(exhausted.next_hops.len(), 1);
+        assert_eq!(
+            exhausted.finish(&destinations[..1]).unwrap_err(),
+            PubSubRouteError::BudgetExhausted
+        );
+
+        let mut invalid = PubSubRouteSink::new(1);
+        invalid.deadline = std::time::Instant::now() + Duration::from_secs(60);
+        assert_eq!(
+            invalid.route(1, first),
+            Err(PubSubRouteError::InvalidDestination)
+        );
+    }
+
+    #[test]
+    fn oversized_route_request_never_invokes_provider() {
+        let pubsub = test_pubsub("route-input-admission");
+        let provider = Arc::new(CountingRouteProvider {
+            calls: AtomicU64::new(0),
+        });
+        pubsub.set_route_provider(provider.clone());
+        let peer = crate::KeyPair::new_for_testing("route-input-peer").peer_id();
+        let oversized = vec![peer.clone(); pubsub.limits.routing_records.get() + 1];
+        assert_eq!(
+            pubsub
+                .group_destinations_bounded(1, &oversized)
+                .unwrap_err(),
+            PubSubRouteError::BudgetExhausted
+        );
+        assert_eq!(provider.calls.load(Ordering::Acquire), 0);
+        let grouped = pubsub
+            .group_destinations_bounded(1, std::slice::from_ref(&peer))
+            .unwrap();
+        assert_eq!(provider.calls.load(Ordering::Acquire), 1);
+        assert_eq!(grouped[&peer].as_ref(), std::slice::from_ref(&peer));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_partial_failure_preserves_complete_published_snapshot() {
+        struct RejectingProvider;
+        impl PubSubRouteProvider for RejectingProvider {
+            fn group_destinations(
+                &self,
+                _topic: u64,
+                peers: &[PeerId],
+                routes: &mut PubSubRouteSink,
+            ) -> std::result::Result<(), PubSubRouteError> {
+                routes.route(0, peers[0].clone())?;
+                let _ = routes.route(0, peers[0].clone());
+                Ok(())
+            }
+        }
+        let pubsub = test_pubsub("route-partial-rejection");
+        let peer = crate::KeyPair::new_for_testing("route-partial-peer").peer_id();
+        pubsub
+            .registry
+            .register_actor(
+                interest_name(1, &peer),
+                RemoteActorLocation::new_with_peer("127.0.0.1:19301".parse().unwrap(), peer),
+            )
+            .await
+            .unwrap();
+        pubsub.refresh_control_plane().await;
+        let before = pubsub.route_groups.load_full();
+        let acknowledged = pubsub.last_route_provider_revision.load(Ordering::Acquire);
+        pubsub.set_route_provider(Arc::new(RejectingProvider));
+        pubsub.refresh_control_plane().await;
+        assert!(Arc::ptr_eq(&before, &pubsub.route_groups.load_full()));
+        assert_eq!(pubsub.stats().refresh_budget_rejections, 1);
+        assert_eq!(
+            pubsub.last_route_provider_revision.load(Ordering::Acquire),
+            acknowledged
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cooperative_callback_deadline_drops_active_future_and_continues_queue() {
+        struct DropProbe(Arc<AtomicBool>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let pubsub = test_pubsub("callback-deadline");
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let delivered = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let calls = AtomicU64::new(0);
+        let entered_callback = Arc::clone(&entered);
+        let delivered_callback = Arc::clone(&delivered);
+        let dropped_callback = Arc::clone(&dropped);
+        let subscription = pubsub
+            .subscribe_bytes(
+                1,
+                2,
+                CooperativeCallback::new(move |_: bytes::Bytes| {
+                    let first = calls.fetch_add(1, Ordering::AcqRel) == 0;
+                    let entered = Arc::clone(&entered_callback);
+                    let delivered = Arc::clone(&delivered_callback);
+                    let dropped = Arc::clone(&dropped_callback);
+                    async move {
+                        if first {
+                            let _probe = DropProbe(dropped);
+                            entered.notify_one();
+                            std::future::pending::<()>().await;
+                        } else {
+                            delivered.notify_one();
+                        }
+                    }
+                }),
+            )
+            .unwrap();
+        assert_eq!(pubsub.deliver_local(1, 2, Bytes::from_static(b"active")), 1);
+        entered.notified().await;
+        assert_eq!(
+            pubsub.deliver_local(1, 2, Bytes::from_static(b"successor")),
+            1
+        );
+        tokio::time::advance(CALLBACK_MAX_DURATION).await;
+        delivered.notified().await;
+        assert!(dropped.load(Ordering::Acquire));
+        assert_eq!(pubsub.stats().callback_expirations, 1);
+        drop(subscription);
+    }
+
+    #[tokio::test]
+    async fn blocked_gossip_topic_churn_is_bounded_and_recovers_after_cleanup() {
+        let pubsub = test_pubsub("interest-blocked-churn-budget");
+        let lock = pubsub.registry.gossip_state.lock().await;
+        let limit = pubsub.limits.topics.get();
+        let subscribe = |topic| {
+            pubsub.subscribe_bytes(
+                topic,
+                1,
+                CooperativeCallback::new(|_: Bytes| std::future::ready(())),
+            )
+        };
+        for topic in 0..limit as u64 {
+            drop(subscribe(topic).unwrap());
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while pubsub.subscriber_permits.available_permits() != pubsub.limits.subscribers.get() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("subscriber workers must release independently of blocked gossip");
+        {
+            let state = pubsub.interest_state.lock().unwrap();
+            assert!(state.local_counts.is_empty());
+            assert_eq!(state.generations.len(), limit);
+            assert_eq!(state.dispatch_in_flight.len(), limit);
+            assert_eq!(state.dispatch_tasks.len(), limit);
+        }
+        assert!(matches!(
+            subscribe(limit as u64),
+            Err(PubSubAdmissionError::TopicCapacity)
+        ));
+        // Reusing an existing identity coalesces without another dispatch slot.
+        drop(subscribe(0).unwrap());
+        assert_eq!(
+            pubsub.interest_state.lock().unwrap().generations.len(),
+            limit
+        );
+        drop(lock);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if pubsub.interest_state.lock().unwrap().generations.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup must return every dispatch identity");
+        let successor = subscribe(limit as u64).unwrap();
+        let name = interest_name(limit as u64, &pubsub.local_peer_id);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while pubsub.registry.lookup_actor(&name).await.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a successor must actually publish after capacity returns");
+        drop(successor);
+        assert!(pubsub.registry.lookup_actor(&name).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn engine_drop_cancels_interest_wait_before_registry_mutation() {
+        let pubsub = test_pubsub("interest-cancellation-wait");
+        let registry = Arc::clone(&pubsub.registry);
+        let topic = 2718;
+        let name = interest_name(topic, &pubsub.local_peer_id);
+        let lock = registry.gossip_state.lock().await;
+        let subscription = pubsub
+            .subscribe_bytes(
+                topic,
+                1,
+                CooperativeCallback::new(|_: bytes::Bytes| std::future::ready(())),
+            )
+            .unwrap();
+        tokio::task::yield_now().await;
+        let receipt = Arc::clone(&pubsub.interest_state.lock().unwrap().dispatch_receipts[&topic]);
+        drop(pubsub);
+        receipt.cancelled().await;
+        drop(lock);
+        tokio::task::yield_now().await;
+        assert!(registry.lookup_actor(&name).await.is_none());
+        assert!(registry.actor_state.local_actors.is_empty());
+        drop(subscription);
+    }
+
+    #[tokio::test]
+    async fn canceling_registered_interest_removes_actor_before_gossip_lock_is_available() {
+        let pubsub = test_pubsub("interest-cancellation-published");
+        let topic = 3141;
+        let name = interest_name(topic, &pubsub.local_peer_id);
+        let subscription = pubsub
+            .subscribe_bytes(
+                topic,
+                1,
+                CooperativeCallback::new(|_: bytes::Bytes| std::future::ready(())),
+            )
+            .unwrap();
+        assert!(
+            poll_until(
+                || async { pubsub.registry.lookup_actor(&name).await.is_some() },
+                Duration::from_secs(1),
+            )
+            .await
+        );
+        let lock = pubsub.registry.gossip_state.lock().await;
+        drop(subscription);
+        assert!(
+            pubsub
+                .registry
+                .actor_state
+                .local_actors
+                .read_sync(name.as_str(), |_, _| ())
+                .is_none()
+        );
+        drop(lock);
+        pubsub.registry.flush_pubsub_interest_cleanup().await;
+        assert!(
+            pubsub
+                .registry
+                .actor_state
+                .removed_actors
+                .contains_sync(name.as_str())
         );
     }
 }

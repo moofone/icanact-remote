@@ -224,7 +224,7 @@ async fn staggered_single_node_restart_converges_to_one_stable_connection()
     assert!(visible, "registry traffic did not flow after convergence");
 
     set_transport_lifecycle_recorder(None);
-    lo_final.shutdown_and_wait().await;
-    hi.shutdown_and_wait().await;
+    lo_final.shutdown_and_wait().await.unwrap();
+    hi.shutdown_and_wait().await.unwrap();
     Ok(())
 }

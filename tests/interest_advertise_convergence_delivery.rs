@@ -153,10 +153,17 @@ async fn remote_publisher_reaches_topic_that_churned_zero_to_one_under_registry_
     let sub1 = {
         let received = Arc::clone(&received);
         let last_payload = Arc::clone(&last_payload);
-        pubsub_b.subscribe_bytes(topic, type_hash, move |bytes| {
-            received.fetch_add(1, Ordering::SeqCst);
-            *last_payload.lock().unwrap() = bytes.to_vec();
-        })
+        pubsub_b
+            .subscribe_bytes(
+                topic,
+                type_hash,
+                icanact_remote::pubsub::CooperativeCallback::new(move |bytes: bytes::Bytes| {
+                    received.fetch_add(1, Ordering::SeqCst);
+                    *last_payload.lock().unwrap() = bytes.to_vec();
+                    std::future::ready(())
+                }),
+            )
+            .expect("subscription admission")
     };
 
     // Baseline: A must be able to discover and reach B's interest actor
@@ -174,7 +181,7 @@ async fn remote_publisher_reaches_topic_that_churned_zero_to_one_under_registry_
     let baseline_stats = pubsub_a.publish_bytes(
         topic,
         type_hash,
-        bytes::Bytes::from_static(b"baseline"),
+        icanact_remote::ForwardPayload::from_static(b"baseline"),
         PubSubScope::ClusterWide,
         PubSubDeliveryPolicy::default(),
     )?;
@@ -229,9 +236,16 @@ async fn remote_publisher_reaches_topic_that_churned_zero_to_one_under_registry_
     let received2 = Arc::new(AtomicUsize::new(0));
     let sub2 = {
         let received2 = Arc::clone(&received2);
-        pubsub_b.subscribe_bytes(topic, type_hash, move |_bytes| {
-            received2.fetch_add(1, Ordering::SeqCst);
-        })
+        pubsub_b
+            .subscribe_bytes(
+                topic,
+                type_hash,
+                icanact_remote::pubsub::CooperativeCallback::new(move |_bytes: bytes::Bytes| {
+                    received2.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(())
+                }),
+            )
+            .expect("subscription admission")
     };
     sleep(Duration::from_millis(80)).await;
 
@@ -254,7 +268,7 @@ async fn remote_publisher_reaches_topic_that_churned_zero_to_one_under_registry_
     let post_churn_stats = pubsub_a.publish_bytes(
         topic,
         type_hash,
-        bytes::Bytes::from_static(b"post-churn"),
+        icanact_remote::ForwardPayload::from_static(b"post-churn"),
         PubSubScope::ClusterWide,
         PubSubDeliveryPolicy::default(),
     )?;
@@ -283,7 +297,7 @@ async fn remote_publisher_reaches_topic_that_churned_zero_to_one_under_registry_
     );
 
     drop(sub2);
-    a.shutdown_and_wait().await;
-    b.shutdown_and_wait().await;
+    a.shutdown_and_wait().await.unwrap();
+    b.shutdown_and_wait().await.unwrap();
     Ok(())
 }

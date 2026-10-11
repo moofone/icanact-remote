@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use std::sync::{Mutex, OnceLock};
 use tokio::sync::Notify;
-use tokio::time::{Duration, sleep};
+use tokio::time::Duration;
 
 struct RawCapture {
     messages: Mutex<Vec<Bytes>>,
@@ -252,19 +252,82 @@ pub fn tie_break_cooldown_active(
 }
 
 pub async fn wait_for_raw_payload(timeout: Duration) -> Option<Bytes> {
-    let capture = raw_capture();
-    {
-        let mut guard = capture.messages.lock().expect("raw payload mutex poisoned");
-        if let Some(payload) = guard.pop() {
-            return Some(payload);
+    wait_for_raw_payload_in(raw_capture(), timeout, || {}).await
+}
+
+// The callback gives unit tests an exact check-to-await boundary without
+// sharing the process-global capture with other concurrently running tests.
+async fn wait_for_raw_payload_in(
+    capture: &RawCapture,
+    timeout: Duration,
+    mut before_wait: impl FnMut(),
+) -> Option<Bytes> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            // Register before observing the queue: notify_waiters does not
+            // save a permit for a future created after the notification.
+            let notified = capture.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut guard = capture.messages.lock().expect("raw payload mutex poisoned");
+                if let Some(payload) = guard.pop() {
+                    return payload;
+                }
+            }
+            before_wait();
+            notified.await;
+            // Another waiter may have consumed the payload. Keep waiting
+            // within the original timeout rather than returning a false miss.
+        }
+    })
+    .await
+    .ok()
+}
+
+#[cfg(test)]
+mod raw_capture_tests {
+    use super::*;
+
+    fn capture() -> RawCapture {
+        RawCapture {
+            messages: Mutex::new(Vec::new()),
+            notify: Notify::new(),
         }
     }
 
-    tokio::select! {
-        _ = capture.notify.notified() => {
-            let mut guard = capture.messages.lock().expect("raw payload mutex poisoned");
-            guard.pop()
-        }
-        _ = sleep(timeout) => None,
+    #[tokio::test(start_paused = true)]
+    async fn payload_arriving_between_empty_check_and_await_is_not_lost() {
+        let capture = capture();
+        let expected = Bytes::from_static(b"check-to-await");
+        let mut injected = false;
+        let received = wait_for_raw_payload_in(&capture, Duration::from_secs(1), || {
+            assert!(!injected, "the first notification must deliver the payload");
+            injected = true;
+            capture.messages.lock().unwrap().push(expected.clone());
+            capture.notify.notify_waiters();
+        })
+        .await;
+        assert!(injected, "the empty-queue race must actually be exercised");
+        assert_eq!(received, Some(expected));
+        assert!(capture.messages.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn raw_capture_returns_queued_payload_and_times_out_when_empty() {
+        let capture = capture();
+        let expected = Bytes::from_static(b"already-queued");
+        capture.messages.lock().unwrap().push(expected.clone());
+        assert_eq!(
+            wait_for_raw_payload_in(&capture, Duration::from_secs(1), || {
+                panic!("queued payload must not enter the wait path")
+            })
+            .await,
+            Some(expected)
+        );
+        assert_eq!(
+            wait_for_raw_payload_in(&capture, Duration::from_secs(1), || {}).await,
+            None
+        );
     }
 }

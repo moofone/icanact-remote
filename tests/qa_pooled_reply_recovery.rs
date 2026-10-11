@@ -187,8 +187,8 @@ async fn run_burst(default_maintenance: bool, use_immediate_enum: bool, prefix: 
             Duration::from_secs(2),
         )
         .await;
-    a.shutdown().await;
-    b.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
     assert_eq!(
         success, 128,
         "healthy peers must drain finite simultaneous pooled response bursts"

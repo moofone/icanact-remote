@@ -9,7 +9,6 @@ use std::{
     time::Duration,
 };
 
-use bytes::Bytes;
 use icanact_remote::tls;
 use icanact_remote::{
     GossipConfig, GossipRegistryHandle, KeyPair, SecretKey,
@@ -57,9 +56,9 @@ impl ActorMessageHandler for EchoAskHandler {
     ) -> ActorMessageFuture<'_> {
         Box::pin(async move {
             self.asks.fetch_add(1, Ordering::AcqRel);
-            Ok(Some(ActorResponse::Bytes(Bytes::copy_from_slice(
-                payload.as_ref(),
-            ))))
+            Ok(Some(ActorResponse::Bytes(
+                icanact_remote::ForwardPayload::copy_from_slice(payload.as_ref()),
+            )))
         })
     }
 }
@@ -215,7 +214,7 @@ async fn reconnect_continues_ask_bench_after_server_restart() {
         let mut i: u64 = 0;
         loop {
             // Drop the watch borrow guard before any await (required for Send + borrowck).
-            let remote_opt = { rx.borrow().clone() };
+            let remote_opt = { rx.borrow_and_update().clone() };
             let remote = match remote_opt {
                 Some(r) => r,
                 None => {
@@ -224,33 +223,44 @@ async fn reconnect_continues_ask_bench_after_server_restart() {
                 }
             };
 
-            let payload = Bytes::from(format!("ping#{i}"));
-            let conn = match remote.connection_ref() {
-                Some(c) => c.clone(),
-                None => {
+            let conn = match remote.session().await {
+                Ok(conn) => conn,
+                Err(_) => {
                     rx.changed().await.expect("watch closed");
                     continue;
                 }
             };
 
-            let r = conn
-                .ask_actor_frame(actor_id, type_hash, payload.clone(), Duration::from_secs(2))
-                .await;
-            match r {
-                Ok(reply) => {
-                    if reply.as_ref() != format!("ping#{i}").as_bytes() {
-                        return Err(format!("bad reply for i={i}: {:?}", reply));
+            loop {
+                let payload =
+                    icanact_remote::ForwardPayload::from(format!("ping#{i}").into_bytes());
+                let r = conn
+                    .ask_actor_frame_owned(actor_id, type_hash, payload, Duration::from_secs(2))
+                    .await;
+                match r {
+                    Ok(reply) => {
+                        if reply.as_ref() != format!("ping#{i}").as_bytes() {
+                            return Err(format!("bad reply for i={i}: {:?}", reply));
+                        }
+                        bench_ok2.fetch_add(1, Ordering::AcqRel);
+                        i += 1;
+                        if i >= 500 {
+                            return Ok(());
+                        }
                     }
-                    bench_ok2.fetch_add(1, Ordering::AcqRel);
-                    i += 1;
-                    if i >= 500 {
-                        return Ok(());
+                    Err(e) => {
+                        tracing::info!(
+                            i,
+                            error = %e,
+                            "bench: ask failed (will wait for reconnect)"
+                        );
+                        // A new session is acquired only after the reconnect signal.
+                        rx.changed().await.expect("watch closed");
+                        break;
                     }
                 }
-                Err(e) => {
-                    tracing::info!(i, error = %e, "bench: ask failed (will wait for reconnect)");
-                    // Wait for reconnect and try again.
-                    rx.changed().await.expect("watch closed");
+                if rx.has_changed().expect("watch closed") {
+                    break;
                 }
             }
         }
@@ -269,7 +279,7 @@ async fn reconnect_continues_ask_bench_after_server_restart() {
     .expect("bench did not progress before restart");
 
     // Restart server (simulate Ctrl+C / process restart).
-    server.shutdown().await;
+    server.shutdown().await.unwrap();
     drop(server);
 
     // Ensure the client observes a disconnect promptly.

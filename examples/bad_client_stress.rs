@@ -37,10 +37,9 @@ struct ExactlyOnceTestHandler {
     applied_count: AtomicUsize,
 }
 
-#[derive(Clone)]
 struct Done {
     request_payload: Bytes,
-    response_payload: Bytes,
+    response_payload: icanact_remote::ForwardPayload,
 }
 
 enum Entry {
@@ -69,9 +68,9 @@ impl ActorMessageHandler for ExactlyOnceTestHandler {
             // Payload format: [request_id:16][body:N]
             let p = payload.as_ref();
             if p.len() < 16 {
-                return Ok(Some(ActorResponse::Bytes(Bytes::from_static(
-                    b"BAD_REQUEST",
-                ))));
+                return Ok(Some(ActorResponse::Bytes(
+                    icanact_remote::ForwardPayload::from_static(b"BAD_REQUEST"),
+                )));
             }
 
             let request_id = u128::from_be_bytes(p[..16].try_into().unwrap());
@@ -105,15 +104,17 @@ impl ActorMessageHandler for ExactlyOnceTestHandler {
                                 request_id = %format!("{request_id:032x}"),
                                 "server: payload mismatch on pending"
                             );
-                            return Ok(Some(ActorResponse::Bytes(Bytes::from_static(
-                                b"INTEGRITY_ERROR",
-                            ))));
+                            return Ok(Some(ActorResponse::Bytes(
+                                icanact_remote::ForwardPayload::from_static(b"INTEGRITY_ERROR"),
+                            )));
                         }
                         tracing::info!(
                             request_id = %format!("{request_id:032x}"),
                             "server: pending replay -> PENDING"
                         );
-                        return Ok(Some(ActorResponse::Bytes(Bytes::from_static(b"PENDING"))));
+                        return Ok(Some(ActorResponse::Bytes(
+                            icanact_remote::ForwardPayload::from_static(b"PENDING"),
+                        )));
                     }
                     Some(Entry::Done(done)) => {
                         if done.request_payload.as_ref() != body.as_ref() {
@@ -121,15 +122,17 @@ impl ActorMessageHandler for ExactlyOnceTestHandler {
                                 request_id = %format!("{request_id:032x}"),
                                 "server: payload mismatch on done"
                             );
-                            return Ok(Some(ActorResponse::Bytes(Bytes::from_static(
-                                b"INTEGRITY_ERROR",
-                            ))));
+                            return Ok(Some(ActorResponse::Bytes(
+                                icanact_remote::ForwardPayload::from_static(b"INTEGRITY_ERROR"),
+                            )));
                         }
                         tracing::info!(
                             request_id = %format!("{request_id:032x}"),
                             "server: replay cached response"
                         );
-                        return Ok(Some(ActorResponse::Bytes(done.response_payload.clone())));
+                        return Ok(Some(ActorResponse::Bytes(
+                            done.response_payload.shared_clone()?,
+                        )));
                     }
                 }
             }
@@ -141,7 +144,10 @@ impl ActorMessageHandler for ExactlyOnceTestHandler {
             }
 
             let applied = self.applied_count.fetch_add(1, Ordering::SeqCst) + 1;
-            let response = Bytes::from(format!("OK applied={applied}"));
+            // Cache replay deliberately shares one complete response owner.
+            let response =
+                icanact_remote::ForwardPayload::from(format!("OK applied={applied}").into_bytes())
+                    .into_shared();
             tracing::info!(
                 request_id = %format!("{request_id:032x}"),
                 applied,
@@ -155,7 +161,7 @@ impl ActorMessageHandler for ExactlyOnceTestHandler {
                 let entry = m.get_mut(&request_id).expect("reserved above");
                 *entry = Entry::Done(Done {
                     request_payload: body,
-                    response_payload: response.clone(),
+                    response_payload: response.shared_clone()?,
                 });
             }
 
@@ -312,7 +318,7 @@ fn make_payload(request_id: u128, body: &[u8]) -> Bytes {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter("icanact_remote=error,bad_client_stress=info")
         .init();
@@ -548,5 +554,6 @@ async fn main() {
     }
 
     println!("\nALL PASS");
-    handle.shutdown().await;
+    handle.shutdown().await?;
+    Ok(())
 }

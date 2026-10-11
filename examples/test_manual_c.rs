@@ -77,10 +77,8 @@ async fn main() {
             let connected_set: std::collections::HashSet<_> =
                 pool.get_connected_peers().into_iter().collect();
 
-            // Check all configured peers (from peer_id_to_addr)
-            pool.peer_id_to_addr.iter_sync(|peer_id, addr| {
-                let peer_id = peer_id.clone();
-                let addr = *addr;
+            // Inspect a read-only snapshot of configured routes.
+            for (peer_id, addr) in pool.configured_route_snapshot() {
                 configured_count += 1;
 
                 // Check if we have an active connection to this node
@@ -134,8 +132,7 @@ async fn main() {
                     "NOT_CONNECTED".to_string()
                 };
                 status.push(format!("  {} ({}) - {}", peer_id, addr, status_str));
-                true
-            });
+            }
             (status, configured_count, connected_count)
         };
 

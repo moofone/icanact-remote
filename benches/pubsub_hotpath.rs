@@ -50,6 +50,10 @@ fn bench_pubsub_hotpath(c: &mut Criterion) {
     let topic = topic_key("bench.pubsub.hotpath");
     let policy = PubSubDeliveryPolicy::default();
     let payload = encode_bench_msg(&BenchMsg { v: 1 });
+    // This repeated-publication baseline explicitly shares one prebuilt owner.
+    // Setup promotion stays outside timing; each iteration measures an alias.
+    let owned_payload =
+        icanact_remote::ForwardPayload::copy_from_slice(payload.as_ref()).into_shared();
 
     c.bench_function("pubsub_no_interest_short_circuit", |b| {
         b.iter(|| {
@@ -57,7 +61,11 @@ fn bench_pubsub_hotpath(c: &mut Criterion) {
                 .publish_bytes(
                     black_box(topic),
                     BenchMsg::TYPE_HASH,
-                    black_box(payload.clone()),
+                    black_box(
+                        owned_payload
+                            .shared_clone()
+                            .expect("explicit shared baseline"),
+                    ),
                     PubSubScope::AutoExternal,
                     policy,
                 )
@@ -70,12 +78,19 @@ fn bench_pubsub_hotpath(c: &mut Criterion) {
     let delivered_clone = Arc::clone(&delivered);
     // RAII subscription handle: must stay bound for the remaining benches;
     // dropping it would unsubscribe immediately.
-    let _type_subscription =
-        pubsub.subscribe_type_bytes(BenchMsg::TYPE_HASH, move |_topic, payload| {
-            if let Ok(msg) = icanact_remote::decode_typed::<BenchMsg>(payload.as_ref()) {
-                delivered_clone.fetch_add(msg.v, Ordering::Relaxed);
-            }
-        });
+    let _type_subscription = pubsub
+        .subscribe_type_bytes(
+            BenchMsg::TYPE_HASH,
+            icanact_remote::pubsub::CooperativeCallback::new(
+                move |_topic: u64, payload: bytes::Bytes| {
+                    if let Ok(msg) = icanact_remote::decode_typed::<BenchMsg>(payload.as_ref()) {
+                        delivered_clone.fetch_add(msg.v, Ordering::Relaxed);
+                    }
+                    std::future::ready(())
+                },
+            ),
+        )
+        .expect("subscription admission");
 
     c.bench_function("pubsub_local_type_delivery", |b| {
         b.iter(|| {
@@ -83,7 +98,11 @@ fn bench_pubsub_hotpath(c: &mut Criterion) {
                 .publish_bytes(
                     black_box(topic),
                     BenchMsg::TYPE_HASH,
-                    black_box(payload.clone()),
+                    black_box(
+                        owned_payload
+                            .shared_clone()
+                            .expect("explicit shared baseline"),
+                    ),
                     PubSubScope::LocalOnly,
                     policy,
                 )
@@ -99,7 +118,11 @@ fn bench_pubsub_hotpath(c: &mut Criterion) {
                 .publish_bytes(
                     black_box(topic),
                     BenchMsg::TYPE_HASH,
-                    black_box(payload.clone()),
+                    black_box(
+                        owned_payload
+                            .shared_clone()
+                            .expect("explicit shared baseline"),
+                    ),
                     PubSubScope::SelectedPeers(vec![missing_peer.clone()]),
                     policy,
                 )

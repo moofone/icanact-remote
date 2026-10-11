@@ -93,8 +93,8 @@ async fn schema_hash_allows_matching_headers() {
         .expect("handler should be invoked");
     assert_eq!(hits.load(Ordering::SeqCst), 1);
 
-    handle_a.shutdown().await;
-    handle_b.shutdown().await;
+    handle_a.shutdown().await.unwrap();
+    handle_b.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -159,6 +159,6 @@ async fn schema_hash_rejects_mismatched_hello_before_a_session_is_published() {
     assert!(result.is_err(), "handler must not run after rejected Hello");
     assert_eq!(hits.load(Ordering::SeqCst), 0);
 
-    handle_a.shutdown().await;
-    handle_b.shutdown().await;
+    handle_a.shutdown().await.unwrap();
+    handle_b.shutdown().await.unwrap();
 }

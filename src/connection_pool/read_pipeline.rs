@@ -1,6 +1,7 @@
 /// R-6: one-shot handoff of the accept path's first-frame `StreamingState` to
 /// this connection's IO task. See `ReadContext::streaming_state_handoff`.
 pub(crate) struct StreamingStateHandoff {
+    pub(crate) initial_outcome: Option<InitialOutcome>,
     pub(crate) cell: std::sync::Mutex<Option<crate::protocol::StreamingState>>,
     pub(crate) ready: tokio::sync::Notify,
 }
@@ -460,8 +461,8 @@ mod read_pipeline_tests {
         );
         assert!(result.unwrap().is_none());
         assert!(matches!(
-            state,
-            super::ReadState::DiscardStreamPayload { .. }
+            state.phase,
+            super::ReadPhase::DiscardStreamPayload { .. }
         ));
 
         // The discard must consume exactly the remaining bytes, restoring
@@ -490,6 +491,53 @@ mod read_pipeline_tests {
              a chunk's remainder is its only chance to be marked received, since it was already \
              reserved (not a fresh StreamData frame) before the reap happened"
         );
+    }
+
+    #[tokio::test]
+    async fn blocked_ordinary_write_still_reads_a_ready_control_frame() {
+        let (mut peer, mut stream) = tokio::io::duplex(64);
+        // Fill the outbound direction while leaving the inbound direction
+        // independently readable. No timers or scheduler races are needed.
+        stream.write_all(&[0; 64]).await.unwrap();
+        let abort = crate::framing::write_stream_abort_header(777, 2);
+        peer.write_all(&abort).await.unwrap();
+        let mut pending = super::PendingOrdinaryWrite::new(
+            super::PendingOrdinaryWriteKind::HeaderInline {
+                header: [1; 16],
+                header_len: 16,
+                payload: bytes::Bytes::new(),
+                header_off: 0,
+                payload_off: 0,
+            },
+        );
+        let context = test_read_context(9102);
+        let mut state = super::ReadState::new();
+        let mut streaming = crate::protocol::StreamingState::new();
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        let mut received = false;
+        for _ in 0..4 {
+            match super::poll_pending_duplex(
+                &mut stream, &mut pending, Some((&mut state, &context, &mut streaming)), &mut cx,
+            ) {
+                std::task::Poll::Ready(super::PendingDuplexProgress::Read(read)) => {
+                    if let Some(result) = read.result {
+                        assert!(matches!(result, crate::handle::MessageReadResult::StreamAbort {
+                            stream_id: 777, reason: 2,
+                        }));
+                        received = true;
+                        break;
+                    }
+                }
+                _ => panic!("a blocked write must not hide ready inbound control"),
+            }
+        }
+        assert!(received);
+        assert!(matches!(
+            pending.kind,
+            super::PendingOrdinaryWriteKind::HeaderInline { header_off: 0, .. }
+        ));
+        assert!(matches!(super::poll_pending_duplex(&mut stream, &mut pending, None, &mut cx), std::task::Poll::Pending));
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -806,10 +854,156 @@ mod read_pipeline_tests {
         )
         .await;
         assert!(matches!(
-            state,
-            super::ReadState::DiscardStreamPayload { .. }
+            state.phase,
+            super::ReadPhase::DiscardStreamPayload { .. }
         ));
         assert_truncation(&error, "the discard of a rejected stream payload");
+    }
+
+    #[tokio::test]
+    async fn parser_receipt_releases_only_after_complete_terminal_body() {
+        use tokio::io::AsyncReadExt;
+
+        let sent = super::outcome_window::TerminalWindow::new();
+        let (inner, mut peer) = tokio::io::duplex(4096);
+        let mut stream = super::outcome_window::OutcomeStream::new(inner, sent.clone());
+        let mut state = super::ReadState::with_outcomes(stream.take_read_outcomes());
+        let context = test_read_context(9210);
+        let mut streaming = crate::protocol::StreamingState::new();
+        let ask = crate::framing::write_direct_ask_header(1, 17, 0);
+        sent.admit_header(&ask).unwrap().commit();
+        stream.write_all(&ask).await.unwrap();
+        let mut written = [0; 16];
+        peer.read_exact(&mut written).await.unwrap();
+        assert_eq!(written, ask);
+        assert_eq!(sent.occupied(), 1);
+
+        let reply =
+            crate::framing::write_ask_nack_header(1, crate::framing::AskNackReason::Backpressure);
+        peer.write_all(&reply[..reply.len() - 1]).await.unwrap();
+        loop {
+            let read = super::read_message_step_nonblocking(
+                &mut stream,
+                &mut state,
+                &context,
+                &mut streaming,
+            )
+            .await
+            .unwrap();
+            assert!(read.result.is_none());
+            if !read.progressed {
+                break;
+            }
+        }
+        assert_eq!(sent.occupied(), 1, "partial terminal cannot refund admission");
+        let mut pending = Box::pin(super::read_message_step_poll(
+            &mut stream,
+            &mut state,
+            &context,
+            &mut streaming,
+            true,
+        ));
+        assert!(futures::poll!(pending.as_mut()).is_pending());
+        drop(pending);
+        assert!(
+            sent.admit_header(&crate::framing::write_direct_ask_header(65, 17, 0))
+                .is_err()
+        );
+        peer.write_all(&reply[reply.len() - 1..]).await.unwrap();
+        let read = super::read_message_step_poll(
+            &mut stream,
+            &mut state,
+            &context,
+            &mut streaming,
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            read.result,
+            Some(crate::handle::MessageReadResult::AskNack {
+                correlation_id: 1,
+                ..
+            })
+        ));
+        assert_eq!(sent.occupied(), 0);
+        let successor = sent
+            .admit_header(&crate::framing::write_direct_ask_header(65, 17, 0))
+            .unwrap();
+        assert_eq!(sent.occupied(), 1);
+        drop(successor);
+        assert_eq!(sent.occupied(), 0);
+    }
+
+    #[tokio::test]
+    async fn parser_stream_receipt_waits_for_last_payload_byte() {
+        let sent = super::outcome_window::TerminalWindow::new();
+        let (inner, mut peer) = tokio::io::duplex(4096);
+        let mut stream = super::outcome_window::OutcomeStream::new(inner, sent.clone());
+        let mut state = super::ReadState::with_outcomes(stream.take_read_outcomes());
+        let context = test_read_context(9211);
+        let mut streaming = crate::protocol::StreamingState::new();
+        let ask = crate::framing::write_direct_ask_header(2, 18, 0);
+        sent.admit_header(&ask).unwrap().commit();
+        stream.write_all(&ask).await.unwrap();
+        let mut first = crate::framing::try_write_stream_response_start_header(90, 2, 2, 1)
+            .unwrap()
+            .to_vec();
+        first.push(b'a');
+        peer.write_all(&first).await.unwrap();
+        loop {
+            let read = super::read_message_step_nonblocking(
+                &mut stream,
+                &mut state,
+                &context,
+                &mut streaming,
+            )
+            .await
+            .unwrap();
+            assert!(read.result.is_none());
+            if !read.progressed {
+                break;
+            }
+        }
+        assert_eq!(sent.occupied(), 1);
+        let last = crate::framing::try_write_stream_data_header(true, 90, 1, 1).unwrap();
+        peer.write_all(&last).await.unwrap();
+        loop {
+            let read = super::read_message_step_nonblocking(
+                &mut stream,
+                &mut state,
+                &context,
+                &mut streaming,
+            )
+            .await
+            .unwrap();
+            assert!(read.result.is_none());
+            if !read.progressed {
+                break;
+            }
+        }
+        assert_eq!(sent.occupied(), 1, "metadata is not a complete frame");
+        peer.write_all(b"b").await.unwrap();
+        let read = super::read_message_step_poll(
+            &mut stream,
+            &mut state,
+            &context,
+            &mut streaming,
+            true,
+        )
+        .await
+        .unwrap();
+        match read.result.unwrap() {
+            crate::handle::MessageReadResult::Response {
+                correlation_id,
+                payload,
+            } => {
+                assert_eq!(correlation_id, 2);
+                assert_eq!(payload.as_ref(), b"ab");
+            }
+            _ => panic!("expected the actual reassembled response"),
+        }
+        assert_eq!(sent.occupied(), 0);
     }
 }
 
@@ -854,12 +1048,35 @@ pub(crate) fn eof_in_length_prefix(prefix_bytes_read: usize) -> GossipError {
     }
 }
 
-enum ReadState {
+struct ReadState {
+    phase: ReadPhase,
+    outcomes: Option<outcome_window::ReadOutcomes>,
+}
+
+impl ReadState {
+    #[cfg(test)]
+    fn new() -> Self {
+        Self {
+            phase: ReadPhase::new(),
+            outcomes: None,
+        }
+    }
+
+    fn with_outcomes(outcomes: outcome_window::ReadOutcomes) -> Self {
+        Self {
+            phase: ReadPhase::new(),
+            outcomes: Some(outcomes),
+        }
+    }
+}
+
+enum ReadPhase {
     ReadLen {
         buf: [u8; crate::framing::LENGTH_PREFIX_LEN],
         read: usize,
     },
     ReadBody {
+        kind: crate::framing::WireKind,
         msg_len: usize,
         buffer: crate::PooledAlignedBuffer,
         read: usize,
@@ -877,6 +1094,7 @@ enum ReadState {
     /// The TLS reader writes directly into the reservation held by
     /// `StreamingState`; the bitmap is committed only at frame completion.
     ReadStreamPayload {
+        outcome: InitialOutcome,
         reservation: crate::protocol::StreamChunkReservation,
         read: usize,
     },
@@ -885,6 +1103,7 @@ enum ReadState {
     /// Consume it into a fixed scratch buffer to keep framing aligned
     /// without allocating.
     DiscardStreamPayload {
+        outcome: InitialOutcome,
         remaining: usize,
         scratch: Box<[u8; 8192]>,
         /// `(stream_id, chunk_index)` to mark received, once `remaining`
@@ -1032,14 +1251,19 @@ fn stream_payload_state(
     reservation: Option<crate::protocol::StreamChunkReservation>,
     body_len: usize,
     meta_len: usize,
-) -> ReadState {
+    outcome: InitialOutcome,
+) -> ReadPhase {
+    if body_len == meta_len {
+        return ReadPhase::new();
+    }
     match reservation {
-        Some(reservation) if reservation.is_empty() => ReadState::new(),
-        Some(reservation) => ReadState::ReadStreamPayload {
+        Some(reservation) => ReadPhase::ReadStreamPayload {
+            outcome,
             reservation,
             read: 0,
         },
-        None => ReadState::DiscardStreamPayload {
+        None => ReadPhase::DiscardStreamPayload {
+            outcome,
             remaining: body_len - meta_len,
             scratch: Box::new([0; 8192]),
             on_complete_mark_received: None,
@@ -1057,8 +1281,10 @@ fn stream_payload_state(
 fn discard_remainder_of_reservation(
     reservation: crate::protocol::StreamChunkReservation,
     read: usize,
-) -> ReadState {
-    ReadState::DiscardStreamPayload {
+    outcome: InitialOutcome,
+) -> ReadPhase {
+    ReadPhase::DiscardStreamPayload {
+        outcome,
         remaining: reservation.len() - read,
         scratch: Box::new([0; 8192]),
         // This chunk was already reserved (and partially read) against the
@@ -1093,7 +1319,7 @@ fn reject_zero_length_frame() -> GossipError {
     ))
 }
 
-impl ReadState {
+impl ReadPhase {
     fn new() -> Self {
         Self::ReadLen {
             buf: [0u8; crate::framing::LENGTH_PREFIX_LEN],
@@ -1119,6 +1345,7 @@ where
 }
 
 struct ReadPollResult {
+    outcome: Option<InitialOutcome>,
     result: Option<crate::handle::MessageReadResult>,
     progressed: bool,
 }
@@ -1145,11 +1372,58 @@ async fn read_message_step_poll<S>(
 where
     S: AsyncRead + Unpin,
 {
-    futures::future::poll_fn(|cx| match state {
-        ReadState::ReadLen { buf, read } => {
+    futures::future::poll_fn(|cx| {
+        poll_read_message_step(stream, state, ctx, streaming_state, block_on_pending, cx)
+    })
+    .await
+}
+
+fn poll_read_message_step<S>(
+    stream: &mut S,
+    state: &mut ReadState,
+    ctx: &ReadContext,
+    streaming_state: &mut crate::protocol::StreamingState,
+    block_on_pending: bool,
+    cx: &mut Context<'_>,
+) -> Poll<Result<ReadPollResult>>
+where
+    S: AsyncRead + Unpin,
+{
+    let mut result = poll_read_message_phase(
+        stream,
+        &mut state.phase,
+        ctx,
+        streaming_state,
+        block_on_pending,
+        cx,
+    );
+    if let Poll::Ready(Ok(read)) = &mut result
+        && let Some(outcome) = read.outcome.take()
+        && let Some(outcomes) = &mut state.outcomes
+        && let Err(error) = outcomes.complete(outcome)
+    {
+        return Poll::Ready(Err(error.into()));
+    }
+    result
+}
+
+fn poll_read_message_phase<S>(
+    stream: &mut S,
+    state: &mut ReadPhase,
+    ctx: &ReadContext,
+    streaming_state: &mut crate::protocol::StreamingState,
+    block_on_pending: bool,
+    cx: &mut Context<'_>,
+) -> Poll<Result<ReadPollResult>>
+where
+    S: AsyncRead + Unpin,
+{
+    match state {
+        ReadPhase::ReadLen { buf, read } => {
             let target = &mut buf[*read..];
             if target.is_empty() {
                 return Poll::Ready(Ok(ReadPollResult {
+                    outcome: None,
                     result: None,
                     progressed: false,
                 }));
@@ -1160,6 +1434,7 @@ where
                         Poll::Pending
                     } else {
                         Poll::Ready(Ok(ReadPollResult {
+                            outcome: None,
                             result: None,
                             progressed: false,
                         }))
@@ -1170,6 +1445,7 @@ where
                     *read += n;
                     if *read < crate::framing::LENGTH_PREFIX_LEN {
                         return Poll::Ready(Ok(ReadPollResult {
+                            outcome: None,
                             result: None,
                             progressed: true,
                         }));
@@ -1199,7 +1475,7 @@ where
                                 "truncated V5 stream metadata",
                             ))));
                         }
-                        *state = ReadState::ReadStreamMeta {
+                        *state = ReadPhase::ReadStreamMeta {
                             kind: control.kind,
                             body_len: msg_len,
                             meta: [0; crate::framing::STREAM_REQUEST_START_HEADER_LEN],
@@ -1207,21 +1483,24 @@ where
                             read: 0,
                         };
                         return Poll::Ready(Ok(ReadPollResult {
+                            outcome: None,
                             result: None,
                             progressed: true,
                         }));
                     }
                     let total_len = msg_len + crate::framing::LENGTH_PREFIX_LEN;
                     let mut buffer =
-                        crate::PooledAlignedBuffer::with_len(total_len, ctx.aligned_pool.clone());
+                        crate::PooledAlignedBuffer::with_len(total_len, ctx.aligned_pool.clone())?;
                     buffer.as_mut_slice()[..crate::framing::LENGTH_PREFIX_LEN].copy_from_slice(buf);
 
-                    *state = ReadState::ReadBody {
+                    *state = ReadPhase::ReadBody {
+                        kind: control.kind,
                         msg_len,
                         buffer,
                         read: 0,
                     };
                     Poll::Ready(Ok(ReadPollResult {
+                        outcome: None,
                         result: None,
                         progressed: true,
                     }))
@@ -1229,7 +1508,8 @@ where
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             }
         }
-        ReadState::ReadBody {
+        ReadPhase::ReadBody {
+            kind,
             msg_len,
             buffer,
             read,
@@ -1239,6 +1519,7 @@ where
             let target = &mut buffer.as_mut_slice()[offset..end];
             if target.is_empty() {
                 return Poll::Ready(Ok(ReadPollResult {
+                    outcome: None,
                     result: None,
                     progressed: false,
                 }));
@@ -1249,6 +1530,7 @@ where
                         Poll::Pending
                     } else {
                         Poll::Ready(Ok(ReadPollResult {
+                            outcome: None,
                             result: None,
                             progressed: false,
                         }))
@@ -1262,13 +1544,19 @@ where
                     *read += n;
                     if *read < *msg_len {
                         return Poll::Ready(Ok(ReadPollResult {
+                            outcome: None,
                             result: None,
                             progressed: true,
                         }));
                     }
 
-                    let (msg_len, buffer) = match std::mem::replace(state, ReadState::new()) {
-                        ReadState::ReadBody {
+                    let outcome = InitialOutcome::from_metadata(
+                        *kind,
+                        *msg_len,
+                        &buffer.as_ref()[crate::framing::LENGTH_PREFIX_LEN..],
+                    )?;
+                    let (msg_len, buffer) = match std::mem::replace(state, ReadPhase::new()) {
+                        ReadPhase::ReadBody {
                             msg_len, buffer, ..
                         } => (msg_len, buffer),
                         _ => unreachable!("read state must be ReadBody when complete"),
@@ -1280,6 +1568,7 @@ where
                         Some(&ctx.inbound_routes),
                     )?;
                     Poll::Ready(Ok(ReadPollResult {
+                        outcome: Some(outcome),
                         result: Some(result),
                         progressed: true,
                     }))
@@ -1287,7 +1576,7 @@ where
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             }
         }
-        ReadState::ReadStreamMeta {
+        ReadPhase::ReadStreamMeta {
             kind,
             body_len,
             meta,
@@ -1296,6 +1585,7 @@ where
         } => match poll_read_once(stream, cx, &mut meta[*read..*meta_len]) {
             Poll::Pending if block_on_pending => Poll::Pending,
             Poll::Pending => Poll::Ready(Ok(ReadPollResult {
+                outcome: None,
                 result: None,
                 progressed: false,
             })),
@@ -1307,6 +1597,7 @@ where
                 *read += n;
                 if *read < *meta_len {
                     return Poll::Ready(Ok(ReadPollResult {
+                        outcome: None,
                         result: None,
                         progressed: true,
                     }));
@@ -1318,20 +1609,28 @@ where
                     streaming_state,
                     ctx.aligned_pool.clone(),
                 )?;
-                *state = stream_payload_state(reservation, *body_len, *meta_len);
+                let outcome = InitialOutcome::from_metadata(*kind, *body_len, &meta[..*meta_len])?;
+                let empty = *body_len == *meta_len;
+                *state = stream_payload_state(reservation, *body_len, *meta_len, outcome);
                 Poll::Ready(Ok(ReadPollResult {
+                    outcome: empty.then_some(outcome),
                     result: None,
                     progressed: true,
                 }))
             }
             Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
         },
-        ReadState::ReadStreamPayload { reservation, read } => {
+        ReadPhase::ReadStreamPayload {
+            outcome,
+            reservation,
+            read,
+        } => {
             let target = match streaming_state.v5_chunk_target(*reservation, *read) {
                 Ok(target) => target,
                 Err(e) if crate::protocol::is_stream_reaped_error(&e) => {
-                    *state = discard_remainder_of_reservation(*reservation, *read);
+                    *state = discard_remainder_of_reservation(*reservation, *read, *outcome);
                     return Poll::Ready(Ok(ReadPollResult {
+                        outcome: None,
                         result: None,
                         progressed: true,
                     }));
@@ -1341,6 +1640,7 @@ where
             match poll_read_once(stream, cx, target) {
                 Poll::Pending if block_on_pending => Poll::Pending,
                 Poll::Pending => Poll::Ready(Ok(ReadPollResult {
+                    outcome: None,
                     result: None,
                     progressed: false,
                 })),
@@ -1353,18 +1653,21 @@ where
                     streaming_state.record_v5_chunk_progress(*reservation, n);
                     if *read < reservation.len() {
                         return Poll::Ready(Ok(ReadPollResult {
+                            outcome: None,
                             result: None,
                             progressed: true,
                         }));
                     }
-                    let reservation = match std::mem::replace(state, ReadState::new()) {
-                        ReadState::ReadStreamPayload { reservation, .. } => reservation,
+                    let outcome = *outcome;
+                    let reservation = match std::mem::replace(state, ReadPhase::new()) {
+                        ReadPhase::ReadStreamPayload { reservation, .. } => reservation,
                         _ => unreachable!(),
                     };
                     let result = streaming_state
                         .commit_v5_chunk(reservation)?
                         .map(completed_v5_stream_result);
                     Poll::Ready(Ok(ReadPollResult {
+                        outcome: Some(outcome),
                         result,
                         progressed: true,
                     }))
@@ -1372,16 +1675,19 @@ where
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             }
         }
-        ReadState::DiscardStreamPayload {
+        ReadPhase::DiscardStreamPayload {
+            outcome,
             remaining,
             scratch,
             on_complete_mark_received,
         } => {
             let read_len = (*remaining).min(scratch.len());
             if read_len == 0 {
+                let outcome = *outcome;
                 finish_discarding_reservation(streaming_state, *on_complete_mark_received);
-                *state = ReadState::new();
+                *state = ReadPhase::new();
                 return Poll::Ready(Ok(ReadPollResult {
+                    outcome: Some(outcome),
                     result: None,
                     progressed: true,
                 }));
@@ -1389,6 +1695,7 @@ where
             match poll_read_once(stream, cx, &mut scratch[..read_len]) {
                 Poll::Pending if block_on_pending => Poll::Pending,
                 Poll::Pending => Poll::Ready(Ok(ReadPollResult {
+                    outcome: None,
                     result: None,
                     progressed: false,
                 })),
@@ -1398,11 +1705,13 @@ where
                 )))),
                 Poll::Ready(Ok(n)) => {
                     *remaining -= n;
+                    let outcome = (*remaining == 0).then_some(*outcome);
                     if *remaining == 0 {
                         finish_discarding_reservation(streaming_state, *on_complete_mark_received);
-                        *state = ReadState::new();
+                        *state = ReadPhase::new();
                     }
                     Poll::Ready(Ok(ReadPollResult {
+                        outcome,
                         result: None,
                         progressed: true,
                     }))
@@ -1410,8 +1719,7 @@ where
                 Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
             }
         }
-    })
-    .await
+    }
 }
 
 /// Non-blocking variant of `read_message_step_poll`.
@@ -1535,7 +1843,7 @@ where
                 bytes_written_counter,
                 bytes_since_flush,
                 &header,
-                &bytes,
+                bytes.as_ref(),
             )
             .await?;
         }
@@ -1660,6 +1968,7 @@ fn park_pooled_inline_response(
     prefix: Option<[u8; 16]>,
     payload_len: usize,
     max_message_size: usize,
+    streaming_responses: &mut LocalStreamingQueue,
 ) -> Result<()> {
     let prefix_len = prefix.map(|p| p.len()).unwrap_or(0);
     let actual_len = prefix_len + payload.remaining();
@@ -1679,18 +1988,15 @@ fn park_pooled_inline_response(
         actual_len,
         max_message_size,
     )?;
-    let bytes = match prefix {
-        Some(prefix) => {
-            let rest = payload.into_remaining_bytes();
-            let mut out = Vec::with_capacity(prefix.len() + rest.len());
-            out.extend_from_slice(&prefix);
-            out.extend_from_slice(&rest);
-            bytes::Bytes::from(out)
-        }
-        None => payload.into_remaining_bytes(),
-    };
-    response_batch.push_bytes(correlation_id, bytes);
-    Ok(())
+    match response_batch.push_pooled(correlation_id, payload, prefix) {
+        Err(GossipError::WriteQueueFull) => streaming_responses.queue_ask_nack(
+            crate::framing::write_ask_nack_header(
+                correlation_id, crate::framing::AskNackReason::Backpressure,
+            ),
+        ),
+        other => other,
+    }
+
 }
 
 async fn write_ask_disposition_io<S>(
@@ -1713,179 +2019,67 @@ where
         .max_message_size
         .saturating_sub(crate::framing::ASK_RESPONSE_HEADER_LEN);
     let schema_hash = ctx.expected_schema_hash;
-    match disposition {
-        crate::registry::AskDisposition::Deferred => {}
+    let owned = match disposition {
+        crate::registry::AskDisposition::Deferred => None,
         crate::registry::AskDisposition::Nack(reason) => {
-            // Queued (`LocalStreamingQueue::queue_ask_nack`), never written
-            // here directly: this function has no way to know whether a
-            // partial streaming frame currently owns the wire, and a direct
-            // write regardless would risk splicing the NACK's bytes into
-            // that frame's payload. `io_task` drains the queue only once it
-            // has proven the wire free of a partial frame.
             streaming_responses.queue_ask_nack(crate::framing::write_ask_nack_header(
-                correlation_id,
-                reason,
+                correlation_id, reason,
             ))?;
             *wrote_response_bytes = true;
+            None
         }
-        crate::registry::AskDisposition::Immediate(response) => match response {
-            crate::registry::ActorResponse::Bytes(payload) => {
-                let should_stream =
-                    payload.len() > inline_payload_limit || payload.len() > STREAMING_THRESHOLD;
-                if should_stream {
-                    queue_streaming_response_bytes_or_nack(
-                        streaming_responses,
-                        correlation_id,
-                        payload,
-                        ctx.max_message_size,
-                        schema_hash,
-                    )?;
+        crate::registry::AskDisposition::Immediate(crate::registry::ActorResponse::Bytes(payload))
+        | crate::registry::AskDisposition::ImmediateBytes(payload) => Some(payload),
+        crate::registry::AskDisposition::Immediate(crate::registry::ActorResponse::Aligned(payload))
+        | crate::registry::AskDisposition::ImmediateAligned(payload) => {
+            match crate::ForwardPayload::try_from(payload) {
+                Ok(payload) => Some(payload),
+                Err(_) => {
+                    // An arbitrary aligned Bytes view does not prove owner
+                    // capacity. Reject only this handler result, not transport.
+                    streaming_responses.queue_ask_nack(crate::framing::write_ask_nack_header(
+                        correlation_id, crate::framing::AskNackReason::HandlerError,
+                    ))?;
                     *wrote_response_bytes = true;
-                } else {
-                    response_batch.push_bytes(correlation_id, payload);
-                    *wrote_response_bytes = true;
+                    None
                 }
             }
-            crate::registry::ActorResponse::Aligned(payload) => {
-                let len = payload.len();
-                let should_stream = len > inline_payload_limit || len > STREAMING_THRESHOLD;
-                if should_stream {
-                    queue_streaming_response_bytes_or_nack(
-                        streaming_responses,
-                        correlation_id,
-                        payload.into_bytes(),
-                        ctx.max_message_size,
-                        schema_hash,
-                    )?;
-                    *wrote_response_bytes = true;
-                } else {
-                    response_batch.push_bytes(correlation_id, payload.into_bytes());
-                    *wrote_response_bytes = true;
-                }
-            }
-            other => {
-                let should_stream = match &other {
-                    crate::registry::ActorResponse::Pooled { payload_len, .. } => {
-                        *payload_len > inline_payload_limit || *payload_len > STREAMING_THRESHOLD
-                    }
-                    _ => false,
-                };
-                if should_stream {
-                    if let crate::registry::ActorResponse::Pooled {
-                        payload,
-                        prefix,
-                        payload_len,
-                    } = other
-                    {
-                        queue_streaming_response_pooled_or_nack(
-                            streaming_responses,
-                            correlation_id,
-                            payload,
-                            prefix,
-                            payload_len,
-                            ctx.max_message_size,
-                            schema_hash,
-                        )?;
-                    } else {
-                        let bytes = match other {
-                            crate::registry::ActorResponse::Bytes(b) => b,
-                            crate::registry::ActorResponse::Aligned(b) => b.into_bytes(),
-                            crate::registry::ActorResponse::Pooled { .. } => unreachable!(),
-                        };
-                        queue_streaming_response_bytes_or_nack(
-                            streaming_responses,
-                            correlation_id,
-                            bytes,
-                            ctx.max_message_size,
-                            schema_hash,
-                        )?;
-                    }
-                    *wrote_response_bytes = true;
-                } else {
-                    let crate::registry::ActorResponse::Pooled {
-                        payload,
-                        prefix,
-                        payload_len,
-                    } = other
-                    else {
-                        unreachable!("only pooled responses reach the parked inline branch")
-                    };
-                    park_pooled_inline_response(
-                        response_batch,
-                        correlation_id,
-                        payload,
-                        prefix,
-                        payload_len,
-                        ctx.max_message_size,
-                    )?;
-                    *wrote_response_bytes = true;
-                }
-            }
-        },
-        crate::registry::AskDisposition::ImmediateBytes(payload) => {
-            let should_stream =
-                payload.len() > inline_payload_limit || payload.len() > STREAMING_THRESHOLD;
-            if should_stream {
-                queue_streaming_response_bytes_or_nack(
-                    streaming_responses,
-                    correlation_id,
-                    payload,
-                    ctx.max_message_size,
-                    schema_hash,
-                )?;
-                *wrote_response_bytes = true;
-            } else {
-                response_batch.push_bytes(correlation_id, payload);
-                *wrote_response_bytes = true;
-            }
         }
-        crate::registry::AskDisposition::ImmediateAligned(payload) => {
-            let len = payload.len();
-            let should_stream = len > inline_payload_limit || len > STREAMING_THRESHOLD;
-            if should_stream {
-                queue_streaming_response_bytes_or_nack(
-                    streaming_responses,
-                    correlation_id,
-                    payload.into_bytes(),
-                    ctx.max_message_size,
-                    schema_hash,
-                )?;
-                *wrote_response_bytes = true;
-            } else {
-                response_batch.push_bytes(correlation_id, payload.into_bytes());
-                *wrote_response_bytes = true;
-            }
-        }
-        crate::registry::AskDisposition::ImmediatePooled {
-            payload,
-            prefix,
-            payload_len,
-        } => {
-            let should_stream =
-                payload_len > inline_payload_limit || payload_len > STREAMING_THRESHOLD;
-            if should_stream {
+        crate::registry::AskDisposition::Immediate(crate::registry::ActorResponse::Pooled {
+            payload, prefix, payload_len,
+        })
+        | crate::registry::AskDisposition::ImmediatePooled { payload, prefix, payload_len } => {
+            if payload_len > inline_payload_limit || payload_len > STREAMING_THRESHOLD {
                 queue_streaming_response_pooled_or_nack(
-                    streaming_responses,
-                    correlation_id,
-                    payload,
-                    prefix,
-                    payload_len,
-                    ctx.max_message_size,
-                    schema_hash,
+                    streaming_responses, correlation_id, payload, prefix, payload_len,
+                    ctx.max_message_size, schema_hash,
                 )?;
-                *wrote_response_bytes = true;
             } else {
                 park_pooled_inline_response(
-                    response_batch,
-                    correlation_id,
-                    payload,
-                    prefix,
-                    payload_len,
-                    ctx.max_message_size,
+                    response_batch, correlation_id, payload, prefix, payload_len,
+                    ctx.max_message_size, streaming_responses,
                 )?;
-                *wrote_response_bytes = true;
+            }
+            *wrote_response_bytes = true;
+            None
+        }
+    };
+    if let Some(payload) = owned {
+        if payload.len() > inline_payload_limit || payload.len() > STREAMING_THRESHOLD {
+            queue_streaming_response_bytes_or_nack(
+                streaming_responses, correlation_id, payload, ctx.max_message_size, schema_hash,
+            )?;
+        } else if let Err(error) = response_batch.push_owned(correlation_id, payload) {
+            match error {
+                GossipError::WriteQueueFull => {
+                    streaming_responses.queue_ask_nack(crate::framing::write_ask_nack_header(
+                        correlation_id, crate::framing::AskNackReason::Backpressure,
+                    ))?;
+                }
+                other => return Err(other),
             }
         }
+        *wrote_response_bytes = true;
     }
     if let (Some(perf), Some(start)) = (perf, write_start) {
         perf.response_write_calls.fetch_add(1, Ordering::Relaxed);
@@ -1913,7 +2107,7 @@ where
 fn queue_streaming_response_bytes(
     streaming_responses: &mut LocalStreamingQueue,
     correlation_id: u32,
-    payload: bytes::Bytes,
+    payload: crate::ForwardPayload,
     max_message_size: usize,
     _schema_hash: Option<u64>,
 ) -> Result<()> {
@@ -1934,7 +2128,8 @@ fn queue_streaming_response_bytes(
         )));
     }
     let chunk_size = std::cmp::min(STREAM_CHUNK_SIZE, max_chunk);
-    let (payload, retained_bytes) = normalize_streaming_payload(payload);
+    let retained_bytes = payload.retained_bytes();
+    let payload = payload.into_bytes();
     if !streaming_responses.can_admit_response(2, retained_bytes) {
         return Err(GossipError::Network(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
@@ -1951,7 +2146,7 @@ fn queue_streaming_response_bytes(
         chunk_size,
     );
     streaming_responses.try_extend([
-        StreamingCommand::BytesResponse(Box::new(response)),
+        StreamingCommand::BytesResponse(response),
         StreamingCommand::Flush,
     ])
 }
@@ -2010,7 +2205,7 @@ fn queue_streaming_response_pooled(
     // writes, so admission does not expand the response into one queue entry
     // (or one copied `Bytes`) per chunk.
     let command_count = 2;
-    let retained_bytes = payload.remaining().saturating_add(prefix_len);
+    let retained_bytes = payload.retained_bytes().saturating_add(prefix_len);
     if !streaming_responses.can_admit_response(command_count, retained_bytes) {
         return Err(GossipError::Network(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
@@ -2030,7 +2225,7 @@ fn queue_streaming_response_pooled(
         expected_payload_bytes,
     );
     streaming_responses.try_extend([
-        StreamingCommand::PooledResponse(Box::new(response)),
+        StreamingCommand::PooledResponse(response),
         StreamingCommand::Flush,
     ])
 }
@@ -2051,7 +2246,7 @@ fn queue_streaming_response_pooled(
 fn queue_streaming_response_bytes_or_nack(
     streaming_responses: &mut LocalStreamingQueue,
     correlation_id: u32,
-    payload: bytes::Bytes,
+    payload: crate::ForwardPayload,
     max_message_size: usize,
     schema_hash: Option<u64>,
 ) -> Result<()> {
@@ -2284,6 +2479,35 @@ where
             .await;
             Ok(())
         }
+        #[cfg(any(test, feature = "test-helpers"))]
+        crate::handle::MessageReadResult::AskRaw { correlation_id, payload } => {
+            // Mock echo runs on the sole I/O consumer too. Never await a
+            // shared-queue/lease completion that only this task can drive.
+            let bytes = if std::env::var("ICANACT_REMOTE_TYPED_ECHO").is_ok() && payload.len() >= 8 {
+                payload.to_vec()
+            } else {
+                crate::connection_pool::process_mock_request_payload(payload.as_ref())
+            };
+            let response = crate::ForwardPayload::from(bytes);
+            let limit = registry.config.max_message_size
+                .saturating_sub(crate::framing::ASK_RESPONSE_HEADER_LEN);
+            if response.len() > limit || response.len() > STREAMING_THRESHOLD {
+                queue_streaming_response_bytes_or_nack(
+                    streaming_responses, correlation_id, response,
+                    registry.config.max_message_size, registry.config.schema_hash,
+                )?;
+            } else if let Err(error) = response_batch.push_owned(correlation_id, response) {
+                match error {
+                    GossipError::WriteQueueFull => streaming_responses.queue_ask_nack(
+                        crate::framing::write_ask_nack_header(
+                            correlation_id, crate::framing::AskNackReason::Backpressure,
+                        ),
+                    )?,
+                    other => return Err(other),
+                }
+            }
+            Ok(())
+        }
         // A raw (unaddressed) Ask has no production dispatcher at all (see
         // `handle::handle_raw_ask_request`'s doc) -- production always
         // NACKs it. Queued here via `queue_ask_nack`, not sent through
@@ -2300,9 +2524,8 @@ where
         // this call site was the one still missing it. Excluded under
         // `test`/`test-helpers` so the mock/benchmark echo scaffolding in
         // `handle_raw_ask_request` (reachable only in those builds) is
-        // untouched -- it already answers off this same task via a direct,
-        // bounded write, not the shared queue, so it has no deadlock risk
-        // to fix.
+        // handled above through this task's local bounded response batch,
+        // never through a shared queue consumed by this same task.
         #[cfg(not(any(test, feature = "test-helpers")))]
         crate::handle::MessageReadResult::AskRaw {
             correlation_id,
@@ -2707,7 +2930,7 @@ mod write_actor_response_direct_size_gate_tests {
     async fn bytes_response_over_max_message_size_is_rejected() {
         let payload_len = MAX_MESSAGE_SIZE - crate::framing::ASK_RESPONSE_HEADER_LEN + 1;
         let response =
-            crate::registry::ActorResponse::Bytes(bytes::Bytes::from(vec![0u8; payload_len]));
+            crate::registry::ActorResponse::Bytes(crate::ForwardPayload::from(vec![0u8; payload_len]));
         let (result, written) = write_bytes_response(response).await;
         assert!(
             matches!(result, Err(crate::GossipError::MessageTooLarge { .. })),
@@ -2749,7 +2972,7 @@ mod write_actor_response_direct_size_gate_tests {
     async fn bytes_response_at_max_message_size_is_written() {
         let payload_len = MAX_MESSAGE_SIZE - crate::framing::ASK_RESPONSE_HEADER_LEN;
         let response =
-            crate::registry::ActorResponse::Bytes(bytes::Bytes::from(vec![9u8; payload_len]));
+            crate::registry::ActorResponse::Bytes(crate::ForwardPayload::from(vec![9u8; payload_len]));
         let (result, written) = write_bytes_response(response).await;
         assert!(result.is_ok(), "expected Ok, got {result:?}");
         let control = crate::framing::decode_control(written[..4].try_into().unwrap()).unwrap();

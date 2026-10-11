@@ -96,7 +96,7 @@ async fn test_priority_registration_timing() {
         normal_registration_time, immediate_registration_time
     );
 
-    registry.shutdown().await;
+    registry.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -138,8 +138,8 @@ async fn test_two_node_gossip_propagation() {
             .is_some()
     );
 
-    node1.shutdown().await;
-    node2.shutdown().await;
+    node1.shutdown().await.unwrap();
+    node2.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -202,8 +202,8 @@ async fn test_immediate_vs_normal_priority() {
         println!("immediate propagation: {:?}", v);
     }
 
-    node1.shutdown().await;
-    node2.shutdown().await;
+    node1.shutdown().await.unwrap();
+    node2.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -228,7 +228,7 @@ async fn test_immediate_priority_config() {
         .unwrap();
     let lookup = registry_disabled.lookup("immediate_actor").await.unwrap();
     assert_eq!(lookup.location.priority, RegistrationPriority::Immediate);
-    registry_disabled.shutdown().await;
+    registry_disabled.shutdown().await.unwrap();
 
     let registry_enabled = create_test_registry(
         "127.0.0.1:0",
@@ -251,5 +251,5 @@ async fn test_immediate_priority_config() {
         .unwrap();
     let lookup2 = registry_enabled.lookup("immediate_actor2").await.unwrap();
     assert_eq!(lookup2.location.priority, RegistrationPriority::Immediate);
-    registry_enabled.shutdown().await;
+    registry_enabled.shutdown().await.unwrap();
 }

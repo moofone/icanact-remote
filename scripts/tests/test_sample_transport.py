@@ -16,6 +16,12 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(result["completed"], 100)
         self.assertEqual(result["metrics"]["throughput"], 10)
 
+    def test_invalid_minimum_duration_cannot_disable_gate(self):
+        for minimum in (float("nan"), float("inf"), -float("inf"), -1, True, "10", None):
+            with self.subTest(minimum=minimum), self.assertRaises(ValueError):
+                SAMPLE.parse(GOOD, "tell_delivered", minimum)
+        self.assertEqual(SAMPLE.parse(GOOD, "tell_delivered", 0)["completed"], 100)
+
     def test_libtest_same_line_prefix_is_supported(self):
         result = SAMPLE.parse("test integration::fixture ... " + GOOD, "tell_delivered", 10)
         self.assertEqual(result["completed"], 100)

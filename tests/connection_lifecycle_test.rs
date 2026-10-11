@@ -156,8 +156,8 @@ fn test_connection_survives_multiple_gossip_rounds() {
         info!("Connection still available after gossip rounds - PASS");
 
         // Cleanup
-        handle_a.shutdown().await;
-        handle_b.shutdown().await;
+        handle_a.shutdown().await.unwrap();
+        handle_b.shutdown().await.unwrap();
     });
 }
 
@@ -268,8 +268,8 @@ fn test_addr_mappings_preserved_after_fullsync() {
 
         info!("All 20 rounds passed - address mappings are correctly preserved");
 
-        handle_a.shutdown().await;
-        handle_b.shutdown().await;
+        handle_a.shutdown().await.unwrap();
+        handle_b.shutdown().await.unwrap();
     });
 }
 
@@ -329,7 +329,7 @@ fn test_reconnect_cleanup() {
 
         // Disconnect by shutting down B
         info!("Shutting down node B to force disconnect");
-        handle_b.shutdown().await;
+        handle_b.shutdown().await.unwrap();
 
         // Wait longer for peer cleanup to avoid consensus query race condition
         // (old peer failure handling needs time to complete before we reconnect with new peer)
@@ -366,8 +366,8 @@ fn test_reconnect_cleanup() {
 
         info!("Reconnection successful - no orphaned address entries");
 
-        handle_a.shutdown().await;
-        handle_b2.shutdown().await;
+        handle_a.shutdown().await.unwrap();
+        handle_b2.shutdown().await.unwrap();
     });
 }
 
@@ -431,7 +431,7 @@ fn test_clean_disconnect_releases_ownership_promptly() {
         info!("Initial connection established");
 
         info!("Shutting down node B to force a clean disconnect");
-        handle_b.shutdown().await;
+        handle_b.shutdown().await.unwrap();
 
         // Deliberately short: a clean teardown must release its claim
         // promptly, not merely within `test_reconnect_cleanup`'s much
@@ -468,7 +468,7 @@ fn test_clean_disconnect_releases_ownership_promptly() {
 
         info!("Prompt reclaim successful");
 
-        handle_a.shutdown().await;
-        handle_c.shutdown().await;
+        handle_a.shutdown().await.unwrap();
+        handle_c.shutdown().await.unwrap();
     });
 }

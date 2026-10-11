@@ -139,6 +139,6 @@ async fn wire_v5_e2e_zero_copy_proof() {
     assert_eq!(echo.asks.load(Ordering::SeqCst), 3);
     assert_eq!(echo.last_len.load(Ordering::SeqCst), 2 * 1024 * 1024);
 
-    a.shutdown().await;
-    b.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
 }

@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use tokio::time::{Duration, sleep};
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_env_filter("icanact_remote=info")
         .init();
@@ -79,6 +79,7 @@ async fn main() {
     }
 
     // Shutdown
-    handle_a.shutdown().await;
-    handle_b.shutdown().await;
+    handle_a.shutdown().await?;
+    handle_b.shutdown().await?;
+    Ok(())
 }

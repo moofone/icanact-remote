@@ -122,7 +122,7 @@ async fn tls_one_way_nat_outbound_reconnect_restores_bidirectional() -> icanact_
     );
 
     let peer_id_a = handle_a1.registry.peer_id.clone();
-    handle_a1.shutdown().await;
+    handle_a1.shutdown().await.unwrap();
     if !wait_for_active_peers(&handle_b, 0, Duration::from_secs(8)).await {
         handle_b.disconnect_peer_connection(&peer_id_a);
     }
@@ -175,7 +175,7 @@ async fn tls_one_way_nat_outbound_reconnect_restores_bidirectional() -> icanact_
         "A should receive updates from B after reconnect"
     );
 
-    handle_a2.shutdown().await;
-    handle_b.shutdown().await;
+    handle_a2.shutdown().await.unwrap();
+    handle_b.shutdown().await.unwrap();
     Ok(())
 }

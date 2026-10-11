@@ -324,7 +324,7 @@ async fn test_concurrent_shutdown_and_operations() {
     let shutdown_handle = {
         let registry_clone = registry.clone();
         tokio::spawn(async move {
-            registry_clone.shutdown().await;
+            registry_clone.shutdown().await.unwrap();
         })
     };
     
@@ -481,7 +481,7 @@ async fn test_concurrent_handle_operations() {
     let stats = handle.stats().await;
     assert_eq!(stats.local_actors, 0);
     
-    handle.shutdown().await;
+    handle.shutdown().await.unwrap();
 }
 
 #[tokio::test]

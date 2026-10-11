@@ -167,11 +167,11 @@ async fn actor_ask_timeout_covers_full_write_queue() {
         CorrelationTracker::new(),
     );
     for _ in 0..cap {
-        match stream.write_queue.try_push(WriteCommand::Payload(
+        match stream.write_queue.try_push(&mut Some(WriteCommand::Payload(
             WritePayload::TrustedFrame(bytes::Bytes::from_static(&[0u8; 32])),
-        )) {
+        ))) {
             Ok(()) => {}
-            Err(WriteTryPushError::Full(_)) => break,
+            Err(WriteTryPushError::Full) => break,
             Err(other) => panic!("unexpected fill error: {other:?}"),
         }
     }

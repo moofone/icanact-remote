@@ -173,7 +173,7 @@ async fn server_never_dials_client_only_peer_after_disconnect() -> Result<(), Dy
         "session never formed"
     );
 
-    client.shutdown_and_wait().await;
+    client.shutdown_and_wait().await.unwrap();
     assert!(
         wait_for_condition(Duration::from_secs(10), || async {
             !server.registry.has_connection_to_peer(&client_id).await
@@ -225,7 +225,7 @@ async fn configured_client_only_peer_is_not_supervised_or_redialed() -> Result<(
     );
 
     let client_addr = client.registry.bind_addr;
-    client.shutdown_and_wait().await;
+    client.shutdown_and_wait().await.unwrap();
     // A pooled outbound connection to an exited process is only noticed when
     // something fails against it; surface the close as the transport does.
     let _ = server
@@ -420,7 +420,7 @@ async fn client_reconnects_after_server_restart_and_observes_events() -> Result<
         b"server-1:hi"
     );
 
-    server.shutdown_and_wait().await;
+    server.shutdown_and_wait().await.unwrap();
     next_event(&mut rx, Event::Disconnected, "disconnect after server stop").await;
 
     let server2 = node_on(server_key, server_addr, cfg(false)).await;

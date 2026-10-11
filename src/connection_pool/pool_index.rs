@@ -4,13 +4,13 @@
 pub struct ConnectionPool<T = ()> {
     /// PRIMARY: Mapping Peer ID -> LockFreeConnection
     /// This is the main storage - we identify connections by peer ID, not address
-    pub connections_by_peer: SccHashMap<crate::PeerId, Arc<LockFreeConnection>>,
+    pub(crate) connections_by_peer: SccHashMap<crate::PeerId, Arc<LockFreeConnection>>,
     /// SECONDARY: Mapping SocketAddr -> Peer ID (for incoming connection identification)
-    pub addr_to_peer_id: SccHashMap<SocketAddr, crate::PeerId>,
+    pub(crate) addr_to_peer_id: SccHashMap<SocketAddr, crate::PeerId>,
     /// Configuration: Peer ID -> Expected SocketAddr (where to connect)
-    pub peer_id_to_addr: SccHashMap<crate::PeerId, SocketAddr>,
+    pub(crate) peer_id_to_addr: SccHashMap<crate::PeerId, SocketAddr>,
     /// Address-based connection index for fast lookup by SocketAddr
-    pub connections_by_addr: SccHashMap<SocketAddr, Arc<LockFreeConnection>>,
+    pub(crate) connections_by_addr: SccHashMap<SocketAddr, Arc<LockFreeConnection>>,
     /// Stable per-peer session state that survives reconnects.
     peer_sessions: SccHashMap<crate::PeerId, Arc<PeerSession>>,
     /// Ownership table for outstanding `connection_counter` contributions,
@@ -29,6 +29,11 @@ pub struct ConnectionPool<T = ()> {
     counted_instances: SccHashMap<u64, ()>,
     /// Cold-path dial ownership gate keyed by address so concurrent callers share one outbound dial.
     outbound_dial_gates: SccHashMap<SocketAddr, Arc<OutboundDialGate>>,
+    /// Cold-path count admission, shared by every publication and dial gate.
+    /// Never acquired by established messaging operations.
+    admission: std::sync::Mutex<()>,
+    projection_restorations: Arc<std::sync::Mutex<ProjectionRestorationSlots>>,
+    session_publication: Arc<std::sync::Mutex<()>>,
     max_connections: usize,
     connection_timeout: Duration,
     /// Registry reference for handling incoming messages
@@ -62,7 +67,53 @@ pub struct ConnectionPool<T = ()> {
     _marker: PhantomData<fn() -> T>,
 }
 
+/// Holds a bounded peer-state admission through an owner transaction.
+/// Idle pruning cannot reclaim the slot while this receipt exists.
+pub(crate) struct PeerSessionReservation {
+    _session: Arc<PeerSession>,
+}
+
+#[derive(Default)]
+struct ProjectionRestorationSlots {
+    peers: std::collections::HashMap<crate::PeerId, usize>,
+    addresses: std::collections::HashMap<SocketAddr, usize>,
+}
+
+/// Capacity remains charged while speculative projection may need rollback.
+pub(crate) struct PoolProjectionReservation {
+    slots: Arc<std::sync::Mutex<ProjectionRestorationSlots>>,
+    peers: Vec<crate::PeerId>,
+    addresses: Vec<SocketAddr>,
+    _sessions: Vec<Arc<PeerSession>>,
+}
+
+impl Drop for PoolProjectionReservation {
+    fn drop(&mut self) {
+        let mut slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for peer in &self.peers {
+            if let Some(count) = slots.peers.get_mut(peer) {
+                *count -= 1;
+                if *count == 0 {
+                    slots.peers.remove(peer);
+                }
+            }
+        }
+        for address in &self.addresses {
+            if let Some(count) = slots.addresses.get_mut(address) {
+                *count -= 1;
+                if *count == 0 {
+                    slots.addresses.remove(address);
+                }
+            }
+        }
+    }
+}
+
 struct PeerSession {
+    publication: Arc<std::sync::Mutex<()>>,
     /// Updated when a caller acquires this session. A disconnected,
     /// non-required session can be reclaimed only after this grace period.
     last_touched: std::sync::Mutex<Instant>,
@@ -71,10 +122,6 @@ struct PeerSession {
     required_peer: AtomicBool,
     correlation: Arc<CorrelationTracker>,
     current_connection: ArcSwapOption<LockFreeConnection>,
-    /// Consecutive consumer-classified streak-timeouts for this peer. Lives on
-    /// the session (which survives reconnects) so the streak is genuinely
-    /// per-peer. Reset on a successful ask or on eviction.
-    consecutive_ask_timeouts: AtomicU8,
     outbound_dial_retry: OutboundDialRetry,
 }
 
@@ -210,15 +257,20 @@ impl OutboundDialRetry {
 }
 
 impl PeerSession {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_publication(Arc::new(std::sync::Mutex::new(())))
+    }
+
+    fn with_publication(publication: Arc<std::sync::Mutex<()>>) -> Self {
         Self {
+            publication,
             last_touched: std::sync::Mutex::new(Instant::now()),
             route_addr: std::sync::RwLock::new(None),
             required_addr: std::sync::RwLock::new(None),
             required_peer: AtomicBool::new(false),
             correlation: CorrelationTracker::new(),
             current_connection: ArcSwapOption::empty(),
-            consecutive_ask_timeouts: AtomicU8::new(0),
             outbound_dial_retry: OutboundDialRetry::new(),
         }
     }
@@ -236,17 +288,6 @@ impl PeerSession {
             .expect("peer session last_touched poisoned")
             .elapsed()
             >= ttl
-    }
-
-    fn reset_ask_timeout_streak(&self) {
-        self.consecutive_ask_timeouts.store(0, Ordering::Release);
-    }
-
-    /// Increment and return the new consecutive streak-timeout count.
-    fn record_ask_timeout(&self) -> u8 {
-        self.consecutive_ask_timeouts
-            .fetch_add(1, Ordering::AcqRel)
-            .saturating_add(1)
     }
 
     fn configured_addr(&self) -> Option<SocketAddr> {
@@ -303,11 +344,24 @@ impl PeerSession {
         self.current_connection.load_full()
     }
 
-    fn set_current_connection(&self, connection: Option<Arc<LockFreeConnection>>) {
+    fn set_current_connection(
+        &self,
+        connection: Option<Arc<LockFreeConnection>>,
+        publish_mirror: impl FnOnce(),
+    ) {
+        let _publication = self
+            .publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.current_connection.store(connection);
+        publish_mirror();
     }
 
     fn take_current_connection(&self) -> Option<Arc<LockFreeConnection>> {
+        let _publication = self
+            .publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.current_connection.swap(None)
     }
 
@@ -325,6 +379,10 @@ impl PeerSession {
     /// something else and leaves the slot untouched — there is no
     /// observable state in between.
     fn compare_and_clear_current_connection(&self, expected: &Arc<LockFreeConnection>) -> bool {
+        let _publication = self
+            .publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = self.current_connection.compare_and_swap(expected, None);
         matches!(&*previous, Some(prev) if Arc::ptr_eq(prev, expected))
     }
@@ -347,6 +405,10 @@ impl PeerSession {
         &self,
         expected: &Arc<LockFreeConnection>,
     ) -> std::result::Result<(), Option<Arc<LockFreeConnection>>> {
+        let _publication = self
+            .publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous = self.current_connection.compare_and_swap(expected, None);
         if matches!(&*previous, Some(prev) if Arc::ptr_eq(prev, expected)) {
             Ok(())
@@ -376,16 +438,24 @@ impl PeerSession {
         &self,
         expected: Option<&Arc<LockFreeConnection>>,
         new: Arc<LockFreeConnection>,
+        publish_mirror: impl FnOnce(),
     ) -> std::result::Result<(), Option<Arc<LockFreeConnection>>> {
+        let _publication = self
+            .publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let expected_owned: Option<Arc<LockFreeConnection>> = expected.cloned();
         let previous = self
             .current_connection
-            .compare_and_swap(&expected_owned, Some(new));
+            .compare_and_swap(&expected_owned, Some(new.clone()));
         let matched = match (&expected_owned, &*previous) {
             (None, None) => true,
             (Some(exp), Some(prev)) => Arc::ptr_eq(exp, prev),
             _ => false,
         };
+        if matched || previous.as_ref().is_some_and(|current| Arc::ptr_eq(current, &new)) {
+            publish_mirror();
+        }
         if matched {
             Ok(())
         } else {

@@ -73,7 +73,7 @@ async fn delta_transport_timing_preserves_registration_version() -> Result<(), D
         "the original registration timestamp is immutable actor metadata"
     );
 
-    source.shutdown().await;
-    sink.shutdown().await;
+    source.shutdown().await.unwrap();
+    sink.shutdown().await.unwrap();
     Ok(())
 }

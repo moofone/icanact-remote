@@ -39,8 +39,8 @@ try:
     )
 except subprocess.CalledProcessError as err:
     if err.returncode == 1:
-        print("No CRITICAL_PATH markers were found under src/")
-        sys.exit(0)
+        print("ERROR: no CRITICAL_PATH markers were found under src/", file=sys.stderr)
+        sys.exit(1)
     raise
 
 critical_lines = []

@@ -127,25 +127,29 @@ async fn setup_mesh(decode_on_receive: bool) -> Arc<BenchMesh> {
     let topic = topic_key(TOPIC);
     let delivered_for_sub = Arc::clone(&delivered);
     let checksum_for_sub = Arc::clone(&checksum);
-    let subscription = subscriber_pubsub.subscribe_borrowed_bytes(
-        topic,
-        JobBroadcastV1::TYPE_HASH,
-        move |payload| {
-            if decode_on_receive {
-                let msg = icanact_remote::decode_typed::<JobBroadcastV1>(payload).unwrap();
-                checksum_for_sub.fetch_add(
-                    msg.epoch ^ msg.job_id ^ msg.proxy_published_at_ns ^ u64::from(msg.coin_id),
-                    Ordering::Relaxed,
-                );
-            } else {
-                checksum_for_sub.fetch_add(
-                    payload.len() as u64 + u64::from(payload.first().copied().unwrap_or_default()),
-                    Ordering::Relaxed,
-                );
-            }
-            delivered_for_sub.fetch_add(1, Ordering::Release);
-        },
-    );
+    let subscription = subscriber_pubsub
+        .subscribe_borrowed_bytes(
+            topic,
+            JobBroadcastV1::TYPE_HASH,
+            icanact_remote::pubsub::CooperativeCallback::new(move |payload: &[u8]| {
+                if decode_on_receive {
+                    let msg = icanact_remote::decode_typed::<JobBroadcastV1>(payload).unwrap();
+                    checksum_for_sub.fetch_add(
+                        msg.epoch ^ msg.job_id ^ msg.proxy_published_at_ns ^ u64::from(msg.coin_id),
+                        Ordering::Relaxed,
+                    );
+                } else {
+                    checksum_for_sub.fetch_add(
+                        payload.len() as u64
+                            + u64::from(payload.first().copied().unwrap_or_default()),
+                        Ordering::Relaxed,
+                    );
+                }
+                delivered_for_sub.fetch_add(1, Ordering::Release);
+                std::future::ready(())
+            }),
+        )
+        .expect("subscription admission");
 
     let peer = publisher.add_peer(&subscriber.registry.peer_id).await;
     peer.connect(&subscriber.registry.bind_addr).await.unwrap();

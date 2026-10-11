@@ -33,6 +33,31 @@ class ABTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             AB.validate(c)
 
+    def test_numeric_limits_must_be_finite_positive_numbers(self):
+        for value in (float("nan"), float("inf"), -float("inf"), True, "10", None, 0, -1):
+            with self.subTest(value=value):
+                c = config()
+                c["workloads"][0]["timeout_seconds"] = value
+                with self.assertRaises(ValueError):
+                    AB.validate(c)
+                c = config()
+                work = c["workloads"][0]
+                work.update(completion_policy="fixed_duration", duration_metric="cost",
+                            minimum_duration=value)
+                with self.assertRaises(ValueError):
+                    AB.validate(c)
+                c = config("improve")
+                c["workloads"][0]["metrics"]["cost"]["min_improvement"] = value
+                with self.assertRaises(ValueError):
+                    AB.validate(c)
+        for value in (1, 0.5):
+            c = config("improve")
+            work = c["workloads"][0]
+            work.update(timeout_seconds=value, completion_policy="fixed_duration",
+                        duration_metric="cost", minimum_duration=value)
+            work["metrics"]["cost"]["min_improvement"] = value
+            AB.validate(c)
+
     def test_analysis_preserves_sessions_and_rejects_regression(self):
         rows = []
         for session in range(2):

@@ -116,8 +116,8 @@ fn test_typed_ask_over_tls_with_pooled_path() {
         let response: Ping = conn.ask_typed(&request).await.unwrap();
         assert_eq!(response, request);
 
-        handle_a.shutdown().await;
-        handle_b.shutdown().await;
+        handle_a.shutdown().await.unwrap();
+        handle_b.shutdown().await.unwrap();
 
         unsafe {
             std::env::remove_var("ICANACT_REMOTE_TYPED_ECHO");
@@ -178,8 +178,8 @@ fn test_typed_ask_archived_over_tls_with_pooled_path() {
         let archived = response.archived().unwrap();
         assert_eq!(archived.id, request.id);
 
-        handle_a.shutdown().await;
-        handle_b.shutdown().await;
+        handle_a.shutdown().await.unwrap();
+        handle_b.shutdown().await.unwrap();
 
         unsafe {
             std::env::remove_var("ICANACT_REMOTE_TYPED_ECHO");
@@ -265,8 +265,8 @@ fn test_typed_tell_over_tls_with_pooled_path() {
 
         assert_eq!(decoded, Some(request));
 
-        handle_a.shutdown().await;
-        handle_b.shutdown().await;
+        handle_a.shutdown().await.unwrap();
+        handle_b.shutdown().await.unwrap();
 
         unsafe {
             std::env::remove_var("ICANACT_REMOTE_TYPED_TELL_CAPTURE");

@@ -290,8 +290,8 @@ async fn ordered_lifecycle_evidence_proves_publication_and_stale_teardown_fencin
     };
     let key_a = KeyPair::new_for_testing("qa-r1-ordered-evidence-a");
     let key_b = KeyPair::new_for_testing("qa-r1-ordered-evidence-b");
-    let node_a = create_tls_node_with_keypair(key_a, config.clone()).await?;
-    let node_b = create_tls_node_with_keypair(key_b.clone(), config.clone()).await?;
+    let node_a = Arc::new(create_tls_node_with_keypair(key_a, config.clone()).await?);
+    let node_b = Arc::new(create_tls_node_with_keypair(key_b.clone(), config.clone()).await?);
     let addr_a = node_a.registry.bind_addr;
     let addr_b = node_b.registry.bind_addr;
     let peer_a = node_a.registry.peer_id.clone();
@@ -343,7 +343,11 @@ async fn ordered_lifecycle_evidence_proves_publication_and_stale_teardown_fencin
     // Run the real bidirectional setup concurrently with the recorder wait.
     // The publication callback blocks before returning, so no re-mark can be
     // observed until this test explicitly releases the publication gate.
-    let mut setup = Box::pin(connect_bidirectional(&node_a, &node_b));
+    // A synchronous recorder gate may run on the dial future itself. Keep
+    // that future off the controller which must observe/open the gate.
+    let setup_a = Arc::clone(&node_a);
+    let setup_b = Arc::clone(&node_b);
+    let mut setup = tokio::spawn(async move { connect_bidirectional(&setup_a, &setup_b).await });
     let first_publication = tokio::time::timeout(EVIDENCE_TIMEOUT, async {
         loop {
             tokio::select! {
@@ -360,7 +364,7 @@ async fn ordered_lifecycle_evidence_proves_publication_and_stale_teardown_fencin
     .await
     .expect("initial publication event did not arrive")
     .clone();
-    let (initial_peer, initial_addr, initial_instance, initial_publication_sequence) =
+    let (initial_peer, initial_addr, initial_instance, _initial_publication_sequence) =
         match first_publication {
             TransportTestHelperEvent::PublicationCommitted {
                 peer,
@@ -382,37 +386,47 @@ async fn ordered_lifecycle_evidence_proves_publication_and_stale_teardown_fencin
         "pre-re-mark cannot precede the gated completed-publication event"
     );
     publication_gate.open();
-    setup.await?;
-
-    let initial_pre_remark = next_event(&mut events, |event| {
-        pre_remark_for(event, &initial_peer, initial_addr, initial_instance)
+    setup.await??;
+    // The first published candidate can lose the real bidirectional
+    // tie-break. Observe bounded convergence, then prove ordering for the
+    // actual surviving receipt, not an abandoned candidate or an alias.
+    let quiet_window = config.preferred_inbound_wait + Duration::from_millis(250);
+    tokio::time::timeout(EVIDENCE_TIMEOUT, async {
+        loop {
+            match tokio::time::timeout(quiet_window, events.recv()).await {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("lifecycle recorder channel closed"),
+                Err(_) => break,
+            }
+        }
     })
-    .await;
-    let initial_mark = next_event(&mut events, |event| {
-        mark_connected_for(event, &initial_peer, initial_addr, initial_instance)
-    })
-    .await;
-    assert!(
-        initial_publication_sequence < event_sequence(&initial_pre_remark).unwrap()
-            && event_sequence(&initial_pre_remark).unwrap()
-                < event_sequence(&initial_mark).unwrap(),
-        "publication -> pre-re-mark -> mark-connected order must be monotonic"
-    );
-
-    assert!(
-        common::wait_for_condition(EVIDENCE_TIMEOUT, || async {
-            node_a
-                .client()
-                .current_peer_connection_instance(&peer_b)
-                .is_some()
-        })
-        .await,
-        "A must expose the initial current B instance"
-    );
+    .await
+    .expect("initial sessions must converge within the existing evidence budget");
     let old_instance = node_a
         .client()
         .current_peer_connection_instance(&peer_b)
-        .expect("initial current B instance disappeared");
+        .expect("A must expose the surviving initial B instance");
+    let initial_events = evidence_events(&recorded);
+    let initial_publication = initial_events
+        .iter()
+        .find(|event| publication_for(event, &peer_b, addr_b, Some(old_instance)))
+        .expect("surviving initial publication receipt");
+    let initial_pre_remark = initial_events
+        .iter()
+        .find(|event| pre_remark_for(event, &peer_b, addr_b, old_instance))
+        .expect("surviving initial pre-remark receipt");
+    let initial_mark = initial_events
+        .iter()
+        .find(|event| {
+            mark_connected_for(event, &peer_b, addr_b, old_instance)
+                && event_sequence(event) > event_sequence(initial_pre_remark)
+        })
+        .expect("surviving initial post-remark commit receipt");
+    assert!(
+        event_sequence(initial_publication) < event_sequence(initial_pre_remark)
+            && event_sequence(initial_pre_remark) < event_sequence(initial_mark),
+        "publication -> pre-re-mark -> mark-connected order must be monotonic for the same physical receipt"
+    );
     stale_gate_enabled.store(true, Ordering::Release);
     let failure_registry = node_a.registry.clone();
     let failure_task = tokio::spawn(async move {
@@ -438,7 +452,7 @@ async fn ordered_lifecycle_evidence_proves_publication_and_stale_teardown_fencin
     // immediately before its instance CAS teardown. The replacement's own
     // publication/re-mark events—not sequential snapshots—prove the causal
     // interleaving under test.
-    node_b.shutdown().await;
+    node_b.shutdown().await.unwrap();
     let replacement_b = node_at(addr_b, key_b, config).await?;
     replacement_b
         .registry
@@ -530,8 +544,8 @@ async fn ordered_lifecycle_evidence_proves_publication_and_stale_teardown_fencin
         "final current instance must be the replacement, never the stale instance"
     );
 
-    replacement_b.shutdown().await;
-    node_a.shutdown().await;
+    replacement_b.shutdown().await.unwrap();
+    node_a.shutdown().await.unwrap();
     drop(event_sender);
     Ok(())
 }
@@ -663,7 +677,7 @@ async fn late_replacement_before_disconnect_callback_is_fenced() -> Result<(), D
     })
     .await;
 
-    node_b.shutdown().await;
+    node_b.shutdown().await.unwrap();
     let replacement_b = node_at(addr_b, key_b, config).await?;
     connect_bidirectional(&node_a, &replacement_b).await?;
 
@@ -772,8 +786,8 @@ async fn late_replacement_before_disconnect_callback_is_fenced() -> Result<(), D
         "replacement remains current after delivery-time fencing"
     );
 
-    replacement_b.shutdown().await;
-    node_a.shutdown().await;
+    replacement_b.shutdown().await.unwrap();
+    node_a.shutdown().await.unwrap();
     drop(event_sender);
     Ok(())
 }
@@ -872,7 +886,7 @@ async fn genuine_eof_lookup_miss_runs_fenced_failure_lifecycle() -> Result<(), D
     // ExitGuard marks the handle exited before invoking failure cleanup, so
     // the handler's live current-session lookup misses even though this is a
     // genuine current-session EOF, not a superseded instance.
-    node_b.shutdown().await;
+    node_b.shutdown().await.unwrap();
     let teardown = next_event(&mut events, |event| {
         matches!(
             event,
@@ -940,7 +954,7 @@ async fn genuine_eof_lookup_miss_runs_fenced_failure_lifecycle() -> Result<(), D
     assert_eq!(discovery.remaining_slots(), 1);
     drop(state);
 
-    node_a.shutdown().await;
+    node_a.shutdown().await.unwrap();
     drop(event_sender);
     Ok(())
 }
@@ -1027,7 +1041,7 @@ async fn identified_failure_lookup_miss_preserves_replacement() -> Result<(), Dy
         "the identified failure must begin with no current peer lookup result"
     );
     eprintln!("lookup-miss evidence: old instance={old_instance}, shutting down B");
-    node_b.shutdown().await;
+    node_b.shutdown().await.unwrap();
     eprintln!("lookup-miss evidence: B shutdown done");
 
     let failure_registry = node_a.registry.clone();
@@ -1102,8 +1116,8 @@ async fn identified_failure_lookup_miss_preserves_replacement() -> Result<(), Dy
         "replacement must remain connected after old failure cleanup"
     );
 
-    replacement_b.shutdown().await;
-    node_a.shutdown().await;
+    replacement_b.shutdown().await.unwrap();
+    node_a.shutdown().await.unwrap();
     drop(event_sender);
     Ok(())
 }

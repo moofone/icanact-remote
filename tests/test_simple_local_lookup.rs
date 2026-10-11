@@ -68,6 +68,6 @@ fn test_simple_local_lookup() {
             None => println!("❌ Actor not found!"),
         }
 
-        handle.shutdown().await;
+        handle.shutdown().await.unwrap();
     });
 }

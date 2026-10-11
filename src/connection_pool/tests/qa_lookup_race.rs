@@ -15,10 +15,10 @@ fn same_address_index_publication_supersedes_armed_disconnect_claim() {
     let addr: SocketAddr = "127.0.0.1:60700".parse().unwrap();
     let old = Arc::new(LockFreeConnection::new(addr, ConnectionDirection::Inbound));
     let replacement = Arc::new(LockFreeConnection::new(addr, ConnectionDirection::Inbound));
-    pool.index_connection_by_addr(addr, old);
+    pool.index_connection_by_addr(addr, old).expect("address admitted");
 
     let claim = try_arm_disconnect_delivery().expect("disconnect claim must arm");
-    pool.index_connection_by_addr(addr, replacement.clone());
+    pool.index_connection_by_addr(addr, replacement.clone()).expect("address admitted");
 
     assert!(
         !claim.enter(),
@@ -49,9 +49,9 @@ async fn fallback_capture_then_replacement_cannot_be_overwritten_on_resume() {
         ..(*fallback).clone()
     });
 
-    pool.set_configured_peer_addr(&peer_id, fallback_addr);
-    pool.index_connection_by_addr(fallback_addr, fallback.clone());
-    pool.add_addr_to_peer_id(fallback_addr, peer_id.clone());
+    pool.set_configured_peer_addr(&peer_id, fallback_addr).expect("peer state admitted");
+    pool.index_connection_by_addr(fallback_addr, fallback.clone()).expect("address admitted");
+    pool.add_addr_to_peer_id(fallback_addr, peer_id.clone()).expect("address owner admitted");
     assert!(
         pool.peer_sessions
             .read_sync(&peer_id, |_, session| session.current_connection())
@@ -128,9 +128,9 @@ async fn fallback_adoption_retries_after_raced_unusable_session() {
     });
     stale.set_state(ConnectionState::Disconnected);
 
-    pool.set_configured_peer_addr(&peer_id, fallback_addr);
-    pool.index_connection_by_addr(fallback_addr, fallback.clone());
-    pool.add_addr_to_peer_id(fallback_addr, peer_id.clone());
+    pool.set_configured_peer_addr(&peer_id, fallback_addr).expect("peer state admitted");
+    pool.index_connection_by_addr(fallback_addr, fallback.clone()).expect("address admitted");
+    pool.add_addr_to_peer_id(fallback_addr, peer_id.clone()).expect("address owner admitted");
 
     let captured = Arc::new(Barrier::new(2));
     let resume = Arc::new(Barrier::new(2));
@@ -318,6 +318,50 @@ async fn publication_lifecycle_recorder_can_reenter_after_gate_release() {
 
 struct AddressRouteRetireHookReset;
 
+/// A handle resolved before address reuse retains the identity of its own
+/// physical connection, even after every address index names another peer.
+#[tokio::test]
+async fn resolved_handle_identity_survives_address_reassignment() {
+    let pool = ConnectionPool::<()>::new(4, Duration::from_secs(1));
+    let old_peer = crate::KeyPair::new_for_testing("qa-handle-old-peer").peer_id();
+    let new_peer = crate::KeyPair::new_for_testing("qa-handle-new-peer").peer_id();
+    assert_ne!(old_peer, new_peer);
+    let addr: SocketAddr = "127.0.0.1:60990".parse().unwrap();
+    let old = make_live_connection(addr, ConnectionDirection::Outbound).await;
+    let old = Arc::new(LockFreeConnection {
+        embedded_peer_id: Some(old_peer.clone()),
+        ..(*old).clone()
+    });
+    pool.publish_address_index(addr, old.clone(), Some(&old_peer)).expect("address admitted");
+    let handle = pool.make_connection_handle(addr, &old).unwrap();
+    let replacement = make_live_connection(addr, ConnectionDirection::Inbound).await;
+    let replacement = Arc::new(LockFreeConnection {
+        embedded_peer_id: Some(new_peer.clone()),
+        ..(*replacement).clone()
+    });
+    pool.publish_address_index(addr, replacement.clone(), Some(&new_peer)).expect("address admitted");
+    assert_eq!(pool.get_peer_id_by_addr(&addr), Some(new_peer));
+    assert!(
+        pool.get_lock_free_connection(addr)
+            .is_some_and(|current| Arc::ptr_eq(&current, &replacement))
+    );
+    assert_eq!(handle.authenticated_peer_id(), Some(&old_peer));
+    assert_eq!(handle.clone().authenticated_peer_id(), Some(&old_peer));
+    let unidentified = Arc::new(LockFreeConnection {
+        embedded_peer_id: None,
+        ..(*old).clone()
+    });
+    assert!(
+        pool.make_connection_handle(addr, &unidentified)
+            .unwrap()
+            .authenticated_peer_id()
+            .is_none(),
+        "an address alias must not authenticate an unidentified handle"
+    );
+    old.abort_tasks();
+    replacement.abort_tasks();
+}
+
 impl Drop for AddressRouteRetireHookReset {
     fn drop(&mut self) {
         set_address_route_retire_hook(None);
@@ -335,9 +379,10 @@ async fn connected_addr_keeps_embedded_identity_when_route_row_is_missing() {
         embedded_peer_id: Some(peer_id.clone()),
         ..(*connection).clone()
     });
-    pool.publish_address_index(addr, connection.clone(), Some(&peer_id));
+    pool.publish_address_index(addr, connection.clone(), Some(&peer_id)).expect("address admitted");
     assert!(pool.addr_to_peer_id.remove_sync(&addr).is_some());
-    assert_eq!(pool.peer_id_for_connected_addr(&addr, addr), Some(peer_id));
+    let handle = pool.make_connection_handle(addr, &connection).unwrap();
+    assert_eq!(handle.authenticated_peer_id(), Some(&peer_id));
     connection.abort_tasks();
 }
 
@@ -358,7 +403,7 @@ async fn retired_instance_does_not_clear_successor_address_route() {
         embedded_peer_id: Some(peer_id.clone()),
         ..(*successor).clone()
     });
-    pool.publish_address_index(addr, retired.clone(), Some(&peer_id));
+    pool.publish_address_index(addr, retired.clone(), Some(&peer_id)).expect("address admitted");
     let retired_id = retired
         .stream_handle
         .as_ref()
@@ -381,7 +426,7 @@ async fn retired_instance_does_not_clear_successor_address_route() {
     });
 
     captured.wait();
-    pool.publish_address_index(addr, successor.clone(), Some(&peer_id));
+    pool.publish_address_index(addr, successor.clone(), Some(&peer_id)).expect("address admitted");
     resume.wait();
     retire
         .await

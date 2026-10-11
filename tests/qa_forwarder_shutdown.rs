@@ -8,7 +8,8 @@ use icanact_remote::registry::{
     ActorAskHandlerSync, ActorMessageFuture, ActorMessageHandler, ActorResponse, AskDisposition,
 };
 use icanact_remote::{
-    AskContext, AskForwardObserver, AskForwarder, GossipConfig, RemoteConnection, Result,
+    AskContext, AskForwardObserver, AskForwarder, ForwardDestination, GossipConfig,
+    RemoteConnection, Result,
 };
 #[cfg(feature = "test-helpers")]
 use std::sync::atomic::AtomicBool;
@@ -58,7 +59,7 @@ impl ActorMessageHandler for ReplyAfter {
 
 struct ForwardingHandler {
     forwarder: AskForwarder,
-    destination: RemoteConnection,
+    destination: ForwardDestination,
     submitted: Arc<AtomicUsize>,
     timeout: Option<Duration>,
 }
@@ -72,21 +73,21 @@ impl ActorAskHandlerSync for ForwardingHandler {
         context: AskContext<'_>,
     ) -> Result<AskDisposition> {
         let responder = context.responder();
-        let payload = Bytes::copy_from_slice(payload.as_ref());
+        let payload = icanact_remote::ForwardPayload::try_from(payload)?;
         if let Some(timeout) = self.timeout {
             self.forwarder.try_forward_actor_ask_combined_timeout(
-                self.destination.clone(),
+                self.destination,
                 actor_id,
                 type_hash,
                 payload,
                 timeout,
                 responder,
-                Bytes::from_static(b"f5-timeout"),
-                Bytes::from_static(b"f5-error"),
+                icanact_remote::ForwardPayload::from_static(b"f5-timeout"),
+                icanact_remote::ForwardPayload::from_static(b"f5-error"),
             )?;
         } else {
             self.forwarder.try_forward_actor_ask_no_timeout(
-                self.destination.clone(),
+                self.destination,
                 actor_id,
                 type_hash,
                 payload,
@@ -182,7 +183,7 @@ async fn shutdown_drains_tasks_queued_before_first_worker_poll() {
     // Constructing the worker from inside the synchronous handler places the
     // first accepted task before that worker can be polled on this executor.
     struct LazyHandler {
-        slot: Arc<Mutex<Option<AskForwarder>>>,
+        slot: Arc<Mutex<Option<(AskForwarder, ForwardDestination)>>>,
         destination: RemoteConnection,
         submitted: Arc<AtomicUsize>,
     }
@@ -194,20 +195,26 @@ async fn shutdown_drains_tasks_queued_before_first_worker_poll() {
             payload: icanact_remote::AlignedBytes,
             context: AskContext<'_>,
         ) -> Result<AskDisposition> {
-            let forwarder = {
+            let (forwarder, destination) = {
                 let mut slot = self.slot.lock().unwrap();
-                slot.get_or_insert_with(|| AskForwarder::new(1, 128))
-                    .clone()
+                slot.get_or_insert_with(|| {
+                    let forwarder = AskForwarder::new(1, 128);
+                    let destination = forwarder
+                        .bind_destination(self.destination.clone())
+                        .unwrap();
+                    (forwarder, destination)
+                })
+                .clone()
             };
             forwarder.try_forward_actor_ask_combined_timeout(
-                self.destination.clone(),
+                destination,
                 actor_id,
                 type_hash,
-                Bytes::copy_from_slice(payload.as_ref()),
+                icanact_remote::ForwardPayload::try_from(payload)?,
                 Duration::ZERO,
                 context.responder(),
-                Bytes::from_static(b"queued-before-poll"),
-                Bytes::from_static(b"f5-error"),
+                icanact_remote::ForwardPayload::from_static(b"queued-before-poll"),
+                icanact_remote::ForwardPayload::from_static(b"f5-error"),
             )?;
             self.submitted.fetch_add(1, Ordering::SeqCst);
             Ok(AskDisposition::Deferred)
@@ -239,17 +246,17 @@ async fn shutdown_drains_tasks_queued_before_first_worker_poll() {
         })
         .await
     );
-    let forwarder = slot
+    let (forwarder, _) = slot
         .lock()
         .unwrap()
         .clone()
         .expect("lazy worker must be published");
     assert!(forwarder.shutdown(Duration::from_secs(1)).await.is_ok());
     assert_eq!(ask.await.unwrap().unwrap().as_ref(), b"queued-before-poll");
-    caller.shutdown().await;
-    gateway.shutdown().await;
-    downstream.shutdown().await;
-    sink.shutdown().await;
+    caller.shutdown().await.unwrap();
+    gateway.shutdown().await.unwrap();
+    downstream.shutdown().await.unwrap();
+    sink.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -294,7 +301,7 @@ async fn shutdown_abandons_inflight_and_repeated_observers_see_timeout() {
         .registry
         .set_actor_ask_handler_sync(Arc::new(ForwardingHandler {
             forwarder: forwarder.clone(),
-            destination,
+            destination: forwarder.bind_destination(destination).unwrap(),
             submitted: submitted.clone(),
             timeout: None,
         }))
@@ -327,10 +334,10 @@ async fn shutdown_abandons_inflight_and_repeated_observers_see_timeout() {
     ));
     let _ = ask.await;
     assert_eq!(observer.error.load(Ordering::SeqCst), 1);
-    caller.shutdown().await;
-    gateway.shutdown().await;
-    downstream.shutdown().await;
-    sink.shutdown().await;
+    caller.shutdown().await.unwrap();
+    gateway.shutdown().await.unwrap();
+    downstream.shutdown().await.unwrap();
+    sink.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -349,7 +356,7 @@ async fn shutdown_drains_waiting_and_inflight_with_observer_accounting() {
         .registry
         .set_actor_ask_handler_sync(Arc::new(ForwardingHandler {
             forwarder: forwarder.clone(),
-            destination,
+            destination: forwarder.bind_destination(destination).unwrap(),
             submitted: submitted.clone(),
             timeout: Some(Duration::from_secs(2)),
         }))
@@ -382,10 +389,10 @@ async fn shutdown_drains_waiting_and_inflight_with_observer_accounting() {
     }
     assert_eq!(observer.success.load(Ordering::SeqCst), 24);
     assert_eq!(observer.error.load(Ordering::SeqCst), 0);
-    caller.shutdown().await;
-    gateway.shutdown().await;
-    downstream.shutdown().await;
-    sink.shutdown().await;
+    caller.shutdown().await.unwrap();
+    gateway.shutdown().await.unwrap();
+    downstream.shutdown().await.unwrap();
+    sink.shutdown().await.unwrap();
 }
 
 #[cfg(feature = "test-helpers")]
@@ -412,12 +419,15 @@ async fn no_timeout_return_delivery_failure_is_accounted_as_error() {
     let failed_writer = Arc::new(failed_writer);
     failed_writer.shutdown();
     failed_writer.wait_for_exit().await;
+    let failed_destination = failed_forwarder
+        .bind_destination(destination.clone())
+        .unwrap();
     failed_forwarder
         .try_forward_actor_ask_no_timeout(
-            destination.clone(),
+            failed_destination,
             ACTOR,
             TYPE,
-            Bytes::from_static(b"failed-return-delivery"),
+            icanact_remote::ForwardPayload::from_static(b"failed-return-delivery"),
             icanact_remote::AskResponder::from_stream_handle_for_test(
                 100,
                 failed_writer.clone(),
@@ -445,12 +455,13 @@ async fn no_timeout_return_delivery_failure_is_accounted_as_error() {
         None,
     );
     let success_writer = Arc::new(success_writer);
+    let success_destination = success_forwarder.bind_destination(destination).unwrap();
     success_forwarder
         .try_forward_actor_ask_no_timeout(
-            destination,
+            success_destination,
             ACTOR,
             TYPE,
-            Bytes::from_static(b"successful-return-delivery"),
+            icanact_remote::ForwardPayload::from_static(b"successful-return-delivery"),
             icanact_remote::AskResponder::from_stream_handle_for_test(
                 101,
                 success_writer.clone(),
@@ -467,8 +478,8 @@ async fn no_timeout_return_delivery_failure_is_accounted_as_error() {
     success_writer.shutdown();
     success_writer_task.await.expect("success writer must exit");
 
-    source.shutdown().await;
-    sink.shutdown().await;
+    source.shutdown().await.unwrap();
+    sink.shutdown().await.unwrap();
 }
 
 #[cfg(feature = "test-helpers")]
@@ -479,6 +490,7 @@ async fn duplicate_claim_accounting_case(
 ) -> Arc<Counts> {
     let observer = Arc::new(Counts::default());
     let forwarder = AskForwarder::new_with_observer(1, 128, Some(observer.clone()));
+    let destination = forwarder.bind_destination(destination).unwrap();
     let (io, _peer) = tokio::io::duplex(4096);
     let (writer, writer_task, _reader_task) = LockFreeStreamHandle::new(
         io,
@@ -499,7 +511,9 @@ async fn duplicate_claim_accounting_case(
         used.clone(),
     );
     let responder = icanact_remote::AskResponder::from_stream_handle_for_test(102, writer, used);
-    let rejected = sibling.try_reply_bytes_with_fallback(Bytes::from_static(b"rejected-sibling"));
+    let rejected = sibling.try_reply_bytes_with_fallback(
+        icanact_remote::ForwardPayload::from_static(b"rejected-sibling"),
+    );
     let _sibling_fallback = match rejected {
         Err(icanact_remote::TryReplyError::Enqueue(fallback)) => fallback,
         Ok(()) => panic!("the closed return path must reject the sibling enqueue"),
@@ -514,11 +528,11 @@ async fn duplicate_claim_accounting_case(
                 destination,
                 ACTOR,
                 TYPE,
-                Bytes::from_static(b"timed-duplicate-claim"),
+                icanact_remote::ForwardPayload::from_static(b"timed-duplicate-claim"),
                 timeout,
                 responder,
-                Bytes::from_static(b"f5-timeout"),
-                Bytes::from_static(b"f5-error"),
+                icanact_remote::ForwardPayload::from_static(b"f5-timeout"),
+                icanact_remote::ForwardPayload::from_static(b"f5-error"),
             )
             .expect("timed duplicate-claim task must be admitted");
     } else {
@@ -527,7 +541,7 @@ async fn duplicate_claim_accounting_case(
                 destination,
                 ACTOR,
                 TYPE,
-                Bytes::from_static(b"nonblocking-duplicate-claim"),
+                icanact_remote::ForwardPayload::from_static(b"nonblocking-duplicate-claim"),
                 responder,
             )
             .expect("nonblocking duplicate-claim task must be admitted");
@@ -562,8 +576,8 @@ async fn duplicate_claim_return_failure_is_error_for_timed_and_nonblocking() {
     assert_eq!(nonblocking.error.load(Ordering::SeqCst), 1);
     assert_eq!(timed.success.load(Ordering::SeqCst), 0);
     assert_eq!(timed.error.load(Ordering::SeqCst), 1);
-    source.shutdown().await;
-    sink.shutdown().await;
+    source.shutdown().await.unwrap();
+    sink.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -598,7 +612,7 @@ async fn cancelled_shutdown_owner_can_be_replaced_publicly() {
         .registry
         .set_actor_ask_handler_sync(Arc::new(ForwardingHandler {
             forwarder: forwarder.clone(),
-            destination,
+            destination: forwarder.bind_destination(destination).unwrap(),
             submitted: submitted.clone(),
             timeout: None,
         }))
@@ -642,10 +656,10 @@ async fn cancelled_shutdown_owner_can_be_replaced_publicly() {
     ));
     assert!(ask.await.unwrap().is_err());
 
-    caller.shutdown().await;
-    gateway.shutdown().await;
-    downstream.shutdown().await;
-    sink.shutdown().await;
+    caller.shutdown().await.unwrap();
+    gateway.shutdown().await.unwrap();
+    downstream.shutdown().await.unwrap();
+    sink.shutdown().await.unwrap();
 }
 
 /// Public transport coverage for the same ownership invariant exercised by
@@ -668,7 +682,7 @@ async fn shutdown_reconciles_queued_waiting_and_inflight_public_work() {
         .registry
         .set_actor_ask_handler_sync(Arc::new(ForwardingHandler {
             forwarder: forwarder.clone(),
-            destination,
+            destination: forwarder.bind_destination(destination).unwrap(),
             submitted: submitted.clone(),
             timeout: None,
         }))
@@ -705,10 +719,10 @@ async fn shutdown_reconciles_queued_waiting_and_inflight_public_work() {
     assert_eq!(observer.success.load(Ordering::SeqCst), 0);
     assert_eq!(observer.error.load(Ordering::SeqCst), 20);
 
-    caller.shutdown().await;
-    gateway.shutdown().await;
-    downstream.shutdown().await;
-    sink.shutdown().await;
+    caller.shutdown().await.unwrap();
+    gateway.shutdown().await.unwrap();
+    downstream.shutdown().await.unwrap();
+    sink.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -726,7 +740,7 @@ async fn shutdown_closed_receiver_does_not_spin_while_peer_progresses() {
         .registry
         .set_actor_ask_handler_sync(Arc::new(ForwardingHandler {
             forwarder: forwarder.clone(),
-            destination,
+            destination: forwarder.bind_destination(destination).unwrap(),
             submitted: submitted.clone(),
             timeout: Some(Duration::from_secs(2)),
         }))
@@ -759,8 +773,8 @@ async fn shutdown_closed_receiver_does_not_spin_while_peer_progresses() {
         .is_ok()
     );
     assert_eq!(ask.await.unwrap().unwrap().as_ref(), b"progress");
-    caller.shutdown().await;
-    gateway.shutdown().await;
-    downstream.shutdown().await;
-    sink.shutdown().await;
+    caller.shutdown().await.unwrap();
+    gateway.shutdown().await.unwrap();
+    downstream.shutdown().await.unwrap();
+    sink.shutdown().await.unwrap();
 }

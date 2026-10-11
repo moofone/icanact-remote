@@ -206,7 +206,10 @@ include!("correlation.rs");
 include!("handle.rs");
 include!("pool_connect.rs");
 
+mod outcome_window;
 pub(crate) mod reply_slots;
+pub(crate) use outcome_window::InitialOutcome;
+use outcome_window::OutcomeWrite;
 
 #[cfg(test)]
 mod disconnect_delivery_tests {
@@ -237,7 +240,8 @@ mod disconnect_delivery_tests {
         let connection = Arc::new(LockFreeConnection::new(addr, ConnectionDirection::Inbound));
         let claim = try_arm_disconnect_delivery().expect("test callback must arm");
 
-        pool.publish_address_index(addr, connection.clone(), None);
+        pool.publish_address_index(addr, connection.clone(), None)
+            .expect("address admitted");
 
         assert!(
             !claim.enter(),
@@ -253,6 +257,9 @@ mod disconnect_delivery_tests {
 
 #[cfg(test)]
 mod lease_test_support;
+
+#[cfg(test)]
+mod owned_chunk_poll_tests;
 
 #[cfg(test)]
 mod pending_write_cleanup_tests;

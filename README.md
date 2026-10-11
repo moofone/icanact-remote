@@ -5,13 +5,23 @@
 The canonical remote-transport contract is
 [`docs/architecture/REMOTE_INVARIANTS.md`](docs/architecture/REMOTE_INVARIANTS.md).
 
+The current admission and session-provenance API migrations are documented in
+[REMEDIATION_API_MIGRATIONS.md](docs/REMEDIATION_API_MIGRATIONS.md). These changes
+do not establish architecture or performance acceptance; the contract remains
+UNPROVED pending the full host matrix and required measurements.
+
+Deferred replies now use scoped responders or bounded, physical-session reply
+endpoints; forwarding binds its destination once and queues opaque session tokens.
+A replacement connection requires a new bound forwarder rather than retargeting
+old jobs. See [reply ownership](docs/REPLY_OWNER_MIGRATION.md) and
+[forwarding admission](docs/FORWARDER_ADMISSION.md) before migrating callers.
+
 ## What the crate provides
 
 - `GossipRegistryHandle` for node lifecycle, peer registration, gossip, and shutdown.
-- `RemoteActorRef` for cached remote sends via `tell`, `ask`, `ask_deferred`, and typed helpers.
+- `RemoteActorRef` for route lookup and `session()` acquisition; `RemoteActorSession` for exact-session sends, scoped `ask_deferred`, and typed helpers.
 - Built-in TLS bootstrap through `BuilderTlsBootstrap`.
 - DNS refresh hooks for peer addresses that may change over time.
-- Optional Linux `io_uring` writer support behind the `io_uring` feature flag.
 
 ## Quick start
 
@@ -36,7 +46,7 @@ async fn main() -> icanact_remote::Result<()> {
     .await?;
 
     println!("listening on {}", handle.registry.bind_addr);
-    handle.shutdown().await;
+    handle.shutdown().await?;
     Ok(())
 }
 ```
@@ -46,6 +56,16 @@ async fn main() -> icanact_remote::Result<()> {
 - `lookup("actor_name")` returns `Option<RemoteActorRef>`.
 - `lookup_peer(&PeerId)` returns `Result<RemoteActorRef>` and is the preferred path when peer identity matters.
 - Low-level connection APIs are intentionally not public; callers should work through lookup methods.
+
+## Correlation exhaustion
+
+A shared correlation tracker issues each nonzero `u32` wire ID at most once.
+After `u32::MAX`, new asks return the existing typed correlation-capacity error
+instead of wrapping and allowing a delayed reply to complete an unrelated ask.
+Existing in-flight requests may still complete. The tracker stays exhausted;
+releasing a slot or replacing its transport does not reset the namespace.
+Creating a new registry establishes a fresh namespace. No application timeout
+or namespace exhaustion is used as peer-liveness evidence.
 
 ## DNS refresh on reconnect
 
@@ -89,7 +109,10 @@ servers that have this version.
 rejects, during the TLS handshake, any client whose authenticated `PeerId` is
 not in the `PeerAllowlist` (typed `tls::allowlist::PeerNotAllowed`, recoverable
 from the accept error with `tls::allowlist::peer_not_allowed`). Rejections log
-one line per identity per 60 s. Keep a clone of the list and call
+at most one line per identity per 60 s. Diagnostic dedupe retains up to 1024
+recent identities; while all windows are recent, new identities are rejected
+silently until capacity expires. Churn cannot reset existing suppression, and
+this diagnostic policy never changes handshake rejection. Keep a clone of the list and call
 `list.replace(new_peer_ids)` to swap the whole set atomically at runtime; it
 applies to new handshakes. Existing sessions are not torn down by a swap.
 
@@ -105,17 +128,10 @@ the `tests/client_only_peer_e2e.rs` / `tests/peer_allowlist_e2e.rs` suites.
 
 ## Feature flags
 
-- `io_uring`: enables the Linux-only `io_uring` stream writer path when supported by the target.
 - `strict-zero-copy`: reserved feature flag present in `Cargo.toml`.
 - `test-helpers`: exports the `test_helpers` module.
 
-Build with `io_uring`:
-
-```bash
-cargo build --features io_uring
-```
-
-On non-Linux platforms, or without that feature, the crate uses the standard Tokio-based writer path.
+The crate uses the Tokio-based writer path.
 
 ## Examples and tests
 

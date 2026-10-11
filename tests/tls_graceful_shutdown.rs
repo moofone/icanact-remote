@@ -253,7 +253,7 @@ async fn pending_asks_resolve_promptly_scenario() {
     );
 
     let started = Instant::now();
-    low.shutdown().await;
+    low.shutdown().await.unwrap();
     for (name, ask) in [
         ("surviving node", survivor_ask),
         ("closing node", closer_ask),
@@ -271,7 +271,7 @@ async fn pending_asks_resolve_promptly_scenario() {
         );
     }
     assert!(started.elapsed() < Duration::from_secs(10));
-    high.shutdown().await;
+    high.shutdown().await.unwrap();
 }
 
 async fn explicit_shutdown_scenarios() {
@@ -279,22 +279,22 @@ async fn explicit_shutdown_scenarios() {
     let (high, low) = established_pair("graceful_tls_a", "graceful_tls_b").await;
     reset_log();
     let low_peer = low.registry.peer_id.clone();
-    low.shutdown().await;
+    low.shutdown().await.unwrap();
     assert_session_retired(&high, &low_peer).await;
     wait_for_orderly_teardown().await;
     assert_no_failure_warnings("inbound-side shutdown()");
-    high.shutdown().await;
+    high.shutdown().await.unwrap();
 
     // Outbound side (high) shuts down with shutdown_and_wait(); low survives
     // and observes the peer close on its inbound handler.
     let (high, low) = established_pair("graceful_tls_e", "graceful_tls_f").await;
     reset_log();
     let high_peer = high.registry.peer_id.clone();
-    high.shutdown_and_wait().await;
+    high.shutdown_and_wait().await.unwrap();
     assert_session_retired(&low, &high_peer).await;
     wait_for_orderly_teardown().await;
     assert_no_failure_warnings("outbound-side shutdown_and_wait()");
-    low.shutdown().await;
+    low.shutdown().await.unwrap();
 }
 
 async fn owner_drop_scenario() {
@@ -302,7 +302,7 @@ async fn owner_drop_scenario() {
     reset_log();
     drop(low);
     wait_for_log(Level::WARN, READ_ERROR, 1).await;
-    high.shutdown().await;
+    high.shutdown().await.unwrap();
 }
 
 /// Raw, mutually-authenticated TLS client that completes the hello handshake
@@ -376,7 +376,7 @@ async fn initial_frame_scenarios() {
     wait_for_log(Level::WARN, "TLS accept failed", 1).await;
     drop(garbage);
 
-    node.shutdown().await;
+    node.shutdown().await.unwrap();
 }
 
 #[test]

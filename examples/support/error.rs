@@ -8,6 +8,8 @@ pub enum Error {
     #[error(transparent)]
     Remote(#[from] icanact_remote::GossipError),
     #[error(transparent)]
+    ShutdownIncomplete(#[from] icanact_remote::RegistryShutdownIncomplete),
+    #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Hex(#[from] hex::FromHexError),

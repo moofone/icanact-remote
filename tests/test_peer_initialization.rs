@@ -228,9 +228,9 @@ async fn test_peer_initialization_with_names_inner() {
     }
 
     // Cleanup
-    handle1.shutdown().await;
-    handle2.shutdown().await;
-    handle3.shutdown().await;
+    handle1.shutdown().await.unwrap();
+    handle2.shutdown().await.unwrap();
+    handle3.shutdown().await.unwrap();
 }
 
 #[test]

@@ -71,7 +71,7 @@ async fn restart_with_different_identity_is_treated_as_new_peer() -> icanact_rem
     }
     assert!(handle_b.lookup("identity_old_actor").await.is_some());
 
-    handle_a1.shutdown().await;
+    handle_a1.shutdown().await.unwrap();
     for _ in 0..100 {
         if handle_b.stats().await.active_peers == 0 {
             break;
@@ -110,7 +110,7 @@ async fn restart_with_different_identity_is_treated_as_new_peer() -> icanact_rem
     assert!(handle_b.lookup("identity_new_actor").await.is_some());
     assert!(handle_b.stats().await.active_peers >= 1);
 
-    handle_a2.shutdown().await;
-    handle_b.shutdown().await;
+    handle_a2.shutdown().await.unwrap();
+    handle_b.shutdown().await.unwrap();
     Ok(())
 }

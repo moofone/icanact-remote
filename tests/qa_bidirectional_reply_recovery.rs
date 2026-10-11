@@ -4,7 +4,7 @@ use icanact_remote::{BuilderTlsBootstrap, GossipRegistryHandle, SecretKey};
 use std::sync::Arc;
 use std::time::Duration;
 
-struct ReplyLarge(bytes::Bytes);
+struct ReplyLarge(icanact_remote::ForwardPayload);
 
 impl icanact_remote::registry::ActorAskImmediateHandlerSync for ReplyLarge {
     fn handle_actor_ask_sync_immediate(
@@ -14,7 +14,7 @@ impl icanact_remote::registry::ActorAskImmediateHandlerSync for ReplyLarge {
         _: icanact_remote::AlignedBytes,
     ) -> icanact_remote::Result<icanact_remote::registry::AskDisposition> {
         Ok(icanact_remote::registry::AskDisposition::ImmediateBytes(
-            self.0.clone(),
+            self.0.shared_clone()?,
         ))
     }
 }
@@ -50,9 +50,11 @@ async fn run_burst(default_maintenance: bool) {
     )
     .await
     .unwrap();
-    let payload = bytes::Bytes::from(vec![7; 512 * 1024]);
+    let payload = icanact_remote::ForwardPayload::from(vec![7; 512 * 1024]).into_shared();
     a.registry
-        .set_actor_ask_immediate_handler_sync(Arc::new(ReplyLarge(payload.clone())))
+        .set_actor_ask_immediate_handler_sync(Arc::new(ReplyLarge(
+            payload.shared_clone().expect("explicit shared response"),
+        )))
         .await;
     b.registry
         .set_actor_ask_immediate_handler_sync(Arc::new(ReplyLarge(payload)))
@@ -120,8 +122,8 @@ async fn run_burst(default_maintenance: bool) {
             Duration::from_secs(2),
         )
         .await;
-    a.shutdown().await;
-    b.shutdown().await;
+    a.shutdown().await.unwrap();
+    b.shutdown().await.unwrap();
     assert_eq!(
         success,
         128,

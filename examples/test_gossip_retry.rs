@@ -4,7 +4,7 @@ use tokio::time::sleep;
 use tracing::info;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter("icanact_remote=debug,test_gossip_retry=info")
@@ -101,6 +101,7 @@ async fn main() {
     info!("Node2 stats: {:?}", stats2);
 
     // Cleanup
-    handle1.shutdown().await;
-    handle2.shutdown().await;
+    handle1.shutdown().await?;
+    handle2.shutdown().await?;
+    Ok(())
 }

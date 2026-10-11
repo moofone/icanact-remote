@@ -28,7 +28,8 @@ async fn exercise_identify_supersession(survivor_alive: bool) {
     pool.set_registry(registry.clone());
     let addr: SocketAddr = "127.0.0.1:41802".parse().unwrap();
     let fresh_addr: SocketAddr = "127.0.0.1:41803".parse().unwrap();
-    pool.add_addr_to_peer_id(addr, peer.clone());
+    pool.add_addr_to_peer_id(addr, peer.clone())
+        .expect("address owner admitted");
     let (io, _keep) = tokio::io::duplex(4096);
     let gossip_guard = registry.gossip_state.lock().await;
     let finalize = {

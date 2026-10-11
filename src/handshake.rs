@@ -64,6 +64,9 @@ pub enum Feature {
     /// opt-in role is configured; a peer that predates this variant rejects
     /// the Hello, so enable it only against upgraded servers.
     ClientOnly = 2,
+    /// Mandatory bounded terminal ownership: at most 64 wire asks, one per
+    /// correlation-ID modulo-64 cell, recycled only by a complete terminal.
+    TerminalOutcomeWindow = 3,
 }
 
 impl Feature {
@@ -72,6 +75,7 @@ impl Feature {
             Feature::PeerListGossip => 1u64 << 0,
             Feature::ClockCalibration => 1u64 << 1,
             Feature::ClientOnly => 1u64 << 2,
+            Feature::TerminalOutcomeWindow => 1u64 << 3,
         }
     }
 }
@@ -136,14 +140,21 @@ impl Hello {
     pub fn new() -> Self {
         Self {
             protocol_version: CURRENT_PROTOCOL_VERSION,
-            features: vec![Feature::PeerListGossip, Feature::ClockCalibration],
+            features: vec![
+                Feature::PeerListGossip,
+                Feature::ClockCalibration,
+                Feature::TerminalOutcomeWindow,
+            ],
             schema_hash: None,
             boot_id: RemoteBootId::new(),
         }
     }
 
     /// Create Hello with specific features
-    pub fn with_features(features: Vec<Feature>) -> Self {
+    pub fn with_features(mut features: Vec<Feature>) -> Self {
+        if !features.contains(&Feature::TerminalOutcomeWindow) {
+            features.push(Feature::TerminalOutcomeWindow);
+        }
         Self {
             protocol_version: CURRENT_PROTOCOL_VERSION,
             features,
@@ -165,7 +176,7 @@ fn hello_for_config(
     boot_id: RemoteBootId,
     client_only: bool,
 ) -> Hello {
-    let mut features = vec![Feature::ClockCalibration];
+    let mut features = vec![Feature::ClockCalibration, Feature::TerminalOutcomeWindow];
     if enable_peer_discovery {
         features.push(Feature::PeerListGossip);
     }
@@ -357,6 +368,14 @@ where
             "unsupported protocol version: {}",
             remote_hello.protocol_version
         )));
+    }
+    if !remote_hello
+        .features
+        .contains(&Feature::TerminalOutcomeWindow)
+    {
+        return Err(GossipError::TlsHandshakeFailed(
+            "peer lacks mandatory 64-slot terminal outcome ownership protocol".into(),
+        ));
     }
     if remote_hello.schema_hash != local_hello.schema_hash {
         return Err(GossipError::TlsHandshakeFailed(format!(
@@ -618,6 +637,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn current_wire_peer_without_terminal_window_is_rejected() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let server_task = tokio::spawn(async move {
+            let _ = read_hello_message(&mut server).await.unwrap();
+            let mut legacy = Hello::new();
+            legacy
+                .features
+                .retain(|feature| *feature != Feature::TerminalOutcomeWindow);
+            send_hello_message(&mut server, &legacy).await.unwrap();
+        });
+        let error = perform_hello_handshake(
+            &mut client,
+            Some(ALPN_ICANACT_V6),
+            false,
+            None,
+            RemoteBootId::from_bytes([19; 16]),
+        )
+        .await
+        .expect_err("same wire version is insufficient without terminal ownership support");
+        assert!(error.to_string().contains("terminal outcome ownership"));
+        server_task.await.unwrap();
+        assert!(
+            Hello::new()
+                .features
+                .contains(&Feature::TerminalOutcomeWindow)
+        );
+        assert!(
+            Hello::with_features(Vec::new())
+                .features
+                .contains(&Feature::TerminalOutcomeWindow)
+        );
+    }
+
+    #[tokio::test]
     async fn hello_rejects_different_present_schema_hashes() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -629,7 +682,7 @@ mod tests {
             server.read_exact(&mut local).await.unwrap();
             let remote = Hello {
                 protocol_version: CURRENT_PROTOCOL_VERSION,
-                features: vec![],
+                features: vec![Feature::TerminalOutcomeWindow],
                 schema_hash: Some(2),
                 boot_id: RemoteBootId::from_bytes([6; 16]),
             };

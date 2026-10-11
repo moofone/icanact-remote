@@ -175,7 +175,15 @@ async fn wildcard_bind_interest_advertises_routable_address() -> icanact_remote:
     let pubsub_a = RoutedPubSub::install(Arc::clone(&a.registry)).await;
     let topic = topic_key("coins/wildcard-interest-storm/prices");
     let type_hash: u64 = 0x000C_01E5;
-    let _subscription = pubsub_a.subscribe_bytes(topic, type_hash, |_bytes| {});
+    let _subscription = pubsub_a
+        .subscribe_bytes(
+            topic,
+            type_hash,
+            icanact_remote::pubsub::CooperativeCallback::new(|_bytes: bytes::Bytes| {
+                std::future::ready(())
+            }),
+        )
+        .expect("subscription admission");
 
     let interest_name = interest_actor_name(topic, &a_peer_id);
 
@@ -206,8 +214,8 @@ async fn wildcard_bind_interest_advertises_routable_address() -> icanact_remote:
         "advertised interest location must not be the wildcard IP"
     );
 
-    a.shutdown_and_wait().await;
-    b.shutdown_and_wait().await;
+    a.shutdown_and_wait().await.unwrap();
+    b.shutdown_and_wait().await.unwrap();
     Ok(())
 }
 
@@ -276,7 +284,7 @@ async fn wildcard_bind_interest_storm_settles_to_quiet_steady_state() -> icanact
             let _ = peer.connect(&b_addr).await;
         }
         sleep(Duration::from_millis(*up_ms)).await;
-        a.shutdown_and_wait().await;
+        a.shutdown_and_wait().await.unwrap();
         sleep(Duration::from_millis(*down_ms)).await;
     }
 
@@ -292,7 +300,15 @@ async fn wildcard_bind_interest_storm_settles_to_quiet_steady_state() -> icanact
     let pubsub_a = RoutedPubSub::install(Arc::clone(&a_final.registry)).await;
     let topic = topic_key("coins/wildcard-interest-storm/steady-state");
     let type_hash: u64 = 0x000C_01E6;
-    let _subscription = pubsub_a.subscribe_bytes(topic, type_hash, |_bytes| {});
+    let _subscription = pubsub_a
+        .subscribe_bytes(
+            topic,
+            type_hash,
+            icanact_remote::pubsub::CooperativeCallback::new(|_bytes: bytes::Bytes| {
+                std::future::ready(())
+            }),
+        )
+        .expect("subscription admission");
     let interest_name = interest_actor_name(topic, &a_peer_id);
 
     let location = wait_for_interest_location(&b, &interest_name, Duration::from_secs(5)).await;
@@ -342,7 +358,7 @@ async fn wildcard_bind_interest_storm_settles_to_quiet_steady_state() -> icanact
     );
 
     set_transport_lifecycle_recorder(None);
-    a_final.shutdown_and_wait().await;
-    b.shutdown_and_wait().await;
+    a_final.shutdown_and_wait().await.unwrap();
+    b.shutdown_and_wait().await.unwrap();
     Ok(())
 }

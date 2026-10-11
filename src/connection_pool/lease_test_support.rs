@@ -114,15 +114,24 @@ pub(crate) struct PublicationGate {
 
 impl PublicationGate {
     pub(crate) fn new() -> Self {
-        Self {
+        let gate = Self {
             state: Mutex::new(PublicationState::default()),
             changed: Condvar::new(),
-        }
+        };
+        drop(
+            gate.state
+                .lock()
+                .expect("cold publication gate initialization"),
+        );
+        gate
     }
 
     pub(crate) fn arm(&self) {
         let mut state = self.state.lock().expect("publication gate lock");
-        state.armed = true;
+        *state = PublicationState {
+            armed: true,
+            ..PublicationState::default()
+        };
     }
 
     pub(crate) fn wait_publisher_entered(&self) {

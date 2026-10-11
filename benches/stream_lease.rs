@@ -6,13 +6,15 @@
 //! the timed routine. The separately named `*_end_to_end` cases intentionally
 //! include delivery and are not paired performance samples.
 
-use bytes::Bytes;
 use criterion::{Criterion, criterion_group, criterion_main};
 use icanact_remote::lease_test_support::{
     BufferConfig, ChannelId, LockFreeStreamHandle, lease_stats,
 };
-use icanact_remote::{AskResponder, ReplyDeliveryBudget, ReplyLease, ReplyPayload};
-use std::sync::{Arc, atomic::AtomicBool};
+use icanact_remote::{
+    AskContext, AskResponder, ReplyDeliveryBudget, ReplyDeliverySession, ReplyLease, ReplyPayload,
+    ReplySession,
+};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 
@@ -56,6 +58,12 @@ impl TransportFixture {
         }
     }
 
+    fn reply_session(&self) -> ReplySession {
+        AskContext::from_stream_handle_for_test(0, &self.handle)
+            .reply_session()
+            .expect("benchmark reply session")
+    }
+
     async fn drain(&mut self, bytes: usize) {
         self.peer
             .read_exact(&mut self.received[..bytes])
@@ -88,64 +96,59 @@ impl TransportFixture {
     }
 }
 
-fn lease(
+fn lease<'a>(
     handle: &Arc<LockFreeStreamHandle>,
-    budget: &ReplyDeliveryBudget,
+    session: &'a ReplyDeliverySession<'_>,
     correlation_id: u32,
-) -> ReplyLease {
-    AskResponder::from_stream_handle_for_test(
-        correlation_id,
-        Arc::clone(handle),
-        Arc::new(AtomicBool::new(false)),
-    )
-    .try_reply_lease(budget, PAYLOAD_LEN)
-    .expect("lease reservation")
+) -> ReplyLease<'a> {
+    AskContext::from_stream_handle_for_test(correlation_id, handle)
+        .responder()
+        .try_reply_lease(session, PAYLOAD_LEN)
+        .expect("lease reservation")
 }
 
-fn unleased_responder(fixture: &TransportFixture) -> AskResponder {
-    AskResponder::from_stream_handle_for_test(
-        1,
-        Arc::clone(&fixture.handle),
-        Arc::new(AtomicBool::new(false)),
-    )
+fn unleased_context(fixture: &TransportFixture) -> AskContext<'_> {
+    AskContext::from_stream_handle_for_test(1, &fixture.handle)
 }
 
-fn publish_unleased_inline(responder: AskResponder) {
+fn publish_unleased_inline(responder: AskResponder<'_>) {
     responder
-        .try_reply_bytes(Bytes::from_static(PAYLOAD))
+        .try_reply_bytes(icanact_remote::ForwardPayload::from_static(PAYLOAD))
         .expect("inline transport enqueue");
 }
 
-fn publish_lease(lease: ReplyLease) {
+fn publish_lease(lease: ReplyLease<'_>) {
     lease
         .try_reply_bytes(ReplyPayload::from_static(PAYLOAD))
         .expect("lease publication");
 }
 
-fn prepare_shared_fanout(
+fn prepare_shared_fanout<'a>(
     fixture: &TransportFixture,
-    budget: &ReplyDeliveryBudget,
+    session: &'a ReplyDeliverySession<'_>,
     fanout: usize,
-) -> Vec<ReplyLease> {
+) -> Vec<ReplyLease<'a>> {
     (0..fanout as u32)
-        .map(|correlation_id| lease(&fixture.handle, budget, 100 + correlation_id))
+        .map(|correlation_id| lease(&fixture.handle, session, 100 + correlation_id))
         .collect()
 }
 
-fn publish_shared_fanout(leases: Vec<ReplyLease>) {
+fn publish_shared_fanout(leases: Vec<ReplyLease<'_>>) {
     for lease in leases {
         publish_lease(lease);
     }
 }
 
-fn cancel_one(mut leases: Vec<ReplyLease>) -> Vec<ReplyLease> {
+fn cancel_one<'a>(mut leases: Vec<ReplyLease<'a>>) -> Vec<ReplyLease<'a>> {
     let canceled = leases.pop().expect("occupied cancellation lease");
     drop(canceled);
     leases
 }
 
 async fn bench_unleased_inline_end_to_end(fixture: &mut TransportFixture) {
-    publish_unleased_inline(unleased_responder(fixture));
+    let context = unleased_context(fixture);
+    publish_unleased_inline(context.responder());
+    drop(context);
     fixture
         .drain_and_wait_for_release(16 + PAYLOAD_LEN, 0)
         .await;
@@ -153,9 +156,9 @@ async fn bench_unleased_inline_end_to_end(fixture: &mut TransportFixture) {
 
 async fn bench_lease_publish_end_to_end(
     fixture: &mut TransportFixture,
-    budget: &ReplyDeliveryBudget,
+    session: &ReplyDeliverySession<'_>,
 ) {
-    publish_lease(lease(&fixture.handle, budget, 2));
+    publish_lease(lease(&fixture.handle, session, 2));
     fixture
         .drain_and_wait_for_release(16 + PAYLOAD_LEN, 0)
         .await;
@@ -163,19 +166,19 @@ async fn bench_lease_publish_end_to_end(
 
 async fn bench_shared_fanout_end_to_end(
     fixture: &mut TransportFixture,
-    budget: &ReplyDeliveryBudget,
+    session: &ReplyDeliverySession<'_>,
     fanout: usize,
 ) {
-    publish_shared_fanout(prepare_shared_fanout(fixture, budget, fanout));
+    publish_shared_fanout(prepare_shared_fanout(fixture, session, fanout));
     fixture
         .drain_and_wait_for_release(fanout * (16 + PAYLOAD_LEN), 0)
         .await;
 }
 
-async fn bench_cancel_end_to_end(
+async fn bench_cancel_end_to_end<'a>(
     fixture: &mut TransportFixture,
-    budget: &ReplyDeliveryBudget,
-    leases: &mut Vec<ReplyLease>,
+    session: &'a ReplyDeliverySession<'_>,
+    leases: &mut Vec<ReplyLease<'a>>,
     next_correlation: &mut u32,
 ) {
     let canceled = leases.pop().expect("occupied cancellation lease");
@@ -184,7 +187,7 @@ async fn bench_cancel_end_to_end(
     fixture
         .drain_and_wait_for_release(16 + TERMINAL.len(), survivors)
         .await;
-    leases.push(lease(&fixture.handle, budget, *next_correlation));
+    leases.push(lease(&fixture.handle, session, *next_correlation));
     *next_correlation = next_correlation.wrapping_add(1);
 }
 
@@ -205,10 +208,11 @@ fn bench_stream_lease(c: &mut Criterion) {
         b.iter_custom(|iters| {
             let mut measured = Duration::ZERO;
             for _ in 0..iters {
-                let responder = unleased_responder(&targeted_unleased);
+                let context = unleased_context(&targeted_unleased);
                 let start = Instant::now();
-                publish_unleased_inline(responder);
+                publish_unleased_inline(context.responder());
                 measured += start.elapsed();
+                drop(context);
                 runtime.block_on(targeted_unleased.drain_and_wait_for_release(16 + PAYLOAD_LEN, 0));
             }
             measured
@@ -218,11 +222,15 @@ fn bench_stream_lease(c: &mut Criterion) {
 
     let mut publish =
         runtime.block_on(async { TransportFixture::new(64 * 1024, 16 + PAYLOAD_LEN) });
+    let publish_replies = publish.reply_session();
+    let publish_delivery = publish_budget
+        .bind(&publish_replies)
+        .expect("delivery binding");
     c.bench_function("stream_lease/reserve_publish_end_to_end", |b| {
         b.iter(|| {
             runtime.block_on(bench_lease_publish_end_to_end(
                 &mut publish,
-                &publish_budget,
+                &publish_delivery,
             ))
         })
     });
@@ -230,12 +238,16 @@ fn bench_stream_lease(c: &mut Criterion) {
 
     let mut targeted_publish =
         runtime.block_on(async { TransportFixture::new(64 * 1024, 16 + PAYLOAD_LEN) });
+    let targeted_publish_replies = targeted_publish.reply_session();
+    let targeted_publish_delivery = publish_budget
+        .bind(&targeted_publish_replies)
+        .expect("delivery binding");
     c.bench_function("stream_lease/reserve_publish_targeted", |b| {
         b.iter_custom(|iters| {
             let mut measured = Duration::ZERO;
             for _ in 0..iters {
                 let start = Instant::now();
-                let prepared = lease(&targeted_publish.handle, &publish_budget, 2);
+                let prepared = lease(&targeted_publish.handle, &targeted_publish_delivery, 2);
                 publish_lease(prepared);
                 measured += start.elapsed();
                 runtime.block_on(targeted_publish.drain_and_wait_for_release(16 + PAYLOAD_LEN, 0));
@@ -250,12 +262,16 @@ fn bench_stream_lease(c: &mut Criterion) {
         let mut shared = runtime.block_on(async {
             TransportFixture::new(2 * 1024 * 1024, fanout * (16 + PAYLOAD_LEN))
         });
+        let shared_replies = shared.reply_session();
+        let shared_delivery = shared_budget
+            .bind(&shared_replies)
+            .expect("delivery binding");
         let name = format!("stream_lease/shared_payload_fanout_{fanout}_end_to_end");
         c.bench_function(&name, |b| {
             b.iter(|| {
                 runtime.block_on(bench_shared_fanout_end_to_end(
                     &mut shared,
-                    &shared_budget,
+                    &shared_delivery,
                     fanout,
                 ))
             })
@@ -265,12 +281,17 @@ fn bench_stream_lease(c: &mut Criterion) {
         let mut targeted_shared = runtime.block_on(async {
             TransportFixture::new(2 * 1024 * 1024, fanout * (16 + PAYLOAD_LEN))
         });
+        let targeted_shared_replies = targeted_shared.reply_session();
+        let targeted_shared_delivery = shared_budget
+            .bind(&targeted_shared_replies)
+            .expect("delivery binding");
         let name = format!("stream_lease/shared_payload_fanout_{fanout}_targeted");
         c.bench_function(&name, |b| {
             b.iter_custom(|iters| {
                 let mut measured = Duration::ZERO;
                 for _ in 0..iters {
-                    let prepared = prepare_shared_fanout(&targeted_shared, &shared_budget, fanout);
+                    let prepared =
+                        prepare_shared_fanout(&targeted_shared, &targeted_shared_delivery, fanout);
                     let start = Instant::now();
                     publish_shared_fanout(prepared);
                     measured += start.elapsed();
@@ -288,9 +309,17 @@ fn bench_stream_lease(c: &mut Criterion) {
         let cancel_budget = budget(occupied.max(1));
         let mut cancel = runtime
             .block_on(async { TransportFixture::new(64 * 1024, occupied * (16 + TERMINAL.len())) });
+        let cancel_replies = cancel.reply_session();
+        let cancel_delivery = cancel_budget
+            .bind(&cancel_replies)
+            .expect("delivery binding");
         let mut leases = Vec::with_capacity(occupied);
         for correlation_id in 0..occupied as u32 {
-            leases.push(lease(&cancel.handle, &cancel_budget, 200 + correlation_id));
+            leases.push(lease(
+                &cancel.handle,
+                &cancel_delivery,
+                200 + correlation_id,
+            ));
         }
         let mut next_correlation = 10_000;
         let name = format!("stream_lease/cancel_occupied_{occupied}_end_to_end");
@@ -298,7 +327,7 @@ fn bench_stream_lease(c: &mut Criterion) {
             b.iter(|| {
                 runtime.block_on(bench_cancel_end_to_end(
                     &mut cancel,
-                    &cancel_budget,
+                    &cancel_delivery,
                     &mut leases,
                     &mut next_correlation,
                 ))
@@ -310,6 +339,10 @@ fn bench_stream_lease(c: &mut Criterion) {
         let mut targeted_cancel = runtime
             .block_on(async { TransportFixture::new(64 * 1024, occupied * (16 + TERMINAL.len())) });
         let targeted_budget = budget(occupied.max(1));
+        let targeted_cancel_replies = targeted_cancel.reply_session();
+        let targeted_cancel_delivery = targeted_budget
+            .bind(&targeted_cancel_replies)
+            .expect("delivery binding");
         let name = format!("stream_lease/cancel_occupied_{occupied}_targeted");
         c.bench_function(&name, |b| {
             b.iter_custom(|iters| {
@@ -319,7 +352,7 @@ fn bench_stream_lease(c: &mut Criterion) {
                     for correlation_id in 0..occupied as u32 {
                         occupied_leases.push(lease(
                             &targeted_cancel.handle,
-                            &targeted_budget,
+                            &targeted_cancel_delivery,
                             30_000 + correlation_id,
                         ));
                     }

@@ -1,7 +1,6 @@
 #[path = "support/error.rs"]
 mod example_error;
 
-use bytes::Bytes;
 use example_error::{Error, Result};
 use icanact_remote::tls::allowlist::PeerAllowlist;
 use icanact_remote::{GossipConfig, GossipRegistryHandle, PeerId, SecretKey};
@@ -55,6 +54,7 @@ async fn main() -> Result<()> {
     let mut tick = tokio::time::interval(Duration::from_secs(2));
     let mut seq = 0u64;
     let mut allowed: Option<PeerId> = None;
+    let mut connection: Option<icanact_remote::RemoteConnection> = None;
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
@@ -69,24 +69,33 @@ async fn main() -> Result<()> {
             allowlist.replace(wanted.clone());
             println!("allowlist now: {wanted:?}");
             allowed = wanted;
+            connection = None;
         }
         let Some(client_id) = allowed.as_ref() else {
             continue;
         };
-        match server.client().lookup_connected_peer(client_id) {
-            Some(client) => {
+        if connection.as_ref().is_some_and(|conn| conn.is_closed()) {
+            connection = None;
+        }
+        if connection.is_none() {
+            connection = server
+                .client()
+                .lookup_connected_peer(client_id)
+                .and_then(|client| client.connection_ref());
+        }
+        match connection.as_ref() {
+            Some(conn) => {
                 seq += 1;
-                let payload = Bytes::from(format!("event #{seq}"));
-                let conn = client
-                    .connection_ref()
-                    .ok_or(icanact_remote::GossipError::Shutdown)?;
-                conn.tell_actor_frame(ACTOR_ID, TYPE_HASH, payload).await?;
+                let payload =
+                    icanact_remote::ForwardPayload::from(format!("event #{seq}").into_bytes());
+                conn.tell_actor_frame_owned(ACTOR_ID, TYPE_HASH, payload)
+                    .await?;
                 println!("pushed event #{seq}");
             }
             None => println!("client not connected (the server never dials it)"),
         }
     }
-    server.shutdown_and_wait().await;
+    server.shutdown_and_wait().await?;
     Ok(())
 }
 

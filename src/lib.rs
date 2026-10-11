@@ -13,7 +13,6 @@
     clippy::question_mark,
     clippy::too_many_arguments,
     clippy::type_complexity,
-    clippy::vec_box,
     reason = "legacy lint debt outside the focused gossip QA fix"
 )]
 
@@ -61,10 +60,11 @@ use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 pub use aligned::{AlignedBytes, AlignedBytesPool, PAYLOAD_ALIGNMENT, PooledAlignedBuffer};
-pub use ask_forwarder::{AskForwardObserver, AskForwarder};
+pub use ask_forwarder::{AskForwardObserver, AskForwarder, ForwardDestination, ForwardPayload};
 pub use ask_responder::{
-    AskContext, AskReplyObserver, AskResponder, ImmediateReplyFallback, ReplyPayloadRef,
-    TellContext, TryReplyError,
+    AskContext, AskReplyObserver, AskResponder, ForwardReplyAdmission, ForwardReplyToken,
+    ImmediateReplyFallback, MAX_REPLY_SESSION_CAPACITY, ReplyPayloadRef, ReplySession,
+    ReplySessionFallback, ReplySessionTryError, TellContext, TryReplyError,
 };
 pub use config::{ConnectionRecoveryPolicy, GossipConfig};
 pub use dns::{DnsResolver, TokioDnsResolver};
@@ -88,14 +88,19 @@ pub use lifecycle::{
 };
 pub use priority::RegistrationPriority;
 pub use pubsub::{
-    PubSubDeliveryMode, PubSubDeliveryPolicy, PubSubFrameMetadata, PubSubIngressHandler,
-    PubSubIngressStats, PubSubPublishStats, PubSubRouteProvider, PubSubScope, PubSubSubscription,
-    RoutedPubSub, topic_key,
+    CooperativeCallback, PubSubAdmissionError, PubSubDeliveryMode, PubSubDeliveryPolicy,
+    PubSubFrameMetadata, PubSubIngressHandler, PubSubIngressStats, PubSubLimits,
+    PubSubPublishStats, PubSubRouteError, PubSubRouteProvider, PubSubRouteSink, PubSubScope,
+    PubSubSubscription, RoutedPubSub, topic_key,
 };
-pub use registry::{ClockEchoV1, ClockProbeV1, GossipExtensionsV1, PeerClockSnapshot};
+pub use registry::{
+    ClockEchoV1, ClockProbeV1, GossipExtensionsV1, PeerClockSnapshot, RegistryShutdownIncomplete,
+};
 pub use remote_actor_location::RemoteActorLocation;
-pub use remote_actor_ref::{RemoteActorRef, RemoteConnection};
-pub use reply_lease::{ReplyDeliveryBudget, ReplyLease, ReplyLeaseAdmissionError, ReplyPayload};
+pub use remote_actor_ref::{RemoteActorRef, RemoteActorSession, RemoteConnection};
+pub use reply_lease::{
+    ReplyDeliveryBudget, ReplyDeliverySession, ReplyLease, ReplyLeaseAdmissionError, ReplyPayload,
+};
 
 /// Connection-local construction hooks used by the bounded lease
 /// qualification suite and benchmark harness. They are absent from normal
@@ -112,27 +117,64 @@ pub mod lease_test_support {
 }
 pub use transport::{RegistryTransportBootstrap, TransportWireKind};
 pub use typed::{
-    ArchivedBytes, WireEncode, WireType, decode_typed, decode_typed_archived, encode_typed,
+    ArchivedBytes, WireEncode, WireType, decode_typed, decode_typed_archived,
+    decode_typed_archived_owned, encode_typed,
 };
 
 /// Deferred ask handle exposed as high-level API.
 ///
-/// This can be moved to another task and awaited later.
+/// This borrows the exact connection session that submitted the request. Keep
+/// that session alive while awaiting or dropping its handles. To use a spawned
+/// task, move the session into that task and submit the request there; a handle
+/// cannot escape its session. No tracker reference count is acquired per ask.
+///
+/// ```no_run
+/// use icanact_remote::{RemoteConnection, Result};
+///
+/// async fn scoped(connection: &RemoteConnection) -> Result<icanact_remote::AlignedBytes> {
+///     let pending = connection
+///         .ask_deferred_owned(icanact_remote::ForwardPayload::from_static(b"request"))
+///         .await?;
+///     pending.wait().await
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use icanact_remote::{DeferredAsk, RemoteConnection};
+///
+/// async fn escape(connection: RemoteConnection) -> DeferredAsk<'static> {
+///     connection
+///         .ask_deferred_owned(icanact_remote::ForwardPayload::from_static(b"request"))
+///         .await
+///         .unwrap()
+/// }
+/// ```
 #[derive(Debug)]
-pub struct DeferredAsk {
-    inner: connection_pool::PendingAsk,
+pub struct DeferredAsk<'session> {
+    inner: connection_pool::PendingAsk<'session>,
 }
 
-impl DeferredAsk {
+impl<'session> DeferredAsk<'session> {
     pub fn correlation_id(&self) -> u32 {
         self.inner.correlation_id()
     }
 
-    pub async fn wait(self) -> Result<bytes::Bytes> {
+    /// Await the native aligned response without promoting its owner.
+    pub async fn wait(self) -> Result<AlignedBytes> {
         self.inner.wait().await
     }
 
-    pub(crate) fn from_pending(inner: connection_pool::PendingAsk) -> Self {
+    /// Explicit compatibility promotion to shared Bytes metadata.
+    pub async fn wait_bytes(self) -> Result<bytes::Bytes> {
+        self.wait().await.map(AlignedBytes::into_bytes)
+    }
+
+    /// Await a response without discarding its retained-owner provenance.
+    pub async fn wait_aligned(self) -> Result<AlignedBytes> {
+        self.inner.wait_aligned().await
+    }
+
+    pub(crate) fn from_pending(inner: connection_pool::PendingAsk<'session>) -> Self {
         Self { inner }
     }
 }
@@ -358,6 +400,24 @@ impl VectorClock {
         }
     }
 
+    /// Cold journal capture: charge and copy the same immutable snapshot.
+    /// A concurrent `&self` update cannot grow the map between admission and
+    /// cloning. Rejection happens before the BTreeMap allocation.
+    #[cfg(test)]
+    pub(crate) fn clone_bounded(&self, max_entries: usize) -> Option<(Self, usize)> {
+        let snapshot = self.clocks.load_full();
+        let entries = snapshot.len();
+        if entries > max_entries {
+            return None;
+        }
+        Some((
+            Self {
+                clocks: ArcSwap::from_pointee(snapshot.as_ref().clone()),
+            },
+            entries,
+        ))
+    }
+
     pub fn with_node(node_id: GossipNodeId) -> Self {
         let mut map = BTreeMap::new();
         map.insert(node_id, 0);
@@ -563,11 +623,22 @@ impl std::hash::Hash for VectorClock {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         let sorted = self.to_vec();
         for (node_id, clock) in sorted {
+            // Equality treats missing entries as zero. Explicit zero entries
+            // must therefore contribute nothing to the hash as well.
+            if clock == 0 {
+                continue;
+            }
             node_id.hash(state);
             clock.hash(state);
         }
     }
 }
+
+/// Wire admission limit per vector clock, independent of the runtime compaction
+/// threshold. Oversized archived clocks are rejected before materialization.
+pub const MAX_INGRESS_VECTOR_CLOCK_ENTRIES: usize = 4096;
+/// Aggregate archived clock-entry admission per registry frame.
+pub const MAX_INGRESS_REGISTRY_CLOCK_ENTRIES: usize = 65_536;
 
 // For rkyv serialization, we need a simple wrapper type
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone)]
@@ -590,14 +661,74 @@ impl From<VectorClockData> for VectorClock {
     }
 }
 
-// Custom rkyv implementation that uses VectorClockData
+/// Aggregate logical entry bytes admitted for vector-clock serialization.
+/// Admission never waits and ends with traversal, including failure and
+/// unwinding. The immutable map is borrowed only during serialization; neither
+/// a copied snapshot nor a map owner is retained by the scalar resolver.
+pub const MAX_VECTOR_CLOCK_SNAPSHOT_BYTES: usize = 8 * 1024 * 1024;
+/// Per-clock outbound entry limit. Ingress retains its stricter 4096-entry
+/// admission; this separate limit also bounds serialization of legacy clocks.
+pub const MAX_SERIALIZED_VECTOR_CLOCK_ENTRIES: usize = 65_536;
+static VECTOR_CLOCK_SNAPSHOT_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+struct VectorClockSnapshotReservation {
+    bytes: usize,
+    counter: &'static std::sync::atomic::AtomicUsize,
+}
+
+impl VectorClockSnapshotReservation {
+    fn acquire<E: rkyv::rancor::Source>(bytes: usize) -> std::result::Result<Self, E> {
+        Self::acquire_from::<E>(bytes, &VECTOR_CLOCK_SNAPSHOT_BYTES)
+    }
+
+    fn acquire_from<E: rkyv::rancor::Source>(
+        bytes: usize,
+        counter: &'static std::sync::atomic::AtomicUsize,
+    ) -> std::result::Result<Self, E> {
+        use std::sync::atomic::Ordering;
+        let mut current = counter.load(Ordering::Relaxed);
+        for _ in 0..8 {
+            let Some(next) = current
+                .checked_add(bytes)
+                .filter(|next| *next <= MAX_VECTOR_CLOCK_SNAPSHOT_BYTES)
+            else {
+                break;
+            };
+            match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return Ok(Self { bytes, counter }),
+                Err(observed) => current = observed,
+            }
+        }
+        Err(E::new(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "vector clock serialization snapshot byte budget exhausted",
+        )))
+    }
+}
+
+impl Drop for VectorClockSnapshotReservation {
+    fn drop(&mut self) {
+        self.counter
+            .fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Scalar metadata for entries already written from one immutable map view.
+/// Resolution never reloads the clock, copies entries, or retains a map owner.
+pub struct VectorClockResolver {
+    len: usize,
+    resolver: rkyv::vec::VecResolver,
+}
+
 impl rkyv::Archive for VectorClock {
     type Archived = <VectorClockData as rkyv::Archive>::Archived;
-    type Resolver = <VectorClockData as rkyv::Archive>::Resolver;
+    type Resolver = VectorClockResolver;
 
     fn resolve(&self, resolver: Self::Resolver, out: rkyv::Place<Self::Archived>) {
-        let data = VectorClockData::from(self);
-        data.resolve(resolver, out);
+        rkyv::munge::munge!(let ArchivedVectorClockData { clocks } = out);
+        rkyv::vec::ArchivedVec::resolve_from_len(resolver.len, resolver.resolver, clocks);
     }
 }
 
@@ -610,8 +741,26 @@ where
         &self,
         serializer: &mut S,
     ) -> std::result::Result<Self::Resolver, <S as rkyv::rancor::Fallible>::Error> {
-        let data = VectorClockData::from(self);
-        data.serialize(serializer)
+        let snapshot = self.clocks.load();
+        if snapshot.len() > MAX_SERIALIZED_VECTOR_CLOCK_ENTRIES {
+            return Err(<S::Error as rkyv::rancor::Source>::new(
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "vector clock exceeds serialization entry budget",
+                ),
+            ));
+        }
+        let bytes = snapshot.len() * std::mem::size_of::<(GossipNodeId, u64)>();
+        let _reservation = VectorClockSnapshotReservation::acquire::<S::Error>(bytes)?;
+        let len = snapshot.len();
+        // Both iterator passes see the same immutable map, even if a writer
+        // callback or another thread mutates the live clock. Only each stack
+        // tuple is copied; element resolvers use the serializer's allocator.
+        let entries = snapshot.iter().map(|(node, clock)| (*node, *clock));
+        let resolver = rkyv::vec::ArchivedVec::serialize_from_iter::<(GossipNodeId, u64), _, S>(
+            entries, serializer,
+        )?;
+        Ok(VectorClockResolver { len, resolver })
     }
 }
 
@@ -624,6 +773,14 @@ where
         &self,
         deserializer: &mut D,
     ) -> std::result::Result<VectorClock, <D as rkyv::rancor::Fallible>::Error> {
+        if self.clocks.len() > MAX_INGRESS_VECTOR_CLOCK_ENTRIES {
+            return Err(<D::Error as rkyv::rancor::Source>::new(
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "archived vector clock exceeds ingress entry budget",
+                ),
+            ));
+        }
         let data: VectorClockData = self.deserialize(deserializer)?;
         Ok(VectorClock::from(data))
     }
@@ -919,7 +1076,7 @@ impl<T: 'static> Peer<T> {
             }
         } else {
             let pool = &self.registry.connection_pool;
-            pool.set_discovered_peer_addr(&self.peer_id, *addr);
+            pool.set_discovered_peer_addr(&self.peer_id, *addr)?;
             let _ = pool
                 .addr_to_peer_id
                 .upsert_sync(*addr, self.peer_id.clone());
@@ -1022,32 +1179,9 @@ impl<T: 'static> Peer<T> {
                     effective_addr = %effective_addr,
                     "Successfully connected to peer"
                 );
-                // `connect_to_peer` (required_peer) already did its own
-                // bookkeeping internally; only the discovered/non-required
-                // path has none of its own, so this remains the sole place
-                // that path's success is recorded.
-                if !required_peer {
-                    // Insert-if-absent, keyed to `effective_addr` (never
-                    // the bare `*addr` request) for the same reason as the
-                    // function's own doc comment. Always `resolved(...)`,
-                    // never `ConnectedUnverified` (only `connect_to_peer`
-                    // produces that), so a route is always present here.
-                    let route = outcome.resolved_route().expect(
-                        "the discovered/non-required path always constructs \
-                         ConnectOutcome::resolved -- see this function's own connect_result \
-                         construction above",
-                    );
-                    let mut gossip_state = self.registry.gossip_state.lock().await;
-                    let node_id = Some(self.peer_id.to_node_id());
-                    let peer_info = gossip_state.peers.entry(effective_addr).or_insert_with(|| {
-                        crate::registry::PeerInfo::for_connect_attempt(route, node_id)
-                    });
-                    peer_info.failures = 0;
-                    peer_info.last_failure_time = None;
-                    peer_info.last_failure_instant = None;
-                    peer_info.last_success = crate::current_timestamp();
-                    peer_info.last_response_received_ms = crate::current_timestamp_millis();
-                }
+                // Session finalization owns success bookkeeping. Failed dials
+                // do not write whichever occupant later owns this address.
+
                 // Trigger an immediate gossip round to sync
                 let _ = self.registry.trigger_immediate_gossip().await;
                 Ok(())
@@ -1060,31 +1194,8 @@ impl<T: 'static> Peer<T> {
                     "Network error connecting to peer"
                 );
 
-                // `connect_to_peer` (required_peer) already recorded
-                // failure internally against the address it actually
-                // attempted; recording a second one here keyed by `addr`
-                // would risk a spurious entry. Only the discovered/
-                // non-required path has no bookkeeping of its own, and
-                // `addr` is unambiguous for it.
-                if !required_peer {
-                    let mut gossip_state = self.registry.gossip_state.lock().await;
-                    let node_id = Some(self.peer_id.to_node_id());
-                    let peer_info = gossip_state.peers.entry(*addr).or_insert_with(|| {
-                        crate::registry::PeerInfo::for_failed_connect_attempt(
-                            crate::registry::AttemptedRoute::new(*addr),
-                            node_id,
-                        )
-                    });
-                    peer_info.failures = self.registry.config.max_peer_failures;
-                    peer_info.last_failure_time = Some(crate::current_timestamp());
-                    peer_info.last_failure_instant = Some(std::time::Instant::now());
-                    tracing::debug!(
-                        peer_id = %self.peer_id,
-                        addr = %addr,
-                        failures = peer_info.failures,
-                        "Updated peer failure state after connection error"
-                    );
-                }
+                // Session finalization owns success bookkeeping. Failed dials
+                // do not write whichever occupant later owns this address.
 
                 Err(GossipError::Network(std::io::Error::new(
                     io_err.kind(),
@@ -1101,22 +1212,8 @@ impl<T: 'static> Peer<T> {
                     "Connection timeout when connecting to peer"
                 );
 
-                // See the Network arm above for why this is conditional
-                // and insert-if-absent.
-                if !required_peer {
-                    let mut gossip_state = self.registry.gossip_state.lock().await;
-                    let node_id = Some(self.peer_id.to_node_id());
-                    let peer_info = gossip_state.peers.entry(*addr).or_insert_with(|| {
-                        crate::registry::PeerInfo::for_failed_connect_attempt(
-                            crate::registry::AttemptedRoute::new(*addr),
-                            node_id,
-                        )
-                    });
-                    peer_info.failures = self.registry.config.max_peer_failures;
-                    peer_info.last_failure_time = Some(crate::current_timestamp());
-                    peer_info.last_failure_instant = Some(std::time::Instant::now());
-                }
-
+                // A dial deadline carries no successor session receipt and
+                // cannot overwrite current address bookkeeping.
                 Err(GossipError::Network(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     format!("Connection timeout to peer {} at {}", self.peer_id, addr),
@@ -1355,6 +1452,9 @@ pub enum GossipError {
     #[error("registry shutdown")]
     Shutdown,
 
+    #[error(transparent)]
+    ShutdownIncomplete(#[from] RegistryShutdownIncomplete),
+
     #[error("connection closed: {0}")]
     ConnectionClosed(SocketAddr),
 
@@ -1394,7 +1494,7 @@ pub enum GossipError {
     #[error("non-zero-copy API disabled: {0}")]
     NonZeroCopyPath(&'static str),
 
-    #[error("correlation tracker exhausted: all slots in use (slot leak suspected)")]
+    #[error("correlation tracker exhausted: no response slot or fresh wire ID available")]
     CorrelationTrackerExhausted,
 
     /// The peer answered an ask with an explicit NACK instead of data: it
@@ -1483,6 +1583,195 @@ fn timestamp_nanos_at(time: SystemTime) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_journal_clock_clone_rejects_growth_and_preserves_snapshot() {
+        let original = PublicKey { inner: [1; 32] };
+        let successor = PublicKey { inner: [2; 32] };
+        let clock = VectorClock::with_node(original);
+        assert!(clock.clone_bounded(0).is_none());
+        let (saved, charged_entries) = clock.clone_bounded(1).unwrap();
+        assert_eq!(charged_entries, 1);
+        clock.increment(successor);
+        assert_eq!(saved.len(), charged_entries);
+        assert_eq!(clock.len(), 2);
+        assert!(clock.clone_bounded(1).is_none());
+        let (grown, charged_entries) = clock.clone_bounded(2).unwrap();
+        assert_eq!(grown.len(), charged_entries);
+        assert_eq!(charged_entries, 2);
+    }
+
+    #[test]
+    fn vector_clock_serialization_uses_one_snapshot_across_mutation() {
+        struct MutatingClock {
+            clock: VectorClock,
+            successor: GossipNodeId,
+        }
+        impl rkyv::Archive for MutatingClock {
+            type Archived = rkyv::Archived<VectorClock>;
+            type Resolver = VectorClockResolver;
+
+            fn resolve(&self, resolver: Self::Resolver, out: rkyv::Place<Self::Archived>) {
+                rkyv::Archive::resolve(&self.clock, resolver, out);
+            }
+        }
+        impl<S> rkyv::Serialize<S> for MutatingClock
+        where
+            S: rkyv::rancor::Fallible + rkyv::ser::Writer + rkyv::ser::Allocator + ?Sized,
+            S::Error: rkyv::rancor::Source,
+        {
+            fn serialize(
+                &self,
+                serializer: &mut S,
+            ) -> std::result::Result<Self::Resolver, S::Error> {
+                let snapshot = self.clock.clocks.load_full();
+                let previous = Arc::downgrade(&snapshot);
+                drop(snapshot);
+                let resolver = rkyv::Serialize::serialize(&self.clock, serializer)?;
+                self.clock.increment(self.successor);
+                assert!(
+                    previous.upgrade().is_none(),
+                    "the resolver must not retain the replaced immutable map"
+                );
+                Ok(resolver)
+            }
+        }
+        let original = PublicKey { inner: [1; 32] };
+        let successor = PublicKey { inner: [2; 32] };
+        let value = MutatingClock {
+            clock: VectorClock::with_node(original),
+            successor,
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&value).unwrap();
+        assert_eq!(value.clock.len(), 2, "mutation must happen before resolve");
+        let archived =
+            rkyv::access::<rkyv::Archived<VectorClock>, rkyv::rancor::Error>(&bytes).unwrap();
+        assert_eq!(archived.clocks.len(), 1);
+        assert_eq!(archived.clocks[0].0.inner, original.inner);
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&value.clock).unwrap();
+        let archived =
+            rkyv::access::<rkyv::Archived<VectorClock>, rkyv::rancor::Error>(&bytes).unwrap();
+        assert_eq!(archived.clocks.len(), 2);
+        assert!(!std::mem::needs_drop::<VectorClockResolver>());
+
+        // An empty immutable view must stay empty even when mutation adds the
+        // first entry before the archived vector header is resolved.
+        let empty = MutatingClock {
+            clock: VectorClock::new(),
+            successor,
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&empty).unwrap();
+        assert_eq!(empty.clock.len(), 1);
+        let archived =
+            rkyv::access::<rkyv::Archived<VectorClock>, rkyv::rancor::Error>(&bytes).unwrap();
+        assert!(archived.clocks.is_empty());
+    }
+
+    #[test]
+    fn vector_clock_direct_archive_matches_compatibility_wire_shape() {
+        for count in [0, 1, 17, MAX_INGRESS_VECTOR_CLOCK_ENTRIES] {
+            let clocks = (0..count)
+                .rev()
+                .map(|index| {
+                    let mut inner = [0; 32];
+                    inner[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                    (PublicKey { inner }, u64::MAX - index as u64)
+                })
+                .collect();
+            let clock = VectorClock::from(VectorClockData { clocks });
+            let compatibility = VectorClockData::from(&clock);
+            let direct = rkyv::to_bytes::<rkyv::rancor::Error>(&clock).unwrap();
+            let legacy = rkyv::to_bytes::<rkyv::rancor::Error>(&compatibility).unwrap();
+            assert_eq!(&direct[..], &legacy[..]);
+            let decoded =
+                rkyv::access::<rkyv::Archived<VectorClock>, rkyv::rancor::Error>(&direct).unwrap();
+            assert_eq!(decoded.clocks.len(), count);
+            assert!(decoded.clocks.iter().zip(&compatibility.clocks).all(
+                |(entry, (expected_key, expected_value))| {
+                    entry.0.inner == expected_key.inner && entry.1.to_native() == *expected_value
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn vector_clock_snapshot_budget_has_exact_boundary_and_recovery() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        type Reservation = VectorClockSnapshotReservation;
+        let first = Reservation::acquire_from::<rkyv::rancor::Error>(
+            MAX_VECTOR_CLOCK_SNAPSHOT_BYTES - 40,
+            &COUNTER,
+        )
+        .unwrap();
+        let last = Reservation::acquire_from::<rkyv::rancor::Error>(40, &COUNTER).unwrap();
+        assert_eq!(
+            COUNTER.load(Ordering::Relaxed),
+            MAX_VECTOR_CLOCK_SNAPSHOT_BYTES
+        );
+        assert!(Reservation::acquire_from::<rkyv::rancor::Error>(1, &COUNTER).is_err());
+        assert_eq!(
+            COUNTER.load(Ordering::Relaxed),
+            MAX_VECTOR_CLOCK_SNAPSHOT_BYTES
+        );
+        drop(last);
+        let recovered = Reservation::acquire_from::<rkyv::rancor::Error>(40, &COUNTER).unwrap();
+        assert!(Reservation::acquire_from::<rkyv::rancor::Error>(usize::MAX, &COUNTER).is_err());
+        drop(recovered);
+        drop(first);
+        assert_eq!(COUNTER.load(Ordering::Relaxed), 0);
+        let result = std::panic::catch_unwind(|| {
+            let _held = Reservation::acquire_from::<rkyv::rancor::Error>(40, &COUNTER).unwrap();
+            panic!("test resolver unwinding");
+        });
+        assert!(result.is_err());
+        assert_eq!(COUNTER.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn vector_clock_outbound_entry_budget_rejects_before_snapshot() {
+        let clocks = (0..=MAX_SERIALIZED_VECTOR_CLOCK_ENTRIES)
+            .map(|index| {
+                let mut inner = [0; 32];
+                inner[..8].copy_from_slice(&(index as u64).to_le_bytes());
+                (PublicKey { inner }, 1)
+            })
+            .collect();
+        let clock = VectorClock::from(VectorClockData { clocks });
+        assert_eq!(clock.len(), MAX_SERIALIZED_VECTOR_CLOCK_ENTRIES + 1);
+        assert!(rkyv::to_bytes::<rkyv::rancor::Error>(&clock).is_err());
+        // Boundary admitted for serialization; ingress keeps its separate cap.
+        clock.compact(MAX_SERIALIZED_VECTOR_CLOCK_ENTRIES);
+        assert!(rkyv::to_bytes::<rkyv::rancor::Error>(&clock).is_ok());
+    }
+
+    #[test]
+    fn vector_clock_hash_matches_equality_with_explicit_zero_entries() {
+        fn hash(clock: &VectorClock) -> u64 {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            clock.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        let node = KeyPair::new_for_testing("qa-vector-clock-zero")
+            .peer_id()
+            .to_node_id();
+        let extra = KeyPair::new_for_testing("qa-vector-clock-extra")
+            .peer_id()
+            .to_node_id();
+        let empty = VectorClock::new();
+        let explicit_zero = VectorClock::with_node(node);
+        assert_eq!(empty, explicit_zero);
+        assert_eq!(hash(&empty), hash(&explicit_zero));
+
+        explicit_zero.increment(node);
+        assert_ne!(empty, explicit_zero);
+        let with_extra_zero = explicit_zero.clone();
+        with_extra_zero.merge(&VectorClock::with_node(extra));
+        assert_eq!(with_extra_zero.len(), 2);
+        assert_eq!(explicit_zero, with_extra_zero);
+        assert_eq!(hash(&explicit_zero), hash(&with_extra_zero));
+    }
 
     #[test]
     fn timestamp_nanos_saturates_before_unix_epoch() {
@@ -1783,7 +2072,8 @@ mod tests {
         // connect path did.
         registry
             .connection_pool
-            .set_configured_peer_addr(&peer_id, stale_addr);
+            .set_configured_peer_addr(&peer_id, stale_addr)
+            .unwrap();
 
         assert_eq!(
             registry.connection_pool.get_required_peer_addr(&peer_id),
@@ -2075,7 +2365,7 @@ mod tests {
         // Hold `gossip_state`'s lock across the window `connect_discovered`'s
         // own `get_connection` call needs it, inside `lookup_node_id`'s
         // identity resolution.
-        let guard = registry.gossip_state.lock().await;
+        let mut guard = registry.gossip_state.lock().await;
 
         let connect_task = {
             let peer = peer.clone();
@@ -2113,6 +2403,17 @@ mod tests {
             existing_addr,
             conn.clone(),
         );
+        // Model an already-finalized session. Reusing it is not a new
+        // success event and must not manufacture bookkeeping at the hint.
+        let mut info = crate::registry::PeerInfo::for_connect_attempt(
+            crate::registry::ResolvedRoute::from_connection(
+                existing_addr,
+                Some(ConnectionDirection::Outbound),
+            ),
+            Some(peer_id.to_node_id()),
+        );
+        info.last_success = crate::current_timestamp().max(1);
+        guard.peers.insert(existing_addr, info);
 
         drop(guard);
 
@@ -2191,7 +2492,7 @@ mod tests {
             registry: registry.clone(),
         };
 
-        let guard = registry.gossip_state.lock().await;
+        let mut guard = registry.gossip_state.lock().await;
 
         let connect_task = {
             let peer = peer.clone();
@@ -2220,6 +2521,17 @@ mod tests {
             existing_addr,
             conn.clone(),
         );
+        // Model an already-finalized session. Reusing it is not a new
+        // success event and must not manufacture bookkeeping at the hint.
+        let info = crate::registry::PeerInfo::for_connect_attempt(
+            crate::registry::ResolvedRoute::from_connection(
+                existing_addr,
+                Some(ConnectionDirection::Inbound),
+            ),
+            Some(peer_id.to_node_id()),
+        );
+        assert!(info.transport_source_keyed && info.inbound_observed);
+        guard.peers.insert(existing_addr, info);
 
         drop(guard);
 

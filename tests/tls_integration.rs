@@ -569,7 +569,7 @@ fn test_tls_reconnection() {
         // handle drop only aborts owned background loops; detached connection
         // tasks may otherwise keep the old session alive long enough to race
         // replacement publication.
-        registry_b.shutdown().await;
+        registry_b.shutdown().await.unwrap();
         drop(registry_b);
 
         // Wait for A to detect disconnection and reach max retry failures

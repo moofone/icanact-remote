@@ -82,8 +82,8 @@ async fn connect_pair(a: &GossipRegistryHandle, b: &GossipRegistryHandle) {
         )
         .await;
 
-    a.bootstrap_non_blocking(vec![addr_b]).await;
-    b.bootstrap_non_blocking(vec![addr_a]).await;
+    a.bootstrap_non_blocking(vec![addr_b]).await.unwrap();
+    b.bootstrap_non_blocking(vec![addr_a]).await.unwrap();
 }
 
 async fn wait_for_actor(node: &GossipRegistryHandle, actor: &str, timeout: Duration) -> bool {
@@ -142,8 +142,8 @@ fn test_full_sync_for_small_cluster() -> Result<(), DynError> {
             "full sync exchanges should be recorded for small cluster"
         );
 
-        node_a.shutdown().await;
-        node_b.shutdown().await;
+        node_a.shutdown().await.unwrap();
+        node_b.shutdown().await.unwrap();
         Ok(())
     })
 }
@@ -245,8 +245,8 @@ fn test_delta_gossip_after_initial_full_sync() -> Result<(), DynError> {
             "gossip exchange counters should advance after second update"
         );
 
-        node_a.shutdown().await;
-        node_b.shutdown().await;
+        node_a.shutdown().await.unwrap();
+        node_b.shutdown().await.unwrap();
         Ok(())
     })
 }
@@ -278,8 +278,8 @@ fn test_immediate_propagation_for_urgent_registration() -> Result<(), DynError> 
             "urgent registration should propagate before normal gossip interval"
         );
 
-        node_a.shutdown().await;
-        node_b.shutdown().await;
+        node_a.shutdown().await.unwrap();
+        node_b.shutdown().await.unwrap();
         Ok(())
     })
 }

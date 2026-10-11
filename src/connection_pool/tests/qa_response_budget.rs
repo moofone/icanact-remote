@@ -3,8 +3,10 @@ use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const QA_RESPONSE_OWNER_BYTES: usize = 128 * 1024;
+// A lawful 64-outcome burst must still exceed the unchanged byte budget.
+const QA_RESPONSE_OWNER_BYTES: usize = 512 * 1024;
 const QA_ASK_COUNT: u32 = 512;
+const QA_OUTCOME_WINDOW: u32 = outcome_window::OUTCOME_CAP as u32;
 const QA_RETAINED_BUDGET: usize = 20 * 1024 * 1024;
 
 struct OwnedResponse {
@@ -40,10 +42,10 @@ impl crate::registry::ActorAskImmediateHandlerSync for ImmediateOwnedHandler {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.live.fetch_add(self.payload_len, Ordering::SeqCst);
         Ok(crate::registry::AskDisposition::ImmediateBytes(
-            bytes::Bytes::from_owner(OwnedResponse {
+            crate::ForwardPayload::from_test_owner(OwnedResponse {
                 data: vec![7; self.payload_len],
                 live: self.live.clone(),
-            }),
+            }, self.payload_len),
         ))
     }
 }
@@ -122,8 +124,8 @@ where
 }
 
 /// R1: a non-reading peer must not retain unbounded inline reply owners.
-/// Before the budget covered `PendingOrdinaryWrite`, this dispatched 512/512
-/// handlers and retained 64 MiB.
+/// Exercise the unchanged byte plateau with protocol-lawful saturated
+/// windows, and verify every physical teardown releases its native owners.
 #[tokio::test(flavor = "current_thread")]
 async fn qa_inline_response_retention_stays_bounded_when_peer_never_reads() {
     let addr = "127.0.0.1:39910".parse().unwrap();
@@ -143,32 +145,30 @@ async fn qa_inline_response_retention_stays_bounded_when_peer_never_reads() {
             payload_len: QA_RESPONSE_OWNER_BYTES,
         }))
         .await;
-    let ctx = response_budget_read_context(&registry, addr);
-    let (stream, mut peer) = tokio::io::duplex(64 * 1024);
-    let (writer, task, _) = LockFreeStreamHandle::new(
-        stream,
-        addr,
-        ChannelId::TellAsk,
-        BufferConfig::default(),
-        None,
-        Some(ctx),
-    );
-    write_empty_asks(&mut peer, QA_ASK_COUNT).await;
-    let handled = wait_for_stable_dispatch(&calls, Duration::from_secs(3)).await;
-    assert!(handled > 0, "fixture must dispatch asks");
-    let retained = live.load(Ordering::SeqCst);
-    eprintln!("never-read peer: dispatched={handled}/{QA_ASK_COUNT} retained_bytes={retained}");
-    assert!(
-        retained <= QA_RETAINED_BUDGET,
-        "inline response byte cap bypassed: retained={retained}, dispatched={handled}"
-    );
-    writer.shutdown();
-    task.await.unwrap();
-    assert_eq!(
-        live.load(Ordering::SeqCst),
-        0,
-        "cleanup must drop reply owners"
-    );
+    // Preserve 512 total non-reading requests across eight physical
+    // sessions. Each session saturates one lawful 64-outcome window; no
+    // peer reads replies. Teardown must restore the plateau before reuse.
+    assert_eq!(QA_ASK_COUNT % QA_OUTCOME_WINDOW, 0);
+    let mut submitted = 0;
+    for _ in 0..QA_ASK_COUNT / QA_OUTCOME_WINDOW {
+        let ctx = response_budget_read_context(&registry, addr);
+        let (stream, mut peer) = tokio::io::duplex(64 * 1024);
+        let (writer, task, _) = LockFreeStreamHandle::new(
+            stream, addr, ChannelId::TellAsk, BufferConfig::default(), None, Some(ctx),
+        );
+        write_empty_asks(&mut peer, QA_OUTCOME_WINDOW).await;
+        submitted += QA_OUTCOME_WINDOW;
+        let handled = wait_for_stable_dispatch(&calls, Duration::from_secs(3)).await;
+        assert!(handled > 0, "fixture must dispatch asks");
+        let retained = live.load(Ordering::SeqCst);
+        assert!(retained <= QA_RETAINED_BUDGET,
+            "inline response byte cap bypassed: retained={retained}, dispatched={handled}");
+        writer.shutdown();
+        task.await.unwrap();
+        assert_eq!(live.load(Ordering::SeqCst), 0, "cleanup must drop reply owners");
+        drop(peer);
+    }
+    assert_eq!(submitted, QA_ASK_COUNT);
 }
 
 /// Every submitted ask must resolve as a response, a backpressure NACK, or
@@ -202,36 +202,51 @@ async fn qa_inline_response_overload_has_terminal_outcome_for_every_ask() {
         None,
         Some(ctx),
     );
-    write_empty_asks(&mut peer, QA_ASK_COUNT).await;
-    let handled = wait_for_stable_dispatch(&calls, Duration::from_secs(3)).await;
-    assert!(handled > 0, "fixture must dispatch asks");
-    let retained = live.load(Ordering::SeqCst);
-    assert!(
-        retained <= QA_RETAINED_BUDGET,
-        "inline response byte cap bypassed: retained={retained}, dispatched={handled}"
-    );
-
     let mut responses = 0u32;
     let mut nacks = 0u32;
+    let mut seen = vec![false; QA_ASK_COUNT as usize];
+    let mut saturated_bursts = 0;
     let recovered = tokio::time::timeout(Duration::from_secs(15), async {
         let mut body = vec![0u8; QA_RESPONSE_OWNER_BYTES];
-        while responses + nacks < QA_ASK_COUNT {
-            let mut header = [0u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN];
-            peer.read_exact(&mut header).await.unwrap();
-            let (payload_len, nack) = parse_response_header(&header);
-            if let Some(reason) = nack {
-                assert_eq!(reason, crate::framing::AskNackReason::Backpressure);
-                assert_eq!(payload_len, 0);
-                nacks += 1;
-            } else {
-                assert_eq!(payload_len, QA_RESPONSE_OWNER_BYTES);
-                peer.read_exact(&mut body).await.unwrap();
-                assert!(body.iter().all(|&b| b == 7));
-                responses += 1;
+        // Stall each lawful 64-request burst before reading its terminal
+        // outcomes. Drain those credits before submitting the next burst;
+        // preserve 512 total requests and the original total recovery bound.
+        for start in (1..=QA_ASK_COUNT).step_by(QA_OUTCOME_WINDOW as usize) {
+            let calls_before = calls.load(Ordering::SeqCst);
+            for corr in start..start + QA_OUTCOME_WINDOW {
+                peer.write_all(&crate::framing::try_write_actor_ask_header(corr, 1, 1, 0).unwrap())
+                    .await.unwrap();
+            }
+            let handled = wait_for_stable_dispatch(&calls, Duration::from_secs(3)).await;
+            assert!(handled > calls_before, "fixture must dispatch asks");
+            assert!(handled - calls_before < QA_OUTCOME_WINDOW as usize,
+                "a non-reading saturated window must backpressure before dispatch");
+            saturated_bursts += 1;
+            let retained = live.load(Ordering::SeqCst);
+            assert!(retained <= QA_RETAINED_BUDGET,
+                "inline response byte cap bypassed: retained={retained}, dispatched={handled}");
+            for _ in 0..QA_OUTCOME_WINDOW {
+                let mut header = [0u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN];
+                peer.read_exact(&mut header).await.unwrap();
+                let corr = u32::from_be_bytes(header[4..8].try_into().unwrap());
+                assert!((start..start + QA_OUTCOME_WINDOW).contains(&corr));
+                assert!(!std::mem::replace(&mut seen[corr as usize - 1], true),
+                    "each request has exactly one terminal outcome");
+                let (payload_len, nack) = parse_response_header(&header);
+                if let Some(reason) = nack {
+                    assert_eq!(reason, crate::framing::AskNackReason::Backpressure);
+                    assert_eq!(payload_len, 0);
+                    nacks += 1;
+                } else {
+                    assert_eq!(payload_len, QA_RESPONSE_OWNER_BYTES);
+                    peer.read_exact(&mut body).await.unwrap();
+                    assert!(body.iter().all(|&b| b == 7));
+                    responses += 1;
+                }
             }
         }
-    })
-    .await;
+        assert!(seen.iter().all(|&present| present));
+    }).await;
     assert!(
         recovered.is_ok(),
         "every submitted ask must produce a response or NACK, got responses={responses} nacks={nacks}"
@@ -242,10 +257,11 @@ async fn qa_inline_response_overload_has_terminal_outcome_for_every_ask() {
         responses,
         "backpressure NACKs must be pre-dispatch"
     );
-    assert!(
-        nacks > 0,
-        "non-reading burst must NACK some asks once the inline budget is full"
-    );
+    assert_eq!(saturated_bursts, QA_ASK_COUNT / QA_OUTCOME_WINDOW,
+        "every lawful burst must exercise pre-dispatch saturation");
+    // Bounded deferral is a lawful admission outcome for a finite window;
+    // the old 512-outstanding fixture could only force NACKs by violating
+    // the protocol. Keep NACK accounting, exact terminals and dispatch counts.
     assert!(
         responses > 0,
         "some asks must still complete once the peer reads"
@@ -312,6 +328,8 @@ async fn qa_inline_response_healthy_burst_delivers_all() {
         Some(ctx),
     );
     let (mut peer_read, mut peer_write) = tokio::io::split(peer);
+    let credits = Arc::new(tokio::sync::Semaphore::new(QA_OUTCOME_WINDOW as usize));
+    let reply_credits = credits.clone();
     let reader = tokio::spawn(async move {
         let mut body = vec![0u8; 64];
         for _ in 1..=QA_ASK_COUNT {
@@ -321,9 +339,14 @@ async fn qa_inline_response_healthy_burst_delivers_all() {
             assert!(nack.is_none(), "healthy burst must not NACK");
             assert_eq!(payload_len, 64);
             peer_read.read_exact(&mut body).await.unwrap();
+            reply_credits.add_permits(1);
         }
     });
-    write_empty_asks(&mut peer_write, QA_ASK_COUNT).await;
+    for corr in 1..=QA_ASK_COUNT {
+        credits.acquire().await.unwrap().forget();
+        peer_write.write_all(&crate::framing::try_write_actor_ask_header(corr, 1, 1, 0).unwrap())
+            .await.unwrap();
+    }
     tokio::time::timeout(Duration::from_secs(10), reader)
         .await
         .expect("healthy burst must finish")

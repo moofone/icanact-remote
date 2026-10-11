@@ -8,6 +8,7 @@ not a closed-loop saturation measurement.
 """
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -26,7 +27,7 @@ def parse(output, rate, seconds, max_inflight):
     if len(lines) != 1:
         raise ValueError("exactly one native record required")
     record = json.loads(lines[0])
-    if record.get("workload") != f"ask_offered{rate}" or record.get("completed", 0) <= 0:
+    if record.get("workload") != f"ask_offered{rate}" or (type(record.get("completed")) is not int or record["completed"] <= 0):
         raise ValueError("wrong workload identity or no completed work")
     if record.get("offered") != rate * seconds:
         raise ValueError("offer count does not match the preregistered rate and window")
@@ -35,6 +36,11 @@ def parse(output, rate, seconds, max_inflight):
     if record.get("errors") != 0 or record.get("drops") != 0:
         raise ValueError("errors and drops must be zero")
     metrics = record["metrics"]
+    required_metrics = ("duration_ns", "offer_window_ns", "max_backlog", "p50_ns", "p95_ns", "p99_ns")
+    for key in required_metrics:
+        value = metrics.get(key)
+        if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"invalid/missing metric {key}")
     if metrics["offer_window_ns"] != seconds * 1_000_000_000:
         raise ValueError("offer window does not match the requested duration")
     # The last offer is one interval before the nominal window ends.

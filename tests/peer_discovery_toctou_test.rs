@@ -113,11 +113,11 @@ fn test_max_peers_respected_under_concurrent_discovery() {
 
         // All peers bootstrap to hub rapidly (without waiting between)
         // This creates the race condition scenario
-        peer_1.bootstrap_non_blocking(vec![hub_addr]).await;
-        peer_2.bootstrap_non_blocking(vec![hub_addr]).await;
-        peer_3.bootstrap_non_blocking(vec![hub_addr]).await;
-        peer_4.bootstrap_non_blocking(vec![hub_addr]).await;
-        peer_5.bootstrap_non_blocking(vec![hub_addr]).await;
+        peer_1.bootstrap_non_blocking(vec![hub_addr]).await.unwrap();
+        peer_2.bootstrap_non_blocking(vec![hub_addr]).await.unwrap();
+        peer_3.bootstrap_non_blocking(vec![hub_addr]).await.unwrap();
+        peer_4.bootstrap_non_blocking(vec![hub_addr]).await.unwrap();
+        peer_5.bootstrap_non_blocking(vec![hub_addr]).await.unwrap();
 
         // Let gossip propagate and connections settle
         sleep(Duration::from_millis(800)).await;
@@ -160,7 +160,7 @@ fn test_connection_teardown_aborts_tasks() {
         // Connect B to A
         node_a.registry.add_peer(addr_b).await;
         node_b.registry.add_peer(addr_a).await;
-        node_b.bootstrap_non_blocking(vec![addr_a]).await;
+        node_b.bootstrap_non_blocking(vec![addr_a]).await.unwrap();
 
         // Wait for connection
         sleep(Duration::from_millis(300)).await;
@@ -207,7 +207,7 @@ fn test_peer_state_transitions() {
         node_a.registry.add_peer(addr_b).await;
 
         // Attempt connection
-        node_a.bootstrap_non_blocking(vec![addr_b]).await;
+        node_a.bootstrap_non_blocking(vec![addr_b]).await.unwrap();
 
         // Wait for connection attempt
         sleep(Duration::from_millis(300)).await;

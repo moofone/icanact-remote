@@ -1,11 +1,13 @@
 #[path = "support/error.rs"]
 mod example_error;
 
-use bytes::Bytes;
 use example_error::{Error, Result};
 use futures::future::BoxFuture;
 use icanact_remote::registry::PeerDisconnectHandler;
-use icanact_remote::{GossipConfig, GossipNodeId, GossipRegistryHandle, SecretKey, wire_type};
+use icanact_remote::{
+    AlignedBytes, ForwardPayload, GossipConfig, GossipNodeId, GossipRegistryHandle, SecretKey,
+    wire_type,
+};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::env;
 use std::fs;
@@ -162,43 +164,45 @@ async fn main() -> Result<()> {
 
     // Tell (fire-and-forget) via ActorTell frame
     conn_handle
-        .tell_actor_frame(actor_id, type_hash, Bytes::from_static(b"tell:hello"))
+        .tell_actor_frame_owned(
+            actor_id,
+            type_hash,
+            ForwardPayload::from_static(b"tell:hello"),
+        )
         .await?;
     println!("✅ Tell sent");
 
     // Ask (request-response) via ActorAsk frame
-    let response: Bytes = if use_direct {
+    let response: AlignedBytes = if use_direct {
         // DirectAsk fast path: bypass ActorAsk envelope
         if use_direct_timeout {
             conn_handle
-                .ask_direct(Bytes::from_static(b"ask:ping"), ask_timeout)
+                .ask_direct_owned(ForwardPayload::from_static(b"ask:ping"), ask_timeout)
                 .await?
         } else {
             conn_handle
-                .ask_direct_no_timeout(Bytes::from_static(b"ask:ping"))
+                .ask_direct_no_timeout_owned(ForwardPayload::from_static(b"ask:ping"))
                 .await?
         }
     } else {
         // Regular ask through ActorAsk frames
         if effective_no_timeout {
             conn_handle
-                .ask_actor_frame_no_timeout_aligned(
+                .ask_actor_frame_no_timeout_owned(
                     actor_id,
                     type_hash,
-                    Bytes::from_static(b"ask:ping"),
+                    ForwardPayload::from_static(b"ask:ping"),
                 )
                 .await?
-                .into_bytes()
         } else {
             conn_handle
-                .ask_actor_frame_aligned(
+                .ask_actor_frame_owned(
                     actor_id,
                     type_hash,
-                    Bytes::from_static(b"ask:ping"),
+                    ForwardPayload::from_static(b"ask:ping"),
                     ask_timeout,
                 )
                 .await?
-                .into_bytes()
         }
     };
 
@@ -211,7 +215,7 @@ async fn main() -> Result<()> {
         #[cfg(debug_assertions)]
         {
             // Typed ask (debug-only type hash verification)
-            let typed_response: EchoResponse = conn
+            let typed_response: EchoResponse = conn_handle
                 .ask_typed::<EchoRequest, EchoResponse>(&EchoRequest {
                     payload: b"ask:typed".to_vec(),
                 })
@@ -238,7 +242,11 @@ async fn main() -> Result<()> {
             for _ in 0..tell_count {
                 let start = Instant::now();
                 conn_handle
-                    .tell_actor_frame(actor_id, type_hash, Bytes::from_static(b"tell:hello"))
+                    .tell_actor_frame_owned(
+                        actor_id,
+                        type_hash,
+                        ForwardPayload::from_static(b"tell:hello"),
+                    )
                     .await?;
                 tell_latencies.push(start.elapsed());
             }
@@ -277,44 +285,36 @@ async fn main() -> Result<()> {
             for _ in 0..warmup {
                 if use_direct {
                     if use_direct_timeout {
-                        let _ = conn
-                            .connection_ref()
-                            .unwrap()
-                            .ask_direct(Bytes::from_static(ask_payload), ask_timeout)
+                        let _ = conn_handle
+                            .ask_direct_owned(ForwardPayload::from_static(ask_payload), ask_timeout)
                             .await?;
                     } else {
-                        let _ = conn
-                            .connection_ref()
-                            .unwrap()
-                            .ask_direct_no_timeout(Bytes::from_static(ask_payload))
+                        let _ = conn_handle
+                            .ask_direct_no_timeout_owned(ForwardPayload::from_static(ask_payload))
                             .await?;
                     }
+                } else if effective_no_timeout {
+                    let _ = conn_handle
+                        .ask_actor_frame_no_timeout_owned(
+                            actor_id,
+                            type_hash,
+                            ForwardPayload::from_static(ask_payload),
+                        )
+                        .await?;
                 } else {
-                    let conn_handle = conn.connection_ref().unwrap();
-                    if effective_no_timeout {
-                        let _ = conn_handle
-                            .ask_actor_frame_no_timeout_aligned(
-                                actor_id,
-                                type_hash,
-                                Bytes::from_static(ask_payload),
-                            )
-                            .await?;
-                    } else {
-                        let _ = conn_handle
-                            .ask_actor_frame_aligned(
-                                actor_id,
-                                type_hash,
-                                Bytes::from_static(ask_payload),
-                                ask_timeout,
-                            )
-                            .await?;
-                    }
+                    let _ = conn_handle
+                        .ask_actor_frame_owned(
+                            actor_id,
+                            type_hash,
+                            ForwardPayload::from_static(ask_payload),
+                            ask_timeout,
+                        )
+                        .await?;
                 }
             }
             tokio::task::yield_now().await;
 
             let worker_count = ask_concurrency.min(ask_count).max(1);
-            let conn_handle = conn.connection_ref().unwrap().clone();
             let remaining = Arc::new(AtomicUsize::new(0));
             let warmup_done = Arc::new(AtomicUsize::new(0));
             let warmup_complete = Arc::new(Notify::new());
@@ -329,7 +329,6 @@ async fn main() -> Result<()> {
                     .map(|_| AtomicU64::new(0))
                     .collect::<Vec<_>>(),
             );
-            let ask_payload = Bytes::from_static(ask_payload);
 
             let mut tasks = Vec::with_capacity(worker_count);
 
@@ -337,7 +336,6 @@ async fn main() -> Result<()> {
                 let conn_handle = conn_handle.clone();
                 let remaining = remaining.clone();
                 let latencies = latencies.clone();
-                let ask_payload = ask_payload.clone();
                 let warmup_done = warmup_done.clone();
                 let warmup_complete = warmup_complete.clone();
                 let warmup_error = warmup_error.clone();
@@ -358,30 +356,35 @@ async fn main() -> Result<()> {
                     let warmup_result = if use_direct {
                         if use_direct_timeout {
                             conn_handle
-                                .ask_direct(ask_payload.clone(), ask_timeout)
+                                .ask_direct_owned(
+                                    ForwardPayload::from_static(ask_payload),
+                                    ask_timeout,
+                                )
                                 .await
                                 .map(|_| ())
                         } else {
                             conn_handle
-                                .ask_direct_no_timeout(ask_payload.clone())
+                                .ask_direct_no_timeout_owned(ForwardPayload::from_static(
+                                    ask_payload,
+                                ))
                                 .await
                                 .map(|_| ())
                         }
                     } else if effective_no_timeout {
                         conn_handle
-                            .ask_actor_frame_no_timeout_aligned(
+                            .ask_actor_frame_no_timeout_owned(
                                 actor_id,
                                 type_hash,
-                                ask_payload.clone(),
+                                ForwardPayload::from_static(ask_payload),
                             )
                             .await
                             .map(|_| ())
                     } else {
                         conn_handle
-                            .ask_actor_frame_aligned(
+                            .ask_actor_frame_owned(
                                 actor_id,
                                 type_hash,
-                                ask_payload.clone(),
+                                ForwardPayload::from_static(ask_payload),
                                 ask_timeout,
                             )
                             .await
@@ -414,27 +417,32 @@ async fn main() -> Result<()> {
                         if use_direct {
                             if use_direct_timeout {
                                 let _ = conn_handle
-                                    .ask_direct(ask_payload.clone(), ask_timeout)
+                                    .ask_direct_owned(
+                                        ForwardPayload::from_static(ask_payload),
+                                        ask_timeout,
+                                    )
                                     .await?;
                             } else {
                                 let _ = conn_handle
-                                    .ask_direct_no_timeout(ask_payload.clone())
+                                    .ask_direct_no_timeout_owned(ForwardPayload::from_static(
+                                        ask_payload,
+                                    ))
                                     .await?;
                             }
                         } else if effective_no_timeout {
                             let _ = conn_handle
-                                .ask_actor_frame_no_timeout_aligned(
+                                .ask_actor_frame_no_timeout_owned(
                                     actor_id,
                                     type_hash,
-                                    ask_payload.clone(),
+                                    ForwardPayload::from_static(ask_payload),
                                 )
                                 .await?;
                         } else {
                             let _ = conn_handle
-                                .ask_actor_frame_aligned(
+                                .ask_actor_frame_owned(
                                     actor_id,
                                     type_hash,
-                                    ask_payload.clone(),
+                                    ForwardPayload::from_static(ask_payload),
                                     ask_timeout,
                                 )
                                 .await?;
@@ -530,7 +538,7 @@ async fn main() -> Result<()> {
         })
         .await;
         println!("🛑 [CLIENT] Enter received, shutting down registry...");
-        registry.shutdown().await;
+        registry.shutdown().await?;
         Ok::<(), Error>(())
     };
 
@@ -538,7 +546,7 @@ async fn main() -> Result<()> {
         res = run => res?,
         _ = tokio::signal::ctrl_c() => {
             println!("🛑 [CLIENT] Ctrl+C received, shutting down...");
-            registry.shutdown_and_wait().await;
+            registry.shutdown_and_wait().await?;
         }
     }
     Ok(())

@@ -29,7 +29,7 @@ impl RemoteConnection {
 
     /// Instance id of the specific connection this handle was cached from —
     /// used to retire exactly this instance (never "whatever is currently
-    /// indexed for the peer") when an ask on it fails or is cancelled.
+    /// indexed for the peer") after a hard transport failure.
     pub(crate) fn instance_id(&self) -> Option<u64> {
         self.inner.instance_id()
     }
@@ -75,6 +75,39 @@ impl RemoteConnection {
             .try_tell_actor_frame(actor_id, type_hash, payload)
     }
 
+    /// Raw tell preserving the complete request owner.
+    pub async fn tell_owned(&self, payload: crate::ForwardPayload) -> crate::Result<()> {
+        self.inner.tell_owned(payload).await
+    }
+
+    /// Actor tell preserving the complete request owner.
+    pub async fn tell_actor_frame_owned(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: crate::ForwardPayload,
+    ) -> crate::Result<()> {
+        self.inner
+            .tell_actor_frame_owned(actor_id, type_hash, payload)
+            .await
+    }
+
+    /// Raw tell preserving the complete request owner.
+    pub fn try_tell_owned(&self, payload: crate::ForwardPayload) -> crate::Result<()> {
+        self.inner.try_tell_owned(payload)
+    }
+
+    /// Actor tell preserving the complete request owner.
+    pub fn try_tell_actor_frame_owned(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: crate::ForwardPayload,
+    ) -> crate::Result<()> {
+        self.inner
+            .try_tell_actor_frame_owned(actor_id, type_hash, payload)
+    }
+
     pub async fn pubsub_frame(&self, payload: bytes::Bytes) -> crate::Result<()> {
         self.inner.send_pubsub_payload(payload).await
     }
@@ -93,6 +126,33 @@ impl RemoteConnection {
             .try_send_pubsub_payload_pooled(payload, prefix, payload_len)
     }
 
+    /// Preserve the complete request owner and the aligned response owner.
+    pub async fn ask_actor_frame_owned(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: crate::ForwardPayload,
+        timeout: Duration,
+    ) -> crate::Result<crate::AlignedBytes> {
+        self.inner
+            .ask_actor_frame_owned(actor_id, type_hash, payload, timeout)
+            .await
+    }
+
+    /// Preserve owners without allocating a timeout wrapper.
+    pub async fn ask_actor_frame_no_timeout_owned(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: crate::ForwardPayload,
+    ) -> crate::Result<crate::AlignedBytes> {
+        self.inner
+            .ask_actor_frame_no_timeout_owned(actor_id, type_hash, payload)
+            .await
+    }
+
+    /// Copying Bytes compatibility path; prefer [`Self::ask_actor_frame_owned`]
+    /// for proven request owners and aligned responses.
     pub async fn ask_actor_frame(
         &self,
         actor_id: u64,
@@ -193,13 +253,29 @@ impl RemoteConnection {
             .await
     }
 
+    /// Deferred ask preserving the native request owner through admission.
+    /// The returned handle borrows this exact connection for its entire lifetime.
+    pub async fn ask_actor_frame_deferred_owned(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: crate::ForwardPayload,
+        timeout: Duration,
+    ) -> crate::Result<crate::DeferredAsk<'_>> {
+        let pending = self
+            .inner
+            .ask_actor_frame_deferred_owned(actor_id, type_hash, payload, timeout)
+            .await?;
+        Ok(crate::DeferredAsk::from_pending(pending))
+    }
+
     pub async fn ask_actor_frame_deferred(
         &self,
         actor_id: u64,
         type_hash: u32,
         payload: bytes::Bytes,
         timeout: Duration,
-    ) -> crate::Result<crate::DeferredAsk> {
+    ) -> crate::Result<crate::DeferredAsk<'_>> {
         let pending = self
             .inner
             .ask_actor_frame_deferred(actor_id, type_hash, payload, timeout)
@@ -207,6 +283,7 @@ impl RemoteConnection {
         Ok(crate::DeferredAsk::from_pending(pending))
     }
 
+    /// Bytes compatibility adapter; native `*_owned` APIs avoid response promotion.
     pub async fn ask_with_timeout_bytes(
         &self,
         request: bytes::Bytes,
@@ -215,10 +292,12 @@ impl RemoteConnection {
         self.inner.ask_with_timeout_bytes(request, timeout).await
     }
 
+    /// Bytes compatibility adapter; native `*_owned` APIs avoid response promotion.
     pub async fn ask(&self, request: bytes::Bytes) -> crate::Result<bytes::Bytes> {
         self.inner.ask(request).await
     }
 
+    /// Bytes compatibility adapter; native `*_owned` APIs avoid response promotion.
     pub async fn ask_direct(
         &self,
         request: bytes::Bytes,
@@ -227,11 +306,58 @@ impl RemoteConnection {
         self.inner.ask_direct(request, timeout).await
     }
 
+    /// Bytes compatibility adapter; native `*_owned` APIs avoid response promotion.
     pub async fn ask_direct_no_timeout(
         &self,
         request: bytes::Bytes,
     ) -> crate::Result<bytes::Bytes> {
         self.inner.ask_direct_no_timeout(request).await
+    }
+
+    /// Native-owner request path; preserves the aligned response without promotion.
+    pub async fn ask_owned(
+        &self,
+        request: crate::ForwardPayload,
+        timeout: Duration,
+    ) -> crate::Result<crate::AlignedBytes> {
+        self.inner.ask_owned(request, timeout).await
+    }
+
+    /// Native-owner request path; preserves the aligned response without promotion.
+    pub async fn ask_no_timeout_owned(
+        &self,
+        request: crate::ForwardPayload,
+    ) -> crate::Result<crate::AlignedBytes> {
+        self.inner.ask_no_timeout_owned(request).await
+    }
+
+    /// Native-owner request path; preserves the aligned response without promotion.
+    pub async fn ask_direct_owned(
+        &self,
+        request: crate::ForwardPayload,
+        timeout: Duration,
+    ) -> crate::Result<crate::AlignedBytes> {
+        self.inner.ask_direct_owned(request, timeout).await
+    }
+
+    /// Native-owner request path; preserves the aligned response without promotion.
+    pub async fn ask_direct_no_timeout_owned(
+        &self,
+        request: crate::ForwardPayload,
+    ) -> crate::Result<crate::AlignedBytes> {
+        self.inner.ask_direct_no_timeout_owned(request).await
+    }
+
+    /// Native-owner request path; preserves the aligned response without promotion.
+    pub async fn ask_direct_owned_with_id(
+        &self,
+        request_id: u64,
+        request: crate::ForwardPayload,
+        timeout: Duration,
+    ) -> crate::Result<crate::AlignedBytes> {
+        self.inner
+            .ask_direct_owned_with_id(request_id, request, timeout)
+            .await
     }
 
     pub async fn ask_streaming_bytes(
@@ -269,7 +395,19 @@ impl RemoteConnection {
             .await
     }
 
-    pub async fn ask_deferred(&self, request: bytes::Bytes) -> crate::Result<crate::DeferredAsk> {
+    /// Native raw deferred ask; the wait borrows this exact connection.
+    pub async fn ask_deferred_owned(
+        &self,
+        request: crate::ForwardPayload,
+    ) -> crate::Result<crate::DeferredAsk<'_>> {
+        let pending = self.inner.ask_deferred_owned(request).await?;
+        Ok(crate::DeferredAsk::from_pending(pending))
+    }
+
+    pub async fn ask_deferred(
+        &self,
+        request: bytes::Bytes,
+    ) -> crate::Result<crate::DeferredAsk<'_>> {
         let pending = self.inner.ask_deferred(request).await?;
         Ok(crate::DeferredAsk::from_pending(pending))
     }
@@ -344,10 +482,14 @@ impl RemoteConnection {
     }
 }
 
-/// A remote actor reference with a cached connection for zero-lookup message sending.
+/// A reconnectable remote actor locator.
 ///
-/// This is returned by `lookup()` and provides `tell()`, `ask()`, and `ask_streaming_bytes()`
-/// methods that use the cached connection directly (no hashmap lookups, just pointer deref).
+/// Acquire [`Self::session`] once for healthy repeated operations. Convenience
+/// methods on this locator acquire a shared connection owner for each call;
+/// they are recovery/acquisition adapters, not the allocation-free hot path.
+///
+/// Returned by `lookup()`. A scoped session borrows its exact cached connection
+/// for repeated operations; locator convenience calls acquire it separately.
 ///
 /// # Resource Management
 ///
@@ -370,13 +512,12 @@ impl RemoteConnection {
 /// The cached connection lives in a lock-free swappable slot
 /// (`ArcSwapOption<RemoteConnection>`), not a fixed field set once at
 /// construction. When a transport-level failure is observed on `tell()`/
-/// `ask()` (connection reset, broken pipe, or an already-closed handle) —
-/// or an actor-ask times out, subject to `ConnectionRecoveryPolicy` — the
+/// `ask()` (connection reset, broken pipe, or an already-closed handle), the
 /// ref re-resolves the peer through the registry's connection pool
 /// (`peer_id` → address, refreshing DNS as needed), and **persists** the
-/// healed connection back into the slot so every subsequent call on this ref
-/// (and on any of its clones, which share the same slot) uses it directly
-/// with zero additional lookups. The failed operation is not replayed because
+/// healed connection back into the slot for subsequent session acquisition.
+/// Existing sessions stay on their original generation. Application timeout
+/// and cancellation never retire a healthy connection. The failed operation is not replayed because
 /// a transport error is ambiguous; an actor ask is retried only when the
 /// caller explicitly enables the timeout-retry policy.
 ///
@@ -395,7 +536,8 @@ impl RemoteConnection {
 ///     return Ok(());
 /// };
 ///
-/// // Step 2: tell/ask use cached connection - ZERO lookups, just pointer deref
+/// // Step 2: acquire once, then borrow one exact generation for repeated work
+/// let remote_actor = remote_actor.session().await?;
 /// remote_actor.tell(Bytes::from_static(b"message1")).await?;
 /// remote_actor.tell(Bytes::from_static(b"message2")).await?;
 /// let _response = remote_actor.ask(Bytes::from_static(b"request")).await?;
@@ -417,7 +559,7 @@ pub struct RemoteActorRef<T = ()> {
     #[cfg(not(any(test, feature = "test-helpers", debug_assertions)))]
     connection: Option<RemoteConnection>,
     /// Lock-free live slot shared by every clone of this ref. A transport
-    /// failure or actor-ask timeout replaces this slot atomically.
+    /// failure replaces this slot atomically. Application timeout never retires it.
     connection_slot: Arc<ArcSwapOption<RemoteConnection>>,
     /// Registry weak reference - doesn't prevent registry shutdown/cleanup
     /// Used for reconnection after DNS changes
@@ -427,55 +569,8 @@ pub struct RemoteActorRef<T = ()> {
     /// used instead of a bare Notify so a waiter cannot miss a completion
     /// that races with subscribing.
     recovery_completed: watch::Sender<u64>,
+    retry_actor_ask_once_after_timeout: bool,
     _marker: PhantomData<fn() -> T>,
-}
-
-struct ActorAskCancellationGuard {
-    registry: Arc<crate::registry::GossipRegistry>,
-    peer_id: crate::PeerId,
-    addr: SocketAddr,
-    instance_id: Option<u64>,
-    armed: bool,
-}
-
-impl ActorAskCancellationGuard {
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for ActorAskCancellationGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        // Instance-scoped, not peer-wide: this guard was armed for the
-        // SPECIFIC connection instance the cancelled ask was made on
-        // (`addr`/`instance_id` captured from that connection at guard
-        // creation). A peer-wide `disconnect_connection_by_peer_id` here
-        // would tear down whatever is *currently* indexed for the peer,
-        // which may already be a fresh, healthy reconnection established
-        // after this ask was sent — collateral teardown of a session this
-        // cancellation has nothing to do with. `instance_id == None` means
-        // the connection this ask ran on had no live stream handle to begin
-        // with, so there is nothing identifiable to retire.
-        // Peer-id-aware: `self.peer_id` is known here (captured at guard
-        // creation), so current-session cleanup does not depend on
-        // `addr_to_peer_id[self.addr]` still holding this peer's alias — see
-        // `ConnectionPool::remove_connection_instance_for_peer`.
-        let evicted = self.instance_id.is_some_and(|instance_id| {
-            self.registry
-                .connection_pool
-                .remove_connection_instance_for_peer(&self.peer_id, self.addr, instance_id)
-                .is_some()
-        });
-        tracing::warn!(
-            peer_id = %self.peer_id,
-            addr = %self.addr,
-            evicted,
-            "actor ask cancelled; evicted the specific peer transport session instance it ran on"
-        );
-    }
 }
 
 struct AmbiguousRecoveryGuard {
@@ -507,6 +602,16 @@ impl<T> RemoteActorRef<T> {
             .checked_duration_since(tokio::time::Instant::now())
             .filter(|remaining| !remaining.is_zero())
             .ok_or(crate::GossipError::Timeout)
+    }
+
+    fn recovery_deadline(
+        deadline: Option<tokio::time::Instant>,
+        timeout: Duration,
+    ) -> crate::Result<tokio::time::Instant> {
+        let base = deadline.unwrap_or_else(tokio::time::Instant::now);
+        // Match deadline_after: an unrepresentable budget is a timeout,
+        // never a panic or an invented fallback recovery duration.
+        base.checked_add(timeout).ok_or(crate::GossipError::Timeout)
     }
 
     async fn ask_actor_frame_with_deadline(
@@ -546,6 +651,12 @@ impl<T> RemoteActorRef<T> {
         &self,
         deadline: Option<tokio::time::Instant>,
     ) -> crate::Result<Arc<RemoteConnection>> {
+        let current = self.current_connection_or_not_listening()?;
+        if !current.is_closed() {
+            return Ok(current);
+        }
+        // Cold recovery only. Subscribe before re-reading the slot and owner
+        // flag, so completion before or after subscription cannot be lost.
         let mut completed = self.recovery_completed.subscribe();
         loop {
             let current = self.current_connection_or_not_listening()?;
@@ -834,9 +945,11 @@ impl<T> RemoteActorRef<T> {
         // window. Otherwise a short ask timeout cancels the first repair just
         // before the peer's preferred-inbound path completes, and every
         // subsequent cached-ref operation observes the same closed slot.
-        let recovery_deadline = deadline
-            .map(|operation_deadline| operation_deadline + registry.config.connection_timeout)
-            .unwrap_or_else(|| tokio::time::Instant::now() + registry.config.connection_timeout);
+        let Ok(recovery_deadline) =
+            Self::recovery_deadline(deadline, registry.config.connection_timeout)
+        else {
+            return err;
+        };
         let repair = self.reheal_connection(failed, Some(recovery_deadline));
 
         if let Some(operation_deadline) = deadline {
@@ -893,6 +1006,7 @@ impl<T> RemoteActorRef<T> {
             registry: self.registry.clone(),
             recovery_in_flight: Arc::clone(&self.recovery_in_flight),
             recovery_completed: self.recovery_completed.clone(),
+            retry_actor_ask_once_after_timeout: self.retry_actor_ask_once_after_timeout,
             _marker: PhantomData,
         };
         tokio::spawn(async move {
@@ -919,11 +1033,41 @@ impl<T> RemoteActorRef<T> {
             location,
             connection: connection.clone(),
             connection_slot: Arc::new(ArcSwapOption::from(connection.map(Arc::new))),
+            retry_actor_ask_once_after_timeout: registry
+                .config
+                .connection_recovery
+                .retry_actor_ask_once_after_timeout,
             registry: Arc::downgrade(&registry), // Weak reference - prevents cycle
             recovery_in_flight: Arc::new(AtomicBool::new(false)),
             recovery_completed,
             _marker: PhantomData,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_handle(handle: crate::connection_pool::ConnectionHandle) -> Self {
+        let location = RemoteActorLocation::new_with_peer(
+            handle.addr,
+            crate::KeyPair::new_for_testing("exact-session-endpoint").peer_id(),
+        );
+        let connection = RemoteConnection::from_handle(handle);
+        let (recovery_completed, _) = watch::channel(0);
+        Self {
+            location,
+            connection: Some(connection.clone()),
+            connection_slot: Arc::new(ArcSwapOption::from(Some(Arc::new(connection)))),
+            registry: Weak::new(),
+            recovery_in_flight: Arc::new(AtomicBool::new(false)),
+            recovery_completed,
+            retry_actor_ask_once_after_timeout: false,
+            _marker: PhantomData,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_successor(&self, handle: crate::connection_pool::ConnectionHandle) {
+        self.connection_slot
+            .store(Some(Arc::new(RemoteConnection::from_handle(handle))));
     }
 
     /// Check if registry is still alive (for shutdown detection)
@@ -946,118 +1090,23 @@ impl<T> RemoteActorRef<T> {
         self.connection_slot.load_full().map(|arc| (*arc).clone())
     }
 
-    fn actor_ask_cancellation_guard(
-        &self,
-        conn: &RemoteConnection,
-    ) -> Option<ActorAskCancellationGuard> {
-        let registry = self.registry.upgrade()?;
-        if !registry.config.connection_recovery.evict_peer_on_ask_cancel {
-            return None;
-        }
-        Some(ActorAskCancellationGuard {
-            registry,
-            peer_id: self.location.peer_id.clone(),
-            addr: conn.addr,
-            instance_id: conn.instance_id(),
-            armed: true,
-        })
-    }
-
-    async fn recover_connection_after_actor_ask_timeout(
-        &self,
-        deadline: tokio::time::Instant,
-        failed_conn: &Arc<RemoteConnection>,
-    ) -> crate::Result<Option<Arc<RemoteConnection>>> {
-        let Some(registry) = self.registry.upgrade() else {
-            return Err(crate::GossipError::Shutdown);
-        };
-        if registry.shutdown.load(Ordering::Acquire) {
-            return Err(crate::GossipError::Shutdown);
-        }
-        let policy = registry.config.connection_recovery;
-        if !policy.evict_peer_on_ask_timeout {
-            return Ok(None);
-        }
-
-        let peer_id = &self.location.peer_id;
-        // Instance-scoped, not peer-wide: retire exactly the connection
-        // instance the timed-out ask actually ran on
-        // (`failed_conn`'s own addr/instance id), never whatever happens to
-        // be indexed for the peer at this moment — a concurrent reconnect
-        // landing here must not be collaterally destroyed by a timeout on a
-        // now-superseded instance.
-        // Peer-id-aware: `peer_id` is known here, so current-session cleanup
-        // does not depend on `addr_to_peer_id[failed_conn.addr]` still
-        // holding this peer's alias — see
-        // `ConnectionPool::remove_connection_instance_for_peer`.
-        let evicted = failed_conn.instance_id().is_some_and(|instance_id| {
-            registry
-                .connection_pool
-                .remove_connection_instance_for_peer(peer_id, failed_conn.addr, instance_id)
-                .is_some()
-        });
-        tracing::warn!(
-            peer_id = %peer_id,
-            addr = %failed_conn.addr,
-            evicted,
-            retry = policy.retry_actor_ask_once_after_timeout,
-            "actor ask timed out; evicted the specific peer transport session instance it ran on"
-        );
-
-        // Dial and persist a replacement unconditionally once eviction is
-        // enabled - whether the CALLER replays the timed-out ask onto it is
-        // an entirely separate decision, gated below by
-        // `retry_actor_ask_once_after_timeout`. Conflating the two left the
-        // safety-oriented combination (evict on timeout, never replay)
-        // stuck holding the just-evicted connection forever: the eviction
-        // above ran, but nothing ever replaced what this ref itself was
-        // still caching, so the next call on it hit the identical dead
-        // handle again.
-        let fresh = Self::dial_replacement(&registry, peer_id, failed_conn, Some(deadline)).await?;
-        let healed = match self.compare_and_set_connection(Some(failed_conn), fresh.clone()) {
-            Ok(()) => fresh,
-            Err(Some(other)) if !other.is_closed() => other,
-            Err(Some(other)) => {
-                if let Some(instance_id) = other.instance_id() {
-                    registry
-                        .connection_pool
-                        .remove_connection_instance_for_peer(peer_id, other.addr, instance_id);
-                }
-                match self.compare_and_set_connection(Some(&other), fresh.clone()) {
-                    Ok(()) => fresh,
-                    Err(Some(current)) if !current.is_closed() => current,
-                    Err(Some(current)) => {
-                        return Err(crate::GossipError::ConnectionClosed(current.addr));
-                    }
-                    Err(None) => {
-                        self.connection_slot.store(Some(fresh.clone()));
-                        fresh
-                    }
-                }
-            }
-            Err(None) => {
-                self.connection_slot.store(Some(fresh.clone()));
-                fresh
-            }
-        };
-
-        if !policy.retry_actor_ask_once_after_timeout {
-            return Ok(None);
-        }
-        Ok(Some(healed))
-    }
-
     /// Send a fire-and-forget message to the remote actor.
     ///
     /// ZERO-LOCK: Uses cached connection directly with no mutex overhead.
     /// ConnectionHandle internally uses lock-free stream operations.
     ///
     /// Returns error if registry has shut down or no connection is available.
+    ///
+    /// Compatibility acquisition adapter: retains a shared connection per call.
+    /// Repeated messaging should acquire [`Self::session`] once and borrow it.
     pub async fn tell(&self, message: bytes::Bytes) -> crate::Result<()> {
         self.tell_bytes(message).await
     }
 
     /// Send a fire-and-forget message using owned bytes (no payload copy at this layer).
+    ///
+    /// Compatibility acquisition adapter: retains a shared connection per call.
+    /// Repeated messaging should acquire [`Self::session`] once and borrow it.
     pub async fn tell_bytes(&self, message: bytes::Bytes) -> crate::Result<()> {
         let conn = self.current_connection_for_operation(None).await?;
 
@@ -1084,6 +1133,9 @@ impl<T> RemoteActorRef<T> {
     }
 
     /// Send an actor-routed fire-and-forget frame (MessageType::ActorTell).
+    ///
+    /// Compatibility acquisition adapter: retains a shared connection per call.
+    /// Repeated messaging should acquire [`Self::session`] once and borrow it.
     pub async fn tell_actor_frame(
         &self,
         actor_id: u64,
@@ -1113,6 +1165,9 @@ impl<T> RemoteActorRef<T> {
     }
 
     /// Ask an actor-routed frame and wait for a reply (MessageType::ActorAsk).
+    ///
+    /// Compatibility acquisition adapter: retains a shared connection per call.
+    /// Repeated messaging should acquire [`Self::session`] once and borrow it.
     pub async fn ask_actor_frame(
         &self,
         actor_id: u64,
@@ -1124,57 +1179,23 @@ impl<T> RemoteActorRef<T> {
         let conn = self
             .current_connection_for_operation(Some(deadline))
             .await?;
-        let mut guard = self.actor_ask_cancellation_guard(&conn);
+        let retry_payload = self
+            .retry_actor_ask_once_after_timeout
+            .then(|| payload.clone());
         let remaining = Self::remaining_until(deadline)?;
-        let result = Self::ask_actor_frame_with_deadline(
-            &conn,
-            actor_id,
-            type_hash,
-            payload.clone(),
-            remaining,
-        )
-        .await;
-        if let Some(guard) = guard.as_mut() {
-            guard.disarm();
-        }
+        let result =
+            Self::ask_actor_frame_with_deadline(&conn, actor_id, type_hash, payload, remaining)
+                .await;
         match result {
             Err(crate::GossipError::Timeout) => {
-                // The remote may have received the request before the local
-                // timeout fired. By default, repair the cached connection for
-                // the next operation but do not replay this potentially
-                // non-idempotent ask. The timeout-retry policy is the explicit
-                // caller opt-in to one replay after recovery.
-                // Retrying a timed-out, potentially delivered actor ask is an
-                // explicit caller opt-in. That replay intentionally receives a
-                // fresh budget; ordinary connection recovery below remains
-                // bounded by the original operation deadline.
-                let recovery_deadline = Self::deadline_after(timeout)?;
-                match self
-                    .recover_connection_after_actor_ask_timeout(recovery_deadline, &conn)
+                // An actor deadline is not evidence about transport health.
+                // Explicit replay opt-in receives one fresh budget on the same
+                // session; it never evicts or dials because of a timeout.
+                let Some(payload) = retry_payload else {
+                    return Err(crate::GossipError::Timeout);
+                };
+                Self::ask_actor_frame_with_deadline(&conn, actor_id, type_hash, payload, timeout)
                     .await
-                {
-                    Ok(Some(reconnected)) => {
-                        let remaining = Self::remaining_until(recovery_deadline)?;
-                        let mut retry_guard = self.actor_ask_cancellation_guard(&reconnected);
-                        let retry_result = Self::ask_actor_frame_with_deadline(
-                            &reconnected,
-                            actor_id,
-                            type_hash,
-                            payload,
-                            remaining,
-                        )
-                        .await;
-                        if let Some(guard) = retry_guard.as_mut() {
-                            guard.disarm();
-                        }
-                        retry_result
-                    }
-                    Ok(None) => Err(crate::GossipError::Timeout),
-                    Err(repair_err) => {
-                        tracing::debug!(error = ?repair_err, "failed to repair cached connection after timed-out ask");
-                        Err(repair_err)
-                    }
-                }
             }
             Err(err) if Self::is_transport_failure(&err) => Err(self
                 .preserve_ambiguous_ask_error(&conn, err, Some(deadline))
@@ -1184,6 +1205,9 @@ impl<T> RemoteActorRef<T> {
     }
 
     /// Ask an actor-routed frame without timeout allocation.
+    ///
+    /// Compatibility acquisition adapter: retains a shared connection per call.
+    /// Repeated messaging should acquire [`Self::session`] once and borrow it.
     pub async fn ask_actor_frame_no_timeout(
         &self,
         actor_id: u64,
@@ -1205,10 +1229,13 @@ impl<T> RemoteActorRef<T> {
     /// Send a request and wait for a response.
     ///
     /// ZERO-LOCK: Uses cached connection directly with no mutex overhead.
-    /// ZERO-COPY: Returns `Bytes` instead of `Vec<u8>` to avoid allocation.
+    /// Bytes responses may allocate owner metadata; native session responses do not.
     /// ConnectionHandle internally uses lock-free stream operations.
     ///
     /// Returns error if registry has shut down or no connection is available.
+    ///
+    /// Compatibility acquisition adapter: retains a shared connection per call.
+    /// Repeated messaging should acquire [`Self::session`] once and borrow it.
     pub async fn ask(&self, request: bytes::Bytes) -> crate::Result<bytes::Bytes> {
         let conn = self.current_connection_for_operation(None).await?;
         // Direct call - ZERO LOCKS
@@ -1224,6 +1251,9 @@ impl<T> RemoteActorRef<T> {
     ///
     /// ZERO-LOCK: Uses cached connection directly with no mutex overhead.
     /// ZERO-COPY: Takes owned Bytes to avoid allocation.
+    ///
+    /// Compatibility acquisition adapter: retains a shared connection per call.
+    /// Repeated messaging should acquire [`Self::session`] once and borrow it.
     pub async fn ask_with_timeout(
         &self,
         request: bytes::Bytes,
@@ -1243,6 +1273,9 @@ impl<T> RemoteActorRef<T> {
     }
 
     /// Send a direct request and wait for a direct response.
+    ///
+    /// Compatibility acquisition adapter: retains a shared connection per call.
+    /// Repeated messaging should acquire [`Self::session`] once and borrow it.
     pub async fn ask_direct(
         &self,
         request: bytes::Bytes,
@@ -1262,6 +1295,9 @@ impl<T> RemoteActorRef<T> {
     }
 
     /// Send a direct request and wait without timeout allocation.
+    ///
+    /// Compatibility acquisition adapter: retains a shared connection per call.
+    /// Repeated messaging should acquire [`Self::session`] once and borrow it.
     pub async fn ask_direct_no_timeout(
         &self,
         request: bytes::Bytes,
@@ -1275,22 +1311,24 @@ impl<T> RemoteActorRef<T> {
         }
     }
 
-    /// Send a request and return a deferred handle that can be awaited later.
+    /// Acquire one exact transport generation for a batch of operations.
     ///
-    /// This is the correct way to delegate "waiting for the response" to another task.
-    ///
-    /// ZERO-LOCK: Uses cached connection directly with no mutex overhead.
-    pub async fn ask_deferred(&self, request: bytes::Bytes) -> crate::Result<crate::DeferredAsk> {
-        let conn = self.current_connection_for_operation(None).await?;
-        match conn.ask_deferred(request).await {
-            Err(err) if Self::is_transport_failure(&err) => {
-                Err(self.preserve_ambiguous_ask_error(&conn, err, None).await)
-            }
-            other => other,
-        }
+    /// This is cold setup: it retains one connection owner. Operations on the
+    /// returned session borrow that owner and never reload the live slot. After
+    /// a hard failure, acquire a new session to observe recovery; an old session
+    /// and its deferred asks can never be retargeted to the replacement.
+    pub async fn session(&self) -> crate::Result<RemoteActorSession<'_, T>> {
+        let connection = self.current_connection_for_operation(None).await?;
+        Ok(RemoteActorSession {
+            remote: self,
+            connection,
+        })
     }
 
     /// Send a typed fire-and-forget message
+    ///
+    /// Compatibility acquisition adapter: retains a shared connection per call.
+    /// Repeated messaging should acquire [`Self::session`] once and borrow it.
     pub async fn tell_typed<M>(&self, message: &M) -> crate::Result<()>
     where
         M: crate::typed::WireEncode,
@@ -1314,6 +1352,9 @@ impl<T> RemoteActorRef<T> {
     }
 
     /// Send a typed request and wait for a typed response
+    ///
+    /// Compatibility acquisition adapter: retains a shared connection per call.
+    /// Repeated messaging should acquire [`Self::session`] once and borrow it.
     pub async fn ask_typed<M, R>(&self, request: &M) -> crate::Result<R>
     where
         M: crate::typed::WireEncode,
@@ -1338,6 +1379,9 @@ impl<T> RemoteActorRef<T> {
     }
 
     /// Send a typed request and keep the reply as an archived zero-copy view.
+    ///
+    /// Compatibility acquisition adapter: retains a shared connection per call.
+    /// Repeated messaging should acquire [`Self::session`] once and borrow it.
     pub async fn ask_typed_archived<M, R>(
         &self,
         request: &M,
@@ -1366,6 +1410,9 @@ impl<T> RemoteActorRef<T> {
     }
 
     /// Send a typed request and keep the reply as an archived zero-copy view.
+    ///
+    /// Compatibility acquisition adapter: retains a shared connection per call.
+    /// Repeated messaging should acquire [`Self::session`] once and borrow it.
     pub async fn ask_typed_archived_with_timeout<M, R>(
         &self,
         request: &M,
@@ -1407,6 +1454,9 @@ impl<T> RemoteActorRef<T> {
     /// ConnectionHandle internally uses lock-free stream operations.
     ///
     /// Returns error if registry has shut down or no connection is available.
+    ///
+    /// Compatibility acquisition adapter: retains a shared connection per call.
+    /// Repeated messaging should acquire [`Self::session`] once and borrow it.
     pub async fn ask_streaming_bytes(
         &self,
         payload: bytes::Bytes,
@@ -1437,6 +1487,570 @@ impl<T> RemoteActorRef<T> {
     }
 }
 
+/// A scoped endpoint pinned to one exact physical connection generation.
+///
+/// Acquisition retains one owner; requests borrow it. No operation on this
+/// endpoint reloads the locator or silently switches generations. Owned request
+/// methods preserve native owners and aligned responses. Bytes-returning methods
+/// are explicit compatibility paths and may allocate response owner metadata.
+/// Deferred waits cannot outlive this endpoint. Hard failures repair the locator
+/// for the next acquisition, without replaying ambiguous requests.
+pub struct RemoteActorSession<'remote, T = ()> {
+    remote: &'remote RemoteActorRef<T>,
+    connection: Arc<RemoteConnection>,
+}
+
+impl<T> std::ops::Deref for RemoteActorSession<'_, T> {
+    type Target = RemoteConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+
+impl<T> RemoteActorSession<'_, T> {
+    /// Raw tell borrowing this exact endpoint and preserving native ownership.
+    pub async fn tell_owned(&self, payload: crate::ForwardPayload) -> crate::Result<()> {
+        match self.connection.tell_owned(payload).await {
+            Err(err) if RemoteActorRef::<T>::is_transport_failure(&err) => Err(self
+                .remote
+                .preserve_ambiguous_ask_error(&self.connection, err, None)
+                .await),
+            result => result,
+        }
+    }
+
+    /// Actor tell borrowing this exact endpoint and preserving native ownership.
+    pub async fn tell_actor_frame_owned(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: crate::ForwardPayload,
+    ) -> crate::Result<()> {
+        match self
+            .connection
+            .tell_actor_frame_owned(actor_id, type_hash, payload)
+            .await
+        {
+            Err(err) if RemoteActorRef::<T>::is_transport_failure(&err) => Err(self
+                .remote
+                .preserve_ambiguous_ask_error(&self.connection, err, None)
+                .await),
+            result => result,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn endpoint_owner_count(&self) -> usize {
+        Arc::strong_count(&self.connection)
+    }
+
+    /// Borrow this exact session and preserve complete request/response owners.
+    pub async fn ask_owned(
+        &self,
+        request: crate::ForwardPayload,
+        timeout: Duration,
+    ) -> crate::Result<crate::AlignedBytes> {
+        let deadline = Some(RemoteActorRef::<T>::deadline_after(timeout)?);
+        let result = self.connection.ask_owned(request, timeout).await;
+        self.finish_owned(result, deadline).await
+    }
+
+    /// Borrow this exact session and preserve complete request/response owners.
+    pub async fn ask_no_timeout_owned(
+        &self,
+        request: crate::ForwardPayload,
+    ) -> crate::Result<crate::AlignedBytes> {
+        let deadline = None;
+        let result = self.connection.ask_no_timeout_owned(request).await;
+        self.finish_owned(result, deadline).await
+    }
+
+    /// Borrow this exact session and preserve complete request/response owners.
+    pub async fn ask_direct_owned(
+        &self,
+        request: crate::ForwardPayload,
+        timeout: Duration,
+    ) -> crate::Result<crate::AlignedBytes> {
+        let deadline = Some(RemoteActorRef::<T>::deadline_after(timeout)?);
+        let result = self.connection.ask_direct_owned(request, timeout).await;
+        self.finish_owned(result, deadline).await
+    }
+
+    /// Borrow this exact session and preserve complete request/response owners.
+    pub async fn ask_direct_no_timeout_owned(
+        &self,
+        request: crate::ForwardPayload,
+    ) -> crate::Result<crate::AlignedBytes> {
+        let deadline = None;
+        let result = self.connection.ask_direct_no_timeout_owned(request).await;
+        self.finish_owned(result, deadline).await
+    }
+
+    /// Borrow this exact session and preserve complete request/response owners.
+    pub async fn ask_direct_owned_with_id(
+        &self,
+        request_id: u64,
+        request: crate::ForwardPayload,
+        timeout: Duration,
+    ) -> crate::Result<crate::AlignedBytes> {
+        let deadline = Some(RemoteActorRef::<T>::deadline_after(timeout)?);
+        let result = self
+            .connection
+            .ask_direct_owned_with_id(request_id, request, timeout)
+            .await;
+        self.finish_owned(result, deadline).await
+    }
+
+    /// Borrow this exact session and preserve complete request/response owners.
+    pub async fn ask_actor_frame_no_timeout_owned(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: crate::ForwardPayload,
+    ) -> crate::Result<crate::AlignedBytes> {
+        let deadline = None;
+        let result = self
+            .connection
+            .ask_actor_frame_no_timeout_owned(actor_id, type_hash, payload)
+            .await;
+        self.finish_owned(result, deadline).await
+    }
+
+    /// Native actor ask. Explicit retry opt-in alone creates a shared request
+    /// owner so one replay is possible; ordinary requests stay uniquely owned.
+    pub async fn ask_actor_frame_owned(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: crate::ForwardPayload,
+        timeout: Duration,
+    ) -> crate::Result<crate::AlignedBytes> {
+        let deadline = RemoteActorRef::<T>::deadline_after(timeout)?;
+        let (payload, retry) = if self.remote.retry_actor_ask_once_after_timeout {
+            let shared = payload.into_shared();
+            let retry = shared.shared_clone()?;
+            (shared, Some(retry))
+        } else {
+            (payload, None)
+        };
+        let remaining = RemoteActorRef::<T>::remaining_until(deadline)?;
+        let result = self
+            .connection
+            .ask_actor_frame_owned(actor_id, type_hash, payload, remaining)
+            .await;
+        if matches!(result, Err(crate::GossipError::Timeout))
+            && let Some(payload) = retry
+        {
+            return self
+                .connection
+                .ask_actor_frame_owned(actor_id, type_hash, payload, timeout)
+                .await;
+        }
+        self.finish_owned(result, Some(deadline)).await
+    }
+
+    async fn finish_owned(
+        &self,
+        result: crate::Result<crate::AlignedBytes>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> crate::Result<crate::AlignedBytes> {
+        match result {
+            Err(err) if RemoteActorRef::<T>::is_transport_failure(&err) => Err(self
+                .remote
+                .preserve_ambiguous_ask_error(&self.connection, err, deadline)
+                .await),
+            result => result,
+        }
+    }
+
+    /// Send a fire-and-forget message to the remote actor.
+    ///
+    /// ZERO-LOCK: Uses cached connection directly with no mutex overhead.
+    /// ConnectionHandle internally uses lock-free stream operations.
+    ///
+    /// Returns error if registry has shut down or no connection is available.
+    ///
+    /// Bytes compatibility adapter; prefer native `*_owned` request/response owners.
+    pub async fn tell(&self, message: bytes::Bytes) -> crate::Result<()> {
+        self.tell_bytes(message).await
+    }
+
+    /// Send a fire-and-forget message using owned bytes (no payload copy at this layer).
+    ///
+    /// Bytes compatibility adapter; prefer native `*_owned` request/response owners.
+    pub async fn tell_bytes(&self, message: bytes::Bytes) -> crate::Result<()> {
+        let conn = &self.connection;
+
+        // Direct call - ZERO LOCKS
+        // ConnectionHandle.tell_bytes() avoids an extra payload clone.
+        match conn.tell_bytes(message).await {
+            Err(err) if RemoteActorRef::<T>::is_transport_failure(&err) => Err(self
+                .remote
+                .preserve_ambiguous_ask_error(conn, err, None)
+                .await),
+            other => other,
+        }
+    }
+
+    /// Non-blocking tell using owned bytes.
+    ///
+    /// Returns `GossipError::WriteQueueFull` when the connection write queue is saturated.
+    ///
+    /// This is synchronous and cannot perform the async re-resolution self-healing
+    /// relies on, so it benefits from a healed connection only if a previous
+    /// `async` call on this ref already repaired the slot.
+    pub fn try_tell_bytes(&self, message: bytes::Bytes) -> crate::Result<()> {
+        let conn = &self.connection;
+        conn.try_tell_bytes(message)
+    }
+
+    /// Send an actor-routed fire-and-forget frame (MessageType::ActorTell).
+    ///
+    /// Bytes compatibility adapter; prefer native `*_owned` request/response owners.
+    pub async fn tell_actor_frame(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+    ) -> crate::Result<()> {
+        let conn = &self.connection;
+        match conn.tell_actor_frame(actor_id, type_hash, payload).await {
+            Err(err) if RemoteActorRef::<T>::is_transport_failure(&err) => Err(self
+                .remote
+                .preserve_ambiguous_ask_error(conn, err, None)
+                .await),
+            other => other,
+        }
+    }
+
+    /// Non-blocking actor-routed tell. Returns `GossipError::WriteQueueFull` on backpressure.
+    ///
+    /// See `try_tell_bytes` for why this cannot self-heal synchronously.
+    pub fn try_tell_actor_frame(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+    ) -> crate::Result<()> {
+        let conn = &self.connection;
+        conn.try_tell_actor_frame(actor_id, type_hash, payload)
+    }
+
+    /// Ask an actor-routed frame and wait for a reply (MessageType::ActorAsk).
+    ///
+    /// Bytes compatibility adapter; prefer native `*_owned` request/response owners.
+    pub async fn ask_actor_frame(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+        timeout: std::time::Duration,
+    ) -> crate::Result<bytes::Bytes> {
+        let deadline = RemoteActorRef::<T>::deadline_after(timeout)?;
+        let conn = &self.connection;
+        let retry_payload = self
+            .remote
+            .retry_actor_ask_once_after_timeout
+            .then(|| payload.clone());
+        let remaining = RemoteActorRef::<T>::remaining_until(deadline)?;
+        let result = RemoteActorRef::<T>::ask_actor_frame_with_deadline(
+            conn, actor_id, type_hash, payload, remaining,
+        )
+        .await;
+        match result {
+            Err(crate::GossipError::Timeout) => {
+                // An actor deadline is not evidence about transport health.
+                // Explicit replay opt-in receives one fresh budget on the same
+                // session; it never evicts or dials because of a timeout.
+                let Some(payload) = retry_payload else {
+                    return Err(crate::GossipError::Timeout);
+                };
+                RemoteActorRef::<T>::ask_actor_frame_with_deadline(
+                    conn, actor_id, type_hash, payload, timeout,
+                )
+                .await
+            }
+            Err(err) if RemoteActorRef::<T>::is_transport_failure(&err) => Err(self
+                .remote
+                .preserve_ambiguous_ask_error(conn, err, Some(deadline))
+                .await),
+            result => result,
+        }
+    }
+
+    /// Ask an actor-routed frame without timeout allocation.
+    ///
+    /// Bytes compatibility adapter; prefer native `*_owned` request/response owners.
+    pub async fn ask_actor_frame_no_timeout(
+        &self,
+        actor_id: u64,
+        type_hash: u32,
+        payload: bytes::Bytes,
+    ) -> crate::Result<bytes::Bytes> {
+        let conn = &self.connection;
+        match conn
+            .ask_actor_frame_no_timeout(actor_id, type_hash, payload)
+            .await
+        {
+            Err(err) if RemoteActorRef::<T>::is_transport_failure(&err) => Err(self
+                .remote
+                .preserve_ambiguous_ask_error(conn, err, None)
+                .await),
+            other => other,
+        }
+    }
+
+    /// Send a request and wait for a response.
+    ///
+    /// ZERO-LOCK: Uses cached connection directly with no mutex overhead.
+    /// Bytes compatibility response; use `ask_owned` for native response ownership.
+    /// ConnectionHandle internally uses lock-free stream operations.
+    ///
+    /// Returns error if registry has shut down or no connection is available.
+    ///
+    /// Bytes compatibility adapter; prefer native `*_owned` request/response owners.
+    pub async fn ask(&self, request: bytes::Bytes) -> crate::Result<bytes::Bytes> {
+        let conn = &self.connection;
+        // Direct call - ZERO LOCKS
+        match conn.ask(request).await {
+            Err(err) if RemoteActorRef::<T>::is_transport_failure(&err) => Err(self
+                .remote
+                .preserve_ambiguous_ask_error(conn, err, None)
+                .await),
+            other => other,
+        }
+    }
+
+    /// Send a request with timeout and wait for response
+    ///
+    /// ZERO-LOCK: Uses cached connection directly with no mutex overhead.
+    /// ZERO-COPY: Takes owned Bytes to avoid allocation.
+    ///
+    /// Bytes compatibility adapter; prefer native `*_owned` request/response owners.
+    pub async fn ask_with_timeout(
+        &self,
+        request: bytes::Bytes,
+        timeout: std::time::Duration,
+    ) -> crate::Result<bytes::Bytes> {
+        let deadline = RemoteActorRef::<T>::deadline_after(timeout)?;
+        let conn = &self.connection;
+        let remaining = RemoteActorRef::<T>::remaining_until(deadline)?;
+        match conn.ask_with_timeout_bytes(request, remaining).await {
+            Err(err) if RemoteActorRef::<T>::is_transport_failure(&err) => Err(self
+                .remote
+                .preserve_ambiguous_ask_error(conn, err, Some(deadline))
+                .await),
+            other => other,
+        }
+    }
+
+    /// Send a direct request and wait for a direct response.
+    ///
+    /// Bytes compatibility adapter; prefer native `*_owned` request/response owners.
+    pub async fn ask_direct(
+        &self,
+        request: bytes::Bytes,
+        timeout: std::time::Duration,
+    ) -> crate::Result<bytes::Bytes> {
+        let deadline = RemoteActorRef::<T>::deadline_after(timeout)?;
+        let conn = &self.connection;
+        let remaining = RemoteActorRef::<T>::remaining_until(deadline)?;
+        match conn.ask_direct(request, remaining).await {
+            Err(err) if RemoteActorRef::<T>::is_transport_failure(&err) => Err(self
+                .remote
+                .preserve_ambiguous_ask_error(conn, err, Some(deadline))
+                .await),
+            other => other,
+        }
+    }
+
+    /// Send a direct request and wait without timeout allocation.
+    ///
+    /// Bytes compatibility adapter; prefer native `*_owned` request/response owners.
+    pub async fn ask_direct_no_timeout(
+        &self,
+        request: bytes::Bytes,
+    ) -> crate::Result<bytes::Bytes> {
+        let conn = &self.connection;
+        match conn.ask_direct_no_timeout(request).await {
+            Err(err) if RemoteActorRef::<T>::is_transport_failure(&err) => Err(self
+                .remote
+                .preserve_ambiguous_ask_error(conn, err, None)
+                .await),
+            other => other,
+        }
+    }
+
+    /// Native raw deferred ask with the original 30-second submission deadline.
+    pub async fn ask_deferred_owned(
+        &self,
+        request: crate::ForwardPayload,
+    ) -> crate::Result<crate::DeferredAsk<'_>> {
+        match self.connection.ask_deferred_owned(request).await {
+            Err(err) if RemoteActorRef::<T>::is_transport_failure(&err) => Err(self
+                .remote
+                .preserve_ambiguous_ask_error(&self.connection, err, None)
+                .await),
+            result => result,
+        }
+    }
+
+    /// Submit a request whose deferred wait borrows this exact session.
+    pub async fn ask_deferred(
+        &self,
+        request: bytes::Bytes,
+    ) -> crate::Result<crate::DeferredAsk<'_>> {
+        match self.connection.ask_deferred(request).await {
+            Err(err) if RemoteActorRef::<T>::is_transport_failure(&err) => Err(self
+                .remote
+                .preserve_ambiguous_ask_error(&self.connection, err, None)
+                .await),
+            result => result,
+        }
+    }
+
+    /// Send a typed fire-and-forget message
+    pub async fn tell_typed<M>(&self, message: &M) -> crate::Result<()>
+    where
+        M: crate::typed::WireEncode,
+    {
+        let conn = &self.connection;
+        match conn.tell_typed(message).await {
+            Err(err) if RemoteActorRef::<T>::is_transport_failure(&err) => Err(self
+                .remote
+                .preserve_ambiguous_ask_error(conn, err, None)
+                .await),
+            other => other,
+        }
+    }
+
+    /// Send a typed request and wait for a typed response
+    pub async fn ask_typed<M, R>(&self, request: &M) -> crate::Result<R>
+    where
+        M: crate::typed::WireEncode,
+        R: crate::typed::WireType + rkyv::Archive,
+        for<'a> R::Archived: rkyv::bytecheck::CheckBytes<
+                rkyv::rancor::Strategy<
+                    rkyv::validation::Validator<
+                        rkyv::validation::archive::ArchiveValidator<'a>,
+                        rkyv::validation::shared::SharedValidator,
+                    >,
+                    rkyv::rancor::Error,
+                >,
+            > + rkyv::Deserialize<R, rkyv::rancor::Strategy<rkyv::de::Pool, rkyv::rancor::Error>>,
+    {
+        let conn = &self.connection;
+        match conn.ask_typed(request).await {
+            Err(err) if RemoteActorRef::<T>::is_transport_failure(&err) => Err(self
+                .remote
+                .preserve_ambiguous_ask_error(conn, err, None)
+                .await),
+            other => other,
+        }
+    }
+
+    /// Send a typed request and keep the reply as an archived zero-copy view.
+    pub async fn ask_typed_archived<M, R>(
+        &self,
+        request: &M,
+    ) -> crate::Result<crate::typed::ArchivedBytes<R>>
+    where
+        M: crate::typed::WireEncode,
+        R: crate::typed::WireType + rkyv::Archive,
+        for<'a> R::Archived: rkyv::Portable
+            + rkyv::bytecheck::CheckBytes<
+                rkyv::rancor::Strategy<
+                    rkyv::validation::Validator<
+                        rkyv::validation::archive::ArchiveValidator<'a>,
+                        rkyv::validation::shared::SharedValidator,
+                    >,
+                    rkyv::rancor::Error,
+                >,
+            >,
+    {
+        let conn = &self.connection;
+        match conn.ask_typed_archived(request).await {
+            Err(err) if RemoteActorRef::<T>::is_transport_failure(&err) => Err(self
+                .remote
+                .preserve_ambiguous_ask_error(conn, err, None)
+                .await),
+            other => other,
+        }
+    }
+
+    /// Send a typed request and keep the reply as an archived zero-copy view.
+    pub async fn ask_typed_archived_with_timeout<M, R>(
+        &self,
+        request: &M,
+        timeout: std::time::Duration,
+    ) -> crate::Result<crate::typed::ArchivedBytes<R>>
+    where
+        M: crate::typed::WireEncode,
+        R: crate::typed::WireType + rkyv::Archive,
+        for<'a> R::Archived: rkyv::Portable
+            + rkyv::bytecheck::CheckBytes<
+                rkyv::rancor::Strategy<
+                    rkyv::validation::Validator<
+                        rkyv::validation::archive::ArchiveValidator<'a>,
+                        rkyv::validation::shared::SharedValidator,
+                    >,
+                    rkyv::rancor::Error,
+                >,
+            >,
+    {
+        let deadline = RemoteActorRef::<T>::deadline_after(timeout)?;
+        let conn = &self.connection;
+        let remaining = RemoteActorRef::<T>::remaining_until(deadline)?;
+        match conn
+            .ask_typed_archived_with_timeout(request, remaining)
+            .await
+        {
+            Err(err) if RemoteActorRef::<T>::is_transport_failure(&err) => Err(self
+                .remote
+                .preserve_ambiguous_ask_error(conn, err, Some(deadline))
+                .await),
+            other => other,
+        }
+    }
+
+    /// Send a large request using streaming (for payloads > 1MB)
+    ///
+    /// ZERO-LOCK: Uses cached connection directly with no mutex overhead.
+    /// ConnectionHandle internally uses lock-free stream operations.
+    ///
+    /// Returns error if registry has shut down or no connection is available.
+    ///
+    /// Bytes compatibility adapter; prefer native `*_owned` request/response owners.
+    pub async fn ask_streaming_bytes(
+        &self,
+        payload: bytes::Bytes,
+        actor_id: u64,
+        type_hash: u32,
+        timeout: std::time::Duration,
+    ) -> crate::Result<bytes::Bytes> {
+        let deadline = RemoteActorRef::<T>::deadline_after(timeout)?;
+        let conn = &self.connection;
+        let remaining = RemoteActorRef::<T>::remaining_until(deadline)?;
+        // Direct call - ZERO LOCKS
+        match conn
+            .ask_streaming_bytes(payload, type_hash, actor_id, remaining)
+            .await
+        {
+            Err(err) if RemoteActorRef::<T>::is_transport_failure(&err) => Err(self
+                .remote
+                .preserve_ambiguous_ask_error(conn, err, Some(deadline))
+                .await),
+            other => other,
+        }
+    }
+
+    /// Get the streaming threshold for this connection
+    pub fn streaming_threshold(&self) -> usize {
+        crate::connection_pool::STREAMING_THRESHOLD
+    }
+}
+
 // Custom Debug implementation
 impl<T> std::fmt::Debug for RemoteActorRef<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1451,25 +2065,122 @@ impl<T> std::fmt::Debug for RemoteActorRef<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::{ActorMessageFuture, ActorMessageHandler};
     use crate::{GossipConfig, GossipRegistryHandle, KeyPair};
     use tokio::time::{Duration, sleep};
 
-    struct NeverRespondsHandler;
+    #[test]
+    fn recovery_deadline_rejects_overflow_and_preserves_representable_budgets() {
+        let base = tokio::time::Instant::now();
+        let timeout = Duration::from_secs(5);
+        assert_eq!(
+            RemoteActorRef::<()>::recovery_deadline(Some(base), timeout).unwrap(),
+            base.checked_add(timeout).unwrap(),
+        );
+        assert!(matches!(
+            RemoteActorRef::<()>::recovery_deadline(Some(base), Duration::MAX),
+            Err(crate::GossipError::Timeout)
+        ));
+        assert!(matches!(
+            RemoteActorRef::<()>::recovery_deadline(None, Duration::MAX),
+            Err(crate::GossipError::Timeout)
+        ));
+    }
 
-    impl ActorMessageHandler for NeverRespondsHandler {
-        fn handle_actor_message(
+    struct SignalAndDeferHandler(Arc<tokio::sync::Notify>);
+
+    impl crate::registry::ActorAskHandlerSync for SignalAndDeferHandler {
+        fn handle_actor_ask_sync(
             &self,
             _actor_id: u64,
             _type_hash: u32,
             _payload: crate::AlignedBytes,
-            _correlation_id: Option<u32>,
-        ) -> ActorMessageFuture<'_> {
-            Box::pin(async move {
-                sleep(Duration::from_secs(30)).await;
-                Ok(None)
-            })
+            _context: crate::AskContext<'_>,
+        ) -> crate::Result<crate::registry::AskDisposition> {
+            // Exercise a genuinely unanswered application request without
+            // blocking the transport's own inline callback executor forever.
+            self.0.notify_one();
+            Ok(crate::registry::AskDisposition::Deferred)
         }
+    }
+
+    async fn assert_actor_outcome_preserves_session(cancel: bool) {
+        let (key_a, key_b) = ordered_pair("cancel-healthy-a", "cancel-healthy-b");
+        let peer_b = key_b.peer_id();
+        let config = GossipConfig {
+            gossip_interval: Duration::from_secs(300),
+            peer_supervisor_interval: Duration::from_secs(300),
+            connection_recovery: crate::ConnectionRecoveryPolicy {
+                evict_peer_on_ask_timeout: true,
+                evict_peer_on_ask_cancel: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let a = GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:28495".parse().unwrap(),
+            key_a.to_secret_key(),
+            Some(config.clone()),
+            crate::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
+        let b = GossipRegistryHandle::new_with_transport_stack(
+            "127.0.0.1:28496".parse().unwrap(),
+            key_b.to_secret_key(),
+            Some(config),
+            crate::BuilderTlsBootstrap,
+        )
+        .await
+        .unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        b.registry
+            .set_actor_ask_handler_sync(Arc::new(SignalAndDeferHandler(entered.clone())))
+            .await;
+        a.add_peer(&peer_b)
+            .await
+            .connect(&"127.0.0.1:28496".parse().unwrap())
+            .await
+            .unwrap();
+        let remote = a.lookup_peer(&peer_b).await.unwrap();
+        let before = remote.connection_ref().unwrap();
+        let mut ask = Box::pin(remote.ask_actor_frame(
+            7,
+            11,
+            bytes::Bytes::from_static(b"observed-actor-request"),
+            Duration::from_secs(1),
+        ));
+        tokio::select! {
+            result = &mut ask => panic!("ask completed before cancellation: {result:?}"),
+            _ = entered.notified() => {},
+            _ = tokio::time::sleep(Duration::from_secs(5)) => panic!("handler not entered"),
+        }
+        if cancel {
+            drop(ask);
+        } else {
+            assert!(matches!(ask.await, Err(crate::GossipError::Timeout)));
+        }
+        let after = remote.connection_ref().unwrap();
+        assert_eq!(before.instance_id(), after.instance_id());
+        assert!(
+            !before.is_closed(),
+            "application timeout or cancellation must not retire the live session"
+        );
+        assert!(!RemoteActorRef::<()>::is_transport_failure(
+            &crate::GossipError::Timeout
+        ));
+        assert!(RemoteActorRef::<()>::is_transport_failure(
+            &crate::GossipError::ConnectionDropped
+        ));
+        assert_eq!(
+            remote
+                .ask(bytes::Bytes::from_static(b"ECHO:after-cancel"))
+                .await
+                .unwrap()
+                .as_ref(),
+            b"ECHOED:after-cancel",
+        );
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
     }
 
     /// `add_peer`/`connect` dial in one fixed direction; order the pair so
@@ -1560,87 +2271,18 @@ mod tests {
              the pool's own get-or-create still has it indexed"
         );
 
-        handle_a.shutdown().await;
-        handle_b.shutdown().await;
+        handle_a.shutdown().await.unwrap();
+        handle_b.shutdown().await.unwrap();
     }
 
-    /// A timeout-recovery failure is a distinct caller-visible outcome from the original ask
-    /// timing out. In particular, a registry that is already shutting down must not be reported
-    /// as a peer timeout: callers use `Shutdown` to stop issuing work and `Timeout` to consider a
-    /// bounded retry.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn timeout_recovery_propagates_registry_shutdown() {
-        let addr_a: SocketAddr = "127.0.0.1:28493".parse().unwrap();
-        let addr_b: SocketAddr = "127.0.0.1:28494".parse().unwrap();
-        let (key_pair_a, key_pair_b) = ordered_pair("timeout_shutdown_a", "timeout_shutdown_b");
-        let peer_id_b = key_pair_b.peer_id();
-        let config = GossipConfig {
-            gossip_interval: Duration::from_secs(300),
-            peer_supervisor_interval: Duration::from_secs(300),
-            connection_recovery: crate::ConnectionRecoveryPolicy {
-                evict_peer_on_ask_timeout: true,
-                evict_peer_on_ask_cancel: false,
-                retry_actor_ask_once_after_timeout: false,
-                consecutive_timeout_threshold: 0,
-            },
-            ..Default::default()
-        };
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn actor_timeout_does_not_invent_transport_recovery() {
+        assert_actor_outcome_preserves_session(false).await;
+    }
 
-        let handle_a = GossipRegistryHandle::new_with_transport_stack(
-            addr_a,
-            key_pair_a.to_secret_key(),
-            Some(config.clone()),
-            crate::BuilderTlsBootstrap,
-        )
-        .await
-        .unwrap();
-        let handle_b = GossipRegistryHandle::new_with_transport_stack(
-            addr_b,
-            key_pair_b.to_secret_key(),
-            Some(config),
-            crate::BuilderTlsBootstrap,
-        )
-        .await
-        .unwrap();
-        handle_b
-            .registry
-            .set_actor_message_handler(Arc::new(NeverRespondsHandler))
-            .await;
-
-        handle_a
-            .add_peer(&peer_id_b)
-            .await
-            .connect(&addr_b)
-            .await
-            .unwrap();
-        sleep(Duration::from_millis(300)).await;
-        let remote_actor = handle_a
-            .lookup_peer(&peer_id_b)
-            .await
-            .expect("lookup should succeed");
-
-        // Keep the cached connection alive long enough for the first ask to time out, then make
-        // the recovery boundary observe shutdown. The old implementation converted this precise
-        // `Shutdown` into `Timeout`.
-        handle_a
-            .registry
-            .shutdown
-            .store(true, std::sync::atomic::Ordering::Release);
-        let result = remote_actor
-            .ask_actor_frame(
-                0x5E1F_4EA1,
-                0xC0DE_CAFE,
-                bytes::Bytes::from_static(b"shutdown"),
-                Duration::from_millis(50),
-            )
-            .await;
-        assert!(
-            matches!(result, Err(crate::GossipError::Shutdown)),
-            "timeout recovery must preserve Shutdown, got {result:?}"
-        );
-
-        handle_a.shutdown().await;
-        handle_b.shutdown().await;
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_actor_ask_preserves_exact_healthy_session() {
+        assert_actor_outcome_preserves_session(true).await;
     }
 
     #[tokio::test]

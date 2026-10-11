@@ -9,6 +9,9 @@ use tokio::time::sleep;
 
 mod qa_connect_publication;
 mod qa_nack_capacity;
+mod qa_pool_admission;
+mod qa_pool_identity_cleanup;
+mod qa_reply_provenance;
 
 struct TestActor;
 
@@ -31,7 +34,46 @@ impl crate::registry::ActorMessageHandlerSync for TestActor {
     }
 }
 
-struct DeferredTestActor;
+struct DeferredTestActor {
+    tx: tokio::sync::mpsc::Sender<(crate::ForwardPayload, crate::ForwardReplyToken)>,
+    session: Arc<std::sync::OnceLock<crate::ReplySession>>,
+}
+
+struct DeferredTestReplies {
+    rx: tokio::sync::mpsc::Receiver<(crate::ForwardPayload, crate::ForwardReplyToken)>,
+    session: Arc<std::sync::OnceLock<crate::ReplySession>>,
+}
+
+impl Drop for DeferredTestReplies {
+    fn drop(&mut self) {
+        self.rx.close();
+        if let Some(session) = self.session.get() {
+            while let Ok((_, token)) = self.rx.try_recv() {
+                session.cancel(token);
+            }
+        }
+    }
+}
+
+impl DeferredTestActor {
+    fn new() -> Self {
+        // One physical test connection, 64 deferred claims, at most 4 MiB
+        // of retained input owners. All tokens end with this fixture worker.
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let session = Arc::new(std::sync::OnceLock::new());
+        let mut replies = DeferredTestReplies {
+            rx,
+            session: Arc::clone(&session),
+        };
+        tokio::spawn(async move {
+            while let Some((payload, token)) = replies.rx.recv().await {
+                let session = replies.session.get().expect("session bound before enqueue");
+                let _ = session.reply_owned(token, payload).await;
+            }
+        });
+        Self { tx, session }
+    }
+}
 
 impl crate::registry::ActorAskHandlerSync for DeferredTestActor {
     fn handle_actor_ask_sync(
@@ -45,10 +87,26 @@ impl crate::registry::ActorAskHandlerSync for DeferredTestActor {
             return Ok(crate::registry::AskDisposition::Deferred);
         }
 
+        let payload = crate::ForwardPayload::try_from(payload)?;
+        if payload.retained_bytes() > 64 * 1024 {
+            return Err(crate::GossipError::MessageTooLarge {
+                size: payload.retained_bytes(),
+                max: 64 * 1024,
+            });
+        }
+        let permit = self.tx.try_reserve().map_err(|error| match error {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => crate::GossipError::WriteQueueFull,
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => crate::GossipError::Shutdown,
+        })?;
         let responder = context.responder();
-        tokio::spawn(async move {
-            let _ = responder.reply_bytes(payload.into_bytes()).await;
-        });
+        if self.session.get().is_none() {
+            let session = responder.reply_session_with_capacity(64)?;
+            let _ = self.session.set(session);
+        }
+        let session = self.session.get().ok_or(crate::GossipError::Shutdown)?;
+        let admission = responder.prepare_forward_reply(session)?;
+        permit.send((payload, admission.token()));
+        admission.commit();
 
         Ok(crate::registry::AskDisposition::Deferred)
     }
@@ -781,7 +839,12 @@ fn local_streaming_queue_full_does_not_stop_the_io_task_from_processing_a_later_
             peer_id: None,
             max_message_size: MASTER_BUFFER_SIZE,
             expected_schema_hash: None,
-            aligned_pool: registry_wedged.connection_pool.aligned_bytes_pool(),
+            // Admit the MAX_STREAM_SIZE fixture plus read scratch within
+            // an explicit finite pool, rather than test the smaller default.
+            aligned_pool: Arc::new(crate::AlignedBytesPool::new_with_budget(
+                crate::aligned::DEFAULT_ALIGNED_POOL_SIZE,
+                crate::MAX_INFLIGHT_STREAM_BYTES,
+            )),
             inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
             response_correlation: Some(correlation_wedged.clone()),
             response_writer: None,
@@ -955,7 +1018,12 @@ fn ask_dispatch_is_skipped_not_consumed_when_streaming_queue_has_no_room() {
             peer_id: None,
             max_message_size: MASTER_BUFFER_SIZE,
             expected_schema_hash: None,
-            aligned_pool: registry_wedged.connection_pool.aligned_bytes_pool(),
+            // Admit the MAX_STREAM_SIZE fixture plus read scratch within
+            // an explicit finite pool, rather than test the smaller default.
+            aligned_pool: Arc::new(crate::AlignedBytesPool::new_with_budget(
+                crate::aligned::DEFAULT_ALIGNED_POOL_SIZE,
+                crate::MAX_INFLIGHT_STREAM_BYTES,
+            )),
             inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
             response_correlation: Some(correlation_wedged.clone()),
             response_writer: None,
@@ -1671,8 +1739,9 @@ fn disconnect_by_peer_id_preserves_session_correlation_tracker() {
     let peer_id = crate::KeyPair::new_for_testing("session_correlation").peer_id();
     let addr: SocketAddr = "127.0.0.1:40555".parse().unwrap();
 
-    pool.set_configured_peer_addr(&peer_id, addr);
-    let original = pool.get_or_create_correlation_tracker(&peer_id);
+    pool.set_configured_peer_addr(&peer_id, addr)
+        .expect("peer state admitted");
+    let original = pool.get_or_create_correlation_tracker(&peer_id).unwrap();
 
     let connection = Arc::new(LockFreeConnection::new(addr, ConnectionDirection::Outbound));
     connection.set_state(ConnectionState::Connected);
@@ -1681,7 +1750,7 @@ fn disconnect_by_peer_id_preserves_session_correlation_tracker() {
     pool.disconnect_connection_by_peer_id(&peer_id)
         .expect("expected connection to be removed");
 
-    let preserved = pool.get_or_create_correlation_tracker(&peer_id);
+    let preserved = pool.get_or_create_correlation_tracker(&peer_id).unwrap();
     assert!(Arc::ptr_eq(&original, &preserved));
     assert_eq!(pool.get_configured_peer_addr(&peer_id), Some(addr));
 }
@@ -1692,7 +1761,7 @@ async fn rejected_candidate_preserves_rival_correlation_at_another_address() {
     let rival_addr: SocketAddr = "127.0.0.1:40570".parse().unwrap();
     let candidate_addr: SocketAddr = "127.0.0.1:40571".parse().unwrap();
     let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
-    let tracker = pool.get_or_create_correlation_tracker(&peer_id);
+    let tracker = pool.get_or_create_correlation_tracker(&peer_id).unwrap();
     let rival = make_live_connection_with_correlation(
         rival_addr,
         ConnectionDirection::Inbound,
@@ -1711,18 +1780,18 @@ async fn rejected_candidate_preserves_rival_correlation_at_another_address() {
         .upsert_sync(candidate_addr, candidate.clone());
 
     let guard = tracker
-        .allocate()
+        .allocate_for_session(rival.stream_handle.as_ref().unwrap().instance_id())
         .expect("correlation slot should allocate");
     let slot = CorrelationTracker::slot_index(guard.id());
     assert_eq!(
-        tracker.pending[slot].state.load(Ordering::Acquire),
+        tracker.pending[slot].state.load(Ordering::Acquire) & 3,
         SLOT_WAITING
     );
 
     pool.unpublish_rejected_outbound_candidate(candidate_addr, &candidate, &peer_id, Some(&rival));
 
     assert_eq!(
-        tracker.pending[slot].state.load(Ordering::Acquire),
+        tracker.pending[slot].state.load(Ordering::Acquire) & 3,
         SLOT_WAITING,
         "retiring a candidate must not cancel a live rival's shared ask slot"
     );
@@ -1762,7 +1831,7 @@ async fn a_caller_side_check_then_mutate_reindex_is_vulnerable_to_an_interleaved
     let losing_addr: SocketAddr = "127.0.0.1:40560".parse().unwrap();
     let winning_addr: SocketAddr = "127.0.0.1:40561".parse().unwrap();
 
-    let connection = qa_r11_generation_race_connection(raw_addr);
+    let connection = qa_r11_generation_race_connection(raw_addr, &peer_id);
     assert!(pool.add_connection_by_peer_id(peer_id.clone(), raw_addr, connection));
     assert!(!pool.has_connection(&losing_addr), "precondition");
 
@@ -1773,7 +1842,8 @@ async fn a_caller_side_check_then_mutate_reindex_is_vulnerable_to_an_interleaved
     let _ = pool
         .addr_to_peer_id
         .upsert_sync(losing_addr, peer_id.clone());
-    pool.set_configured_peer_addr(&peer_id, losing_addr);
+    pool.set_configured_peer_addr(&peer_id, losing_addr)
+        .expect("peer state admitted");
     assert_eq!(pool.get_required_peer_addr(&peer_id), Some(losing_addr));
 
     // An owner command interleaves BETWEEN the check and the mutate below,
@@ -1783,7 +1853,8 @@ async fn a_caller_side_check_then_mutate_reindex_is_vulnerable_to_an_interleaved
     // OLD address's ownership is retracted, so `addr_to_peer_id[losing_addr]`
     // deliberately still shows `peer_id` here, unretracted -- the exact
     // window the coordinator's ordering question asked about.
-    pool.set_configured_peer_addr(&peer_id, winning_addr);
+    pool.set_configured_peer_addr(&peer_id, winning_addr)
+        .expect("peer state admitted");
 
     // The stale "mutate" proceeds anyway, using the check from before the
     // interleaved move -- exactly what a caller-side compare-and-apply
@@ -1841,7 +1912,7 @@ async fn concurrent_configure_peer_calls_always_reindex_the_current_pin_winner()
         let addr_b: SocketAddr = format!("127.0.0.1:{}", 41_200 + round).parse().unwrap();
 
         let raw_addr: SocketAddr = format!("127.0.0.1:{}", 41_300 + round).parse().unwrap();
-        let connection = qa_r11_generation_race_connection(raw_addr);
+        let connection = qa_r11_generation_race_connection(raw_addr, &peer_id);
         assert!(registry.connection_pool.add_connection_by_peer_id(
             peer_id.clone(),
             raw_addr,
@@ -1888,6 +1959,7 @@ async fn disconnect_by_peer_id_removes_configured_addr_connection_without_alias_
     );
     let mut connection = LockFreeConnection::new(addr, ConnectionDirection::Outbound);
     connection.stream_handle = Some(Arc::new(stream_handle));
+    connection.embedded_peer_id = Some(peer_id.clone());
     connection.set_state(ConnectionState::Connected);
     let connection = Arc::new(connection);
     assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, connection));
@@ -1945,7 +2017,8 @@ async fn get_connection_by_peer_id_recovers_live_alias_connection() {
     let configured_addr: SocketAddr = "127.0.0.1:40558".parse().unwrap();
     let alias_addr: SocketAddr = "127.0.0.1:50558".parse().unwrap();
 
-    pool.set_configured_peer_addr(&peer_id, configured_addr);
+    pool.set_configured_peer_addr(&peer_id, configured_addr)
+        .expect("peer state admitted");
     let (io, _peer_io) = tokio::io::duplex(1024);
     let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
         io,
@@ -1961,8 +2034,10 @@ async fn get_connection_by_peer_id_recovers_live_alias_connection() {
     connection.set_state(ConnectionState::Connected);
     let connection = Arc::new(connection);
 
-    pool.index_connection_by_addr(alias_addr, connection.clone());
-    pool.add_addr_to_peer_id(alias_addr, peer_id.clone());
+    pool.index_connection_by_addr(alias_addr, connection.clone())
+        .expect("address admitted");
+    pool.add_addr_to_peer_id(alias_addr, peer_id.clone())
+        .expect("address owner admitted");
 
     let resolved = pool
         .get_connection_by_peer_id(&peer_id)
@@ -1983,7 +2058,8 @@ async fn get_connection_by_peer_id_rejects_alias_identity_mismatch() {
     let configured_addr: SocketAddr = "127.0.0.1:40560".parse().unwrap();
     let alias_addr: SocketAddr = "127.0.0.1:50560".parse().unwrap();
 
-    pool.set_configured_peer_addr(&victim_peer_id, configured_addr);
+    pool.set_configured_peer_addr(&victim_peer_id, configured_addr)
+        .expect("peer state admitted");
     let (io, _peer_io) = tokio::io::duplex(1024);
     let (stream_handle, _writer_task, _reader_task) = LockFreeStreamHandle::new(
         io,
@@ -1999,8 +2075,10 @@ async fn get_connection_by_peer_id_rejects_alias_identity_mismatch() {
     connection.set_state(ConnectionState::Connected);
     let connection = Arc::new(connection);
 
-    pool.index_connection_by_addr(alias_addr, connection);
-    pool.add_addr_to_peer_id(alias_addr, victim_peer_id.clone());
+    pool.index_connection_by_addr(alias_addr, connection)
+        .expect("address admitted");
+    pool.add_addr_to_peer_id(alias_addr, victim_peer_id.clone())
+        .expect("address owner admitted");
 
     assert!(pool.get_connection_by_peer_id(&victim_peer_id).is_none());
     assert!(!pool.has_connection_by_peer_id(&victim_peer_id));
@@ -2029,7 +2107,8 @@ async fn finalize_binds_cert_identity_over_stale_addr_map_on_rekey() {
     let addr: SocketAddr = "127.0.0.1:40611".parse().unwrap();
 
     let stale_b = crate::KeyPair::new_for_testing("rekey_stale_peer_b").peer_id();
-    pool.add_addr_to_peer_id(addr, stale_b.clone());
+    pool.add_addr_to_peer_id(addr, stale_b.clone())
+        .expect("address owner admitted");
 
     let new_a = crate::KeyPair::new_for_testing("rekey_new_peer_a").peer_id();
     let new_a_node_id = new_a.to_node_id();
@@ -2079,8 +2158,10 @@ async fn remove_connection_cleans_all_address_aliases_for_same_stream() {
     let connection = Arc::new(connection);
 
     assert!(pool.add_connection_by_peer_id(peer_id.clone(), configured_addr, connection.clone()));
-    pool.index_connection_by_addr(alias_addr, connection.clone());
-    pool.add_addr_to_peer_id(alias_addr, peer_id.clone());
+    pool.index_connection_by_addr(alias_addr, connection.clone())
+        .expect("address admitted");
+    pool.add_addr_to_peer_id(alias_addr, peer_id.clone())
+        .expect("address owner admitted");
 
     let removed = pool
         .remove_connection(alias_addr)
@@ -2121,7 +2202,7 @@ fn deferred_actor_ask_sync_replies_via_responder() {
             },
         ));
         server_registry
-            .set_actor_ask_handler_sync(Arc::new(DeferredTestActor))
+            .set_actor_ask_handler_sync(Arc::new(DeferredTestActor::new()))
             .await;
 
         let client_registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
@@ -2199,7 +2280,9 @@ fn deferred_actor_ask_sync_replies_via_responder() {
             Some(server_read_ctx),
         );
         let server_writer = Arc::new(server_writer);
-        response_writer.bind_stream_handle(server_writer.clone());
+        response_writer
+            .bind_stream_handle(server_writer.clone())
+            .unwrap();
 
         let payload = bytes::Bytes::from_static(b"deferred-ping");
         let reply = client_conn
@@ -2322,7 +2405,9 @@ fn ask_immediate_handler_sync_error_nacks_instead_of_letting_the_asker_time_out(
             Some(server_read_ctx),
         );
         let server_writer = Arc::new(server_writer);
-        response_writer.bind_stream_handle(server_writer.clone());
+        response_writer
+            .bind_stream_handle(server_writer.clone())
+            .unwrap();
 
         let payload = bytes::Bytes::from_static(b"trigger-handler-error");
         let result = tokio::time::timeout(
@@ -2451,7 +2536,9 @@ fn ask_handler_sync_error_nacks_instead_of_letting_the_asker_time_out() {
             Some(server_read_ctx),
         );
         let server_writer = Arc::new(server_writer);
-        response_writer.bind_stream_handle(server_writer.clone());
+        response_writer
+            .bind_stream_handle(server_writer.clone())
+            .unwrap();
 
         let payload = bytes::Bytes::from_static(b"trigger-handler-error");
         let result = tokio::time::timeout(
@@ -2495,7 +2582,7 @@ fn deferred_actor_ask_pending_wait_replies_repeatedly() {
             },
         ));
         server_registry
-            .set_actor_ask_handler_sync(Arc::new(DeferredTestActor))
+            .set_actor_ask_handler_sync(Arc::new(DeferredTestActor::new()))
             .await;
 
         let client_registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
@@ -2575,7 +2662,9 @@ fn deferred_actor_ask_pending_wait_replies_repeatedly() {
             Some(server_read_ctx),
         );
         let server_writer = Arc::new(server_writer);
-        response_writer.bind_stream_handle(server_writer.clone());
+        response_writer
+            .bind_stream_handle(server_writer.clone())
+            .unwrap();
 
         for round in 0..128u8 {
             let payload = bytes::Bytes::from(vec![round; 32]);
@@ -2589,7 +2678,7 @@ fn deferred_actor_ask_pending_wait_replies_repeatedly() {
                 .await
                 .unwrap();
             let reply = pending.wait().await.unwrap();
-            assert_eq!(reply, payload);
+            assert_eq!(reply.as_ref(), payload.as_ref());
         }
 
         client_writer.shutdown();
@@ -2616,7 +2705,7 @@ fn deferred_actor_ask_still_dispatches_when_immediate_handler_declines() {
             .set_actor_ask_immediate_handler_sync(Arc::new(ImmediateMissActor))
             .await;
         server_registry
-            .set_actor_ask_handler_sync(Arc::new(DeferredTestActor))
+            .set_actor_ask_handler_sync(Arc::new(DeferredTestActor::new()))
             .await;
 
         let client_registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
@@ -2698,7 +2787,9 @@ fn deferred_actor_ask_still_dispatches_when_immediate_handler_declines() {
             Some(server_read_ctx),
         );
         let server_writer = Arc::new(server_writer);
-        response_writer.bind_stream_handle(server_writer.clone());
+        response_writer
+            .bind_stream_handle(server_writer.clone())
+            .unwrap();
 
         let payload = bytes::Bytes::from_static(b"deferred-ping-immediate-miss");
         let reply = client_conn
@@ -2728,7 +2819,7 @@ fn get_connection_to_peer_reuses_existing_connection_correlation_tracker() {
             },
         ));
         server_registry
-            .set_actor_ask_handler_sync(Arc::new(DeferredTestActor))
+            .set_actor_ask_handler_sync(Arc::new(DeferredTestActor::new()))
             .await;
 
         let client_registry = Arc::new(crate::registry::GossipRegistry::<()>::new(
@@ -2744,7 +2835,8 @@ fn get_connection_to_peer_reuses_existing_connection_correlation_tracker() {
         let peer_id = server_registry.peer_id.clone();
         let session_correlation = client_registry
             .connection_pool
-            .get_or_create_correlation_tracker(&peer_id);
+            .get_or_create_correlation_tracker(&peer_id)
+            .unwrap();
 
         let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
         let connection_correlation = CorrelationTracker::new();
@@ -2822,7 +2914,9 @@ fn get_connection_to_peer_reuses_existing_connection_correlation_tracker() {
             Some(server_read_ctx),
         );
         let server_writer = Arc::new(server_writer);
-        response_writer.bind_stream_handle(server_writer.clone());
+        response_writer
+            .bind_stream_handle(server_writer.clone())
+            .unwrap();
 
         let handle = client_registry
             .connection_pool
@@ -2871,6 +2965,8 @@ impl tokio::io::AsyncRead for RecordingWriter {
     }
 }
 
+impl crate::connection_pool::outcome_window::OutcomeWrite for RecordingWriter {}
+
 impl AsyncWrite for RecordingWriter {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -2901,11 +2997,13 @@ async fn streaming_slice_progress_notifies_shared_capacity_exactly_once() {
         crate::framing::try_write_stream_data_header(false, 7, 1, STREAM_WRITE_SLICE_BYTES + 17)
             .unwrap();
     let payload = bytes::Bytes::from(vec![0xA7; STREAM_WRITE_SLICE_BYTES + 17]);
-    let pending =
-        PendingStreamingCommand::shared(StreamingCommand::VectoredWrite(VectoredSendItem {
+    let pending = PendingStreamingCommand::shared(StreamingCommand::AdmittedVectored(
+        VectoredSendItem {
             header: InlineFrameHeader::from_array(header),
             payload,
-        }));
+        },
+        outcome_window::AdmittedFrames::default(),
+    ));
     let mut pending_slot = Some(pending);
     let mut turns = 0usize;
     loop {
@@ -3021,7 +3119,7 @@ fn concurrent_responses_admit_when_configured_max_message_size_exceeds_the_queue
     queue_streaming_response_bytes(
         &mut queue,
         1,
-        bytes::Bytes::from(vec![0xA5u8; one_response]),
+        crate::ForwardPayload::from(vec![0xA5u8; one_response]),
         default_max_message_size,
         None,
     )
@@ -3123,7 +3221,7 @@ fn streaming_admission_backpressure_nacks_instead_of_dropping_the_computed_respo
         queue_streaming_response_bytes(
             &mut queue,
             1,
-            bytes::Bytes::from(vec![0x11u8; crate::MAX_STREAM_SIZE]),
+            crate::ForwardPayload::from(vec![0x11u8; crate::MAX_STREAM_SIZE]),
             MASTER_BUFFER_SIZE,
             None,
         )
@@ -3132,7 +3230,7 @@ fn streaming_admission_backpressure_nacks_instead_of_dropping_the_computed_respo
         queue_streaming_response_bytes(
             &mut queue,
             2,
-            bytes::Bytes::from(vec![0x22u8; STREAMING_THRESHOLD + 1_048_576]),
+            crate::ForwardPayload::from(vec![0x22u8; STREAMING_THRESHOLD + 1_048_576]),
             MASTER_BUFFER_SIZE,
             None,
         )
@@ -3143,7 +3241,7 @@ fn streaming_admission_backpressure_nacks_instead_of_dropping_the_computed_respo
         queue_streaming_response_bytes_or_nack(
             &mut queue,
             correlation_id,
-            bytes::Bytes::from(vec![0x33u8; STREAMING_THRESHOLD + 4096]),
+            crate::ForwardPayload::from(vec![0x33u8; STREAMING_THRESHOLD + 4096]),
             MASTER_BUFFER_SIZE,
             None,
         )
@@ -3312,8 +3410,8 @@ fn drain_pending_ask_nacks_requeues_on_zero_byte_write_miss() {
         );
         assert!(
             matches!(
-                pending,
-                Some(PendingOrdinaryWrite::AskNack { offset: 0, .. })
+                pending.as_ref().map(|pending| &pending.kind),
+                Some(PendingOrdinaryWriteKind::AskNack { offset: 0, .. })
             ),
             "the popped NACK must remain the active frame at offset 0"
         );
@@ -3360,10 +3458,12 @@ fn drain_pending_ask_nacks_requeues_on_zero_byte_write_miss() {
 /// one of the callers that must check `has_room_for_ask_nack` first.
 #[test]
 fn park_deferred_ask_does_not_grow_nack_queue_past_cap() {
-    let pool = Arc::new(crate::AlignedBytesPool::default());
+    // Isolate the deferred-queue limit, not the independent pool checkout
+    // limit: every queued zero-length body still retains its input owner.
+    let pool = Arc::new(crate::AlignedBytesPool::new(DEFERRED_ASK_HOLD_CAP + 1));
     let ask = |id: u32| {
         let header = crate::framing::write_actor_ask_header(id, 1, 1, 0);
-        let buffer = crate::PooledAlignedBuffer::from_slice(&header, pool.clone());
+        let buffer = crate::PooledAlignedBuffer::from_slice(&header, pool.clone()).unwrap();
         let result = crate::handle::parse_message_from_pooled_buffer(
             buffer,
             header.len() - crate::framing::LENGTH_PREFIX_LEN,
@@ -3538,22 +3638,11 @@ fn nine_queued_ask_nacks_all_reach_the_wire_without_further_traffic() {
     });
 }
 
-/// P1: a burst past `PENDING_ASK_NACK_CAP` (64) used to silently *evict*
-/// the oldest not-yet-written NACK to make room for the newest -- dropping
-/// the only remaining record that a specific, already-consumed ask existed
-/// at all. That ask's requester then timed out instead of getting the fast
-/// NACK this whole mechanism exists to deliver: the exact failure class
-/// this line of work removes, reintroduced one layer down. 96 raw
-/// `ActorAsk` frames (comfortably past the 64-entry cap, comfortably under
-/// `READ_BATCH_LIMIT`) land in one `write_all` so all 96 are read and
-/// dispatched -- each `UnknownActor`-NACKed, since the server registry has
-/// no ask handler registered -- inside one read-batch pass. The fix gates
-/// further reads on `LocalStreamingQueue::has_room_for_ask_nack`, so the
-/// batch pauses at 64 queued, drains, and resumes -- every one of the 96
-/// must still arrive, including the earliest ones the old eviction would
-/// have discarded first.
+/// More than one window of terminal outcomes must remain lossless. The raw
+/// peer obeys the mandatory negotiated window, returning credit only after
+/// consuming a terminal frame. A separate negative test sends an overrun.
 #[test]
-fn ninety_six_queued_ask_nacks_all_reach_the_wire_none_evicted() {
+fn ninety_six_windowed_ask_nacks_all_reach_the_wire_none_evicted() {
     run_multi_thread_test(async {
         const ASK_COUNT: u32 = 96;
         const COMPLETION_BOUND: Duration = Duration::from_secs(5);
@@ -3612,13 +3701,13 @@ fn ninety_six_queued_ask_nacks_all_reach_the_wire_none_evicted() {
             frames.extend_from_slice(&header);
             frames.extend_from_slice(payload);
         }
-        tokio::io::AsyncWriteExt::write_all(&mut peer_io, &frames)
+        tokio::io::AsyncWriteExt::write_all(&mut peer_io, &frames[..64 * 33])
             .await
-            .expect("writing all 96 ActorAsk frames at once must succeed");
+            .expect("writing the first negotiated window must succeed");
 
         let outcome = tokio::time::timeout(COMPLETION_BOUND, async {
             let mut received = Vec::with_capacity(ASK_COUNT as usize);
-            for _ in 0..ASK_COUNT {
+            for received_index in 0..ASK_COUNT {
                 let mut header = [0u8; crate::framing::ASK_RESPONSE_FRAME_HEADER_LEN];
                 tokio::io::AsyncReadExt::read_exact(&mut peer_io, &mut header)
                     .await
@@ -3626,6 +3715,12 @@ fn ninety_six_queued_ask_nacks_all_reach_the_wire_none_evicted() {
                 let correlation_id = u32::from_be_bytes(header[4..8].try_into().unwrap());
                 let reason = crate::framing::ask_nack_reason(&header[4..]);
                 received.push((correlation_id, reason));
+                if received_index < ASK_COUNT - 64 {
+                    let offset = (64 + received_index as usize) * 33;
+                    tokio::io::AsyncWriteExt::write_all(&mut peer_io, &frames[offset..offset + 33])
+                        .await
+                        .expect("a consumed terminal permits one successor ask");
+                }
             }
             received
         })
@@ -3633,7 +3728,7 @@ fn ninety_six_queued_ask_nacks_all_reach_the_wire_none_evicted() {
 
         let received = outcome.expect(
             "every one of the 96 asks must reach a terminal outcome (a NACK) -- a burst past \
-             the 64-entry pending-NACK cap must gate further reads, not evict an \
+             the 64-entry terminal window must preserve every \
              already-consumed ask's only remaining record",
         );
 
@@ -3784,7 +3879,7 @@ fn immediate_bytes_response_admission_stays_lazy_for_many_frames() {
     queue_streaming_response_bytes(
         &mut queue,
         0xC0DE,
-        bytes::Bytes::from(vec![0xA7; payload_len]),
+        crate::ForwardPayload::from(vec![0xA7; payload_len]),
         payload_len,
         None,
     )
@@ -3804,7 +3899,7 @@ fn lazy_stream_admission_counts_owned_payload_not_generated_headers() {
     queue_streaming_response_bytes(
         &mut queue,
         0xC0DE,
-        bytes::Bytes::from(vec![0xA7; payload_len]),
+        crate::ForwardPayload::from(vec![0xA7; payload_len]),
         20,
         None,
     )
@@ -3812,13 +3907,19 @@ fn lazy_stream_admission_counts_owned_payload_not_generated_headers() {
 }
 
 #[test]
-fn sliced_bytes_stream_is_compacted_before_admission() {
+fn opaque_bytes_require_explicit_copy_before_stream_admission() {
     let backing = bytes::Bytes::from(vec![0xA7; 4 * STREAM_CHUNK_SIZE]);
     let payload = backing.slice(..STREAM_CHUNK_SIZE);
     let mut queue = LocalStreamingQueue::new();
 
-    queue_streaming_response_bytes(&mut queue, 0xC0DE, payload, 20, None)
-        .expect("a sliced streaming payload should be admitted after compaction");
+    queue_streaming_response_bytes(
+        &mut queue,
+        0xC0DE,
+        crate::ForwardPayload::copy_from_slice(&payload),
+        20,
+        None,
+    )
+    .expect("a sliced streaming payload should be admitted after compaction");
 
     let Some(StreamingCommand::BytesResponse(response)) = queue.queue.front() else {
         panic!("expected a lazy bytes response command");
@@ -4078,7 +4179,7 @@ async fn pooled_streaming_response_writes_prefix_and_payload_in_frame_order() {
         StreamingCommand::PooledResponse(response) => (response.stream_id, response.chunk_size),
         other => panic!("expected pooled response command, got {other:?}"),
     };
-    let mut pending = PendingStreamingCommand::local(command);
+    let mut pending = PendingStreamingCommand::local_response(command);
     let (mut writer, recorded) = RecordingWriter::new();
     loop {
         let (written, complete) = write_streaming_command_slice(&mut writer, &mut pending)
@@ -4197,7 +4298,7 @@ async fn bytes_streaming_response_writes_frame_order() {
     queue_streaming_response_bytes(
         &mut local_queue,
         0xC0DE,
-        bytes::Bytes::from(payload_bytes.clone()),
+        crate::ForwardPayload::from(payload_bytes.clone()),
         64,
         None,
     )
@@ -4259,7 +4360,7 @@ async fn bytes_streaming_response_yields_at_each_frame_boundary() {
     queue_streaming_response_bytes(
         &mut local_queue,
         0xC0DE,
-        bytes::Bytes::from(vec![0xA7; payload_len]),
+        crate::ForwardPayload::from(vec![0xA7; payload_len]),
         64,
         None,
     )
@@ -4568,7 +4669,10 @@ async fn test_outbound_dial_gate_is_released_when_leader_is_cancelled() {
     let pool = ConnectionPool::<()>::new(10, Duration::from_secs(5));
     let addr: SocketAddr = "127.0.0.1:8081".parse().unwrap();
 
-    let gate = match pool.acquire_outbound_dial_gate(addr) {
+    let gate = match pool
+        .acquire_outbound_dial_gate(addr)
+        .expect("gate admission")
+    {
         OutboundDialLease::Leader(gate) => gate,
         OutboundDialLease::Follower(_) => panic!("first dial should own the outbound gate"),
     };
@@ -4581,7 +4685,10 @@ async fn test_outbound_dial_gate_is_released_when_leader_is_cancelled() {
         .await
         .expect("cancelled dial owner must wake outbound gate waiters");
 
-    match pool.acquire_outbound_dial_gate(addr) {
+    match pool
+        .acquire_outbound_dial_gate(addr)
+        .expect("gate admission")
+    {
         OutboundDialLease::Leader(_) => {}
         OutboundDialLease::Follower(_) => {
             panic!("cancelled dial owner must remove stale outbound gate")
@@ -4683,8 +4790,11 @@ async fn connection_published_after_retry_claim_is_reused_before_dial() {
     let pool = registry.connection_pool.clone();
     let peer = crate::KeyPair::new_for_testing("retry_claim_publish_race").peer_id();
     let addr: SocketAddr = "127.0.0.1:7314".parse().unwrap();
-    pool.add_addr_to_peer_id(addr, peer.clone());
-    let session = pool.get_or_create_peer_session(&peer);
+    pool.add_addr_to_peer_id(addr, peer.clone())
+        .expect("address owner admitted");
+    let session = pool
+        .get_or_create_peer_session(&peer)
+        .expect("peer state admitted");
     let attempt = session
         .outbound_dial_retry
         .try_claim_attempt()
@@ -6581,6 +6691,7 @@ fn accept_path_streaming_state_handoff_completes_a_stream_split_across_the_first
         );
 
         let handoff = Arc::new(StreamingStateHandoff {
+            initial_outcome: None,
             cell: std::sync::Mutex::new(Some(inherited)),
             ready: tokio::sync::Notify::new(),
         });
@@ -6658,10 +6769,9 @@ fn correlation_tracker_throughput_bench() {
                 .allocate()
                 .expect("ring should not be exhausted in test")
                 .disarm();
-            let mut payload = Some(crate::AlignedBytes::from_pooled_slice(
-                b"pingpong",
-                Arc::clone(&pool),
-            ));
+            let mut payload = Some(
+                crate::AlignedBytes::from_pooled_slice(b"pingpong", Arc::clone(&pool)).unwrap(),
+            );
             assert!(tracker.complete(correlation_id, &mut payload));
             let reply = tracker
                 .wait_for_response_no_timeout(correlation_id)
@@ -6697,10 +6807,9 @@ fn correlation_tracker_throughput_bench() {
                     .wait_for_response_no_timeout(correlation_id)
                     .await
             }));
-            let mut payload = Some(crate::AlignedBytes::from_pooled_slice(
-                b"pingpong",
-                Arc::clone(&pool),
-            ));
+            let mut payload = Some(
+                crate::AlignedBytes::from_pooled_slice(b"pingpong", Arc::clone(&pool)).unwrap(),
+            );
             assert!(tracker.complete(correlation_id, &mut payload));
             next += 1;
         }
@@ -6721,10 +6830,9 @@ fn correlation_tracker_throughput_bench() {
                         .wait_for_response_no_timeout(correlation_id)
                         .await
                 }));
-                let mut payload = Some(crate::AlignedBytes::from_pooled_slice(
-                    b"pingpong",
-                    Arc::clone(&pool),
-                ));
+                let mut payload = Some(
+                    crate::AlignedBytes::from_pooled_slice(b"pingpong", Arc::clone(&pool)).unwrap(),
+                );
                 assert!(tracker.complete(correlation_id, &mut payload));
                 next += 1;
             }
@@ -6759,8 +6867,11 @@ fn allocate_terminates_when_every_slot_is_already_waiting() {
 
     // Force the ring to the exact state the bug produced in prod: every
     // slot in SLOT_WAITING with no consumer ever going to clear it.
-    for slot in tracker.pending.iter() {
-        slot.state.store(SLOT_WAITING, Ordering::Release);
+    for (index, slot) in tracker.pending.iter().enumerate() {
+        slot.state.store(
+            correlation_slot_word((index + PENDING_RESPONSES_SIZE) as u32, SLOT_WAITING),
+            Ordering::Release,
+        );
     }
 
     // Probe on a separate OS thread. The current_thread tokio executor
@@ -6851,7 +6962,7 @@ fn cancelled_pending_ask_wait_releases_slot() {
             let slot = tracker.allocate().expect("ring should not be exhausted");
             let pending = PendingAsk {
                 correlation_id: slot.disarm(),
-                correlation: Arc::clone(&tracker),
+                correlation: &tracker,
                 deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
                 active: true,
             };
@@ -6873,7 +6984,7 @@ fn count_waiting_slots(tracker: &CorrelationTracker) -> usize {
     tracker
         .pending
         .iter()
-        .filter(|s| s.state.load(Ordering::Acquire) == SLOT_WAITING)
+        .filter(|s| s.state.load(Ordering::Acquire) & 3 == SLOT_WAITING)
         .count()
 }
 
@@ -7098,6 +7209,7 @@ async fn full_sync_response_body_len_with_gossip_header_overhead_over_limit_is_r
         );
         let mut connection = LockFreeConnection::new(sender_addr, ConnectionDirection::Inbound);
         connection.stream_handle = Some(Arc::new(stream_handle));
+        connection.embedded_peer_id = Some(sender_peer_id.clone());
         connection.set_state(ConnectionState::Connected);
         let connection = Arc::new(connection);
         assert!(registry.connection_pool.add_connection_by_peer_id(
@@ -7568,12 +7680,9 @@ async fn delta_gossip_with_mismatched_sender_identity_is_ignored() {
     );
 }
 
-/// DRY consolidation: the per-peer consecutive-timeout streak eviction
-/// mechanism now lives in icanact-remote (the caller supplies only the
-/// classification). Evict only once the streak threshold is reached; a success
-/// resets it; a hard fault evicts immediately.
+// REMOTE-1/3: approved timeout migration retains API compatibility without liveness votes.
 #[test]
-fn streak_timeout_evicts_only_at_threshold_and_resets_on_success() {
+fn timeout_threshold_and_success_do_not_classify_transport_health() {
     let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
     let peer = crate::KeyPair::new_for_testing("streak_threshold").peer_id();
     let addr: SocketAddr = "127.0.0.1:7310".parse().unwrap();
@@ -7585,24 +7694,19 @@ fn streak_timeout_evicts_only_at_threshold_and_resets_on_success() {
     };
     add();
 
-    // Threshold 3: first two streak-timeouts must NOT evict.
     assert!(!pool.note_peer_ask_streak_timeout(&peer, 3, None));
     assert!(!pool.note_peer_ask_streak_timeout(&peer, 3, None));
     assert!(pool.get_lock_free_connection(addr).is_some());
 
-    // A success resets the streak, so the next two again don't evict.
     pool.note_peer_ask_success(&peer);
     assert!(!pool.note_peer_ask_streak_timeout(&peer, 3, None));
     assert!(!pool.note_peer_ask_streak_timeout(&peer, 3, None));
     assert!(pool.get_lock_free_connection(addr).is_some());
 
-    // Third consecutive timeout reaches the threshold and evicts.
-    assert!(pool.note_peer_ask_streak_timeout(&peer, 3, None));
-    assert!(pool.get_lock_free_connection(addr).is_none());
+    assert!(!pool.note_peer_ask_streak_timeout(&peer, 3, None));
+    assert!(pool.get_lock_free_connection(addr).is_some());
 }
 
-/// The per-peer streak is isolated: accruing timeouts for one peer never
-/// evicts another, and evicting one leaves the other untouched.
 #[test]
 fn streak_is_isolated_per_peer() {
     let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
@@ -7616,7 +7720,6 @@ fn streak_is_isolated_per_peer() {
         assert!(pool.add_connection_by_peer_id(peer.clone(), addr, conn));
     }
 
-    // Accrue peer_a to just below the threshold; peer_b once. Neither evicts.
     assert!(!pool.note_peer_ask_streak_timeout(&peer_a, 4, None));
     assert!(!pool.note_peer_ask_streak_timeout(&peer_a, 4, None));
     assert!(!pool.note_peer_ask_streak_timeout(&peer_a, 4, None));
@@ -7624,16 +7727,13 @@ fn streak_is_isolated_per_peer() {
     assert!(pool.get_lock_free_connection(addr_a).is_some());
     assert!(pool.get_lock_free_connection(addr_b).is_some());
 
-    // peer_a's 4th consecutive timeout evicts ONLY peer_a.
-    assert!(pool.note_peer_ask_streak_timeout(&peer_a, 4, None));
-    assert!(pool.get_lock_free_connection(addr_a).is_none());
+    assert!(!pool.note_peer_ask_streak_timeout(&peer_a, 4, None));
+    assert!(pool.get_lock_free_connection(addr_a).is_some());
     assert!(pool.get_lock_free_connection(addr_b).is_some());
 }
 
-/// A hard fault evicts and clears the pending streak, so timeouts on the
-/// reconnected session restart from one rather than evicting immediately.
 #[test]
-fn hard_fault_clears_pending_streak() {
+fn missing_hard_fault_receipt_cannot_retire_transport() {
     let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
     let peer = crate::KeyPair::new_for_testing("hf_clears").peer_id();
     let addr: SocketAddr = "127.0.0.1:7322".parse().unwrap();
@@ -7645,19 +7745,16 @@ fn hard_fault_clears_pending_streak() {
     add();
 
     assert!(!pool.note_peer_ask_streak_timeout(&peer, 4, None)); // streak = 1
-    assert!(pool.note_peer_ask_hard_fault(&peer, None)); // evict + clear
-    assert!(pool.get_lock_free_connection(addr).is_none());
+    assert!(!pool.note_peer_ask_hard_fault(&peer, None)); // no receipt: neutral
+    assert!(pool.get_lock_free_connection(addr).is_some());
 
     add(); // reconnect
-    // Must restart from 1, not carry the pre-fault count.
     assert!(!pool.note_peer_ask_streak_timeout(&peer, 4, None));
     assert!(pool.get_lock_free_connection(addr).is_some());
 }
 
-/// Eviction requires `threshold` *consecutive* streak-timeouts: a success
-/// anywhere in the run resets the counter.
 #[test]
-fn streak_only_evicts_on_consecutive_timeouts() {
+fn consecutive_timeouts_never_evict_healthy_transport() {
     let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
     let peer = crate::KeyPair::new_for_testing("consec").peer_id();
     let addr: SocketAddr = "127.0.0.1:7323".parse().unwrap();
@@ -7675,13 +7772,12 @@ fn streak_only_evicts_on_consecutive_timeouts() {
         pool.get_lock_free_connection(addr).is_some(),
         "max consecutive run was 3 (< threshold 4): must not evict"
     );
-    assert!(pool.note_peer_ask_streak_timeout(&peer, 4, None)); // 4 consecutive -> evict
-    assert!(pool.get_lock_free_connection(addr).is_none());
+    assert!(!pool.note_peer_ask_streak_timeout(&peer, 4, None)); // threshold is inert
+    assert!(pool.get_lock_free_connection(addr).is_some());
 }
 
-/// A hard transport fault evicts immediately, bypassing the streak threshold.
 #[test]
-fn hard_fault_evicts_immediately() {
+fn hard_fault_without_instance_is_neutral() {
     let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
     let peer = crate::KeyPair::new_for_testing("streak_hardfault").peer_id();
     let addr: SocketAddr = "127.0.0.1:7311".parse().unwrap();
@@ -7690,13 +7786,12 @@ fn hard_fault_evicts_immediately() {
     assert!(pool.add_connection_by_peer_id(peer.clone(), addr, conn));
 
     assert!(
-        pool.note_peer_ask_hard_fault(&peer, None),
-        "a hard fault must evict on the first occurrence"
+        !pool.note_peer_ask_hard_fault(&peer, None),
+        "missing stream evidence cannot authorize eviction"
     );
-    assert!(pool.get_lock_free_connection(addr).is_none());
+    assert!(pool.get_lock_free_connection(addr).is_some());
 }
 
-/// `threshold == 0` disables the streak mechanism entirely.
 #[test]
 fn streak_threshold_zero_never_evicts() {
     let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
@@ -7712,17 +7807,10 @@ fn streak_threshold_zero_never_evicts() {
     assert!(pool.get_lock_free_connection(addr).is_some());
 }
 
-/// C3 instance guard: a streak-timeout whose pinned instance no longer matches
-/// the live session (it was reconnected mid-ask) must NOT evict the fresh,
-/// healthy session.
 #[test]
 fn streak_timeout_with_stale_instance_does_not_evict_live_session() {
     run_multi_thread_test(async {
         use crate::{GossipConfig, registry::GossipRegistry};
-        // A real (if otherwise unused) registry: finalize must actually be
-        // able to send its identifying FullSync, or it now fails the
-        // connect outright rather than silently publishing an unidentified
-        // candidate.
         let registry = Arc::new(GossipRegistry::<()>::new(
             "127.0.0.1:0".parse().unwrap(),
             GossipConfig {
@@ -7734,9 +7822,8 @@ fn streak_timeout_with_stale_instance_does_not_evict_live_session() {
         let peer = crate::KeyPair::new_for_testing("streak_instance_guard").peer_id();
         let addr: SocketAddr = "127.0.0.1:7313".parse().unwrap();
 
-        // Associate the address with the peer so finalize publishes it under
-        // the peer id, giving us a real stream instance to pin.
-        pool.add_addr_to_peer_id(addr, peer.clone());
+        pool.add_addr_to_peer_id(addr, peer.clone())
+            .expect("address owner admitted");
         let (io, _keep) = tokio::io::duplex(1024);
         pool.finalize_new_outbound_connection(
             addr,
@@ -7753,7 +7840,6 @@ fn streak_timeout_with_stale_instance_does_not_evict_live_session() {
             .current_peer_connection_instance(&peer)
             .expect("live session should have a stream instance");
 
-        // Threshold 1, but a STALE instance: the guard must block eviction.
         let stale = live_instance.wrapping_add(1);
         assert!(
             !pool.note_peer_ask_streak_timeout(&peer, 1, Some(stale)),
@@ -7764,11 +7850,15 @@ fn streak_timeout_with_stale_instance_does_not_evict_live_session() {
             "the live, reconnected session must survive a stale-instance timeout"
         );
 
-        // The correct instance does evict.
         assert!(
-            pool.note_peer_ask_streak_timeout(&peer, 1, Some(live_instance)),
-            "a streak-timeout pinned to the live instance must evict at threshold"
+            !pool.note_peer_ask_streak_timeout(&peer, 1, Some(live_instance)),
+            "even a current application timeout cannot classify transport health"
         );
+        assert_eq!(
+            pool.current_peer_connection_instance(&peer),
+            Some(live_instance)
+        );
+        assert!(pool.note_peer_ask_hard_fault(&peer, Some(live_instance)));
         assert!(pool.current_peer_connection_instance(&peer).is_none());
     });
 }
@@ -7808,7 +7898,8 @@ fn hard_fault_matched_instance_eviction_is_instance_scoped_not_peer_wide() {
         let peer = crate::KeyPair::new_for_testing("hard_fault_instance_scoped").peer_id();
         let addr: SocketAddr = "127.0.0.1:7314".parse().unwrap();
 
-        pool.add_addr_to_peer_id(addr, peer.clone());
+        pool.add_addr_to_peer_id(addr, peer.clone())
+            .expect("address owner admitted");
         let (io, _keep) = tokio::io::duplex(1024);
         pool.finalize_new_outbound_connection(
             addr,
@@ -7874,7 +7965,8 @@ fn lru_eviction_spares_configured_peers() {
     // A configured (required) peer connection that is the LEAST recently used.
     let cfg_peer = crate::KeyPair::new_for_testing("lru_cfg").peer_id();
     let cfg_addr: SocketAddr = "127.0.0.1:7200".parse().unwrap();
-    pool.set_configured_peer_addr(&cfg_peer, cfg_addr);
+    pool.set_configured_peer_addr(&cfg_peer, cfg_addr)
+        .expect("peer state admitted");
     let cfg_conn = Arc::new(LockFreeConnection::new(
         cfg_addr,
         ConnectionDirection::Inbound,
@@ -7891,9 +7983,10 @@ fn lru_eviction_spares_configured_peers() {
     ));
     other_conn.set_state(ConnectionState::Connected);
     other_conn.last_used.store(100, Ordering::Relaxed);
-    pool.index_connection_by_addr(other_addr, other_conn);
+    pool.index_connection_by_addr(other_addr, other_conn)
+        .expect("address admitted");
 
-    let victim = pool.select_lru_eviction_victim();
+    let victim = pool.select_lru_eviction_victim().map(|(addr, _)| addr);
     assert_eq!(
         victim,
         Some(other_addr),
@@ -7928,7 +8021,8 @@ fn learned_peer_route_is_not_a_required_configured_peer() {
 
     let required_peer = crate::KeyPair::new_for_testing("required_route").peer_id();
     let required_addr: SocketAddr = "127.0.0.1:7211".parse().unwrap();
-    pool.set_configured_peer_addr(&required_peer, required_addr);
+    pool.set_configured_peer_addr(&required_peer, required_addr)
+        .expect("peer state admitted");
 
     assert_eq!(
         pool.list_configured_peers(),
@@ -8050,7 +8144,8 @@ async fn outbound_finalize_reject_fully_unpublishes_and_does_not_bump_counter() 
     // A fresh, non-preferred OUTBOUND dial to a DIFFERENT address for the
     // same peer identity (resolved via the configured-address fallback).
     let dial_addr: SocketAddr = "127.0.0.1:7441".parse().unwrap();
-    pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
+    pool.set_configured_peer_addr(&remote_peer_id, dial_addr)
+        .expect("peer state admitted");
 
     let (io, _keep) = tokio::io::duplex(1024);
     let result = pool
@@ -8121,7 +8216,7 @@ async fn outbound_finalize_reject_does_not_strand_the_sequence_reset_exemption()
     ));
     let registry_weak = Arc::downgrade(&registry);
 
-    let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
+    let pool = registry.connection_pool.clone();
 
     // The existing, live, preferred INBOUND session, published as this
     // peer's CURRENT connection. Its own session source (what its actual
@@ -8138,6 +8233,8 @@ async fn outbound_finalize_reject_does_not_strand_the_sequence_reset_exemption()
     );
     let mut existing_conn = LockFreeConnection::new(existing_addr, ConnectionDirection::Inbound);
     existing_conn.stream_handle = Some(Arc::new(existing_sh));
+    existing_conn.embedded_peer_id = Some(remote_peer_id.clone());
+    existing_conn.session_source = existing_addr;
     existing_conn.set_state(ConnectionState::Connected);
     let existing = Arc::new(existing_conn);
     assert!(pool.add_connection_by_peer_id(
@@ -8150,7 +8247,8 @@ async fn outbound_finalize_reject_does_not_strand_the_sequence_reset_exemption()
     // a session already armed for the EXISTING (surviving) connection --
     // exactly what a real prior inbound accept would have done.
     let dial_addr: SocketAddr = "127.0.0.1:7451".parse().unwrap();
-    pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
+    pool.set_configured_peer_addr(&remote_peer_id, dial_addr)
+        .expect("peer state admitted");
     registry
         .add_peer_with_node_id(
             dial_addr,
@@ -8253,7 +8351,8 @@ async fn outbound_stale_finalizer_arm_after_supersession_does_not_clobber_newer_
     let pool = registry.connection_pool.clone();
 
     let dial_addr: SocketAddr = "127.0.0.1:7460".parse().unwrap();
-    pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
+    pool.set_configured_peer_addr(&remote_peer_id, dial_addr)
+        .expect("peer state admitted");
     registry
         .add_peer_with_node_id(
             dial_addr,
@@ -8276,6 +8375,8 @@ async fn outbound_stale_finalizer_arm_after_supersession_does_not_clobber_newer_
     );
     let mut stale_conn = LockFreeConnection::new(dial_addr, ConnectionDirection::Outbound);
     stale_conn.stream_handle = Some(Arc::new(stale_sh));
+    stale_conn.embedded_peer_id = Some(remote_peer_id.clone());
+    stale_conn.session_source = stale_local_port;
     stale_conn.set_state(ConnectionState::Connected);
     let stale = Arc::new(stale_conn);
     assert!(pool.add_connection_by_peer_id(remote_peer_id.clone(), dial_addr, stale.clone()));
@@ -8295,6 +8396,8 @@ async fn outbound_stale_finalizer_arm_after_supersession_does_not_clobber_newer_
     );
     let mut newer_conn = LockFreeConnection::new(dial_addr, ConnectionDirection::Outbound);
     newer_conn.stream_handle = Some(Arc::new(newer_sh));
+    newer_conn.embedded_peer_id = Some(remote_peer_id.clone());
+    newer_conn.session_source = newer_local_port;
     newer_conn.set_state(ConnectionState::Connected);
     let newer = Arc::new(newer_conn);
     assert!(pool.add_connection_by_peer_id(remote_peer_id.clone(), dial_addr, newer.clone()));
@@ -8404,7 +8507,8 @@ async fn arm_sequence_reset_stale_task_racing_the_lock_does_not_clobber_newer_se
     let pool = registry.connection_pool.clone();
 
     let dial_addr: SocketAddr = "127.0.0.1:7461".parse().unwrap();
-    pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
+    pool.set_configured_peer_addr(&remote_peer_id, dial_addr)
+        .expect("peer state admitted");
     registry
         .add_peer_with_node_id(
             dial_addr,
@@ -8413,7 +8517,7 @@ async fn arm_sequence_reset_stale_task_racing_the_lock_does_not_clobber_newer_se
         )
         .await;
 
-    fn make_connection(addr: SocketAddr) -> Arc<LockFreeConnection> {
+    fn make_connection(addr: SocketAddr, peer_id: &crate::PeerId) -> Arc<LockFreeConnection> {
         let (io, _keep) = tokio::io::duplex(1024);
         let (sh, _w, _r) = LockFreeStreamHandle::new(
             io,
@@ -8425,12 +8529,14 @@ async fn arm_sequence_reset_stale_task_racing_the_lock_does_not_clobber_newer_se
         );
         let mut conn = LockFreeConnection::new(addr, ConnectionDirection::Outbound);
         conn.stream_handle = Some(Arc::new(sh));
+        conn.embedded_peer_id = Some(peer_id.clone());
+        conn.session_source = addr;
         conn.set_state(ConnectionState::Connected);
         Arc::new(conn)
     }
 
     let stale_local_port: SocketAddr = "127.0.0.1:58101".parse().unwrap();
-    let stale = make_connection(dial_addr);
+    let stale = make_connection(dial_addr, &remote_peer_id);
     assert!(pool.add_connection_by_peer_id(remote_peer_id.clone(), dial_addr, stale.clone()));
 
     // Hold `gossip_state` from the test task, so the stale task's own
@@ -8462,7 +8568,7 @@ async fn arm_sequence_reset_stale_task_racing_the_lock_does_not_clobber_newer_se
 
     // The NEWER connection is published WHILE the stale task is still
     // parked waiting for the lock this test task holds.
-    let newer = make_connection(dial_addr);
+    let newer = make_connection(dial_addr, &remote_peer_id);
     assert!(pool.add_connection_by_peer_id(remote_peer_id.clone(), dial_addr, newer.clone()));
 
     // Release the lock: the stale task's arm call can now proceed. Its
@@ -8555,13 +8661,19 @@ async fn old_draining_connection_delta_cannot_restore_pre_restart_high_water() {
 
     // Peer restarts: new session armed and its first sync (seq=1) accepted.
     let new_connection: SocketAddr = "10.77.0.40:51002".parse().unwrap();
+    let new_session = qa_r11_generation_race_connection(new_connection, &owner);
+    assert!(registry.connection_pool.add_connection_by_peer_id(
+        owner.clone(),
+        new_connection,
+        new_session.clone(),
+    ));
     registry
         .arm_sequence_reset_for_new_session(
             peer_addr,
             node_id,
             new_connection,
             &owner,
-            &qa_r11_delta_gate_dummy_connection(new_connection),
+            &new_session,
         )
         .await;
     let restart_sync = crate::registry::RegistryMessage::FullSync {
@@ -8659,22 +8771,6 @@ async fn old_draining_connection_delta_cannot_restore_pre_restart_high_water() {
     );
 }
 
-fn qa_r11_delta_gate_dummy_connection(addr: SocketAddr) -> Arc<LockFreeConnection> {
-    let (io, _keep) = tokio::io::duplex(1024);
-    let (sh, _w, _r) = LockFreeStreamHandle::new(
-        io,
-        addr,
-        ChannelId::Global,
-        BufferConfig::default(),
-        None,
-        None,
-    );
-    let mut conn = LockFreeConnection::new(addr, ConnectionDirection::Inbound);
-    conn.stream_handle = Some(Arc::new(sh));
-    conn.set_state(ConnectionState::Connected);
-    Arc::new(conn)
-}
-
 /// R-11: a non-arming successor connection (e.g. a reconnect whose TLS
 /// certificate doesn't decode to a `GossipNodeId`, so `arm_sequence_reset_for_new_session`
 /// is never called for it) must not be permanently locked out once the
@@ -8703,7 +8799,8 @@ async fn non_arming_successor_connections_full_sync_is_accepted_after_armed_conn
     let pool = registry.connection_pool.clone();
 
     let bind_addr: SocketAddr = "127.0.0.1:7470".parse().unwrap();
-    pool.set_configured_peer_addr(&remote_peer_id, bind_addr);
+    pool.set_configured_peer_addr(&remote_peer_id, bind_addr)
+        .expect("peer state admitted");
     registry
         .add_peer_with_node_id(
             bind_addr,
@@ -8726,6 +8823,8 @@ async fn non_arming_successor_connections_full_sync_is_accepted_after_armed_conn
     );
     let mut a_conn = LockFreeConnection::new(a_addr, ConnectionDirection::Inbound);
     a_conn.stream_handle = Some(Arc::new(a_sh));
+    a_conn.embedded_peer_id = Some(remote_peer_id.clone());
+    a_conn.session_source = a_addr;
     a_conn.set_state(ConnectionState::Connected);
     let a = Arc::new(a_conn);
     assert!(pool.add_connection_by_peer_id(remote_peer_id.clone(), a_addr, a.clone()));
@@ -8770,6 +8869,8 @@ async fn non_arming_successor_connections_full_sync_is_accepted_after_armed_conn
     );
     let mut b_conn = LockFreeConnection::new(b_addr, ConnectionDirection::Inbound);
     b_conn.stream_handle = Some(Arc::new(b_sh));
+    b_conn.embedded_peer_id = Some(remote_peer_id.clone());
+    b_conn.session_source = b_addr;
     b_conn.set_state(ConnectionState::Connected);
     let b = Arc::new(b_conn);
     assert!(pool.add_connection_by_peer_id(remote_peer_id.clone(), b_addr, b.clone()));
@@ -8806,10 +8907,12 @@ async fn non_arming_successor_connections_full_sync_is_accepted_after_armed_conn
     );
 }
 
-fn qa_r11_generation_race_connection(addr: SocketAddr) -> Arc<LockFreeConnection> {
-    let (io, _keep) = tokio::io::duplex(1024);
+fn qa_r11_generation_race_connection(
+    addr: SocketAddr,
+    peer_id: &crate::PeerId,
+) -> Arc<LockFreeConnection> {
     let (sh, _w, _r) = LockFreeStreamHandle::new(
-        io,
+        ReceiptFixtureIo,
         addr,
         ChannelId::Global,
         BufferConfig::default(),
@@ -8818,6 +8921,8 @@ fn qa_r11_generation_race_connection(addr: SocketAddr) -> Arc<LockFreeConnection
     );
     let mut conn = LockFreeConnection::new(addr, ConnectionDirection::Inbound);
     conn.stream_handle = Some(Arc::new(sh));
+    conn.embedded_peer_id = Some(peer_id.clone());
+    conn.session_source = addr;
     conn.set_state(ConnectionState::Connected);
     Arc::new(conn)
 }
@@ -8855,7 +8960,8 @@ async fn full_sync_stale_apply_paused_between_validation_and_mutation_is_dropped
     let pool = registry.connection_pool.clone();
 
     let peer_addr: SocketAddr = "127.0.0.1:7480".parse().unwrap();
-    pool.set_configured_peer_addr(&remote_peer_id, peer_addr);
+    pool.set_configured_peer_addr(&remote_peer_id, peer_addr)
+        .expect("peer state admitted");
     registry
         .add_peer_with_node_id(
             peer_addr,
@@ -8865,7 +8971,7 @@ async fn full_sync_stale_apply_paused_between_validation_and_mutation_is_dropped
         .await;
 
     let old_addr: SocketAddr = "127.0.0.1:59101".parse().unwrap();
-    let old_conn = qa_r11_generation_race_connection(old_addr);
+    let old_conn = qa_r11_generation_race_connection(old_addr, &remote_peer_id);
     assert!(pool.add_connection_by_peer_id(remote_peer_id.clone(), old_addr, old_conn.clone()));
     registry
         .arm_sequence_reset_for_new_session(
@@ -8918,7 +9024,7 @@ async fn full_sync_stale_apply_paused_between_validation_and_mutation_is_dropped
             // this closure is about to drive.
             crate::set_transport_lifecycle_recorder(None);
 
-            let new_conn = qa_r11_generation_race_connection(new_addr);
+            let new_conn = qa_r11_generation_race_connection(new_addr, &peer_id);
             assert!(pool.add_connection_by_peer_id(peer_id.clone(), new_addr, new_conn.clone()));
 
             let registry_for_hook = registry_for_hook.clone();
@@ -9030,7 +9136,8 @@ async fn full_sync_stale_apply_survives_peer_entry_removal_and_recreation_at_sam
     let pool = registry.connection_pool.clone();
 
     let peer_addr: SocketAddr = "127.0.0.1:7483".parse().unwrap();
-    pool.set_configured_peer_addr(&remote_peer_id, peer_addr);
+    pool.set_configured_peer_addr(&remote_peer_id, peer_addr)
+        .expect("peer state admitted");
 
     // A brand-new peer entry; this is its FIRST-EVER arm (current_session_epoch
     // starts at the "never armed" sentinel 0), the precondition an
@@ -9043,7 +9150,7 @@ async fn full_sync_stale_apply_survives_peer_entry_removal_and_recreation_at_sam
         )
         .await;
     let old_addr: SocketAddr = "127.0.0.1:59401".parse().unwrap();
-    let old_conn = qa_r11_generation_race_connection(old_addr);
+    let old_conn = qa_r11_generation_race_connection(old_addr, &remote_peer_id);
     assert!(pool.add_connection_by_peer_id(remote_peer_id.clone(), old_addr, old_conn.clone()));
     registry
         .arm_sequence_reset_for_new_session(
@@ -9092,7 +9199,7 @@ async fn full_sync_stale_apply_survives_peer_entry_removal_and_recreation_at_sam
             }
             crate::set_transport_lifecycle_recorder(None);
 
-            let new_conn = qa_r11_generation_race_connection(new_addr);
+            let new_conn = qa_r11_generation_race_connection(new_addr, &peer_id);
             assert!(pool.add_connection_by_peer_id(peer_id.clone(), new_addr, new_conn.clone()));
 
             let registry_for_hook = registry_for_hook.clone();
@@ -9221,7 +9328,8 @@ async fn late_message_from_superseded_armed_source_is_rejected_not_self_healed()
     let pool = registry.connection_pool.clone();
 
     let peer_addr: SocketAddr = "127.0.0.1:7484".parse().unwrap();
-    pool.set_configured_peer_addr(&remote_peer_id, peer_addr);
+    pool.set_configured_peer_addr(&remote_peer_id, peer_addr)
+        .expect("peer state admitted");
     registry
         .add_peer_with_node_id(
             peer_addr,
@@ -9253,7 +9361,7 @@ async fn late_message_from_superseded_armed_source_is_rejected_not_self_healed()
     // Connection A: authenticates and arms -- its restart exemption is now
     // live and unconsumed.
     let a_addr: SocketAddr = "127.0.0.1:59501".parse().unwrap();
-    let a_conn = qa_r11_generation_race_connection(a_addr);
+    let a_conn = qa_r11_generation_race_connection(a_addr, &remote_peer_id);
     assert!(pool.add_connection_by_peer_id(remote_peer_id.clone(), a_addr, a_conn.clone()));
     registry
         .arm_sequence_reset_for_new_session(
@@ -9292,7 +9400,7 @@ async fn late_message_from_superseded_armed_source_is_rejected_not_self_healed()
     // arming (e.g. a cert-type migration, a non-mTLS client, or simply a
     // node_id mismatch on B's own accept).
     let b_addr: SocketAddr = "127.0.0.1:59502".parse().unwrap();
-    let b_conn = qa_r11_generation_race_connection(b_addr);
+    let b_conn = qa_r11_generation_race_connection(b_addr, &remote_peer_id);
     assert!(pool.add_connection_by_peer_id(remote_peer_id.clone(), b_addr, b_conn.clone()));
 
     // Case 2: a LATE message, still on A's own (now-superseded) armed
@@ -9416,7 +9524,8 @@ async fn stale_third_connection_cannot_self_heal_while_a_different_successor_is_
     let pool = registry.connection_pool.clone();
 
     let peer_addr: SocketAddr = "127.0.0.1:7486".parse().unwrap();
-    pool.set_configured_peer_addr(&remote_peer_id, peer_addr);
+    pool.set_configured_peer_addr(&remote_peer_id, peer_addr)
+        .expect("peer state admitted");
     registry
         .add_peer_with_node_id(
             peer_addr,
@@ -9446,7 +9555,7 @@ async fn stale_third_connection_cannot_self_heal_while_a_different_successor_is_
 
     // Connection A arms the session; its restart exemption is live.
     let a_addr: SocketAddr = "127.0.0.1:59601".parse().unwrap();
-    let a_conn = qa_r11_generation_race_connection(a_addr);
+    let a_conn = qa_r11_generation_race_connection(a_addr, &remote_peer_id);
     assert!(pool.add_connection_by_peer_id(remote_peer_id.clone(), a_addr, a_conn.clone()));
     registry
         .arm_sequence_reset_for_new_session(
@@ -9462,7 +9571,7 @@ async fn stale_third_connection_cannot_self_heal_while_a_different_successor_is_
     // peer -- the genuine live successor -- but never arms itself (e.g. a
     // cert-type migration or node_id mismatch on its own accept).
     let b_addr: SocketAddr = "127.0.0.1:59602".parse().unwrap();
-    let b_conn = qa_r11_generation_race_connection(b_addr);
+    let b_conn = qa_r11_generation_race_connection(b_addr, &remote_peer_id);
     assert!(pool.add_connection_by_peer_id(remote_peer_id.clone(), b_addr, b_conn.clone()));
 
     // Connection C is a THIRD connection: its own `session_source` differs
@@ -9585,7 +9694,8 @@ async fn stale_full_sync_and_response_on_old_connection_do_not_reset_health_book
         .connection_pool
         .peer_id_to_addr
         .upsert_sync(remote_peer_id.clone(), peer_addr);
-    pool.set_configured_peer_addr(&remote_peer_id, peer_addr);
+    pool.set_configured_peer_addr(&remote_peer_id, peer_addr)
+        .expect("peer state admitted");
     registry
         .add_peer_with_node_id(
             peer_addr,
@@ -9615,7 +9725,7 @@ async fn stale_full_sync_and_response_on_old_connection_do_not_reset_health_book
     // A NEW connection arms and becomes current -- everything after this
     // is superseded.
     let new_addr: SocketAddr = "127.0.0.1:59601".parse().unwrap();
-    let new_conn = qa_r11_generation_race_connection(new_addr);
+    let new_conn = qa_r11_generation_race_connection(new_addr, &remote_peer_id);
     assert!(pool.add_connection_by_peer_id(remote_peer_id.clone(), new_addr, new_conn.clone()));
     registry
         .arm_sequence_reset_for_new_session(
@@ -9733,7 +9843,8 @@ async fn delta_gossip_stale_apply_paused_between_validation_and_mutation_is_drop
         .connection_pool
         .peer_id_to_addr
         .upsert_sync(remote_peer_id.clone(), peer_addr);
-    pool.set_configured_peer_addr(&remote_peer_id, peer_addr);
+    pool.set_configured_peer_addr(&remote_peer_id, peer_addr)
+        .expect("peer state admitted");
     registry
         .add_peer_with_node_id(
             peer_addr,
@@ -9743,7 +9854,7 @@ async fn delta_gossip_stale_apply_paused_between_validation_and_mutation_is_drop
         .await;
 
     let old_addr: SocketAddr = "127.0.0.1:59201".parse().unwrap();
-    let old_conn = qa_r11_generation_race_connection(old_addr);
+    let old_conn = qa_r11_generation_race_connection(old_addr, &remote_peer_id);
     assert!(pool.add_connection_by_peer_id(remote_peer_id.clone(), old_addr, old_conn.clone()));
     registry
         .arm_sequence_reset_for_new_session(
@@ -9792,7 +9903,7 @@ async fn delta_gossip_stale_apply_paused_between_validation_and_mutation_is_drop
             }
             crate::set_transport_lifecycle_recorder(None);
 
-            let new_conn = qa_r11_generation_race_connection(new_addr);
+            let new_conn = qa_r11_generation_race_connection(new_addr, &peer_id);
             assert!(pool.add_connection_by_peer_id(peer_id.clone(), new_addr, new_conn.clone()));
 
             let registry_for_hook = registry_for_hook.clone();
@@ -9903,7 +10014,8 @@ async fn delta_gossip_response_stale_apply_paused_between_validation_and_mutatio
         .connection_pool
         .peer_id_to_addr
         .upsert_sync(remote_peer_id.clone(), peer_addr);
-    pool.set_configured_peer_addr(&remote_peer_id, peer_addr);
+    pool.set_configured_peer_addr(&remote_peer_id, peer_addr)
+        .expect("peer state admitted");
     registry
         .add_peer_with_node_id(
             peer_addr,
@@ -9913,7 +10025,7 @@ async fn delta_gossip_response_stale_apply_paused_between_validation_and_mutatio
         .await;
 
     let old_addr: SocketAddr = "127.0.0.1:59301".parse().unwrap();
-    let old_conn = qa_r11_generation_race_connection(old_addr);
+    let old_conn = qa_r11_generation_race_connection(old_addr, &remote_peer_id);
     assert!(pool.add_connection_by_peer_id(remote_peer_id.clone(), old_addr, old_conn.clone()));
     registry
         .arm_sequence_reset_for_new_session(
@@ -9961,7 +10073,7 @@ async fn delta_gossip_response_stale_apply_paused_between_validation_and_mutatio
             }
             crate::set_transport_lifecycle_recorder(None);
 
-            let new_conn = qa_r11_generation_race_connection(new_addr);
+            let new_conn = qa_r11_generation_race_connection(new_addr, &peer_id);
             assert!(pool.add_connection_by_peer_id(peer_id.clone(), new_addr, new_conn.clone()));
 
             let registry_for_hook = registry_for_hook.clone();
@@ -10232,7 +10344,8 @@ async fn outbound_finalize_accept_incoming_compare_and_publishes_against_snapsho
     assert!(pool.get_connection_by_peer_id(&remote_peer_id).is_none());
 
     let dial_addr: SocketAddr = "127.0.0.1:7480".parse().unwrap();
-    pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
+    pool.set_configured_peer_addr(&remote_peer_id, dial_addr)
+        .expect("peer state admitted");
 
     // The PREFERRED inbound that will be published concurrently, in the gap
     // between the `existing_before` snapshot and the outbound's own publish
@@ -10358,7 +10471,8 @@ async fn outbound_finalize_evict_stale_reject_incoming_cas_lost_fully_unpublishe
     assert!(pool.get_connection_by_peer_id(&remote_peer_id).is_none());
 
     let dial_addr: SocketAddr = "127.0.0.1:7482".parse().unwrap();
-    pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
+    pool.set_configured_peer_addr(&remote_peer_id, dial_addr)
+        .expect("peer state admitted");
 
     // The rival published concurrently in the CAS window is already
     // stale/dead (`has_live_stream() == false`) — `existing_usable == false`
@@ -10507,7 +10621,8 @@ async fn outbound_finalize_clear_race_retry_loss_to_second_rival_fully_unpublish
     let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
 
     let dial_addr: SocketAddr = "127.0.0.1:7490".parse().unwrap();
-    pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
+    pool.set_configured_peer_addr(&remote_peer_id, dial_addr)
+        .expect("peer state admitted");
 
     // The pre-existing session at the candidate's own dial address — LIVE at
     // snapshot time (so `get_connection_by_peer_id` actually returns it as
@@ -10698,7 +10813,8 @@ async fn outbound_finalize_evict_replace_retry_loss_to_new_rival_fully_unpublish
     let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
 
     let dial_addr: SocketAddr = "127.0.0.1:7492".parse().unwrap();
-    pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
+    pool.set_configured_peer_addr(&remote_peer_id, dial_addr)
+        .expect("peer state admitted");
 
     // The pre-existing session at the candidate's own dial address — LIVE at
     // snapshot time (so `get_connection_by_peer_id` returns it as
@@ -10894,7 +11010,8 @@ async fn outbound_finalize_nested_replace_existing_retry_loss_to_new_rival_fully
     let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
 
     let dial_addr: SocketAddr = "127.0.0.1:7498".parse().unwrap();
-    pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
+    pool.set_configured_peer_addr(&remote_peer_id, dial_addr)
+        .expect("peer state admitted");
 
     // Snapshotted LIVE (so `expected = Some(existing_before)` threads into
     // the first compare-and-publish), flipped dead immediately afterward so
@@ -11090,7 +11207,8 @@ async fn outbound_finalize_replace_existing_compare_and_publishes_against_snapsh
     );
 
     let dial_addr: SocketAddr = "127.0.0.1:7496".parse().unwrap();
-    pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
+    pool.set_configured_peer_addr(&remote_peer_id, dial_addr)
+        .expect("peer state admitted");
 
     // The FRESH, genuinely live, tie-break-preferred (outbound) rival
     // published concurrently, into the exact gap between this candidate's
@@ -11230,6 +11348,9 @@ async fn outbound_finalize_stale_rival_lookup_is_pure_and_excludes_the_new_candi
         None,
     );
     let mut rival_conn = LockFreeConnection::new(dial_addr, ConnectionDirection::Inbound);
+    // Model the identity bound by authenticated inbound construction. Address
+    // aliases alone must not make an unidentified connection a peer rival.
+    rival_conn.embedded_peer_id = Some(remote_peer_id.clone());
     rival_conn.stream_handle = Some(Arc::new(rival_sh));
     rival_conn.set_state(ConnectionState::Connected);
     let rival = Arc::new(rival_conn);
@@ -11237,9 +11358,18 @@ async fn outbound_finalize_stale_rival_lookup_is_pure_and_excludes_the_new_candi
         rival.has_live_stream(),
         "test precondition: rival must be live"
     );
-    pool.index_connection_by_addr(dial_addr, rival.clone());
-    pool.add_addr_to_peer_id(dial_addr, remote_peer_id.clone());
-    pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
+    pool.index_connection_by_addr(dial_addr, rival.clone())
+        .expect("address admitted");
+    pool.add_addr_to_peer_id(dial_addr, remote_peer_id.clone())
+        .expect("address owner admitted");
+    pool.set_configured_peer_addr(&remote_peer_id, dial_addr)
+        .expect("peer state admitted");
+    assert!(Arc::ptr_eq(
+        &pool
+            .peer_current_connection_snapshot(&remote_peer_id)
+            .expect("test precondition: identified rival must be discoverable"),
+        &rival,
+    ));
 
     let (io, _keep) = tokio::io::duplex(1024);
     pool.finalize_new_outbound_connection(dial_addr, io, registry_weak, None, dial_addr, None)
@@ -11345,7 +11475,8 @@ async fn outbound_finalize_decision_snapshot_does_not_clear_fresh_session() {
 
     let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
     let dial_addr: SocketAddr = "127.0.0.1:7460".parse().unwrap();
-    pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
+    pool.set_configured_peer_addr(&remote_peer_id, dial_addr)
+        .expect("peer state admitted");
 
     // A stale (dead) current session for this peer — e.g. an inbound whose
     // IO task has already exited but whose entry has not yet been reaped.
@@ -11492,7 +11623,8 @@ async fn outbound_finalize_does_not_abort_its_own_out_of_band_published_candidat
 
     let pool = Arc::new(ConnectionPool::<()>::new(8, Duration::from_secs(5)));
     let dial_addr: SocketAddr = "127.0.0.1:7480".parse().unwrap();
-    pool.set_configured_peer_addr(&remote_peer_id, dial_addr);
+    pool.set_configured_peer_addr(&remote_peer_id, dial_addr)
+        .expect("peer state admitted");
 
     let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let _guard = {
@@ -11622,8 +11754,10 @@ async fn stale_rival_eviction_at_reindexed_address_is_instance_scoped_not_addres
     fresh_conn.stream_handle = Some(Arc::new(fresh_sh));
     fresh_conn.set_state(ConnectionState::Connected);
     let fresh_conn = Arc::new(fresh_conn);
-    pool.index_connection_by_addr(bind_addr, fresh_conn.clone());
-    pool.add_addr_to_peer_id(bind_addr, peer_id.clone());
+    pool.index_connection_by_addr(bind_addr, fresh_conn.clone())
+        .expect("address admitted");
+    pool.add_addr_to_peer_id(bind_addr, peer_id.clone())
+        .expect("address owner admitted");
     pool.publish_current_peer_connection(&peer_id, fresh_conn.clone());
 
     // The eviction call `connect_via_stream`'s `!alive` branch actually
@@ -11751,8 +11885,10 @@ async fn live_wrong_direction_rival_eviction_is_instance_scoped_not_peer_wide() 
     fresh_conn.stream_handle = Some(Arc::new(fresh_sh));
     fresh_conn.set_state(ConnectionState::Connected);
     let fresh_conn = Arc::new(fresh_conn);
-    pool.index_connection_by_addr(fresh_addr, fresh_conn.clone());
-    pool.add_addr_to_peer_id(fresh_addr, peer_id.clone());
+    pool.index_connection_by_addr(fresh_addr, fresh_conn.clone())
+        .expect("address admitted");
+    pool.add_addr_to_peer_id(fresh_addr, peer_id.clone())
+        .expect("address owner admitted");
     pool.publish_current_peer_connection(&peer_id, fresh_conn.clone());
 
     // The eviction call `connect_via_stream`'s live wrong-direction-rival
@@ -12029,8 +12165,10 @@ fn disconnect_connection_instance_removes_all_address_aliases() {
     // Mirrors the ephemeral-address indexing `handle_incoming_connection_tls`
     // performs after acceptance for an accepted inbound: both the bind addr
     // and the ephemeral socket addr point at the same instance.
-    pool.index_connection_by_addr(ephemeral_addr, target.clone());
-    pool.add_addr_to_peer_id(ephemeral_addr, peer_id.clone());
+    pool.index_connection_by_addr(ephemeral_addr, target.clone())
+        .expect("address admitted");
+    pool.add_addr_to_peer_id(ephemeral_addr, peer_id.clone())
+        .expect("address owner admitted");
 
     assert!(pool.disconnect_connection_instance(&peer_id, &target));
 
@@ -12116,7 +12254,8 @@ async fn connection_handle_direction_survives_a_same_address_reassignment() {
     let mut outbound_conn = LockFreeConnection::new(addr, ConnectionDirection::Outbound);
     outbound_conn.stream_handle = Some(Arc::new(outbound_stream));
     outbound_conn.set_state(ConnectionState::Connected);
-    pool.index_connection_by_addr(addr, Arc::new(outbound_conn));
+    pool.index_connection_by_addr(addr, Arc::new(outbound_conn))
+        .expect("address admitted");
 
     // The address-keyed index now genuinely reports the NEW occupant --
     // proving the reassignment is real, not merely assumed.
@@ -12393,8 +12532,10 @@ async fn ask_timeout_eviction_current_session_survives_stale_alias_without_destr
     // point at `fresh`, a DIFFERENT instance than the one the failed ask ran
     // on.
     let fresh = make_live_connection(stale_addr, ConnectionDirection::Inbound).await;
-    pool.index_connection_by_addr(stale_addr, fresh.clone());
-    pool.add_addr_to_peer_id(stale_addr, peer_id.clone());
+    pool.index_connection_by_addr(stale_addr, fresh.clone())
+        .expect("address admitted");
+    pool.add_addr_to_peer_id(stale_addr, peer_id.clone())
+        .expect("address owner admitted");
     pool.publish_current_peer_connection(&peer_id, fresh.clone());
 
     let evicted = pool.remove_connection_instance_for_peer(&peer_id, stale_addr, stale_instance_id);
@@ -12738,10 +12879,8 @@ fn complete_rejects_aliased_correlation_id() {
     assert_ne!(id, aliased, "the two ids must be distinct");
 
     let pool = Arc::new(crate::AlignedBytesPool::default());
-    let mut response = Some(crate::AlignedBytes::from_pooled_slice(
-        b"stale-response",
-        Arc::clone(&pool),
-    ));
+    let mut response =
+        Some(crate::AlignedBytes::from_pooled_slice(b"stale-response", Arc::clone(&pool)).unwrap());
     assert!(
         !tracker.complete(aliased, &mut response),
         "an aliased correlation id must not complete a slot owned by a different id"
@@ -12780,17 +12919,17 @@ fn write_queue_push_unblocks_on_teardown() {
         let cap = 128usize;
         for _ in 0..cap {
             queue
-                .try_push(WriteCommand::Payload(WritePayload::Single(
+                .try_push(&mut Some(WriteCommand::Payload(WritePayload::Single(
                     bytes::Bytes::new(),
-                )))
+                ))))
                 .expect("fill within capacity");
         }
         // Queue is full now.
         assert!(
             queue
-                .try_push(WriteCommand::Payload(WritePayload::Single(
+                .try_push(&mut Some(WriteCommand::Payload(WritePayload::Single(
                     bytes::Bytes::new()
-                )))
+                ))))
                 .is_err(),
             "queue should be full"
         );
@@ -12828,7 +12967,8 @@ fn idle_non_required_peer_session_is_pruned_without_orphaning_live_state() {
     let peer_id = crate::KeyPair::new_for_testing("idle-session").peer_id();
     let addr: SocketAddr = "127.0.0.1:9111".parse().unwrap();
 
-    pool.set_discovered_peer_addr(&peer_id, addr);
+    pool.set_discovered_peer_addr(&peer_id, addr)
+        .expect("peer state admitted");
     let session = pool
         .peer_sessions
         .read_sync(&peer_id, |_, session| Arc::clone(session))
@@ -12864,8 +13004,10 @@ fn route_index_reclaims_superseded_identity_but_keeps_live_routes() {
     let shared_addr: SocketAddr = "127.0.0.1:9311".parse().unwrap();
     let live_addr: SocketAddr = "127.0.0.1:9312".parse().unwrap();
 
-    pool.set_discovered_peer_addr(&old, shared_addr);
-    pool.set_discovered_peer_addr(&live, live_addr);
+    pool.set_discovered_peer_addr(&old, shared_addr)
+        .expect("peer state admitted");
+    pool.set_discovered_peer_addr(&live, live_addr)
+        .expect("peer state admitted");
     assert!(pool.peer_id_to_addr.read_sync(&old, |_, _| ()).is_some());
     assert!(pool.peer_id_to_addr.read_sync(&live, |_, _| ()).is_some());
 
@@ -12894,8 +13036,9 @@ fn idle_session_with_external_tracker_or_required_route_is_retained() {
     let peer_id = crate::KeyPair::new_for_testing("retained-session").peer_id();
     let addr: SocketAddr = "127.0.0.1:9112".parse().unwrap();
 
-    pool.set_discovered_peer_addr(&peer_id, addr);
-    let tracker = pool.get_or_create_correlation_tracker(&peer_id);
+    pool.set_discovered_peer_addr(&peer_id, addr)
+        .expect("peer state admitted");
+    let tracker = pool.get_or_create_correlation_tracker(&peer_id).unwrap();
     let session = pool
         .peer_sessions
         .read_sync(&peer_id, |_, session| Arc::clone(session))
@@ -12910,7 +13053,8 @@ fn idle_session_with_external_tracker_or_required_route_is_retained() {
     );
     drop(tracker);
 
-    pool.set_configured_peer_addr(&peer_id, addr);
+    pool.set_configured_peer_addr(&peer_id, addr)
+        .expect("peer state admitted");
     let session = pool
         .peer_sessions
         .read_sync(&peer_id, |_, session| Arc::clone(session))
@@ -12935,11 +13079,11 @@ fn streaming_queue_push_unblocks_on_teardown() {
         let cap = 64usize;
         for _ in 0..cap {
             queue
-                .try_push(StreamingCommand::Flush)
+                .try_push(&mut Some(StreamingCommand::Flush))
                 .expect("fill within capacity");
         }
         assert!(
-            queue.try_push(StreamingCommand::Flush).is_err(),
+            queue.try_push(&mut Some(StreamingCommand::Flush)).is_err(),
             "queue should be full"
         );
 
@@ -12970,7 +13114,7 @@ fn streaming_queue_try_push_rejects_teardown() {
     let queue = StreamingQueue::new(1, addr);
     queue.mark_closed_and_wake();
 
-    match queue.try_push(StreamingCommand::Flush) {
+    match queue.try_push(&mut Some(StreamingCommand::Flush)) {
         Err(StreamingTryPushError::Closed(actual)) => assert_eq!(actual, addr),
         other => panic!("expected closed streaming queue, got {other:?}"),
     }
@@ -13287,8 +13431,12 @@ async fn owned_chunks_zero_write_past_max_iov_exits_instead_of_livelocking() {
         None,
     );
 
+    let total = TOTAL_CHUNKS * CHUNK_LEN;
+    let mut frame = crate::framing::write_actor_tell_header(1, 2, total - 16).to_vec();
+    frame.resize(total, b'A');
+    let frame = bytes::Bytes::from(frame);
     let chunks: Vec<bytes::Bytes> = (0..TOTAL_CHUNKS)
-        .map(|_| bytes::Bytes::from_static(b"AAAA"))
+        .map(|index| frame.slice(index * CHUNK_LEN..(index + 1) * CHUNK_LEN))
         .collect();
     stream_handle
         .write_owned_chunks(chunks)
@@ -13435,7 +13583,7 @@ async fn retire_displaced_expected_must_not_cancel_winners_shared_correlation() 
     // a fresh PRIVATE tracker; only this explicit overwrite makes it
     // session-shared — see `pool_connect.rs` outbound ~3216-3219 / inbound
     // ~3634).
-    let tracker = pool.get_or_create_correlation_tracker(&peer_id);
+    let tracker = pool.get_or_create_correlation_tracker(&peer_id).unwrap();
 
     // `expected`: the losing/displaced instance, indexed+counted exactly
     // like a real, previously accepted/finalized connection for this peer,
@@ -13462,11 +13610,13 @@ async fn retire_displaced_expected_must_not_cancel_winners_shared_correlation() 
     // An in-flight ask slot on the WINNER's tracker, exactly as if a real ask
     // were awaiting a reply on the connection that is about to become
     // current.
-    let guard = tracker.allocate().expect("slot should allocate");
+    let guard = tracker
+        .allocate_for_session(winner.stream_handle.as_ref().unwrap().instance_id())
+        .expect("slot should allocate");
     let id = guard.id();
     let slot = CorrelationTracker::slot_index(id);
     assert_eq!(
-        tracker.pending[slot].state.load(Ordering::Acquire),
+        tracker.pending[slot].state.load(Ordering::Acquire) & 3,
         SLOT_WAITING
     );
 
@@ -13490,7 +13640,7 @@ async fn retire_displaced_expected_must_not_cancel_winners_shared_correlation() 
     // NOT cancel the shared tracker's in-flight slots — those belong to the
     // still-live `winner`.
     assert_eq!(
-        tracker.pending[slot].state.load(Ordering::Acquire),
+        tracker.pending[slot].state.load(Ordering::Acquire) & 3,
         SLOT_WAITING,
         "retiring the displaced/losing instance cancelled the shared correlation tracker's \
          in-flight slot — this kills the WINNER's in-flight asks (QA finding R-C)"
@@ -13510,17 +13660,19 @@ async fn disconnect_connection_by_peer_id_still_cancels_correlation_on_final_tea
     let addr: SocketAddr = "127.0.0.1:7497".parse().unwrap();
 
     let pool = ConnectionPool::<()>::new(8, Duration::from_secs(5));
-    let tracker = pool.get_or_create_correlation_tracker(&peer_id);
+    let tracker = pool.get_or_create_correlation_tracker(&peer_id).unwrap();
     let conn =
         make_live_connection_with_correlation(addr, ConnectionDirection::Outbound, tracker.clone())
             .await;
     assert!(pool.add_connection_by_peer_id(peer_id.clone(), addr, conn.clone()));
 
-    let guard = tracker.allocate().expect("slot should allocate");
+    let guard = tracker
+        .allocate_for_session(conn.stream_handle.as_ref().unwrap().instance_id())
+        .expect("slot should allocate");
     let id = guard.id();
     let slot = CorrelationTracker::slot_index(id);
     assert_eq!(
-        tracker.pending[slot].state.load(Ordering::Acquire),
+        tracker.pending[slot].state.load(Ordering::Acquire) & 3,
         SLOT_WAITING
     );
 
@@ -13530,7 +13682,7 @@ async fn disconnect_connection_by_peer_id_still_cancels_correlation_on_final_tea
     assert!(removed.is_some_and(|c| Arc::ptr_eq(&c, &conn)));
 
     assert_eq!(
-        tracker.pending[slot].state.load(Ordering::Acquire),
+        tracker.pending[slot].state.load(Ordering::Acquire) & 3,
         SLOT_EMPTY,
         "a genuinely final teardown (no surviving sibling instance) must still cancel the \
          connection's correlation tracker"
@@ -13576,7 +13728,7 @@ async fn retire_displaced_expected_exit_guard_must_not_cancel_via_task_abort_whe
     ));
     let pool = &registry.connection_pool;
 
-    let tracker = pool.get_or_create_correlation_tracker(&peer_id);
+    let tracker = pool.get_or_create_correlation_tracker(&peer_id).unwrap();
 
     // `expected`: the losing/displaced instance, with a REAL IO task whose
     // `ExitGuard` captured NO peer_id at spawn time.
@@ -13639,7 +13791,9 @@ async fn retire_displaced_expected_exit_guard_must_not_cancel_via_task_abort_whe
             .await;
 
     // An in-flight ask slot on the WINNER's (shared) tracker.
-    let guard = tracker.allocate().expect("slot should allocate");
+    let guard = tracker
+        .allocate_for_session(winner.stream_handle.as_ref().unwrap().instance_id())
+        .expect("slot should allocate");
     let id = guard.id();
     let slot = CorrelationTracker::slot_index(id);
 
@@ -13652,7 +13806,7 @@ async fn retire_displaced_expected_exit_guard_must_not_cancel_via_task_abort_whe
 
     // Give the aborted writer task's `ExitGuard` a bounded chance to run.
     for _ in 0..200 {
-        if tracker.pending[slot].state.load(Ordering::Acquire) != SLOT_WAITING {
+        if tracker.pending[slot].state.load(Ordering::Acquire) & 3 != SLOT_WAITING {
             break;
         }
         tokio::task::yield_now().await;
@@ -13664,7 +13818,7 @@ async fn retire_displaced_expected_exit_guard_must_not_cancel_via_task_abort_whe
     );
 
     assert_eq!(
-        tracker.pending[slot].state.load(Ordering::Acquire),
+        tracker.pending[slot].state.load(Ordering::Acquire) & 3,
         SLOT_WAITING,
         "the exiting loser's OWN IO-task ExitGuard cancelled the shared correlation tracker's \
          in-flight slot via the task-abort path (peer_id unresolved + winner not yet \

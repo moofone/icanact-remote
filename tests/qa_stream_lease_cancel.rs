@@ -2,10 +2,12 @@ use icanact_remote::{ReplyDeliveryBudget, ReplyPayload};
 
 #[test]
 fn reply_payload_is_exact_sized_and_budget_rejects_zero_limits() {
-    let payload = ReplyPayload::copy_from_slice(b"terminal");
+    let payload = ReplyPayload::copy_from_slice(b"terminal").into_shared();
     assert_eq!(payload.len(), 8);
     assert_eq!(payload.as_ref(), b"terminal");
-    assert!(ReplyDeliveryBudget::new(0, 1, payload.clone()).is_err());
+    assert!(
+        ReplyDeliveryBudget::new(0, 1, payload.shared_clone().expect("shared payload")).is_err()
+    );
     assert!(ReplyDeliveryBudget::new(1, 0, payload).is_err());
     assert!(
         ReplyDeliveryBudget::new(usize::MAX, 1, ReplyPayload::from_static(b"terminal"),).is_err()
@@ -16,7 +18,7 @@ fn reply_payload_is_exact_sized_and_budget_rejects_zero_limits() {
 #[tokio::test]
 async fn rejected_claim_has_no_wire_bytes_and_releases_capacity() {
     use icanact_remote::lease_test_support::{BufferConfig, ChannelId, LockFreeStreamHandle};
-    use std::sync::{Arc, atomic::AtomicBool};
+    use std::sync::Arc;
     use tokio::io::AsyncReadExt;
 
     let budget =
@@ -32,17 +34,14 @@ async fn rejected_claim_has_no_wire_bytes_and_releases_capacity() {
         None,
     );
     let handle = Arc::new(handle);
-    let used = Arc::new(AtomicBool::new(false));
-    let first = icanact_remote::AskResponder::from_stream_handle_for_test(
-        80,
-        Arc::clone(&handle),
-        Arc::clone(&used),
-    )
-    .try_reply_lease(&budget, 32)
-    .unwrap();
-    let sibling =
-        icanact_remote::AskResponder::from_stream_handle_for_test(80, Arc::clone(&handle), used);
-    let rejected = sibling.try_reply_lease(&budget, 32).unwrap_err();
+    let context = icanact_remote::AskContext::from_stream_handle_for_test(80, &handle);
+    let reply_session = context.reply_session().expect("reply session");
+    let delivery = budget.bind(&reply_session).expect("delivery session");
+    let first = context.responder().try_reply_lease(&delivery, 32).unwrap();
+    let rejected = context
+        .responder()
+        .try_reply_lease(&delivery, 32)
+        .unwrap_err();
     assert!(matches!(
         rejected,
         icanact_remote::ReplyLeaseAdmissionError::ClaimUnavailable(_)
@@ -55,13 +54,10 @@ async fn rejected_claim_has_no_wire_bytes_and_releases_capacity() {
     .await;
     assert!(read.is_err());
 
-    let replacement = icanact_remote::AskResponder::from_stream_handle_for_test(
-        81,
-        Arc::clone(&handle),
-        Arc::new(AtomicBool::new(false)),
-    )
-    .try_reply_lease(&budget, 32)
-    .expect("discarded sibling reservation must release capacity");
+    let replacement = icanact_remote::AskContext::from_stream_handle_for_test(81, &handle)
+        .responder()
+        .try_reply_lease(&delivery, 32)
+        .expect("discarded sibling reservation must release capacity");
     replacement
         .try_reply_bytes(ReplyPayload::from_static(b"replacement"))
         .unwrap();
@@ -73,9 +69,8 @@ async fn rejected_claim_has_no_wire_bytes_and_releases_capacity() {
 #[cfg(feature = "test-helpers")]
 #[tokio::test]
 async fn closed_sync_lease_publication_rejects_after_real_transport_exit() {
-    use icanact_remote::AskResponder;
     use icanact_remote::lease_test_support::{BufferConfig, ChannelId, LockFreeStreamHandle};
-    use std::sync::{Arc, atomic::AtomicBool};
+    use std::sync::Arc;
 
     let budget =
         ReplyDeliveryBudget::new(1, 32, ReplyPayload::from_static(b"duplicate-suppressed"))
@@ -90,13 +85,13 @@ async fn closed_sync_lease_publication_rejects_after_real_transport_exit() {
         None,
     );
     let handle = Arc::new(handle);
-    let lease = AskResponder::from_stream_handle_for_test(
-        82,
-        Arc::clone(&handle),
-        Arc::new(AtomicBool::new(false)),
-    )
-    .try_reply_lease(&budget, 32)
-    .expect("lease admission");
+    let context = icanact_remote::AskContext::from_stream_handle_for_test(82, &handle);
+    let reply_session = context.reply_session().expect("reply session");
+    let delivery = budget.bind(&reply_session).expect("delivery session");
+    let lease = context
+        .responder()
+        .try_reply_lease(&delivery, 32)
+        .expect("lease admission");
 
     handle.shutdown();
     handle.wait_for_exit().await;

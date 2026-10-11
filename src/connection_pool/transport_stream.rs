@@ -96,7 +96,7 @@ impl<T> ConnectionPool<T> {
         &self,
         mut addr: SocketAddr,
         resolved_node_id: Option<crate::GossipNodeId>,
-        max_connections: usize,
+        _max_connections: usize,
         connection_timeout: Duration,
         registry_weak: std::sync::Weak<GossipRegistry>,
     ) -> Result<ConnectionHandle<T>> {
@@ -181,16 +181,8 @@ impl<T> ConnectionPool<T> {
             }
         }
 
-        // Make room if necessary - evict the least-recently-used connection
-        // that is safe to drop. Configured/required peers are never chosen, so
-        // a new (often transient/discovered) dial cannot disconnect a live
-        // cluster member to fit under the pool cap.
-        if self.connections_by_addr.len() >= max_connections {
-            if let Some(oldest_addr) = self.select_lru_eviction_victim() {
-                let _ = self.remove_connection(oldest_addr);
-                warn!(addr = %oldest_addr, "removed oldest connection to make room");
-            }
-        }
+        // Capacity admission is shared across all publications. Never evict a
+        // healthy peer merely to make room for a new dial (REMOTE-1/5).
 
         // Duplicate connection tie-breaker: decide whether to reuse an existing link
         if let (Some(registry_arc), Some(node_id_value)) =
@@ -680,24 +672,6 @@ impl<T> ConnectionPool<T> {
                             return Err(e);
                         }
                     };
-                    registry_arc.set_peer_capabilities(addr, peer_caps);
-                    if let Some(node_id) = discovered_node_id.as_ref() {
-                        // REMOTE-3: role bound to the TLS-authenticated identity.
-                        let _ = registry_arc
-                            .note_remote_role(&crate::PeerId::from(node_id), peer_caps.remote_client_only);
-                    }
-
-                    let associated_node_id = match discovered_node_id {
-                        Some(node_id) => Some(node_id),
-                        None => registry_arc.lookup_node_id(&addr).await,
-                    };
-                    if let Some(node_id) = associated_node_id {
-                        registry_arc
-                            .associate_peer_capabilities_with_node(addr, node_id)
-                            .await;
-                        registry_arc.mark_peer_connected(addr).await;
-                    }
-
                     // R-11: precompute what OUTBOUND sessions need to arm
                     // the one-shot lower-sequence exemption, but do NOT arm
                     // it here. `finalize_new_outbound_connection` can still
@@ -736,6 +710,8 @@ impl<T> ConnectionPool<T> {
                     // arriving on THIS socket can consume or extend the
                     // exemption.
                     let fresh_session_node_id = outbound_session_authenticated_node_id(&tls_stream);
+                    let session_identity =
+                        OutboundSessionIdentity::authenticated(fresh_session_node_id)?;
 
                     let finalize_started = Instant::now();
                     let result = self
@@ -746,14 +722,14 @@ impl<T> ConnectionPool<T> {
                             // R2: bind the connection identity to the GossipNodeId we
                             // extracted from the peer's verified TLS cert when no
                             // GossipNodeId was pinned (bootstrap/placeholder-SNI dials).
-                            discovered_node_id,
+                            session_identity,
                             local_session_addr,
-                            fresh_session_node_id,
                             connection_instance_id,
+                            Some(peer_caps),
                         )
                         .await;
                     match &result {
-                        Ok(_) => {
+                        Ok(connection) => {
                             // Guaranteed POST-publication discovery mark:
                             // the earlier `mark_peer_connected` call above
                             // ran BEFORE `finalize_new_outbound_connection`
@@ -794,7 +770,9 @@ impl<T> ConnectionPool<T> {
                                     }
                                 });
                             }
-                            registry_arc.mark_peer_connected_if_live(addr).await;
+                            if let Some(receipt) = crate::registry::SessionReceipt::from_handle(connection) {
+                                registry_arc.mark_peer_connected_with_receipt(addr, &receipt).await;
+                            }
                             info!(
                                 target: "icanact_remote_lifecycle",
                                 attempt_id,
@@ -840,7 +818,13 @@ impl<T> ConnectionPool<T> {
                 Err(e) => {
                     if !dns_refreshed {
                         if let Some(registry_arc) = registry_weak.upgrade() {
-                            if let Some(new_addr) = registry_arc.refresh_peer_dns(addr).await {
+                            if let Some(new_addr) = registry_arc
+                                .refresh_peer_dns_for_peer(
+                                    addr,
+                                    resolved_node_id.as_ref().map(crate::PeerId::from).as_ref(),
+                                )
+                                .await
+                            {
                                 info!(
                                     target: "icanact_remote_lifecycle",
                                     attempt_id,

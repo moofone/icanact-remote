@@ -82,8 +82,8 @@ async fn remote_actor_flow() -> icanact_remote::Result<()> {
     actor_ref.tell(Bytes::from_static(b"hello")).await?;
     let _response = actor_ref.ask(Bytes::from_static(b"request")).await?;
 
-    a.shutdown().await;
-    b.shutdown().await;
+    a.shutdown().await?;
+    b.shutdown().await?;
     Ok(())
 }
 ```
@@ -116,6 +116,27 @@ The test file `tests/dns_refresh_on_dial_failure.rs` shows the current end-to-en
 
 - Prefer `lookup_peer(&PeerId)` when identity matters.
 - Use `lookup(...)` when actor-name discovery is the right abstraction.
-- Treat `RemoteActorRef` as the send surface: `tell`, `tell_bytes`, `ask`, `ask_deferred`, typed variants, and streaming helpers.
+- Acquire `RemoteActorRef::session()` once for a batch of exact-session sends. Keep its `RemoteActorSession` alive while scoped `ask_deferred` handles run; `DeferredAsk::wait` returns native `AlignedBytes`, and `wait_bytes` explicitly promotes to `Bytes`. Typed and streaming helpers remain available.
 - Keep `GossipConfig.key_pair` aligned with the `SecretKey` used to bootstrap the node.
 - Use `shutdown()` for clean teardown in examples and tests.
+
+## Bounded registry shutdown
+
+`GossipRegistry::shutdown`, `GossipRegistryHandle::shutdown`, and
+`GossipRegistryHandle::shutdown_and_wait` return
+`Result<(), RegistryShutdownIncomplete>`. Handle this result rather than
+assuming that a closed registry has cleared all state. The registry shares its
+existing 1.5-second graceful transport budget across compensation and public
+gossip-lock acquisition; `shutdown_and_wait` additionally retains the existing
+three task-cancellation waits of at most 100 ms each.
+
+`GossipStateLocked` means a caller-held public gossip guard prevented clearing
+state. Release the guard and call shutdown again. `SpeculativeClaimsPending`
+means finite, admitted compensation is still active; it takes precedence over
+possible gossip contention, and no projection is cleared until it finishes.
+This result stops waiting without expiring destructive authority or discarding
+its journal. Admission is closed and transports are retired on either error.
+Cancellation also retires transports and preserves admitted compensation.
+Retain a clone of the registry `Arc` before consuming a handle with
+`shutdown_and_wait` if you need to retry cleanup. Normal completion and repeated
+completed shutdown return `Ok(())`.

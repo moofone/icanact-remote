@@ -122,9 +122,16 @@ async fn publisher_recovers_from_every_round_of_connection_churn() -> icanact_re
     let received = Arc::new(AtomicUsize::new(0));
     let _sub = {
         let received = Arc::clone(&received);
-        pubsub_sub.subscribe_bytes(topic, type_hash, move |_bytes| {
-            received.fetch_add(1, Ordering::SeqCst);
-        })
+        pubsub_sub
+            .subscribe_bytes(
+                topic,
+                type_hash,
+                icanact_remote::pubsub::CooperativeCallback::new(move |_bytes: bytes::Bytes| {
+                    received.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(())
+                }),
+            )
+            .expect("subscription admission")
     };
 
     let interest_name = interest_actor_name(topic, &subscriber_id);
@@ -145,7 +152,7 @@ async fn publisher_recovers_from_every_round_of_connection_churn() -> icanact_re
         pubsub_pub.publish_bytes(
             topic,
             type_hash,
-            bytes::Bytes::from_static(body),
+            icanact_remote::ForwardPayload::from_static(body),
             PubSubScope::ClusterWide,
             PubSubDeliveryPolicy::default(),
         )
@@ -230,8 +237,8 @@ async fn publisher_recovers_from_every_round_of_connection_churn() -> icanact_re
         );
     }
 
-    subscriber.shutdown_and_wait().await;
-    publisher.shutdown_and_wait().await;
+    subscriber.shutdown_and_wait().await.unwrap();
+    publisher.shutdown_and_wait().await.unwrap();
     Ok(())
 }
 
@@ -289,9 +296,16 @@ async fn publisher_recovers_when_subscriber_process_restarts_unannounced()
     let received = Arc::new(AtomicUsize::new(0));
     let sub = {
         let received = Arc::clone(&received);
-        pubsub_sub.subscribe_bytes(topic, type_hash, move |_bytes| {
-            received.fetch_add(1, Ordering::SeqCst);
-        })
+        pubsub_sub
+            .subscribe_bytes(
+                topic,
+                type_hash,
+                icanact_remote::pubsub::CooperativeCallback::new(move |_bytes: bytes::Bytes| {
+                    received.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(())
+                }),
+            )
+            .expect("subscription admission")
     };
 
     let interest_name = interest_actor_name(topic, &subscriber_id);
@@ -312,7 +326,7 @@ async fn publisher_recovers_when_subscriber_process_restarts_unannounced()
         pubsub_pub.publish_bytes(
             topic,
             type_hash,
-            bytes::Bytes::from_static(body),
+            icanact_remote::ForwardPayload::from_static(body),
             PubSubScope::ClusterWide,
             PubSubDeliveryPolicy::default(),
         )
@@ -322,11 +336,19 @@ async fn publisher_recovers_when_subscriber_process_restarts_unannounced()
         baseline.remote_enqueued >= 1,
         "baseline publish never reached the subscriber (stats={baseline:?})"
     );
-    // The subscriber's process exits. The publisher is told nothing and still
-    // holds a pooled connection to an address nobody is listening on.
+    assert!(
+        wait_until(Duration::from_secs(10), async || received
+            .load(Ordering::SeqCst)
+            >= 1)
+        .await,
+        "baseline publish must actually be delivered before the process exits"
+    );
+    // Model an unannounced process exit, not a graceful unsubscribe: keep
+    // the interest alive until transport shutdown. Dropping it first emits
+    // an authoritative removal and tests causal tombstone rollback instead.
+    subscriber.shutdown_and_wait().await.unwrap();
     drop(sub);
     drop(pubsub_sub);
-    subscriber.shutdown_and_wait().await;
 
     // A new process, same identity, same address -- and it dials back, exactly
     // as the restarted relay did.
@@ -335,9 +357,16 @@ async fn publisher_recovers_when_subscriber_process_restarts_unannounced()
     let received_after = Arc::new(AtomicUsize::new(0));
     let _sub_after = {
         let received_after = Arc::clone(&received_after);
-        pubsub_restarted.subscribe_bytes(topic, type_hash, move |_bytes| {
-            received_after.fetch_add(1, Ordering::SeqCst);
-        })
+        pubsub_restarted
+            .subscribe_bytes(
+                topic,
+                type_hash,
+                icanact_remote::pubsub::CooperativeCallback::new(move |_bytes: bytes::Bytes| {
+                    received_after.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(())
+                }),
+            )
+            .expect("subscription admission")
     };
     restarted.lookup_address(publisher_addr).await?;
 
@@ -364,8 +393,8 @@ async fn publisher_recovers_when_subscriber_process_restarts_unannounced()
          received anything"
     );
 
-    restarted.shutdown_and_wait().await;
-    publisher.shutdown_and_wait().await;
+    restarted.shutdown_and_wait().await.unwrap();
+    publisher.shutdown_and_wait().await.unwrap();
     Ok(())
 }
 
@@ -421,9 +450,16 @@ async fn selected_peers_publisher_recovers_after_socket_close() -> icanact_remot
     let received = Arc::new(AtomicUsize::new(0));
     let _sub = {
         let received = Arc::clone(&received);
-        pubsub_sub.subscribe_bytes(topic, type_hash, move |_bytes| {
-            received.fetch_add(1, Ordering::SeqCst);
-        })
+        pubsub_sub
+            .subscribe_bytes(
+                topic,
+                type_hash,
+                icanact_remote::pubsub::CooperativeCallback::new(move |_bytes: bytes::Bytes| {
+                    received.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(())
+                }),
+            )
+            .expect("subscription admission")
     };
     sleep(Duration::from_millis(300)).await;
 
@@ -432,7 +468,7 @@ async fn selected_peers_publisher_recovers_after_socket_close() -> icanact_remot
         pubsub_pub.publish_bytes(
             topic,
             type_hash,
-            bytes::Bytes::from_static(body),
+            icanact_remote::ForwardPayload::from_static(body),
             PubSubScope::SelectedPeers(vec![subscriber_id.clone()]),
             PubSubDeliveryPolicy::default(),
         )
@@ -488,7 +524,7 @@ async fn selected_peers_publisher_recovers_after_socket_close() -> icanact_remot
         "SelectedPeers recovery enqueued frames but delivered none after reconnect"
     );
 
-    subscriber.shutdown_and_wait().await;
-    publisher.shutdown_and_wait().await;
+    subscriber.shutdown_and_wait().await.unwrap();
+    publisher.shutdown_and_wait().await.unwrap();
     Ok(())
 }

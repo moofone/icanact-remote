@@ -79,7 +79,7 @@ async fn main() -> Result<()> {
 
     let _ = tokio::signal::ctrl_c().await;
     println!("🛑 [SERVER] Ctrl+C received, shutting down...");
-    registry.shutdown_and_wait().await;
+    registry.shutdown_and_wait().await?;
     println!("🛑 [SERVER] Shutdown complete.");
     Ok(())
 }

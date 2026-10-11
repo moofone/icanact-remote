@@ -1,15 +1,11 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
-use bytes::{Buf, Bytes};
+use bytes::Bytes;
 use tracing::{info, warn};
 
 use crate::{
     GossipError, PeerId, Result,
-    handle::{
-        MessageReadResult, handle_raw_ask_request, handle_response_message, send_ask_nack,
-        send_inline_response, send_inline_response_aligned, send_pooled_response,
-        send_streaming_response,
-    },
+    handle::{MessageReadResult, handle_raw_ask_request, handle_response_message, send_ask_nack},
     registry::{ActorResponse, GossipRegistry, RegistryMessage},
 };
 
@@ -327,10 +323,6 @@ impl StreamChunkReservation {
         self.len
     }
 
-    pub(crate) fn is_empty(self) -> bool {
-        self.len == 0
-    }
-
     pub(crate) fn stream_id(self) -> u64 {
         self.stream_id
     }
@@ -552,7 +544,7 @@ impl StreamingState {
                 ),
             )));
         }
-        let buffer = crate::PooledAlignedBuffer::with_len(total_size, pool);
+        let buffer = crate::PooledAlignedBuffer::with_len(total_size, pool)?;
         let stream = InProgressStream {
             stream_id: header.stream_id,
             total_size: header.total_size,
@@ -652,7 +644,9 @@ impl StreamingState {
         let total_size = header.total_size;
         match self.begin_v5_stream(header, correlation_id, pool, is_response, first_chunk_len) {
             Ok(reservation) => Ok(Some(reservation)),
-            Err(error) if is_resource_busy(&error) => {
+            Err(error)
+                if is_resource_busy(&error) || matches!(error, GossipError::WriteQueueFull) =>
+            {
                 if self.reject_stream(header.stream_id, total_size, first_chunk_len) {
                     Ok(None)
                 } else {
@@ -1620,7 +1614,14 @@ pub(crate) async fn process_read_result_with_instance(
             correlation_id,
             payload,
         } => {
-            handle_raw_ask_request(registry, peer_addr, correlation_id, &payload).await;
+            handle_raw_ask_request(
+                registry,
+                peer_addr,
+                correlation_id,
+                &payload,
+                response_connection,
+            )
+            .await;
         }
         MessageReadResult::Response {
             correlation_id,
@@ -1901,6 +1902,7 @@ pub(crate) async fn process_read_result_with_instance(
                 peer_addr,
                 correlation_id,
                 crate::framing::AskNackReason::NoDispatcher,
+                response_connection,
             )
             .await;
         }
@@ -2105,87 +2107,84 @@ async fn handle_assembled_message(
     };
 
     match response {
-        Ok(Some(response)) => {
-            // Only send response for asks (non-zero correlation_id)
-            if corr_id != 0 {
-                match response {
-                    ActorResponse::Bytes(response) => {
-                        if should_stream_response(
-                            registry,
-                            response_connection,
-                            response.len(),
-                            response_mode,
-                        ) {
-                            send_streaming_response(registry, peer_addr, corr_id, response).await;
-                        } else {
-                            send_inline_response(registry, peer_addr, corr_id, response).await;
+        Ok(Some(response)) if corr_id != 0 => {
+            let Some(stream) = response_connection.and_then(|conn| conn.stream_handle.as_ref())
+            else {
+                warn!(peer = %peer_addr, corr_id, "reply missing receiving-stream provenance");
+                return;
+            };
+            let send_result = match response {
+                ActorResponse::Bytes(response) => {
+                    let streaming = should_stream_response(
+                        registry,
+                        response_connection,
+                        response.len(),
+                        response_mode,
+                    );
+                    stream
+                        .send_response_owned(corr_id, response, streaming)
+                        .await
+                }
+                ActorResponse::Aligned(response) => {
+                    let streaming = should_stream_response(
+                        registry,
+                        response_connection,
+                        response.len(),
+                        response_mode,
+                    );
+                    match crate::ForwardPayload::try_from(response) {
+                        Ok(response) => {
+                            stream
+                                .send_response_owned(corr_id, response, streaming)
+                                .await
                         }
-                    }
-                    ActorResponse::Aligned(response) => {
-                        if should_stream_response(
-                            registry,
-                            response_connection,
-                            response.len(),
-                            response_mode,
-                        ) {
-                            let bytes = response.into_bytes();
-                            send_streaming_response(registry, peer_addr, corr_id, bytes).await;
-                        } else {
-                            send_inline_response_aligned(registry, peer_addr, corr_id, response)
-                                .await;
-                        }
-                    }
-                    ActorResponse::Pooled {
-                        payload,
-                        prefix,
-                        payload_len,
-                    } => {
-                        if should_stream_response(
-                            registry,
-                            response_connection,
-                            payload_len,
-                            response_mode,
-                        ) {
-                            // Fallback to copying for oversize pooled responses so the caller doesn't
-                            // time out on a valid response.
-                            let mut buf = bytes::BytesMut::with_capacity(payload_len);
-                            if let Some(p) = prefix {
-                                buf.extend_from_slice(&p); // ALLOW_COPY
-                            }
-                            let mut payload = payload;
-                            while payload.has_remaining() {
-                                let chunk = payload.chunk();
-                                if chunk.is_empty() {
-                                    break;
-                                }
-                                buf.extend_from_slice(chunk); // ALLOW_COPY
-                                let len = chunk.len();
-                                payload.advance(len);
-                            }
-                            let bytes = buf.freeze();
-
-                            send_streaming_response(registry, peer_addr, corr_id, bytes).await;
-                        } else {
-                            send_pooled_response(
-                                registry,
-                                peer_addr,
-                                corr_id,
-                                payload,
-                                prefix,
-                                payload_len,
-                            )
-                            .await;
-                        }
+                        Err(err) => Err(err),
                     }
                 }
+                ActorResponse::Pooled {
+                    payload,
+                    prefix,
+                    payload_len,
+                } => {
+                    let streaming = should_stream_response(
+                        registry,
+                        response_connection,
+                        payload_len,
+                        response_mode,
+                    );
+                    stream
+                        .send_response_pooled_owned(
+                            corr_id,
+                            payload,
+                            prefix,
+                            payload_len,
+                            streaming,
+                        )
+                        .await
+                }
+            };
+            if let Err(err) = send_result {
+                send_ask_nack(
+                    registry,
+                    peer_addr,
+                    corr_id,
+                    err.ask_nack_reason(),
+                    response_connection,
+                )
+                .await;
             }
         }
-        Ok(None) => {}
-        Err(e) => {
-            // Only NACK asks (non-zero correlation_id); a tell has no waiter.
+        Ok(_) => {}
+        Err(err) => {
             if corr_id != 0 {
-                crate::handle::send_ask_nack(registry, peer_addr, corr_id, e.ask_nack_reason())
-                    .await;
+                send_ask_nack(
+                    registry,
+                    peer_addr,
+                    corr_id,
+                    err.ask_nack_reason(),
+                    response_connection,
+                )
+                .await;
             }
         }
     }
@@ -2236,20 +2235,24 @@ mod tests {
 
         let registry = Arc::new(registry);
         let pool = Arc::new(crate::AlignedBytesPool::default());
+        let response_connection = registry
+            .connection_pool
+            .get_connection_by_addr(&addr)
+            .unwrap();
         let request_payload = b"do-not-echo-me-back";
         let mut streaming_state = StreamingState::new();
         process_read_result(
             MessageReadResult::DirectAsk {
                 correlation_id: 4242,
                 request_id: 99,
-                payload: crate::AlignedBytes::from_pooled_slice(request_payload, pool),
+                payload: crate::AlignedBytes::from_pooled_slice(request_payload, pool).unwrap(),
             },
             &mut streaming_state,
             &registry,
             addr,
             addr,
             None,
-            None,
+            Some(&response_connection),
             None,
         )
         .await
@@ -2298,10 +2301,13 @@ mod tests {
 
     #[test]
     fn streaming_enforces_per_connection_inflight_budget() {
-        // A peer must not be able to force unbounded eager allocation by opening
-        // many max-size streams: the SUM of declared in-flight sizes is capped.
+        // Isolate the per-connection budget with an explicitly sized pool;
+        // the smaller default shared-pool budget is a separate admission gate.
         let mut state = StreamingState::new();
-        let pool = Arc::new(crate::AlignedBytesPool::default());
+        let pool = Arc::new(crate::AlignedBytesPool::new_with_budget(
+            crate::MAX_INFLIGHT_STREAM_BYTES / crate::MAX_STREAM_SIZE,
+            crate::MAX_INFLIGHT_STREAM_BYTES,
+        ));
         let per = crate::MAX_STREAM_SIZE as u64;
         let allowed = crate::MAX_INFLIGHT_STREAM_BYTES / crate::MAX_STREAM_SIZE;
 
@@ -2453,11 +2459,12 @@ mod tests {
     }
 
     #[test]
-    fn finalize_empty_stream_survives_exhausted_pool() {
+    fn empty_stream_reports_pool_backpressure_then_recovers() {
         let pool = Arc::new(crate::AlignedBytesPool::new(2));
-        let _checked_out: Vec<_> =
-            std::iter::from_fn(|| (pool.available_count() > 0).then(|| pool.get_buffer(64)))
-                .collect();
+        let checked_out: Vec<_> = std::iter::from_fn(|| {
+            (pool.available_count() > 0).then(|| pool.get_buffer(64).unwrap())
+        })
+        .collect();
         assert_eq!(pool.available_count(), 0, "pool must be fully checked out");
 
         let mut state = StreamingState::new();
@@ -2469,9 +2476,18 @@ mod tests {
             type_hash: 1,
             actor_id: 2,
         };
+        assert!(matches!(
+            state.start_stream_with_correlation(start, 11, pool.clone(), None),
+            Err(GossipError::WriteQueueFull),
+        ));
+        assert!(
+            state.active_streams.is_empty(),
+            "rejection must not retain a stream"
+        );
+        drop(checked_out);
         state
             .start_stream_with_correlation(start, 11, pool, None)
-            .expect("zero-length stream must start with an exhausted pool");
+            .expect("returned owner restores empty-stream admission");
         let out = state
             .finalize_stream_with_correlation(99, None)
             .expect("zero-length stream must finalize")
@@ -2757,7 +2773,10 @@ mod tests {
         use std::time::Duration;
 
         let mut state = StreamingState::new();
-        let pool = Arc::new(crate::AlignedBytesPool::default());
+        let pool = Arc::new(crate::AlignedBytesPool::new_with_budget(
+            crate::MAX_INFLIGHT_STREAM_BYTES / crate::MAX_STREAM_SIZE,
+            crate::MAX_INFLIGHT_STREAM_BYTES,
+        ));
         let per = crate::MAX_STREAM_SIZE as u64;
         let allowed = crate::MAX_INFLIGHT_STREAM_BYTES / crate::MAX_STREAM_SIZE;
 
@@ -2907,9 +2926,58 @@ mod tests {
     }
 
     #[test]
-    fn qa_r8_resource_rejection_tombstones_trailing_chunks() {
+    fn pool_checkout_pressure_rejects_one_stream_without_closing_transport() {
         let mut state = StreamingState::new();
         let pool = Arc::new(crate::AlignedBytesPool::new(1));
+        let held = crate::PooledAlignedBuffer::with_len(4, pool.clone()).unwrap();
+        let header = crate::StreamHeader {
+            stream_id: 91,
+            total_size: 4,
+            chunk_size: 2,
+            chunk_index: 0,
+            type_hash: 1,
+            actor_id: 1,
+        };
+        assert!(
+            state
+                .begin_v5_stream_or_discard(header, 91, pool.clone(), false, 2)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state
+                .reserve_v5_chunk_or_discard(91, 1, 2)
+                .unwrap()
+                .is_none()
+        );
+        let malformed = crate::StreamHeader {
+            stream_id: 92,
+            total_size: crate::MAX_STREAM_SIZE as u64 + 1,
+            ..header
+        };
+        assert!(matches!(
+            state.begin_v5_stream_or_discard(malformed, 92, pool.clone(), false, 2),
+            Err(GossipError::Network(error)) if error.kind() == std::io::ErrorKind::InvalidData
+        ));
+        drop(held);
+        let successor = crate::StreamHeader {
+            stream_id: 93,
+            ..header
+        };
+        assert!(
+            state
+                .begin_v5_stream_or_discard(successor, 93, pool, false, 2)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn qa_r8_resource_rejection_tombstones_trailing_chunks() {
+        let mut state = StreamingState::new();
+        // Keep all sixteen active-stream owners admitted so the seventeenth
+        // request tests tombstoning, rather than the pool's checkout limit.
+        let pool = Arc::new(crate::AlignedBytesPool::new(16));
 
         for stream_id in 1..=16 {
             let reservation = state

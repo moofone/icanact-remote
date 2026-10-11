@@ -2,6 +2,7 @@
 """Long concurrency sample adapter; saturation/closed-loop, not open-loop latency."""
 import argparse
 import json
+import math
 import os
 import re
 import subprocess
@@ -17,11 +18,16 @@ def parse(output, inflight, seconds):
     if len(lines) != 1:
         raise ValueError("exactly one native record required")
     record = json.loads(lines[0])
-    if record.get("workload") != f"ask_inflight{inflight}" or record.get("completed", 0) <= 0:
+    if record.get("workload") != f"ask_inflight{inflight}" or (type(record.get("completed")) is not int or record["completed"] <= 0):
         raise ValueError("wrong workload identity or no completed work")
     if record.get("errors") != 0 or record.get("drops") != 0:
         raise ValueError("errors/drops must be zero")
     metrics = record["metrics"]
+    required_metrics = ("duration_ns", "throughput", "p50_ns", "p95_ns", "p99_ns")
+    for key in required_metrics:
+        value = metrics.get(key)
+        if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"invalid/missing metric {key}")
     if metrics["duration_ns"] < seconds * 1e9:
         raise ValueError("short timing window")
     if not 0 < metrics["p50_ns"] <= metrics["p95_ns"] <= metrics["p99_ns"]:

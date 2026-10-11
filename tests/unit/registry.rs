@@ -71,7 +71,7 @@ async fn test_register_actor() {
 #[tokio::test]
 async fn test_register_actor_after_shutdown() {
     let registry = create_test_registry();
-    registry.shutdown().await;
+    registry.shutdown().await.unwrap();
     
     let result = registry.register_actor(
         "test_actor".to_string(),
@@ -119,7 +119,7 @@ async fn test_unregister_nonexistent_actor() {
 #[tokio::test]
 async fn test_unregister_actor_after_shutdown() {
     let registry = create_test_registry();
-    registry.shutdown().await;
+    registry.shutdown().await.unwrap();
     
     let result = registry.unregister_actor("test_actor").await;
     assert!(matches!(result, Err(GossipError::Shutdown)));
@@ -354,7 +354,7 @@ async fn test_prepare_gossip_round_no_peers() {
 #[tokio::test]
 async fn test_prepare_gossip_round_after_shutdown() {
     let registry = create_test_registry();
-    registry.shutdown().await;
+    registry.shutdown().await.unwrap();
     
     let result = registry.prepare_gossip_round().await;
     assert!(matches!(result, Err(GossipError::Shutdown)));
@@ -386,7 +386,7 @@ async fn test_shutdown_and_is_shutdown() {
     
     assert!(!registry.is_shutdown().await);
     
-    registry.shutdown().await;
+    registry.shutdown().await.unwrap();
     assert!(registry.is_shutdown().await);
 }
 

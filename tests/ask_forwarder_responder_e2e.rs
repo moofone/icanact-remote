@@ -10,7 +10,7 @@ use icanact_remote::registry::{
     ActorAskHandlerSync, ActorMessageFuture, ActorMessageHandler, AskDisposition,
 };
 use icanact_remote::{
-    AskContext, AskForwardObserver, AskForwarder, GossipConfig, RemoteConnection, Result,
+    AskContext, AskForwardObserver, AskForwarder, ForwardDestination, GossipConfig, Result,
 };
 
 const ACTOR_ID: u64 = 41;
@@ -55,7 +55,7 @@ impl ActorMessageHandler for DownstreamHandler {
 
 struct ForwardingHandler {
     forwarder: AskForwarder,
-    destination: RemoteConnection,
+    destination: ForwardDestination,
 }
 
 impl ActorAskHandlerSync for ForwardingHandler {
@@ -72,14 +72,14 @@ impl ActorAskHandlerSync for ForwardingHandler {
             Duration::from_millis(500)
         };
         self.forwarder.try_forward_actor_ask_with_timeout(
-            self.destination.clone(),
+            self.destination,
             actor_id,
             type_hash,
-            Bytes::copy_from_slice(payload.as_ref()),
+            icanact_remote::ForwardPayload::try_from(payload)?,
             timeout,
             context.responder(),
-            Bytes::from_static(b"forward-timeout"),
-            Bytes::from_static(b"forward-error"),
+            icanact_remote::ForwardPayload::from_static(b"forward-timeout"),
+            icanact_remote::ForwardPayload::from_static(b"forward-error"),
         )?;
         Ok(AskDisposition::Deferred)
     }
@@ -143,11 +143,12 @@ async fn forwarded_ask_maps_success_and_timeout_then_recovers() {
     let observer = Arc::new(ForwardObserver::default());
     let observer_trait: Arc<dyn AskForwardObserver> = observer.clone();
     let forwarder = AskForwarder::new_with_observer(1, 128, Some(observer_trait));
+    let destination = forwarder.bind_destination(downstream_connection).unwrap();
     gateway
         .registry
         .set_actor_ask_handler_sync(Arc::new(ForwardingHandler {
             forwarder,
-            destination: downstream_connection,
+            destination,
         }))
         .await;
 
@@ -195,7 +196,7 @@ async fn forwarded_ask_maps_success_and_timeout_then_recovers() {
     assert_eq!(observer.successes.load(Ordering::Relaxed), 2);
     assert_eq!(observer.errors.load(Ordering::Relaxed), 1);
 
-    caller.shutdown().await;
-    gateway.shutdown().await;
-    downstream.shutdown().await;
+    caller.shutdown().await.unwrap();
+    gateway.shutdown().await.unwrap();
+    downstream.shutdown().await.unwrap();
 }

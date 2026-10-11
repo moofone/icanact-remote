@@ -11,9 +11,10 @@
 //! Stage 2 (this module) removes the race by construction rather than by
 //! protocol. Exactly one task owns the ownership table, and that same task
 //! performs routing publication. A claim is therefore decided AND published
-//! inside one serialized command with no `.await` in between and no lock at
-//! all: there is no interleaving point for a second claimant to observe stale
-//! state. Lifecycle callbacks do carry the accepted claim's generation back
+//! inside one serialized command with no `.await` in between. A shared
+//! control-plane publication guard also fences derived projection commits:
+//! there is no interleaving point for a second claimant to observe stale state.
+//! Lifecycle callbacks do carry the accepted claim's generation back
 //! to this task: peer identity alone cannot distinguish an old connection
 //! from a newer reconnect by the same authenticated peer.
 //!
@@ -47,6 +48,86 @@ use crate::addr_ownership::{
 /// full mailbox applies backpressure to the claimant rather than dropping a
 /// decision.
 const OWNER_MAILBOX_CAPACITY: usize = 512;
+/// Maximum guards plus queued cleanup commands. Every granted guard owns one
+/// release slot before publication; cleanup cannot fail due to saturation.
+const OWNER_REAP_CAPACITY: usize = 512;
+const OWNER_STATE_CAPACITY: usize = 65_536;
+/// Conservative retained journal charge, shared across all admitted journals.
+const OWNER_SPECULATIVE_BYTES: usize = 32 * 1024 * 1024;
+/// Pending destructive authority expires; committed work retains exclusivity
+/// until its exact guard releases it, since expiring committed work is unsafe.
+const OWNER_REAP_LEASE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Owner control-plane budgets. Keys and values in these admitted tables are
+/// fixed-size identities, addresses, generations and timestamps. Persistent
+/// configuration fences are retained until owner shutdown, never evicted into
+/// an ABA reissue. Exhaustion rejects new identities, not existing refreshes.
+#[derive(Clone, Copy, Debug)]
+pub struct RegistryOwnerLimits {
+    /// Also bounds retained address-generation history. A vacant address keeps
+    /// its history slot until shutdown; saturation rejects previously unseen
+    /// addresses but permits refresh/reuse of already admitted addresses.
+    pub state_entries: std::num::NonZeroUsize,
+    pub reservations: std::num::NonZeroUsize,
+    pub pending_reap_lifetime: std::time::Duration,
+}
+
+impl Default for RegistryOwnerLimits {
+    fn default() -> Self {
+        Self {
+            state_entries: std::num::NonZeroUsize::new(OWNER_STATE_CAPACITY).unwrap(),
+            reservations: std::num::NonZeroUsize::new(OWNER_REAP_CAPACITY).unwrap(),
+            pending_reap_lifetime: OWNER_REAP_LEASE,
+        }
+    }
+}
+
+/// Reap admission failures that do not grant destructive authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReapAdmissionError {
+    /// All cleanup slots are held by outstanding guards or queued releases.
+    Capacity,
+    /// The owner command processor is unavailable.
+    Closed,
+}
+
+impl std::fmt::Display for ReapAdmissionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "reap admission rejected: {self:?}")
+    }
+}
+
+impl std::error::Error for ReapAdmissionError {}
+
+struct ReapState {
+    state: AtomicU8,
+    expires_at: tokio::time::Instant,
+}
+
+impl std::ops::Deref for ReapState {
+    type Target = AtomicU8;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl ReapState {
+    fn expire(&self) -> bool {
+        if tokio::time::Instant::now() < self.expires_at {
+            return false;
+        }
+        let expired = self
+            .compare_exchange(
+                REAP_PENDING,
+                REAP_INVALIDATED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        expired || self.load(Ordering::Acquire) == REAP_INVALIDATED
+    }
+}
 
 /// Legacy/unit-test callers that only have a socket discriminator still get a
 /// deterministic receipt identity. Production transport paths always pass a
@@ -112,6 +193,9 @@ struct PublishedOwner {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutingSnapshot {
     owner_shards: [Arc<HashMap<SocketAddr, PublishedOwner>>; ROUTING_SNAPSHOT_SHARDS],
+    // Historical receipts never recycle a vacant address generation. Admission
+    // counts these fixed-size rows against state_entries, including vacancies.
+    history_shards: [Arc<HashMap<SocketAddr, CommitSeq>>; ROUTING_SNAPSHOT_SHARDS],
     /// Operator-pin identity, published separately from ownership: a pin is
     /// a DIFFERENT fact than "who owns this address" (see `operator_pinned`'s
     /// doc comment), decided and moved by its own owner commands
@@ -138,12 +222,21 @@ pub struct RoutingSnapshot {
     pinned_by_peer: Arc<HashMap<PeerId, SocketAddr>>,
 }
 
+/// Small opaque address-history witness, including an unowned address epoch.
+/// Journals retain at most two witnesses, never an entire routing snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AddressHistoryReceipt {
+    pub(crate) address: SocketAddr,
+    generation: Option<CommitSeq>,
+}
+
 const ROUTING_SNAPSHOT_SHARDS: usize = 64;
 
 impl Default for RoutingSnapshot {
     fn default() -> Self {
         Self {
             owner_shards: std::array::from_fn(|_| Arc::new(HashMap::new())),
+            history_shards: std::array::from_fn(|_| Arc::new(HashMap::new())),
             pin_shards: std::array::from_fn(|_| Arc::new(HashMap::new())),
             pinned_by_peer: Arc::new(HashMap::new()),
         }
@@ -202,7 +295,40 @@ impl RoutingSnapshot {
         self.owner_shards.iter().all(|shard| shard.is_empty())
     }
 
-    fn with_owner(&self, addr: SocketAddr, owner: Option<(Owner, CommitSeq)>) -> Self {
+    pub(crate) fn address_history_receipt(&self, address: SocketAddr) -> AddressHistoryReceipt {
+        AddressHistoryReceipt {
+            address,
+            generation: self.history_shards[Self::shard_index(&address)]
+                .get(&address)
+                .copied(),
+        }
+    }
+
+    pub(crate) fn matches_address_history(&self, receipt: &AddressHistoryReceipt) -> bool {
+        self.address_history_receipt(receipt.address) == *receipt
+    }
+
+    /// Exact address history, including vacant -> claimed -> vacant ABA.
+    #[cfg(test)]
+    pub(crate) fn address_history_matches(&self, prior: &Self, addr: &SocketAddr) -> bool {
+        let shard = Self::shard_index(addr);
+        self.history_shards[shard].get(addr) == prior.history_shards[shard].get(addr)
+    }
+
+    fn history_can_admit(&self, addr: &SocketAddr, capacity: usize) -> bool {
+        if self.history_shards[Self::shard_index(addr)].contains_key(addr) {
+            return true;
+        }
+        let history_len: usize = self.history_shards.iter().map(|shard| shard.len()).sum();
+        history_len < capacity
+    }
+
+    fn with_owner(
+        &self,
+        addr: SocketAddr,
+        owner: Option<(Owner, CommitSeq)>,
+        sequence: CommitSeq,
+    ) -> Self {
         let mut next = self.clone();
         let shard_index = Self::shard_index(&addr);
         let mut shard = (*next.owner_shards[shard_index]).clone();
@@ -215,6 +341,9 @@ impl RoutingSnapshot {
             }
         }
         next.owner_shards[shard_index] = Arc::new(shard);
+        let mut history = (*next.history_shards[shard_index]).clone();
+        history.insert(addr, sequence);
+        next.history_shards[shard_index] = Arc::new(history);
         next
     }
 
@@ -303,6 +432,12 @@ pub enum ClaimRejection {
     /// was dropped). Fail closed: no address-keyed mutation may proceed on a
     /// decision that was never actually made.
     OwnerUnavailable,
+    /// Configured owner-state or session-receipt capacity is exhausted.
+    Capacity,
+    /// A preclaim snapshot was superseded before its transaction committed.
+    StaleProjection,
+    /// The pending speculative claim exceeded its admission lifetime.
+    ExpiredProjection,
     /// A `cleanup_dead_peers` sweep currently holds a reap reservation for
     /// this address (see `OwnerCommand::ReserveForReap`). Refused
     /// unconditionally, before `arbitrate` is even consulted: the sweep's
@@ -539,6 +674,8 @@ pub enum MigrateOutcome {
     /// as any other refused migration -- the reservation is released
     /// promptly once the sweep finishes with that address.
     ReapInProgress,
+    /// The destination session could not reserve bounded admission.
+    Capacity,
 }
 
 impl MigrateOutcome {
@@ -554,6 +691,7 @@ impl MigrateOutcome {
                 | Self::TargetIsLocal
                 | Self::SourceOwnerMismatch
                 | Self::ReapInProgress
+                | Self::Capacity
         )
     }
 
@@ -570,7 +708,8 @@ impl MigrateOutcome {
             | Self::TargetOwnedByOther
             | Self::TargetIsLocal
             | Self::SourceOwnerMismatch
-            | Self::ReapInProgress => None,
+            | Self::ReapInProgress
+            | Self::Capacity => None,
         }
     }
 }
@@ -578,13 +717,27 @@ impl MigrateOutcome {
 /// Routing publication performed by the owner task, in the same serialized
 /// step as the ownership decision.
 ///
-/// Every method is synchronous and lock-free by contract: the owner task must
-/// never block, and must never await, between deciding and publishing.
+/// Publication is synchronous within the owner command; bounded session
+/// admission and metadata publication share the pool control-plane guards.
+/// There is no await between deciding and publishing.
 pub trait RoutingPublisher: Send + Sync + 'static {
+    /// Retain a bounded session admission slot through the entire command.
+    fn reserve_peer_session(
+        &self,
+        _peer_id: &PeerId,
+    ) -> crate::Result<Option<Box<dyn Send + Sync>>> {
+        Ok(None)
+    }
+
     /// Route `addr` to `peer_id`.
     fn publish_owner(&self, addr: SocketAddr, peer_id: &PeerId);
     /// Withdraw `addr`'s route, but only if it still points at `peer_id`.
     fn retract_owner(&self, addr: SocketAddr, peer_id: &PeerId);
+    /// Update an unpinned dial hint inside the owner publication boundary.
+    fn set_discovered_peer_addr(&self, _addr: SocketAddr, _peer_id: &PeerId) -> crate::Result<()> {
+        Ok(())
+    }
+
     /// Record `addr` as `peer_id`'s configured/required dial target, AND
     /// reindex any live connection for `peer_id` under `addr`
     /// (`ConnectionPool::reindex_connection_addr`), in this SAME call.
@@ -659,19 +812,34 @@ pub trait RoutingPublisher: Send + Sync + 'static {
         addr: SocketAddr,
         peer_id: &PeerId,
         evicted_addr: Option<SocketAddr>,
-    );
+    ) -> crate::Result<()>;
 }
 
 impl<T: 'static> RoutingPublisher for crate::connection_pool::ConnectionPool<T> {
+    fn reserve_peer_session(
+        &self,
+        peer_id: &PeerId,
+    ) -> crate::Result<Option<Box<dyn Send + Sync>>> {
+        let reservation =
+            crate::connection_pool::ConnectionPool::reserve_peer_session(self, peer_id)?;
+        Ok(Some(Box::new(reservation)))
+    }
+
     fn publish_owner(&self, addr: SocketAddr, peer_id: &PeerId) {
+        let _publication = self.session_publication_guard();
         let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
     }
 
     fn retract_owner(&self, addr: SocketAddr, peer_id: &PeerId) {
+        let _publication = self.session_publication_guard();
         let _ = self
             .addr_to_peer_id
             .remove_if_sync(&addr, |current| current == peer_id);
         self.clear_displaced_peer_addr(peer_id, addr);
+    }
+
+    fn set_discovered_peer_addr(&self, addr: SocketAddr, peer_id: &PeerId) -> crate::Result<()> {
+        crate::connection_pool::ConnectionPool::set_discovered_peer_addr(self, peer_id, addr)
     }
 
     fn set_configured_peer_addr(
@@ -679,12 +847,13 @@ impl<T: 'static> RoutingPublisher for crate::connection_pool::ConnectionPool<T> 
         addr: SocketAddr,
         peer_id: &PeerId,
         evicted_addr: Option<SocketAddr>,
-    ) {
-        crate::connection_pool::ConnectionPool::set_configured_peer_addr(self, peer_id, addr);
+    ) -> crate::Result<()> {
+        crate::connection_pool::ConnectionPool::set_configured_peer_addr(self, peer_id, addr)?;
         crate::connection_pool::ConnectionPool::reindex_connection_addr(self, peer_id, addr);
         if let Some(evicted_addr) = evicted_addr {
             crate::connection_pool::ConnectionPool::evict_pin_alias(self, peer_id, evicted_addr);
         }
+        Ok(())
     }
 }
 
@@ -737,9 +906,54 @@ impl ConfigurePeerCommit {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RollbackOutcome {
+    Restored,
+    Superseded,
+    RestorationFailed,
+}
+
+/// A pre-admitted journal transferred to the owner before any claim mutation.
+/// Its callback takes ownership of compensation before the claim reply can be
+/// observed or canceled. The snapshot fence includes secondary address history.
+pub(crate) struct SpeculativeClaimJournal {
+    pub(crate) history: Vec<AddressHistoryReceipt>,
+    pub(crate) deadline: tokio::time::Instant,
+    pub(crate) decision: Arc<AtomicU8>,
+    pub(crate) start: Box<dyn FnOnce(ClaimCommit) + Send>,
+}
+
 /// Commands accepted by the owner task. Every variant that mutates carries a
 /// reply channel so the caller observes the committed state, never a promise.
 enum OwnerCommand {
+    MigrateProjection {
+        from: SocketAddr,
+        to: SocketAddr,
+        expected_source: SourceExpectation,
+        is_local_addr: bool,
+        apply: Box<dyn FnOnce(MigrateOutcome) -> bool + Send>,
+        reply: oneshot::Sender<bool>,
+    },
+    AbortSpeculativeClaim {
+        addr: SocketAddr,
+        generation: CommitSeq,
+        recover: Box<dyn FnOnce() -> bool + Send>,
+        reply: oneshot::Sender<RollbackOutcome>,
+    },
+    FinishSpeculativeClaim {
+        addr: SocketAddr,
+        generation: CommitSeq,
+        reply: oneshot::Sender<()>,
+    },
+    SpeculativeConnectionClaim {
+        addr: SocketAddr,
+        claim: Claim,
+        session_source: SocketAddr,
+        connection_instance_id: u64,
+        evidence_at: std::time::Instant,
+        journal: SpeculativeClaimJournal,
+        reply: oneshot::Sender<ClaimCommit>,
+    },
     Claim {
         addr: SocketAddr,
         claim: Claim,
@@ -754,6 +968,30 @@ enum OwnerCommand {
         expected_owner: PeerId,
         expected_generation: CommitSeq,
         reply: oneshot::Sender<Option<CommitSeq>>,
+    },
+    CommitReap {
+        peer_id: PeerId,
+        addr: SocketAddr,
+        evidence_before: std::time::Instant,
+        reservation: ReapReservation,
+        apply: Box<dyn FnOnce(DeadPeerReleaseOutcome) -> bool + Send>,
+        reply: oneshot::Sender<bool>,
+    },
+    #[cfg(test)]
+    RollbackProjection {
+        addr: SocketAddr,
+        expected_owner: PeerId,
+        expected_generation: CommitSeq,
+        apply: Box<dyn FnOnce(CommitSeq) -> bool + Send>,
+        reply: oneshot::Sender<RollbackOutcome>,
+    },
+    #[cfg(test)]
+    ReleaseForRollback {
+        addr: SocketAddr,
+        expected_owner: PeerId,
+        expected_generation: CommitSeq,
+        release_permit: mpsc::OwnedPermit<OwnerCommand>,
+        reply: oneshot::Sender<Option<(CommitSeq, ReapReservation)>>,
     },
     Migrate {
         from: SocketAddr,
@@ -1073,7 +1311,7 @@ enum OwnerCommand {
         expected_node_id: Option<PeerId>,
         /// `Some(reservation)` when granted -- the reservation guard is
         /// constructed HERE, owner-side, before the reply is sent, and its
-        /// `valid` is the SAME `Arc<AtomicU8>` the owner-internal
+        /// `valid` is the SAME `Arc<ReapState>` the owner-internal
         /// `reap_reserved` map stores for this address, so the caller's
         /// guard and the owner's own entry share one flag. `None` when
         /// refused. See `PeerRegistryOwner::reap_reserved`'s doc comment
@@ -1087,7 +1325,7 @@ enum OwnerCommand {
         /// undelivered guard is dropped and its `Drop` releases the
         /// reservation, so the address never stays `ReapInProgress` for a
         /// claimant that no longer exists.
-        reply: oneshot::Sender<Option<ReapReservation>>,
+        reply: oneshot::Sender<Result<Option<ReapReservation>, ReapAdmissionError>>,
     },
     /// Release a reservation `ReserveForReap` granted, whether the sweep
     /// used it to reap the address or is abandoning the candidate for
@@ -1095,6 +1333,7 @@ enum OwnerCommand {
     /// no-op) -- there is nothing to fail closed against.
     ReleaseReapReservation {
         addr: SocketAddr,
+        valid: Arc<ReapState>,
         reply: oneshot::Sender<()>,
     },
     /// Atomically install `peer_id`'s operator pin at `addr`, replacing
@@ -1156,6 +1395,12 @@ enum OwnerCommand {
         reply: oneshot::Sender<bool>,
     },
     #[cfg(test)]
+    SeedHistoricalProvisional {
+        addr: SocketAddr,
+        peer_id: PeerId,
+        reply: oneshot::Sender<ClaimCommit>,
+    },
+    #[cfg(test)]
     InspectGeneration {
         addr: SocketAddr,
         reply: oneshot::Sender<Option<CommitSeq>>,
@@ -1184,51 +1429,30 @@ enum OwnerCommand {
     /// this update: whichever of the two commands the owner processes
     /// first is fully committed before the other is even looked at,
     /// because both run inside the same single-threaded `handle()`.
-    /// No reply: the caller does not need confirmation the owner
-    /// processed it, only that the send is durably enqueued before this
-    /// call returns (`mpsc::Sender::send` itself is the ordering
-    /// guarantee -- see this variant's caller).
+    /// A reply confirms bounded admission and commit before the caller
+    /// publishes successful liveness in another domain.
     NoteLivenessEvidence {
         addr: SocketAddr,
         at: std::time::Instant,
+        reply: oneshot::Sender<crate::Result<()>>,
     },
 }
 
 /// Shared state behind every [`RegistryOwnerHandle`] clone.
 struct OwnerShared {
+    limits: RegistryOwnerLimits,
+    speculative_admission: Arc<tokio::sync::Semaphore>,
+    speculative_bytes: Arc<tokio::sync::Semaphore>,
+    speculative_failures: std::sync::atomic::AtomicUsize,
+    speculative_shutdown: tokio::sync::watch::Sender<bool>,
+    #[cfg(test)]
+    speculative_failure_notify: tokio::sync::Notify,
+    publication: Arc<std::sync::Mutex<()>>,
     tx: mpsc::Sender<OwnerCommand>,
-    /// Dedicated, UNBOUNDED channel carrying `OwnerCommand::
-    /// ReleaseReapReservation` exclusively -- never routed through the
-    /// bounded `tx` mailbox above. See `ReapReservation`'s doc comment for
-    /// the failure this exists to close: "failing to TAKE a reservation is
-    /// safe (the sweep just skips the candidate); failing to RELEASE one is
-    /// not (every later claim for that address is refused forever)." A
-    /// bounded send can suspend waiting for mailbox capacity, and a task
-    /// aborted while suspended there drops the release with it. An
-    /// unbounded sender's `send` is synchronous -- it enqueues or reports
-    /// the owner gone immediately, with no `.await` point in between for an
-    /// abort to land inside -- so by the time it returns, the release is
-    /// either irrevocably queued or there is no owner left to leak a
-    /// reservation against. This is deliberately NOT unbounded for every
-    /// command, only this one: an unbounded queue for ordinary claim/
-    /// mutation traffic would let a caller flooding requests grow the
-    /// owner's backlog without limit, which the bounded `tx` mailbox's
-    /// backpressure exists to prevent. Releases are different: they can
-    /// only ever be in flight once per outstanding reservation, so their
-    /// worst-case queue depth is already bounded by how many reservations
-    /// are concurrently held, not by caller behavior.
-    ///
-    /// `NoteLivenessEvidence` goes through the ORDINARY bounded `tx`
-    /// mailbox below, deliberately, even though it is genuinely
-    /// higher-frequency than the claim/ownership traffic that mailbox was
-    /// originally sized for: correctness requires it to be serialized
-    /// with `ReleaseDeadPeer` on the SAME queue (see
-    /// `OwnerCommand::NoteLivenessEvidence`'s own doc comment), and
-    /// backpressure on a per-response signal is a feature here, not a
-    /// bug -- it naturally sheds load rather than growing an unbounded
-    /// backlog the way this comment's own reasoning rejects for the
-    /// release channel.
-    release_tx: mpsc::UnboundedSender<OwnerCommand>,
+    /// Dedicated bounded cleanup lane. A guard reserves an owned channel slot
+    /// before the owner grants authority, then synchronously fills that slot
+    /// on release or Drop. Ordinary traffic cannot consume cleanup capacity.
+    release_tx: mpsc::Sender<OwnerCommand>,
     snapshot: Arc<ArcSwap<RoutingSnapshot>>,
     /// Exactly-once start latch. The receiving half plus the publisher live
     /// here until the first command, at which point whichever caller wins the
@@ -1239,7 +1463,7 @@ struct OwnerShared {
 
 struct StartKit {
     rx: mpsc::Receiver<OwnerCommand>,
-    release_rx: mpsc::UnboundedReceiver<OwnerCommand>,
+    release_rx: mpsc::Receiver<OwnerCommand>,
     routing: Weak<dyn RoutingPublisher>,
 }
 
@@ -1264,8 +1488,30 @@ impl RegistryOwnerHandle {
     /// transitively owns this handle, and a strong reference here would keep
     /// the pool alive for as long as the owner task runs.
     pub fn new(routing: Weak<dyn RoutingPublisher>) -> Self {
+        Self::build(routing, RegistryOwnerLimits::default())
+    }
+
+    /// Construct with explicit control-plane bounds. No resources are admitted
+    /// when channel capacity exceeds Tokio's representable semaphore range.
+    pub fn with_limits(
+        routing: Weak<dyn RoutingPublisher>,
+        limits: RegistryOwnerLimits,
+    ) -> crate::Result<Self> {
+        if limits.reservations.get() > tokio::sync::Semaphore::MAX_PERMITS
+            || tokio::time::Instant::now()
+                .checked_add(limits.pending_reap_lifetime)
+                .is_none()
+        {
+            return Err(crate::GossipError::InvalidConfig(
+                "owner reservation capacity or lifetime exceeds representable bounds".into(),
+            ));
+        }
+        Ok(Self::build(routing, limits))
+    }
+
+    fn build(routing: Weak<dyn RoutingPublisher>, limits: RegistryOwnerLimits) -> Self {
         let (tx, rx) = mpsc::channel(OWNER_MAILBOX_CAPACITY);
-        let (release_tx, release_rx) = mpsc::unbounded_channel();
+        let (release_tx, release_rx) = mpsc::channel(limits.reservations.get());
         let pending_start = ArrayQueue::new(1);
         // Cannot fail: the queue was just created with capacity 1.
         let _ = pending_start.push(StartKit {
@@ -1275,12 +1521,32 @@ impl RegistryOwnerHandle {
         });
         Self {
             shared: Arc::new(OwnerShared {
+                speculative_admission: Arc::new(tokio::sync::Semaphore::new(
+                    limits.reservations.get(),
+                )),
+                speculative_bytes: Arc::new(tokio::sync::Semaphore::new(OWNER_SPECULATIVE_BYTES)),
+                speculative_failures: std::sync::atomic::AtomicUsize::new(0),
+                speculative_shutdown: tokio::sync::watch::channel(false).0,
+                #[cfg(test)]
+                speculative_failure_notify: tokio::sync::Notify::new(),
+                limits,
+                publication: Arc::new(std::sync::Mutex::new(())),
                 tx,
                 release_tx,
                 snapshot: Arc::new(ArcSwap::from_pointee(RoutingSnapshot::default())),
                 pending_start,
             }),
         }
+    }
+
+    /// Fences a derived projection with ownership publication. Callers must
+    /// validate their exact receipt while holding this guard, after acquiring
+    /// the projection's own lock, and never await an owner command with it held.
+    pub(crate) fn projection_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.shared
+            .publication
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Record DIRECT liveness evidence for `addr`, observed at `at`: an
@@ -1310,18 +1576,22 @@ impl RegistryOwnerHandle {
     /// the failure mode `claim_committed_at`'s own doc comment already
     /// rejects for claims.
     ///
-    /// No reply is needed: `mpsc::Sender::send` returning is itself the
-    /// ordering guarantee (a bounded, single-consumer FIFO channel), and
-    /// the caller does not need to know whether the owner has processed
-    /// it yet, only that it is durably enqueued before this call
-    /// returns.
-    pub async fn note_liveness_evidence(&self, addr: SocketAddr, at: std::time::Instant) {
+    /// Returns only after the evidence is committed. A new unowned
+    /// address may be rejected with `WriteQueueFull`; no successful peer
+    /// bookkeeping may be published by a caller after that rejection.
+    pub async fn note_liveness_evidence(
+        &self,
+        addr: SocketAddr,
+        at: std::time::Instant,
+    ) -> crate::Result<()> {
         self.ensure_started();
-        let _ = self
-            .shared
+        let (reply, rx) = oneshot::channel();
+        self.shared
             .tx
-            .send(OwnerCommand::NoteLivenessEvidence { addr, at })
-            .await;
+            .send(OwnerCommand::NoteLivenessEvidence { addr, at, reply })
+            .await
+            .map_err(|_| crate::GossipError::Shutdown)?;
+        rx.await.map_err(|_| crate::GossipError::Shutdown)?
     }
 
     /// Current lock-free ownership/routing snapshot.
@@ -1410,6 +1680,168 @@ impl RegistryOwnerHandle {
                 ClaimCommit::Rejected(ClaimRejection::OwnerUnavailable)
             }
         }
+    }
+
+    /// Pending claims have a count budget independent of the ordinary mailbox.
+    /// Shutdown closes admission before draining; no public gossip lock is used.
+    pub(crate) fn reserve_speculative_claim(
+        &self,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, ReapAdmissionError> {
+        if *self.shared.speculative_shutdown.borrow() {
+            return Err(ReapAdmissionError::Closed);
+        }
+        let permit = self
+            .shared
+            .speculative_admission
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| ReapAdmissionError::Capacity)?;
+        if *self.shared.speculative_shutdown.borrow() {
+            return Err(ReapAdmissionError::Closed);
+        }
+        Ok(permit)
+    }
+
+    pub(crate) fn speculative_shutdown_signal(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.shared.speculative_shutdown.subscribe()
+    }
+
+    pub(crate) fn begin_speculative_shutdown(&self) {
+        self.shared.speculative_shutdown.send_replace(true);
+    }
+
+    pub(crate) async fn drain_speculative_claims(&self) {
+        let _all = self
+            .shared
+            .speculative_admission
+            .acquire_many(self.shared.limits.reservations.get() as u32)
+            .await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn abort_speculative_claim(
+        &self,
+        addr: SocketAddr,
+        generation: CommitSeq,
+    ) -> RollbackOutcome {
+        self.abort_speculative_claim_with_recovery(addr, generation, || true)
+            .await
+    }
+
+    pub(crate) async fn abort_speculative_claim_with_recovery(
+        &self,
+        addr: SocketAddr,
+        generation: CommitSeq,
+        recover: impl FnOnce() -> bool + Send + 'static,
+    ) -> RollbackOutcome {
+        let (reply, response) = oneshot::channel();
+        if self
+            .shared
+            .tx
+            .send(OwnerCommand::AbortSpeculativeClaim {
+                addr,
+                generation,
+                recover: Box::new(recover),
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            return RollbackOutcome::RestorationFailed;
+        }
+        response.await.unwrap_or(RollbackOutcome::RestorationFailed)
+    }
+
+    /// Number of rejected synchronous projections. Their owner-only rollback
+    /// still drains; no failed task or retained quarantine is created.
+    pub fn speculative_cleanup_failures(&self) -> usize {
+        self.shared.speculative_failures.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn record_speculative_failure(&self) {
+        self.shared
+            .speculative_failures
+            .fetch_add(1, Ordering::AcqRel);
+        #[cfg(test)]
+        self.shared.speculative_failure_notify.notify_one();
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_speculative_failure_for_test(&self) {
+        self.shared.speculative_failure_notify.notified().await;
+    }
+
+    pub(crate) fn reserve_speculative_bytes(
+        &self,
+        bytes: usize,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, ReapAdmissionError> {
+        let bytes = u32::try_from(bytes).map_err(|_| ReapAdmissionError::Capacity)?;
+        self.shared
+            .speculative_bytes
+            .clone()
+            .try_acquire_many_owned(bytes)
+            .map_err(|_| ReapAdmissionError::Capacity)
+    }
+
+    pub(crate) async fn finish_speculative_claim(&self, addr: SocketAddr, generation: CommitSeq) {
+        let (reply, response) = oneshot::channel();
+        if self
+            .shared
+            .tx
+            .send(OwnerCommand::FinishSpeculativeClaim {
+                addr,
+                generation,
+                reply,
+            })
+            .await
+            .is_ok()
+        {
+            let _ = response.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn drain_speculative_for_test(&self) {
+        let _all = self
+            .shared
+            .speculative_admission
+            .acquire_many(self.shared.limits.reservations.get() as u32)
+            .await
+            .unwrap();
+    }
+
+    pub(crate) fn speculative_claim_lifetime(&self) -> std::time::Duration {
+        self.shared.limits.pending_reap_lifetime
+    }
+
+    pub(crate) async fn claim_speculative_connection(
+        &self,
+        addr: SocketAddr,
+        claim: Claim,
+        session_source: SocketAddr,
+        connection_instance_id: u64,
+        journal: SpeculativeClaimJournal,
+    ) -> ClaimCommit {
+        self.ensure_started();
+        let (reply, response) = oneshot::channel();
+        let deadline = journal.deadline;
+        let command = OwnerCommand::SpeculativeConnectionClaim {
+            addr,
+            claim,
+            session_source,
+            connection_instance_id,
+            evidence_at: std::time::Instant::now(),
+            journal,
+            reply,
+        };
+        match tokio::time::timeout_at(deadline, self.shared.tx.send(command)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return ClaimCommit::Rejected(ClaimRejection::OwnerUnavailable),
+            Err(_) => return ClaimCommit::Rejected(ClaimRejection::ExpiredProjection),
+        }
+        response
+            .await
+            .unwrap_or(ClaimCommit::Rejected(ClaimRejection::OwnerUnavailable))
     }
 
     /// Submit a connection-scoped address claim and wait for the committed
@@ -1717,6 +2149,28 @@ impl RegistryOwnerHandle {
         expected_pin: Option<PeerId>,
         expected_node_id: Option<PeerId>,
     ) -> Option<ReapReservation> {
+        self.try_reserve_for_reap(
+            addr,
+            evidence_before,
+            expected_ownership,
+            expected_pin,
+            expected_node_id,
+        )
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Typed admission variant. `Ok(None)` rejects stale/conflicting evidence;
+    /// `Err(Capacity)` rejects saturation before constructing any guard.
+    pub async fn try_reserve_for_reap(
+        &self,
+        addr: SocketAddr,
+        evidence_before: std::time::Instant,
+        expected_ownership: Option<OwnershipToken>,
+        expected_pin: Option<PeerId>,
+        expected_node_id: Option<PeerId>,
+    ) -> Result<Option<ReapReservation>, ReapAdmissionError> {
         self.ensure_started();
         let (reply, response) = oneshot::channel();
         let command = OwnerCommand::ReserveForReap {
@@ -1728,14 +2182,14 @@ impl RegistryOwnerHandle {
             reply,
         };
         if self.shared.tx.send(command).await.is_err() {
-            return None;
+            return Err(ReapAdmissionError::Closed);
         }
         // The guard arrives already constructed -- the owner built it
         // before replying -- so the window between "the owner granted" and
         // "the caller assembles its guard" cannot exist: if this task dies
         // at the `.await`, the undelivered guard drops undelivered and
         // releases itself (G-4).
-        response.await.ok().flatten()
+        response.await.unwrap_or(Err(ReapAdmissionError::Closed))
     }
 
     /// Reserve `addr` for `peer_id` independently of any connection,
@@ -1898,6 +2352,128 @@ impl RegistryOwnerHandle {
         response.await.unwrap_or(None)
     }
 
+    /// Release an exact rejected candidate while reserving its vacant address
+    /// until synchronous projection rollback completes. Cleanup capacity is
+    /// acquired before submitting the mutation; cancellation drops the receipt
+    /// into the guaranteed cleanup lane, never an unbounded side queue.
+    #[cfg(test)]
+    pub(crate) async fn release_for_rollback(
+        &self,
+        addr: SocketAddr,
+        expected_owner: PeerId,
+        expected_generation: CommitSeq,
+    ) -> Option<(CommitSeq, ReapReservation)> {
+        self.ensure_started();
+        let release_permit = self.shared.release_tx.clone().reserve_owned().await.ok()?;
+        let (reply, response) = oneshot::channel();
+        self.shared
+            .tx
+            .send(OwnerCommand::ReleaseForRollback {
+                addr,
+                expected_owner,
+                expected_generation,
+                release_permit,
+                reply,
+            })
+            .await
+            .ok()?;
+        response.await.ok().flatten()
+    }
+
+    /// The command owns the complete synchronous mutation after submission.
+    /// Dropping the response cannot cancel half a transaction. Callers acquire
+    /// gossip state before enqueueing and never await inside `apply`.
+    pub(crate) async fn commit_reap(
+        &self,
+        peer_id: PeerId,
+        addr: SocketAddr,
+        evidence_before: std::time::Instant,
+        reservation: ReapReservation,
+        apply: impl FnOnce(DeadPeerReleaseOutcome) -> bool + Send + 'static,
+    ) -> bool {
+        self.ensure_started();
+        let (reply, response) = oneshot::channel();
+        let deadline = reservation.deadline();
+        let command = OwnerCommand::CommitReap {
+            peer_id,
+            addr,
+            evidence_before,
+            reservation,
+            apply: Box::new(apply),
+            reply,
+        };
+        if !matches!(
+            tokio::time::timeout_at(deadline, self.shared.tx.send(command)).await,
+            Ok(Ok(()))
+        ) {
+            return false;
+        }
+        response.await.unwrap_or(false)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn rollback_projection(
+        &self,
+        addr: SocketAddr,
+        expected_owner: PeerId,
+        expected_generation: CommitSeq,
+        apply: impl FnOnce(CommitSeq) -> bool + Send + 'static,
+    ) -> bool {
+        self.rollback_projection_outcome(addr, expected_owner, expected_generation, apply)
+            .await
+            == RollbackOutcome::Restored
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn rollback_projection_outcome(
+        &self,
+        addr: SocketAddr,
+        expected_owner: PeerId,
+        expected_generation: CommitSeq,
+        apply: impl FnOnce(CommitSeq) -> bool + Send + 'static,
+    ) -> RollbackOutcome {
+        self.ensure_started();
+        let (reply, response) = oneshot::channel();
+        let command = OwnerCommand::RollbackProjection {
+            addr,
+            expected_owner,
+            expected_generation,
+            apply: Box::new(apply),
+            reply,
+        };
+        if self.shared.tx.send(command).await.is_err() {
+            return RollbackOutcome::RestorationFailed;
+        }
+        response.await.unwrap_or(RollbackOutcome::RestorationFailed)
+    }
+
+    /// Commit ownership and a prevalidated synchronous projection together.
+    /// The command owns the gossip guard via `apply`; response cancellation
+    /// cannot strand a half-migrated DNS route.
+    pub(crate) async fn migrate_projection(
+        &self,
+        from: SocketAddr,
+        to: SocketAddr,
+        expected_source: SourceExpectation,
+        is_local_addr: bool,
+        apply: impl FnOnce(MigrateOutcome) -> bool + Send + 'static,
+    ) -> bool {
+        self.ensure_started();
+        let (reply, response) = oneshot::channel();
+        let command = OwnerCommand::MigrateProjection {
+            from,
+            to,
+            expected_source,
+            is_local_addr,
+            apply: Box::new(apply),
+            reply,
+        };
+        if self.shared.tx.send(command).await.is_err() {
+            return false;
+        }
+        response.await.unwrap_or(false)
+    }
+
     /// Move ownership of `from` onto `to` (address re-resolution).
     ///
     /// Callers that also re-key their own address-keyed state must issue this
@@ -1944,8 +2520,12 @@ impl RegistryOwnerHandle {
         }) = self.shared.pending_start.pop()
         {
             let owner = PeerRegistryOwner {
+                limits: self.shared.limits,
+                publication: Arc::clone(&self.shared.publication),
                 addr_ownership: HashMap::new(),
                 claim_generation: HashMap::new(),
+                speculative_releases: HashMap::new(),
+                unpublished_claims: HashMap::new(),
                 claim_committed_at: HashMap::new(),
                 liveness_evidence_at: HashMap::new(),
                 configure_peer_generation: HashMap::new(),
@@ -1971,6 +2551,28 @@ impl RegistryOwnerHandle {
     /// Observe the authoritative generation in deterministic race tests.
     /// Production lifecycle paths retain the generation returned by their
     /// own claim and never perform a racy read-back.
+    /// Seed a legacy persisted owner for rollback tests, not an admission
+    /// exception: production still rejects every unowned provisional claim.
+    #[cfg(test)]
+    pub(crate) async fn seed_historical_provisional_for_test(
+        &self,
+        addr: SocketAddr,
+        peer_id: PeerId,
+    ) {
+        self.ensure_started();
+        let (reply, response) = oneshot::channel();
+        self.shared
+            .tx
+            .send(OwnerCommand::SeedHistoricalProvisional {
+                addr,
+                peer_id,
+                reply,
+            })
+            .await
+            .unwrap();
+        assert!(response.await.unwrap().is_accepted());
+    }
+
     #[cfg(test)]
     pub(crate) async fn claim_generation_for_test(&self, addr: SocketAddr) -> Option<CommitSeq> {
         self.ensure_started();
@@ -2034,29 +2636,11 @@ impl RegistryOwnerHandle {
 /// as dropping any other value on the stack, which runs this guard's `Drop`
 /// impl synchronously.
 ///
-/// Both paths, `release()` and `Drop`, enqueue through
-/// `RegistryOwnerHandle::enqueue_reap_release` -- the dedicated, UNBOUNDED
-/// release channel (`OwnerShared::release_tx`), never the bounded `tx`
-/// mailbox ordinary commands use. This is what closes a real bug an
-/// earlier version of this guard had: `release()` used to disarm
-/// (`released = true`) and only THEN `.await` a send on the bounded
-/// mailbox. If the task was aborted while that send was suspended waiting
-/// for mailbox capacity, the future -- `released` already `true` -- was
-/// dropped mid-await, `Drop` saw `released == true` and did nothing, and
-/// the `try_send` fallback it would otherwise have attempted could itself
-/// fail on that same full mailbox. The exact leak this guard exists to
-/// prevent, reappearing through the guard's own failure path. The
-/// governing asymmetry: failing to TAKE a reservation is safe --
-/// `reserve_for_reap` returning `None` just means the sweep skips that
-/// candidate this round -- but failing to RELEASE one is not, since every
-/// later claim for that address is refused forever. An unbounded sender's
-/// `send` cannot suspend on capacity and has no `.await` point inside it
-/// for an abort to land in the middle of, so by the time it returns, the
-/// release is either irrevocably queued or the owner task is already gone
-/// -- and in the latter case there is nothing left to leak a reservation
-/// against, since a fresh owner task starts with an empty `reap_reserved`.
-/// `released` is now set only strictly AFTER that synchronous enqueue
-/// succeeds, never before it -- see `release()` below.
+/// Both release paths fill a bounded channel slot reserved before admission.
+/// There is no await or fallible try_send between owning authority and queuing
+/// its cleanup. The slot accounts for both checked-out guards and queued
+/// releases. Expired pending guards cannot consume authority, and cleanup uses
+/// exact Arc identity so an old guard cannot release a successor reservation.
 ///
 /// P1 finding (review round against `d4000e2`, `registry.rs:8750`): a
 /// reservation blocks new ownership CLAIMS, never ordinary liveness
@@ -2066,7 +2650,7 @@ impl RegistryOwnerHandle {
 /// candidate alive can still commit in the window between that verdict
 /// returning and the destructive phase's own irreversible steps -- actor
 /// removal, `ActorRemoved` tombstone emission -- actually running.
-/// `valid` (below) is a shared, lock-free `Arc<AtomicU8>`, the same state
+/// `valid` (below) is a shared, lock-free `Arc<ReapState>`, the same state
 /// stored by `PeerRegistryOwner::reap_reserved` for this address. It starts
 /// as `REAP_PENDING`; owner-side liveness evidence can transition it to
 /// `REAP_INVALIDATED` before the sweep commits. `try_consume` performs the
@@ -2083,34 +2667,36 @@ impl RegistryOwnerHandle {
 /// is reserved, so it cannot invalidate a reap after the destructive decision
 /// has crossed its linearization point.
 pub struct ReapReservation {
-    /// The unbounded release-channel sender this guard's release goes
-    /// through. Owner-side-built guards carry a clone taken inside the
-    /// owner task itself -- deliberately NOT the full
-    /// `RegistryOwnerHandle`, whose command-channel sender would keep the
-    /// owner's own mailbox alive from inside the owner task (see
-    /// `PeerRegistryOwner::run`).
-    release_tx: mpsc::UnboundedSender<OwnerCommand>,
+    release_permit: Option<mpsc::OwnedPermit<OwnerCommand>>,
     addr: SocketAddr,
-    released: bool,
-    valid: Arc<AtomicU8>,
-}
-
-/// Enqueue a `ReleaseReapReservation` on the dedicated unbounded release
-/// channel. Synchronous, no `.await` inside: safe from both `release()`
-/// and `Drop`. Shared by the handle API and the guards the owner task
-/// itself constructs.
-fn enqueue_reap_release_via(
-    release_tx: &mpsc::UnboundedSender<OwnerCommand>,
-    addr: SocketAddr,
-) -> Option<oneshot::Receiver<()>> {
-    let (reply, response) = oneshot::channel();
-    release_tx
-        .send(OwnerCommand::ReleaseReapReservation { addr, reply })
-        .ok()?;
-    Some(response)
+    valid: Arc<ReapState>,
 }
 
 impl ReapReservation {
+    fn enqueue_release(&mut self) -> Option<oneshot::Receiver<()>> {
+        let permit = self.release_permit.take()?;
+        let (reply, response) = oneshot::channel();
+        permit.send(OwnerCommand::ReleaseReapReservation {
+            addr: self.addr,
+            valid: Arc::clone(&self.valid),
+            reply,
+        });
+        Some(response)
+    }
+}
+
+impl ReapReservation {
+    pub(crate) fn deadline(&self) -> tokio::time::Instant {
+        self.valid.expires_at
+    }
+
+    #[cfg(test)]
+    pub(crate) fn protects_rollback(&self, addr: SocketAddr) -> bool {
+        self.addr == addr
+            && self.release_permit.is_some()
+            && self.valid.load(Ordering::Acquire) == REAP_COMMITTED
+    }
+
     /// Cheap, synchronous, no `.await`: `false` while DIRECT liveness
     /// evidence for this reservation's address has invalidated the pending
     /// reservation through the owner's serialized command stream
@@ -2118,13 +2704,13 @@ impl ReapReservation {
     /// state; `try_consume` is the only authorization for the destructive
     /// sequence.
     pub fn is_still_valid(&self) -> bool {
-        self.valid.load(Ordering::Acquire) == REAP_PENDING
+        !self.valid.expire() && self.valid.load(Ordering::Acquire) == REAP_PENDING
     }
 
     /// One-shot, race-free authorization to perform this reservation's
     /// complete destructive sequence: side tables, actors, tombstones and
     /// ownership. It is a compare-and-swap from `REAP_PENDING` to
-    /// `REAP_COMMITTED` on the same `Arc<AtomicU8>` that
+    /// `REAP_COMMITTED` on the same `Arc<ReapState>` that
     /// [`Self::is_still_valid`] reads, not a second read of it. `true` means
     /// this call crossed the reap's linearization point; later owner evidence
     /// is ordered after it and cannot produce an inconsistent ownership
@@ -2134,7 +2720,10 @@ impl ReapReservation {
     /// Call this exactly once per candidate as the single gate for its whole
     /// sequence; do not treat a later diagnostic peek as a second
     /// authorization.
-    pub fn try_consume(&self) -> bool {
+    pub(crate) fn try_consume(&self) -> bool {
+        if self.valid.expire() {
+            return false;
+        }
         self.valid
             .compare_exchange(
                 REAP_PENDING,
@@ -2148,62 +2737,48 @@ impl ReapReservation {
     /// Release this reservation. The normal path: call once the sweep's
     /// destructive work for this address has actually finished.
     pub async fn release(mut self) {
-        match enqueue_reap_release_via(&self.release_tx, self.addr) {
-            Some(response) => {
-                // Durably enqueued the instant `enqueue_reap_release`
-                // returned, above -- see this type's doc comment. Disarm
-                // NOW, before awaiting the reply below: even if this task
-                // is aborted while awaiting it, the release has already
-                // happened (or will, regardless of this task's fate), so
-                // `Drop` firing anyway would only be a redundant, harmless
-                // resend -- but disarming here avoids even that.
-                self.released = true;
-                let _ = response.await;
-            }
-            None => {
-                warn!(
-                    addr = %self.addr,
-                    "reap reservation release found the owner task already gone; nothing to \
-                     release"
-                );
-            }
+        if let Some(response) = self.enqueue_release() {
+            let _ = response.await;
         }
     }
 }
 
 impl Drop for ReapReservation {
     fn drop(&mut self) {
-        if self.released {
-            return;
-        }
-        // Best-effort fallback for a hard task abort -- see this type's
-        // doc comment. Synchronous, like `enqueue_reap_release` itself:
-        // `Drop::drop` cannot `.await`, but nothing here needs to.
-        match enqueue_reap_release_via(&self.release_tx, self.addr) {
-            None => warn!(
-                addr = %self.addr,
-                "reap reservation guard dropped without releasing -- owner task already gone; \
-                 nothing to release"
-            ),
-            Some(_release) => debug!(
-                addr = %self.addr,
-                "reap reservation guard dropped without a claimant releasing it -- released \
-                 best-effort via the release channel"
-            ),
-        }
+        let _ = self.enqueue_release();
     }
+}
+
+/// Fixed-size recovery record. No gossip state, actor names, payload, pool
+/// alias or strong stream reference is mutated or retained while pending.
+struct UnpublishedClaim {
+    prior_owner: Option<Owner>,
+    prior_had_sessions: bool,
+    prior_evidence: Option<std::time::Instant>,
+    candidate_evidence: std::time::Instant,
+    candidate: PeerId,
+    connection_instance_id: u64,
+    candidate_had_receipt: bool,
+    decision: Arc<AtomicU8>,
 }
 
 /// The single writer. Owns `addr_ownership` outright — no `Arc`, no mutex, no
 /// interior mutability — so `&mut self` alone proves exclusivity.
 struct PeerRegistryOwner {
+    limits: RegistryOwnerLimits,
+    publication: Arc<std::sync::Mutex<()>>,
     addr_ownership: HashMap<SocketAddr, Owner>,
     /// Latest accepted claim generation for each owned address. This is
     /// lifecycle fencing metadata, not part of the arbitration truth table.
     claim_generation: HashMap<SocketAddr, CommitSeq>,
+    unpublished_claims: HashMap<(SocketAddr, CommitSeq), UnpublishedClaim>,
+    /// Exact active journal generations and an optional release performed by
+    /// their own session exit. A vacancy is restorable only while its history
+    /// still equals that release; claim/release ABA never grants compensation.
+    speculative_releases: HashMap<(SocketAddr, CommitSeq), Option<CommitSeq>>,
     /// When each owned address last had DIRECT evidence of a live owner --
     /// an outbound dial this node completed, or an authenticated inbound
-    /// session (refreshed only by `claim_connection_scoped`, carried
+    /// session or a direct response (`note_liveness_evidence`), carried
     /// unchanged rather than refreshed by `migrate`, and never touched by
     /// the plain `claim` command gossip/discovery claims also go through).
     /// This is the owner's OWN, self-contained notion of "how recently was
@@ -2220,13 +2795,9 @@ struct PeerRegistryOwner {
     /// indirect chatter (repeated gossip/discovery claims, or DNS refresh
     /// attempts) about a peer nothing has actually reconnected to.
     ///
-    /// Deliberately narrow to NEW-CONNECTION/claim evidence, not ongoing
-    /// liveness on a connection already claimed: see `liveness_evidence_at`
-    /// below for the complementary fence `release_dead_peer` ALSO checks,
-    /// covering exactly the gap this field alone leaves -- an
-    /// already-claimed connection that keeps delivering ordinary responses
-    /// never commits another claim, so `claim_committed_at` never advances
-    /// for it again.
+    /// Direct responses for owned addresses reuse this bounded lifecycle
+    /// slot. `liveness_evidence_at` separately admits unowned candidates;
+    /// saturating that table must never suppress an existing owner's proof.
     claim_committed_at: HashMap<SocketAddr, std::time::Instant>,
     /// Connection-scoped ownership receipts: which live authenticated
     /// sessions currently back a peer's claim on an address, and at what
@@ -2301,14 +2872,17 @@ struct PeerRegistryOwner {
     /// destructive pass per address" true by construction.
     ///
     /// The VALUE is what makes a reservation a live authority rather than a
-    /// one-time admission ticket: a shared, lock-free `Arc<AtomicU8>`,
+    /// one-time admission ticket: a shared, lock-free `Arc<ReapState>`,
     /// initialized to `REAP_PENDING` when granted, with a clone handed to
     /// the matching [`ReapReservation`] guard. Owner-side liveness evidence
     /// can transition it to `REAP_INVALIDATED`; the guard's single
     /// `REAP_PENDING -> REAP_COMMITTED` CAS is the reap's linearization
     /// point. Pin-changing configuration is rejected while a previous pin
     /// is reserved, so no operator eviction can race a committed sweep.
-    reap_reserved: HashMap<SocketAddr, Arc<AtomicU8>>,
+    reap_reserved: HashMap<SocketAddr, Arc<ReapState>>,
+    /// Unowned candidate evidence, capped at `limits.state_entries`.
+    /// Refreshing an existing candidate is always admitted. Evidence is
+    /// promoted to an owner's lifecycle slot once that owner reports again.
     /// Updated ONLY via `OwnerCommand::NoteLivenessEvidence`, from within
     /// this task's own `&mut self` command handling -- see that variant's
     /// doc comment, and `claim_committed_at`'s just above, for why this
@@ -2354,7 +2928,7 @@ struct PeerRegistryOwner {
 
 impl PeerRegistryOwner {
     /// Run until every sender is dropped. Drains TWO channels: the main
-    /// bounded mailbox, and the dedicated unbounded release channel (see
+    /// bounded mailbox, and the dedicated reserved-slot cleanup channel (see
     /// `OwnerShared::release_tx`'s doc comment) -- `biased` so a ready
     /// release is always handled before a ready ordinary command, on the
     /// theory that a granted reservation should be held no longer than
@@ -2384,20 +2958,25 @@ impl PeerRegistryOwner {
     /// instant.
     async fn run(
         mut self,
-        // A clone of the UNBOUNDED release-channel sender only -- never the
+        // A clone of the dedicated release-channel sender only -- never the
         // full `RegistryOwnerHandle`, whose command-channel sender would
         // keep `rx`'s channel alive from inside this very task and prevent
         // it from ever observing "all senders dropped" (the owner task
         // would outlive every external handle). The release channel does
         // not gate this loop's exit: `rx.recv()` returning `None` breaks
         // the loop regardless of `release_rx`.
-        release_tx: mpsc::UnboundedSender<OwnerCommand>,
+        release_tx: mpsc::Sender<OwnerCommand>,
         mut rx: mpsc::Receiver<OwnerCommand>,
-        mut release_rx: mpsc::UnboundedReceiver<OwnerCommand>,
+        mut release_rx: mpsc::Receiver<OwnerCommand>,
     ) {
+        let mut expiry = tokio::time::interval(std::time::Duration::from_secs(1));
+        expiry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 biased;
+                _ = expiry.tick() => {
+                    self.reap_reserved.retain(|_, valid| !valid.expire());
+                }
                 Some(command) = release_rx.recv() => {
                     self.handle(command, &release_tx);
                 }
@@ -2415,7 +2994,7 @@ impl PeerRegistryOwner {
             // still happens per command inside `handle` rather than once
             // per batch: a reply must never be observable before the
             // snapshot that justifies it.
-            loop {
+            for _ in 0..OWNER_MAILBOX_CAPACITY {
                 if let Ok(command) = release_rx.try_recv() {
                     self.handle(command, &release_tx);
                     continue;
@@ -2430,8 +3009,107 @@ impl PeerRegistryOwner {
         debug!("registry owner task stopped: all senders dropped");
     }
 
-    fn handle(&mut self, command: OwnerCommand, release_tx: &mpsc::UnboundedSender<OwnerCommand>) {
+    fn handle(&mut self, command: OwnerCommand, release_tx: &mpsc::Sender<OwnerCommand>) {
+        let publication = Arc::clone(&self.publication);
+        let _publication = publication.lock().unwrap_or_else(|e| e.into_inner());
         match command {
+            OwnerCommand::MigrateProjection {
+                from,
+                to,
+                expected_source,
+                is_local_addr,
+                apply,
+                reply,
+            } => {
+                let outcome = self.migrate(from, to, &expected_source, is_local_addr);
+                let applied = apply(outcome);
+                let _ = reply.send(applied);
+            }
+            OwnerCommand::AbortSpeculativeClaim {
+                addr,
+                generation,
+                recover,
+                reply,
+            } => {
+                let mut outcome = self.abort_unpublished_claim(addr, generation);
+                if outcome == RollbackOutcome::Restored && !recover() {
+                    outcome = RollbackOutcome::RestorationFailed;
+                }
+                let _ = reply.send(outcome);
+            }
+            OwnerCommand::FinishSpeculativeClaim {
+                addr,
+                generation,
+                reply,
+            } => {
+                self.speculative_releases.remove(&(addr, generation));
+                self.unpublished_claims.remove(&(addr, generation));
+                let _ = reply.send(());
+            }
+            OwnerCommand::SpeculativeConnectionClaim {
+                addr,
+                claim,
+                session_source,
+                connection_instance_id,
+                evidence_at,
+                journal,
+                reply,
+            } => {
+                let current = self.snapshot.load();
+                let unchanged = journal
+                    .history
+                    .iter()
+                    .all(|receipt| current.matches_address_history(receipt));
+                drop(current);
+                let prior_owner = self.addr_ownership.get(&addr).cloned();
+                let prior_had_sessions = prior_owner.as_ref().is_some_and(|owner| {
+                    self.connection_scoped_claims
+                        .keys()
+                        .any(|key| key.0 == owner.node_id && key.2 == addr)
+                });
+                let candidate = claim.node_id.clone();
+                let candidate_had_receipt = self.connection_scoped_claims.contains_key(&(
+                    candidate.clone(),
+                    connection_instance_id,
+                    addr,
+                ));
+                let prior_evidence = self.claim_committed_at.get(&addr).copied();
+                let commit = if self.has_unpublished_claim(addr) {
+                    ClaimCommit::Rejected(ClaimRejection::StaleProjection)
+                } else if tokio::time::Instant::now() >= journal.deadline {
+                    ClaimCommit::Rejected(ClaimRejection::ExpiredProjection)
+                } else if unchanged {
+                    self.claim_connection_scoped_inner(
+                        addr,
+                        claim,
+                        session_source,
+                        connection_instance_id,
+                        evidence_at,
+                        false,
+                    )
+                } else {
+                    ClaimCommit::Rejected(ClaimRejection::StaleProjection)
+                };
+                if let Some(receipt) = commit.receipt() {
+                    self.speculative_releases
+                        .insert((addr, receipt.generation()), None);
+                    self.unpublished_claims.insert(
+                        (addr, receipt.generation()),
+                        UnpublishedClaim {
+                            prior_owner,
+                            prior_had_sessions,
+                            prior_evidence,
+                            candidate_evidence: evidence_at,
+                            candidate,
+                            connection_instance_id,
+                            candidate_had_receipt,
+                            decision: journal.decision.clone(),
+                        },
+                    );
+                }
+                (journal.start)(commit.clone());
+                let _ = reply.send(commit);
+            }
             OwnerCommand::Claim {
                 addr,
                 claim,
@@ -2441,6 +3119,126 @@ impl PeerRegistryOwner {
                 let commit = self.claim(addr, claim, is_local_addr);
                 // Reply AFTER the commit + publish above, never before.
                 let _ = reply.send(commit);
+            }
+            OwnerCommand::CommitReap {
+                peer_id,
+                addr,
+                evidence_before,
+                mut reservation,
+                apply,
+                reply,
+            } => {
+                let current = self
+                    .reap_reserved
+                    .get(&addr)
+                    .is_some_and(|state| Arc::ptr_eq(state, &reservation.valid));
+                let committed = reservation.try_consume()
+                    || reservation.valid.load(Ordering::Acquire) == REAP_COMMITTED;
+                let urgent = if current && committed {
+                    let outcome = self.release_dead_peer(&peer_id, addr, evidence_before);
+                    apply(outcome)
+                } else {
+                    false
+                };
+                // Release in the same owner turn, after all synchronous
+                // projection changes. No expired active guard admits a successor.
+                if current {
+                    self.reap_reserved.remove(&addr);
+                }
+                drop(reservation.release_permit.take());
+                let _ = reply.send(urgent);
+            }
+            #[cfg(test)]
+            OwnerCommand::RollbackProjection {
+                addr,
+                expected_owner,
+                expected_generation,
+                apply,
+                reply,
+            } => {
+                // A pending reap has not obtained gossip or destructive
+                // authority. An admitted journal must not lose compensation
+                // to that unrelated wait. Committed reaps already own gossip,
+                // so production rollback cannot reach this command beside one.
+                if self
+                    .speculative_releases
+                    .contains_key(&(addr, expected_generation))
+                    && self.reap_reserved.get(&addr).is_some_and(|state| {
+                        state
+                            .compare_exchange(
+                                REAP_PENDING,
+                                REAP_INVALIDATED,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                    })
+                {
+                    self.reap_reserved.remove(&addr);
+                }
+                let released = if self.reap_reserved.contains_key(&addr) {
+                    None
+                } else {
+                    self.release(addr, &expected_owner, expected_generation)
+                        .or_else(|| {
+                            let release = self
+                                .speculative_releases
+                                .get(&(addr, expected_generation))
+                                .copied()
+                                .flatten()?;
+                            let snapshot = self.snapshot.load();
+                            (snapshot.owner(&addr).is_none()
+                                && snapshot.history_shards[RoutingSnapshot::shard_index(&addr)]
+                                    .get(&addr)
+                                    == Some(&release))
+                            .then_some(release)
+                        })
+                };
+                let outcome = match released {
+                    Some(sequence) => {
+                        if apply(sequence) {
+                            RollbackOutcome::Restored
+                        } else {
+                            RollbackOutcome::RestorationFailed
+                        }
+                    }
+                    None if self.reap_reserved.contains_key(&addr) => {
+                        RollbackOutcome::RestorationFailed
+                    }
+                    None => RollbackOutcome::Superseded,
+                };
+                let _ = reply.send(outcome);
+            }
+            #[cfg(test)]
+            OwnerCommand::ReleaseForRollback {
+                addr,
+                expected_owner,
+                expected_generation,
+                release_permit,
+                reply,
+            } => {
+                if self.reap_reserved.contains_key(&addr) {
+                    let _ = reply.send(None);
+                    return;
+                }
+                let result = self
+                    .release(addr, &expected_owner, expected_generation)
+                    .map(|seq| {
+                        let valid = Arc::new(ReapState {
+                            state: AtomicU8::new(REAP_COMMITTED),
+                            expires_at: tokio::time::Instant::now(),
+                        });
+                        self.reap_reserved.insert(addr, Arc::clone(&valid));
+                        (
+                            seq,
+                            ReapReservation {
+                                release_permit: Some(release_permit),
+                                addr,
+                                valid,
+                            },
+                        )
+                    });
+                let _ = reply.send(result);
             }
             OwnerCommand::Release {
                 addr,
@@ -2536,6 +3334,10 @@ impl PeerRegistryOwner {
                 expected_node_id,
                 reply,
             } => {
+                let Ok(release_permit) = release_tx.clone().try_reserve_owned() else {
+                    let _ = reply.send(Err(ReapAdmissionError::Capacity));
+                    return;
+                };
                 let granted = self.reserve_for_reap(
                     addr,
                     evidence_before,
@@ -2553,12 +3355,11 @@ impl PeerRegistryOwner {
                 // would have left `reap_reserved` pinned forever, refusing
                 // every later claim for the address.
                 let response = granted.map(|valid| ReapReservation {
-                    release_tx: release_tx.clone(),
+                    release_permit: Some(release_permit),
                     addr,
-                    released: false,
                     valid,
                 });
-                if reply.send(response).is_err() {
+                if reply.send(Ok(response)).is_err() {
                     debug!(
                         addr = %addr,
                         "reap reservation dropped without a claimant; the guard's own drop \
@@ -2566,8 +3367,14 @@ impl PeerRegistryOwner {
                     );
                 }
             }
-            OwnerCommand::ReleaseReapReservation { addr, reply } => {
-                self.reap_reserved.remove(&addr);
+            OwnerCommand::ReleaseReapReservation { addr, valid, reply } => {
+                if self
+                    .reap_reserved
+                    .get(&addr)
+                    .is_some_and(|current| Arc::ptr_eq(current, &valid))
+                {
+                    self.reap_reserved.remove(&addr);
+                }
                 let _ = reply.send(());
             }
             #[cfg(test)]
@@ -2597,6 +3404,39 @@ impl PeerRegistryOwner {
                 let _ = reply.send(accepted);
             }
             #[cfg(test)]
+            OwnerCommand::SeedHistoricalProvisional {
+                addr,
+                peer_id,
+                reply,
+            } => {
+                assert!(
+                    self.addr_ownership
+                        .insert(
+                            addr,
+                            Owner {
+                                node_id: peer_id.clone(),
+                                kind: ClaimKind::Provisional,
+                            }
+                        )
+                        .is_none(),
+                    "historical fixture must start vacant"
+                );
+                let result = self.claim(
+                    addr,
+                    Claim {
+                        node_id: peer_id.clone(),
+                        kind: ClaimKind::Provisional,
+                    },
+                    false,
+                );
+                // Seed the historical projection as well: a same-kind
+                // refresh intentionally does not republish an unchanged owner.
+                if let Some(routing) = self.routing.upgrade() {
+                    routing.publish_owner(addr, &peer_id);
+                }
+                let _ = reply.send(result);
+            }
+            #[cfg(test)]
             OwnerCommand::InspectGeneration { addr, reply } => {
                 let _ = reply.send(self.claim_generation.get(&addr).copied());
             }
@@ -2604,13 +3444,151 @@ impl PeerRegistryOwner {
             OwnerCommand::IsReapReserved { addr, reply } => {
                 let _ = reply.send(self.reap_reserved.contains_key(&addr));
             }
-            OwnerCommand::NoteLivenessEvidence { addr, at } => {
-                self.note_liveness_evidence(addr, at);
+            OwnerCommand::NoteLivenessEvidence { addr, at, reply } => {
+                let result = self.note_liveness_evidence(addr, at);
+                let _ = reply.send(result);
             }
         }
     }
 
+    fn claim_rejection(
+        &self,
+        addr: SocketAddr,
+        claim: &Claim,
+        is_local_addr: bool,
+    ) -> Option<ClaimRejection> {
+        if !self
+            .snapshot
+            .load()
+            .history_can_admit(&addr, self.limits.state_entries.get())
+        {
+            return Some(ClaimRejection::Capacity);
+        }
+        if !self.addr_ownership.contains_key(&addr)
+            && self.addr_ownership.len() >= self.limits.state_entries.get()
+        {
+            return Some(ClaimRejection::Capacity);
+        }
+        if self.reap_reserved.contains_key(&addr) {
+            return Some(ClaimRejection::ReapInProgress);
+        }
+        match arbitrate(
+            self.addr_ownership.get(&addr).cloned(),
+            claim.clone(),
+            is_local_addr,
+        ) {
+            Decision::Accept => None,
+            Decision::Reject(reason) => Some(ClaimRejection::Arbitration(reason)),
+        }
+    }
+
+    fn has_unpublished_claim(&self, addr: SocketAddr) -> bool {
+        self.claim_generation.get(&addr).is_some_and(|generation| {
+            self.unpublished_claims
+                .get(&(addr, *generation))
+                .is_some_and(|claim| claim.decision.load(Ordering::Acquire) != 1)
+        })
+    }
+
+    /// Abandon only this unpublished generation. Recovery never reads public
+    /// gossip, waits for a lock, restores a stream, or expires a committed reap.
+    fn abort_unpublished_claim(
+        &mut self,
+        addr: SocketAddr,
+        generation: CommitSeq,
+    ) -> RollbackOutcome {
+        let Some(pending) = self.unpublished_claims.remove(&(addr, generation)) else {
+            return RollbackOutcome::Superseded;
+        };
+        if pending.decision.load(Ordering::Acquire) == 1 {
+            return RollbackOutcome::Superseded;
+        }
+        let current = self.claim_generation.get(&addr) == Some(&generation);
+        let own_release = self
+            .speculative_releases
+            .get(&(addr, generation))
+            .copied()
+            .flatten();
+        let history = self.snapshot.load().address_history_receipt(addr);
+        let own_vacancy = !self.addr_ownership.contains_key(&addr)
+            && own_release.is_some_and(|release| history.generation == Some(release));
+        if !current && !own_vacancy {
+            return RollbackOutcome::Superseded;
+        }
+        let retained_evidence = pending.prior_owner.as_ref().and_then(|owner| {
+            (owner.node_id == pending.candidate)
+                .then(|| self.claim_committed_at.get(&addr).copied())
+                .flatten()
+                .filter(|at| *at > pending.candidate_evidence)
+        });
+        if !pending.candidate_had_receipt {
+            self.connection_scoped_claims.remove(&(
+                pending.candidate,
+                pending.connection_instance_id,
+                addr,
+            ));
+        }
+        let prior = pending.prior_owner.filter(|owner| {
+            !pending.prior_had_sessions
+                || self.operator_pinned.get(&addr) == Some(&owner.node_id)
+                || self
+                    .connection_scoped_claims
+                    .keys()
+                    .any(|key| key.0 == owner.node_id && key.2 == addr)
+        });
+        let sequence = self.advance();
+        match prior {
+            Some(owner) => {
+                self.addr_ownership.insert(addr, owner.clone());
+                self.claim_generation.insert(addr, sequence);
+                for (key, generation) in &mut self.connection_scoped_claims {
+                    if key.0 == owner.node_id && key.2 == addr {
+                        *generation = sequence;
+                    }
+                }
+                match pending.prior_evidence.max(retained_evidence) {
+                    Some(at) => {
+                        self.claim_committed_at.insert(addr, at);
+                    }
+                    None => {
+                        self.claim_committed_at.remove(&addr);
+                    }
+                }
+                self.publish_owner_snapshot(addr, Some((owner, sequence)));
+            }
+            None => {
+                self.addr_ownership.remove(&addr);
+                self.claim_generation.remove(&addr);
+                self.claim_committed_at.remove(&addr);
+                self.publish_owner_snapshot(addr, None);
+            }
+        }
+        RollbackOutcome::Restored
+    }
+
     fn claim(&mut self, addr: SocketAddr, claim: Claim, is_local_addr: bool) -> ClaimCommit {
+        self.claim_inner(addr, claim, is_local_addr, true)
+    }
+
+    fn claim_inner(
+        &mut self,
+        addr: SocketAddr,
+        claim: Claim,
+        is_local_addr: bool,
+        publish_routing: bool,
+    ) -> ClaimCommit {
+        if !self
+            .snapshot
+            .load()
+            .history_can_admit(&addr, self.limits.state_entries.get())
+        {
+            return ClaimCommit::Rejected(ClaimRejection::Capacity);
+        }
+        if !self.addr_ownership.contains_key(&addr)
+            && self.addr_ownership.len() >= self.limits.state_entries.get()
+        {
+            return ClaimCommit::Rejected(ClaimRejection::Capacity);
+        }
         // A `cleanup_dead_peers` sweep is currently reaping this address --
         // see `reap_reserved`'s doc comment and `OwnerCommand::
         // ReserveForReap`. Refused unconditionally, before `arbitrate` is
@@ -2629,6 +3607,7 @@ impl PeerRegistryOwner {
             return ClaimCommit::Rejected(ClaimRejection::ReapInProgress);
         }
         let current = self.addr_ownership.get(&addr).cloned();
+        let prior_unpublished = self.has_unpublished_claim(addr);
         match arbitrate(current.clone(), claim.clone(), is_local_addr) {
             Decision::Reject(reason) => {
                 // Rejected claims mutate nothing and publish nothing.
@@ -2715,7 +3694,7 @@ impl PeerRegistryOwner {
                 // generation fence. Refresh it for every accepted command;
                 // route publication itself remains identity/kind-change only.
                 self.publish_owner_snapshot(addr, Some((next_owner, commit_seq)));
-                if ownership_changed {
+                if publish_routing && (ownership_changed || prior_unpublished) {
                     if let Some(routing) = self.routing.upgrade() {
                         routing.publish_owner(addr, &node_id);
                     }
@@ -2766,8 +3745,37 @@ impl PeerRegistryOwner {
         connection_instance_id: u64,
         evidence_at: std::time::Instant,
     ) -> ClaimCommit {
+        self.claim_connection_scoped_inner(
+            addr,
+            claim,
+            _session_source,
+            connection_instance_id,
+            evidence_at,
+            true,
+        )
+    }
+
+    fn claim_connection_scoped_inner(
+        &mut self,
+        addr: SocketAddr,
+        claim: Claim,
+        _session_source: SocketAddr,
+        connection_instance_id: u64,
+        evidence_at: std::time::Instant,
+        publish_routing: bool,
+    ) -> ClaimCommit {
         let peer_id = claim.node_id.clone();
-        let commit = self.claim(addr, claim, /* is_local_addr */ false);
+        if self.operator_pinned.get(&addr) != Some(&peer_id)
+            && !self.connection_scoped_claims.contains_key(&(
+                peer_id.clone(),
+                connection_instance_id,
+                addr,
+            ))
+            && self.connection_scoped_claims.len() >= self.limits.state_entries.get()
+        {
+            return ClaimCommit::Rejected(ClaimRejection::Capacity);
+        }
+        let commit = self.claim_inner(addr, claim, false, publish_routing);
         if commit.is_accepted() {
             // Unlike the plain `claim` command, every call into this method
             // is backed by an actual connection -- an outbound dial this
@@ -2913,7 +3921,7 @@ impl PeerRegistryOwner {
 
     /// Invalidate a currently-held reap reservation for `addr`, if one
     /// exists -- a no-op otherwise. Cheap and synchronous: transitions the
-    /// SAME `Arc<AtomicU8>` `reap_reserved` shares with the matching
+    /// SAME `Arc<ReapState>` `reap_reserved` shares with the matching
     /// `ReapReservation` guard, from within this task's own serialized
     /// command stream (see `reap_reserved`'s own doc comment for why the
     /// write must happen here, never from outside).
@@ -2957,16 +3965,35 @@ impl PeerRegistryOwner {
     /// reservation here, synchronously, from within this task's serialized
     /// command stream, makes the pending CAS fail; evidence processed after
     /// a committed CAS is ordered after the reap by `release_dead_peer`.
-    fn note_liveness_evidence(&mut self, addr: SocketAddr, at: std::time::Instant) {
-        self.liveness_evidence_at
+    fn note_liveness_evidence(
+        &mut self,
+        addr: SocketAddr,
+        at: std::time::Instant,
+    ) -> crate::Result<()> {
+        // Owned addresses already have bounded lifecycle storage. Unknown
+        // senders cannot exhaust the evidence budget needed by live owners.
+        let mut at = at;
+        let evidence = if self.addr_ownership.contains_key(&addr) {
+            // Promote admitted pre-ownership evidence without losing its
+            // high-water mark, releasing its candidate admission slot.
+            if let Some(candidate_at) = self.liveness_evidence_at.remove(&addr) {
+                at = at.max(candidate_at);
+            }
+            &mut self.claim_committed_at
+        } else {
+            if !self.liveness_evidence_at.contains_key(&addr)
+                && self.liveness_evidence_at.len() >= self.limits.state_entries.get()
+            {
+                return Err(crate::GossipError::WriteQueueFull);
+            }
+            &mut self.liveness_evidence_at
+        };
+        evidence
             .entry(addr)
-            .and_modify(|existing| {
-                if at > *existing {
-                    *existing = at;
-                }
-            })
+            .and_modify(|existing| *existing = (*existing).max(at))
             .or_insert(at);
         self.invalidate_reap_reservation(addr);
+        Ok(())
     }
 
     /// `OwnerCommand::HasNewerLivenessEvidence`'s handler: the SAME causal
@@ -3067,20 +4094,10 @@ impl PeerRegistryOwner {
     /// all) never protects the address, no matter how promptly the sweep
     /// reaches this command.
     ///
-    /// `claim_committed_at` alone only ever advances on a NEW claim/session
-    /// event -- it says nothing about ongoing traffic on a connection
-    /// ALREADY claimed, which never commits another claim no matter how
-    /// many responses it delivers. `liveness_evidence_at` (the same causal
-    /// comparison, against the same `evidence_before`) is the
-    /// complementary fence for exactly that case -- see its own doc
-    /// comment. Checking both, in the SAME synchronous step that decides
-    /// the release, is what finally closes this family of finding: every
-    /// earlier fence in this file answered "did a NEW claim land in some
-    /// window", and gossip delivering ordinary liveness on an
-    /// already-established connection was never a claim at all, so it
-    /// could slip through any fence built only from claim events, no
-    /// matter how many windows those fences closed or how early they
-    /// closed them.
+    /// Owned-session direct responses also advance `claim_committed_at`.
+    /// Unowned candidates have separately bounded `liveness_evidence_at`
+    /// storage. Both fences are checked in the same synchronous release
+    /// decision; neither can silently lose admitted evidence at capacity.
     fn release_dead_peer(
         &mut self,
         peer_id: &PeerId,
@@ -3199,7 +4216,10 @@ impl PeerRegistryOwner {
         expected_ownership: Option<OwnershipToken>,
         expected_pin: Option<PeerId>,
         expected_node_id: Option<PeerId>,
-    ) -> Option<Arc<AtomicU8>> {
+    ) -> Option<Arc<ReapState>> {
+        if self.has_unpublished_claim(addr) {
+            return None;
+        }
         if self
             .claim_committed_at
             .get(&addr)
@@ -3279,7 +4299,10 @@ impl PeerRegistryOwner {
         if self.reap_reserved.contains_key(&addr) {
             return None;
         }
-        let valid = Arc::new(AtomicU8::new(REAP_PENDING));
+        let valid = Arc::new(ReapState {
+            state: AtomicU8::new(REAP_PENDING),
+            expires_at: tokio::time::Instant::now() + self.limits.pending_reap_lifetime,
+        });
         self.reap_reserved.insert(addr, valid.clone());
         Some(valid)
     }
@@ -3340,9 +4363,6 @@ impl PeerRegistryOwner {
         if let Some(evicted_addr) = evicted {
             self.operator_pinned.remove(&evicted_addr);
         }
-        if let Some(routing) = self.routing.upgrade() {
-            routing.set_configured_peer_addr(addr, &peer_id, evicted);
-        }
         self.operator_pinned.insert(addr, peer_id.clone());
         let snapshot = self.snapshot.load_full();
         let mut snapshot = snapshot.with_pin(addr, Some(peer_id));
@@ -3361,6 +4381,21 @@ impl PeerRegistryOwner {
     /// ownership-backed pin must use `configure_peer` instead.
     #[cfg(test)]
     fn pin(&mut self, addr: SocketAddr, peer_id: PeerId) -> Option<SocketAddr> {
+        let routing = self.routing.upgrade();
+        let _admission = if let Some(routing) = &routing {
+            let admission = routing.reserve_peer_session(&peer_id).ok()?;
+            let evicted = self
+                .pinned_by_peer
+                .get(&peer_id)
+                .copied()
+                .filter(|old| *old != addr);
+            routing
+                .set_configured_peer_addr(addr, &peer_id, evicted)
+                .ok()?;
+            admission
+        } else {
+            None
+        };
         self.install_pin(addr, peer_id)
     }
 
@@ -3412,7 +4447,12 @@ impl PeerRegistryOwner {
             // Never a pin eviction: this command only ever runs for an
             // ordinary connect, and declines outright above whenever the
             // peer is pinned anywhere else -- there is nothing to evict.
-            routing.set_configured_peer_addr(addr, peer_id, None);
+            let Ok(_admission) = routing.reserve_peer_session(peer_id) else {
+                return false;
+            };
+            return routing
+                .set_configured_peer_addr(addr, peer_id, None)
+                .is_ok();
         }
         true
     }
@@ -3476,6 +4516,16 @@ impl PeerRegistryOwner {
             .get(&peer_id)
             .copied()
             .unwrap_or(0);
+        if !self.configure_peer_generation.contains_key(&peer_id)
+            && self.configure_peer_generation.len() >= self.limits.state_entries.get()
+        {
+            return ConfigurePeerCommit {
+                claim: ClaimCommit::Rejected(ClaimRejection::Capacity),
+                evicted_pin: None,
+                evicted_release_seq: None,
+                generation: current_generation,
+            };
+        }
         // A reconfiguration also mutates the peer's previous pin: the
         // eviction/release below must not race a reap already committed for
         // that address. Treat the collision as the same temporary refusal as
@@ -3504,7 +4554,14 @@ impl PeerRegistryOwner {
             }
             Some(expected) => expected,
             None => {
-                let bumped = current_generation + 1;
+                let Some(bumped) = current_generation.checked_add(1) else {
+                    return ConfigurePeerCommit {
+                        claim: ClaimCommit::Rejected(ClaimRejection::Capacity),
+                        evicted_pin: None,
+                        evicted_release_seq: None,
+                        generation: current_generation,
+                    };
+                };
                 self.configure_peer_generation
                     .insert(peer_id.clone(), bumped);
                 bumped
@@ -3513,6 +4570,42 @@ impl PeerRegistryOwner {
         let claim = Claim {
             node_id: peer_id.clone(),
             kind: ClaimKind::Verified,
+        };
+        if let Some(reason) = self.claim_rejection(addr, &claim, false) {
+            return ConfigurePeerCommit {
+                claim: ClaimCommit::Rejected(reason),
+                evicted_pin: None,
+                evicted_release_seq: None,
+                generation,
+            };
+        }
+        let routing = self.routing.upgrade();
+        let _admission = if let Some(routing) = &routing {
+            let admission = routing.reserve_peer_session(&peer_id);
+            let evicted = self
+                .pinned_by_peer
+                .get(&peer_id)
+                .copied()
+                .filter(|old| *old != addr);
+            match admission {
+                Ok(admission)
+                    if routing
+                        .set_configured_peer_addr(addr, &peer_id, evicted)
+                        .is_ok() =>
+                {
+                    admission
+                }
+                _ => {
+                    return ConfigurePeerCommit {
+                        claim: ClaimCommit::Rejected(ClaimRejection::Capacity),
+                        evicted_pin: None,
+                        evicted_release_seq: None,
+                        generation,
+                    };
+                }
+            }
+        } else {
+            None
         };
         let commit = self.claim(addr, claim, /* is_local_addr */ false);
         if !commit.is_accepted() {
@@ -3576,7 +4669,12 @@ impl PeerRegistryOwner {
     /// still-live second session that in fact tore down long ago --
     /// permanently stranding the address.
     fn retract_owner(&mut self, addr: SocketAddr, owner: Owner) -> CommitSeq {
-        self.claim_generation.remove(&addr);
+        let generation = self.claim_generation.remove(&addr);
+        let unpublished = generation.is_some_and(|generation| {
+            self.unpublished_claims
+                .get(&(addr, generation))
+                .is_some_and(|claim| claim.decision.load(Ordering::Acquire) != 1)
+        });
         self.claim_committed_at.remove(&addr);
         // Mirrors `claim_committed_at`'s own cleanup above -- prevents
         // unbounded growth over a long-running process's lifetime as
@@ -3584,10 +4682,17 @@ impl PeerRegistryOwner {
         // dead-peer reap). A fresh claim for this address afterward starts
         // with no stale liveness evidence to accidentally protect it.
         self.liveness_evidence_at.remove(&addr);
-        self.connection_scoped_claims.retain(|key, _| key.2 != addr);
+        if !unpublished {
+            self.connection_scoped_claims.retain(|key, _| key.2 != addr);
+        }
         let commit_seq = self.advance();
+        if let Some(generation) = generation
+            && let Some(release) = self.speculative_releases.get_mut(&(addr, generation))
+        {
+            *release = Some(commit_seq);
+        }
         self.publish_owner_snapshot(addr, None);
-        if let Some(routing) = self.routing.upgrade() {
+        if !unpublished && let Some(routing) = self.routing.upgrade() {
             routing.retract_owner(addr, &owner.node_id);
         }
         commit_seq
@@ -3615,6 +4720,16 @@ impl PeerRegistryOwner {
         expected_source: &SourceExpectation,
         is_local_addr: bool,
     ) -> MigrateOutcome {
+        if self.has_unpublished_claim(from) || self.has_unpublished_claim(to) {
+            return MigrateOutcome::SourceOwnerMismatch;
+        }
+        if !self
+            .snapshot
+            .load()
+            .history_can_admit(&to, self.limits.state_entries.get())
+        {
+            return MigrateOutcome::Capacity;
+        }
         // See `MigrateOutcome::ReapInProgress`'s doc comment: this command
         // mutates `addr_ownership`/`claim_committed_at` for BOTH addresses
         // directly, without going through `claim`'s own `reap_reserved`
@@ -3690,6 +4805,25 @@ impl PeerRegistryOwner {
             node_id: owner.node_id,
             kind,
         };
+        let routing = self.routing.upgrade();
+        let pin = self.operator_pinned.get(&from).cloned();
+        let _admission = if let Some(routing) = &routing {
+            let target_peer = pin.as_ref().unwrap_or(&owner.node_id);
+            let Ok(admission) = routing.reserve_peer_session(target_peer) else {
+                return MigrateOutcome::Capacity;
+            };
+            let result = if let Some(pinned_peer) = &pin {
+                routing.set_configured_peer_addr(to, pinned_peer, Some(from))
+            } else {
+                routing.set_discovered_peer_addr(to, &owner.node_id)
+            };
+            if result.is_err() {
+                return MigrateOutcome::Capacity;
+            }
+            admission
+        } else {
+            None
+        };
         self.addr_ownership.remove(&from);
         self.addr_ownership.insert(to, owner.clone());
         // An operator pin travels with its address's re-resolution rather
@@ -3722,9 +4856,6 @@ impl PeerRegistryOwner {
             // not survive the move, or a later, different identity
             // claiming `from` inherits this peer's still-live connection
             // via `get_connection_by_peer_id`'s address fallback.
-            if let Some(routing) = self.routing.upgrade() {
-                routing.set_configured_peer_addr(to, &pinned_peer, Some(from));
-            }
         }
         let commit_seq = self.advance();
         self.claim_generation.remove(&from);
@@ -3809,9 +4940,11 @@ impl PeerRegistryOwner {
                 .or_insert(from_seen_at);
         }
         let snapshot = self.snapshot.load_full();
-        let mut snapshot = snapshot
-            .with_owner(from, None)
-            .with_owner(to, Some((owner.clone(), commit_seq)));
+        let mut snapshot = snapshot.with_owner(from, None, commit_seq).with_owner(
+            to,
+            Some((owner.clone(), commit_seq)),
+            commit_seq,
+        );
         // The pin's own publication moves with it, in this SAME snapshot
         // construction, for the same reason its `ConnectionPool` route
         // does above: a caller revalidating "is my pin still current" (see
@@ -3844,7 +4977,7 @@ impl PeerRegistryOwner {
     fn publish_owner_snapshot(&self, addr: SocketAddr, owner: Option<(Owner, CommitSeq)>) {
         let snapshot = self.snapshot.load_full();
         self.snapshot
-            .store(Arc::new(snapshot.with_owner(addr, owner)));
+            .store(Arc::new(snapshot.with_owner(addr, owner, self.commit_seq)));
     }
 }
 
@@ -3895,11 +5028,12 @@ mod tests {
             addr: SocketAddr,
             peer_id: &PeerId,
             evicted_addr: Option<SocketAddr>,
-        ) {
+        ) -> crate::Result<()> {
             self.configured_routes
                 .lock()
                 .expect("publisher mutex")
                 .push((addr, peer_id.clone(), evicted_addr));
+            Ok(())
         }
     }
 
@@ -3926,6 +5060,283 @@ mod tests {
             .ownership_token(&addr)
             .map(SourceExpectation::Owned)
             .unwrap_or(SourceExpectation::Unowned)
+    }
+
+    #[tokio::test]
+    async fn speculative_journal_admission_is_bounded_and_preserves_owner_progress() {
+        let (owner, _publisher) = owner_handle();
+        let mut permits = Vec::new();
+        for _ in 0..owner.shared.limits.reservations.get() {
+            permits.push(owner.reserve_speculative_claim().unwrap());
+        }
+        assert!(matches!(
+            owner.reserve_speculative_claim(),
+            Err(ReapAdmissionError::Capacity)
+        ));
+        assert!(
+            owner
+                .claim(
+                    addr(39_000),
+                    claim_of(peer("journal-progress"), ClaimKind::Verified),
+                    false,
+                )
+                .await
+                .is_accepted()
+        );
+        permits.pop();
+        assert!(owner.reserve_speculative_claim().is_ok());
+    }
+
+    #[test]
+    fn speculative_byte_charge_has_a_strict_shared_plateau() {
+        let (owner, _publisher) = owner_handle();
+        let full = owner
+            .reserve_speculative_bytes(OWNER_SPECULATIVE_BYTES)
+            .unwrap();
+        assert!(matches!(
+            owner.reserve_speculative_bytes(1),
+            Err(ReapAdmissionError::Capacity)
+        ));
+        drop(full);
+        assert!(
+            owner
+                .reserve_speculative_bytes(OWNER_SPECULATIVE_BYTES)
+                .is_ok()
+        );
+        assert!(matches!(
+            owner.reserve_speculative_bytes(OWNER_SPECULATIVE_BYTES + 1),
+            Err(ReapAdmissionError::Capacity)
+        ));
+    }
+
+    async fn unpublished_claim(
+        owner: &RegistryOwnerHandle,
+        address: SocketAddr,
+        candidate: PeerId,
+        instance: u64,
+    ) -> ClaimCommit {
+        owner
+            .claim_speculative_connection(
+                address,
+                claim_of(candidate, ClaimKind::Verified),
+                address,
+                instance,
+                SpeculativeClaimJournal {
+                    history: vec![owner.snapshot().address_history_receipt(address)],
+                    deadline: tokio::time::Instant::now() + Duration::from_secs(30),
+                    decision: Arc::new(AtomicU8::new(2)),
+                    start: Box::new(|_| {}),
+                },
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn unpublished_claim_cannot_chain_migrate_or_grant_destructive_authority() {
+        let (owner, publisher) = owner_handle();
+        let address = addr(39_010);
+        let candidate = peer("unpublished-candidate");
+        let first = unpublished_claim(&owner, address, candidate.clone(), 99_010).await;
+        let generation = first.commit_seq().unwrap();
+        assert!(
+            publisher.events().is_empty(),
+            "pending claim publishes no pool route"
+        );
+        assert!(matches!(
+            unpublished_claim(&owner, address, candidate.clone(), 99_011).await,
+            ClaimCommit::Rejected(ClaimRejection::StaleProjection)
+        ));
+        assert_eq!(
+            owner
+                .migrate(
+                    address,
+                    addr(39_011),
+                    current_source(&owner, address),
+                    false
+                )
+                .await,
+            MigrateOutcome::SourceOwnerMismatch
+        );
+        assert!(
+            owner
+                .reserve_for_reap(
+                    address,
+                    std::time::Instant::now(),
+                    owner.ownership_token(&address),
+                    None,
+                    Some(candidate.clone()),
+                )
+                .await
+                .is_none()
+        );
+        assert_eq!(
+            owner.abort_speculative_claim(address, generation).await,
+            RollbackOutcome::Restored
+        );
+        owner.finish_speculative_claim(address, generation).await;
+        assert_eq!(owner.routes_to(&address), None);
+        assert!(
+            publisher.events().is_empty(),
+            "rollback has no pool projection to undo"
+        );
+        assert!(
+            owner
+                .claim(address, claim_of(candidate, ClaimKind::Verified), false)
+                .await
+                .is_accepted()
+        );
+        assert!(
+            !publisher.events().is_empty(),
+            "ordinary committed publication still works"
+        );
+    }
+
+    #[tokio::test]
+    async fn unpublished_abort_does_not_resurrect_exited_displaced_session() {
+        let (owner, _publisher) = owner_handle();
+        let address = addr(39_012);
+        let prior = peer("unpublished-prior-session");
+        // A lawful verified owner may refresh onto a successor physical
+        // session; an unverified first claim cannot establish ownership.
+        let candidate = prior.clone();
+        assert!(
+            owner
+                .claim_connection_scoped_at(
+                    address,
+                    claim_of(prior.clone(), ClaimKind::Verified),
+                    address,
+                    99_012,
+                    std::time::Instant::now(),
+                )
+                .await
+                .is_accepted()
+        );
+        let pending = unpublished_claim(&owner, address, candidate, 99_013).await;
+        assert!(
+            owner
+                .release_session_for_instance(prior, address, 99_012)
+                .await
+                .is_empty()
+        );
+        assert_eq!(
+            owner
+                .abort_speculative_claim(address, pending.commit_seq().unwrap())
+                .await,
+            RollbackOutcome::Restored
+        );
+        assert_eq!(owner.routes_to(&address), None);
+    }
+
+    #[tokio::test]
+    async fn unpublished_abort_preserves_live_displaced_receipt_after_candidate_exit() {
+        let (owner, _publisher) = owner_handle();
+        let address = addr(39_013);
+        let prior = peer("unpublished-live-prior");
+        let candidate = prior.clone();
+        owner
+            .claim_connection_scoped_at(
+                address,
+                claim_of(prior.clone(), ClaimKind::Verified),
+                address,
+                99_014,
+                std::time::Instant::now(),
+            )
+            .await;
+        let pending = unpublished_claim(&owner, address, candidate.clone(), 99_015).await;
+        assert_eq!(
+            owner
+                .release_session_for_instance(candidate, address, 99_015)
+                .await
+                .len(),
+            0 // the prior physical receipt still covers this same-peer address
+        );
+        assert_eq!(
+            owner
+                .abort_speculative_claim(address, pending.commit_seq().unwrap())
+                .await,
+            RollbackOutcome::Restored
+        );
+        assert_eq!(owner.routes_to(&address), Some(prior.clone()));
+        assert_eq!(
+            owner
+                .release_session_for_instance(prior, address, 99_014)
+                .await
+                .len(),
+            1
+        );
+        assert_eq!(owner.routes_to(&address), None);
+    }
+
+    #[tokio::test]
+    async fn ordinary_successor_of_unpublished_claim_publishes_and_survives_abort() {
+        let (owner, publisher) = owner_handle();
+        let address = addr(39_014);
+        let candidate = peer("unpublished-ordinary-successor");
+        let pending = unpublished_claim(&owner, address, candidate.clone(), 99_016).await;
+        assert!(publisher.events().is_empty());
+        let successor = owner
+            .claim(
+                address,
+                claim_of(candidate.clone(), ClaimKind::Verified),
+                false,
+            )
+            .await;
+        assert!(!publisher.events().is_empty());
+        assert_eq!(
+            owner
+                .abort_speculative_claim(address, pending.commit_seq().unwrap())
+                .await,
+            RollbackOutcome::Superseded
+        );
+        assert!(owner.claim_is_current(&address, &candidate, successor.commit_seq().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn speculative_preclaim_rejects_secondary_vacant_aba_before_mutation() {
+        let (owner, publisher) = owner_handle();
+        let address = addr(39_001);
+        let secondary = addr(39_002);
+        let history = vec![
+            owner.snapshot().address_history_receipt(address),
+            owner.snapshot().address_history_receipt(secondary),
+        ];
+        let foreign = peer("preclaim-secondary-foreign");
+        let foreign_claim = owner
+            .claim(
+                secondary,
+                claim_of(foreign.clone(), ClaimKind::Verified),
+                false,
+            )
+            .await;
+        owner
+            .release(secondary, foreign, foreign_claim.commit_seq().unwrap())
+            .await
+            .unwrap();
+        let before = publisher.events().len();
+        let (sent, received) = oneshot::channel();
+        let result = owner
+            .claim_speculative_connection(
+                address,
+                claim_of(peer("preclaim-candidate"), ClaimKind::Verified),
+                secondary,
+                99_001,
+                SpeculativeClaimJournal {
+                    history,
+                    deadline: tokio::time::Instant::now() + Duration::from_secs(30),
+                    decision: Arc::new(AtomicU8::new(0)),
+                    start: Box::new(move |commit| {
+                        let _ = sent.send(commit);
+                    }),
+                },
+            )
+            .await;
+        assert!(matches!(
+            result,
+            ClaimCommit::Rejected(ClaimRejection::StaleProjection)
+        ));
+        assert_eq!(received.await.unwrap(), result);
+        assert_eq!(publisher.events().len(), before);
+        assert_eq!(owner.routes_to(&address), None);
     }
 
     #[test]
@@ -4707,7 +6118,8 @@ mod tests {
         // and therefore processed first (single-threaded, FIFO).
         owner
             .note_liveness_evidence(target, std::time::Instant::now())
-            .await;
+            .await
+            .expect("liveness evidence admission");
 
         let released = owner
             .release_dead_peer(node.clone(), target, evidence_before)
@@ -5371,7 +6783,7 @@ mod tests {
 
         // The caller dies without ever taking the response out of the
         // channel -- on the pre-fix shape this was a bare
-        // `Arc<AtomicU8>` whose drop is meaningless; the entry leaked.
+        // `Arc<ReapState>` whose drop is meaningless; the entry leaked.
         drop(response);
 
         // The reservation must be released even though no guard was ever
@@ -6354,5 +7766,355 @@ mod tests {
                  after a migrate races a concurrent pin"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn destructive_command_owns_completion_after_response_cancellation() {
+        let (owner, _publisher) = owner_handle();
+        let address = addr(50_220);
+        let identity = peer("cancel-owned-reap");
+        let claim = owner
+            .claim(
+                address,
+                claim_of(identity.clone(), ClaimKind::Verified),
+                false,
+            )
+            .await;
+        let reservation = owner
+            .reserve_for_reap(
+                address,
+                std::time::Instant::now(),
+                Some(OwnershipToken::new(
+                    identity.clone(),
+                    claim.commit_seq().unwrap(),
+                )),
+                None,
+                Some(identity.clone()),
+            )
+            .await
+            .unwrap();
+        let applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let applied_in_command = applied.clone();
+        let mut operation = Box::pin(owner.commit_reap(
+            identity.clone(),
+            address,
+            std::time::Instant::now(),
+            reservation,
+            move |outcome| {
+                assert!(matches!(outcome, DeadPeerReleaseOutcome::Released(_)));
+                applied_in_command.store(true, Ordering::Release);
+                false
+            },
+        ));
+        assert!(futures::poll!(&mut operation).is_pending());
+        drop(operation);
+        let successor = owner
+            .claim(address, claim_of(identity, ClaimKind::Verified), false)
+            .await;
+        assert!(applied.load(Ordering::Acquire));
+        assert!(
+            successor.is_accepted(),
+            "completion releases exclusive admission"
+        );
+        assert!(!owner.is_reap_reserved_for_test(address).await);
+    }
+
+    #[tokio::test]
+    async fn rollback_receipt_reports_refused_compensation() {
+        let (owner, _publisher) = owner_handle();
+        let address = addr(50_223);
+        let identity = peer("rollback-refused-compensation");
+        let claim = owner
+            .claim(
+                address,
+                claim_of(identity.clone(), ClaimKind::Verified),
+                false,
+            )
+            .await;
+        let applied = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = applied.clone();
+        assert!(
+            !owner
+                .rollback_projection(
+                    address,
+                    identity.clone(),
+                    claim.commit_seq().unwrap(),
+                    move |_| {
+                        observed.store(true, Ordering::Release);
+                        false
+                    },
+                )
+                .await
+        );
+        assert!(applied.load(Ordering::Acquire));
+        assert!(owner.ownership_token(&address).is_none());
+        let successor = owner
+            .claim(
+                address,
+                claim_of(identity.clone(), ClaimKind::Verified),
+                false,
+            )
+            .await;
+        assert!(
+            owner
+                .rollback_projection(address, identity, successor.commit_seq().unwrap(), |_| true,)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn vacant_address_history_is_exact_and_capacity_bounded() {
+        let publisher = Arc::new(RecordingPublisher::default());
+        let weak: Weak<dyn RoutingPublisher> = Arc::downgrade(&publisher) as _;
+        let limits = RegistryOwnerLimits {
+            state_entries: std::num::NonZeroUsize::new(1).unwrap(),
+            ..RegistryOwnerLimits::default()
+        };
+        let owner = RegistryOwnerHandle::with_limits(weak, limits).unwrap();
+        let identity = peer("history-capacity");
+        let first = addr(50_221);
+        let second = addr(50_222);
+        let before = owner.snapshot();
+        let claim = owner
+            .claim(
+                first,
+                claim_of(identity.clone(), ClaimKind::Verified),
+                false,
+            )
+            .await;
+        assert!(
+            owner
+                .release(first, identity.clone(), claim.commit_seq().unwrap())
+                .await
+                .is_some()
+        );
+        assert!(!owner.snapshot().address_history_matches(&before, &first));
+        assert!(owner.snapshot().address_history_matches(&before, &second));
+        assert!(matches!(
+            owner
+                .claim(
+                    second,
+                    claim_of(identity.clone(), ClaimKind::Verified),
+                    false
+                )
+                .await,
+            ClaimCommit::Rejected(ClaimRejection::Capacity)
+        ));
+        assert!(
+            owner
+                .claim(first, claim_of(identity, ClaimKind::Verified), false)
+                .await
+                .is_accepted()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reservation_capacity_includes_guards_and_guaranteed_cleanup() {
+        let (owner, _publisher) = owner_handle();
+        let mut guards = Vec::new();
+        for offset in 0..OWNER_REAP_CAPACITY {
+            guards.push(
+                owner
+                    .reserve_for_reap(
+                        addr(40_000 + offset as u16),
+                        std::time::Instant::now(),
+                        None,
+                        None,
+                        None,
+                    )
+                    .await
+                    .expect("within the declared reservation budget"),
+            );
+        }
+        assert_eq!(owner.shared.release_tx.capacity(), 0);
+        assert!(matches!(
+            owner
+                .try_reserve_for_reap(addr(50_000), std::time::Instant::now(), None, None, None)
+                .await,
+            Err(ReapAdmissionError::Capacity)
+        ));
+        assert!(
+            owner
+                .reserve_for_reap(addr(50_000), std::time::Instant::now(), None, None, None)
+                .await
+                .is_none()
+        );
+        guards.pop().unwrap().release().await;
+        let replacement = owner
+            .reserve_for_reap(addr(50_000), std::time::Instant::now(), None, None, None)
+            .await
+            .expect("released capacity admits one replacement");
+        assert!(replacement.try_consume());
+        replacement.release().await;
+        drop(guards);
+        assert!(
+            owner
+                .claim(
+                    addr(40_000),
+                    claim_of(peer("budget"), ClaimKind::Verified),
+                    false,
+                )
+                .await
+                .is_accepted()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_reservation_cannot_consume_or_release_successor() {
+        let (owner, _publisher) = owner_handle();
+        let target = addr(50_100);
+        let old = owner
+            .reserve_for_reap(target, std::time::Instant::now(), None, None, None)
+            .await
+            .unwrap();
+        tokio::time::advance(OWNER_REAP_LEASE + std::time::Duration::from_secs(1)).await;
+        assert!(!old.try_consume());
+        // The owner processes its due expiry tick before this ordinary command.
+        let successor = owner
+            .reserve_for_reap(target, std::time::Instant::now(), None, None, None)
+            .await
+            .expect("expired pending authority releases the address");
+        old.release().await;
+        assert!(owner.is_reap_reserved_for_test(target).await);
+        assert!(successor.try_consume());
+        tokio::time::advance(OWNER_REAP_LEASE + std::time::Duration::from_secs(1)).await;
+        assert!(owner.is_reap_reserved_for_test(target).await);
+        successor.release().await;
+        assert!(!owner.is_reap_reserved_for_test(target).await);
+    }
+
+    #[tokio::test]
+    async fn ownership_and_configuration_capacity_reject_before_publication() {
+        let publisher = Arc::new(RecordingPublisher::default());
+        let weak: Weak<dyn RoutingPublisher> = Arc::downgrade(&publisher) as _;
+        let limits = RegistryOwnerLimits {
+            state_entries: std::num::NonZeroUsize::new(2).unwrap(),
+            ..RegistryOwnerLimits::default()
+        };
+        let owner = RegistryOwnerHandle::with_limits(weak, limits).unwrap();
+        let first = peer("capacity-first");
+        let second = peer("capacity-second");
+        let foreign = peer("capacity-foreign");
+        assert!(
+            owner
+                .configure_peer(addr(50_201), first.clone(), None)
+                .await
+                .claim()
+                .is_accepted()
+        );
+        assert!(
+            owner
+                .configure_peer(addr(50_202), second.clone(), None)
+                .await
+                .claim()
+                .is_accepted()
+        );
+        let before = publisher.configured_routes();
+        let rejected = owner.configure_peer(addr(50_203), foreign, None).await;
+        assert_eq!(
+            rejected.claim(),
+            &ClaimCommit::Rejected(ClaimRejection::Capacity)
+        );
+        assert_eq!(publisher.configured_routes(), before);
+        assert_eq!(owner.snapshot().len(), 2);
+        // A full table still permits refresh of an admitted identity/address.
+        assert!(
+            owner
+                .configure_peer(addr(50_201), first, None)
+                .await
+                .claim()
+                .is_accepted()
+        );
+        assert!(owner.snapshot().pin_is_current(&addr(50_202), &second));
+    }
+
+    #[tokio::test]
+    async fn session_receipt_capacity_preserves_current_owner_and_recovers() {
+        let publisher = Arc::new(RecordingPublisher::default());
+        let weak: Weak<dyn RoutingPublisher> = Arc::downgrade(&publisher) as _;
+        let limits = RegistryOwnerLimits {
+            state_entries: std::num::NonZeroUsize::new(2).unwrap(),
+            ..RegistryOwnerLimits::default()
+        };
+        let owner = RegistryOwnerHandle::with_limits(weak, limits).unwrap();
+        let node = peer("receipt-capacity");
+        let target = addr(50_210);
+        for source in [addr(50_211), addr(50_212)] {
+            assert!(
+                owner
+                    .claim_connection_scoped(
+                        target,
+                        claim_of(node.clone(), ClaimKind::Verified),
+                        source,
+                    )
+                    .await
+                    .is_accepted()
+            );
+        }
+        let token = owner.snapshot().ownership_token(&target).unwrap();
+        assert_eq!(
+            owner
+                .claim_connection_scoped(
+                    target,
+                    claim_of(node.clone(), ClaimKind::Verified),
+                    addr(50_213),
+                )
+                .await,
+            ClaimCommit::Rejected(ClaimRejection::Capacity)
+        );
+        assert_eq!(owner.snapshot().ownership_token(&target), Some(token));
+        owner.release_session(node.clone(), addr(50_211)).await;
+        assert!(
+            owner
+                .claim_connection_scoped(target, claim_of(node, ClaimKind::Verified), addr(50_213),)
+                .await
+                .is_accepted()
+        );
+    }
+
+    #[tokio::test]
+    async fn liveness_capacity_rejects_unknown_but_preserves_admitted_owner() {
+        let publisher = Arc::new(RecordingPublisher::default());
+        let weak: Weak<dyn RoutingPublisher> = Arc::downgrade(&publisher) as _;
+        let limits = RegistryOwnerLimits {
+            state_entries: std::num::NonZeroUsize::new(1).unwrap(),
+            ..RegistryOwnerLimits::default()
+        };
+        let owner = RegistryOwnerHandle::with_limits(weak, limits).unwrap();
+        let before = std::time::Instant::now();
+        let after = before + Duration::from_secs(1);
+        let unknown = addr(50_220);
+        owner.note_liveness_evidence(unknown, before).await.unwrap();
+        assert!(matches!(
+            owner.note_liveness_evidence(addr(50_221), after).await,
+            Err(crate::GossipError::WriteQueueFull)
+        ));
+        assert!(
+            !owner
+                .has_newer_liveness_evidence(addr(50_221), before)
+                .await
+        );
+        // Existing unknown evidence still refreshes at the plateau.
+        owner.note_liveness_evidence(unknown, after).await.unwrap();
+        assert!(owner.has_newer_liveness_evidence(unknown, before).await);
+        let target = addr(50_222);
+        let node = peer("liveness-capacity-owner");
+        assert!(
+            owner
+                .configure_peer(target, node, None)
+                .await
+                .claim()
+                .is_accepted()
+        );
+        // A full unowned table must not reject an admitted owner or allow
+        // a stale reap to discard its direct proof of continued life.
+        owner.note_liveness_evidence(target, after).await.unwrap();
+        assert!(owner.has_newer_liveness_evidence(target, before).await);
+        owner.note_liveness_evidence(target, before).await.unwrap();
+        assert!(owner.has_newer_liveness_evidence(target, before).await);
+        assert!(matches!(
+            owner.note_liveness_evidence(addr(50_223), after).await,
+            Err(crate::GossipError::WriteQueueFull)
+        ));
     }
 }

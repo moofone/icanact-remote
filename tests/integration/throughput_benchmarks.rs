@@ -11,7 +11,8 @@ use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
 #[cfg(any(feature = "test-helpers", debug_assertions))]
 use icanact_remote::wire_type;
 use icanact_remote::{
-    AlignedBytes, AskContext, GossipConfig, GossipRegistryHandle, KeyPair, RemoteConnection,
+    AlignedBytes, AskContext, ForwardPayload, GossipConfig, GossipRegistryHandle, KeyPair,
+    RemoteConnection,
     registry::{
         ActorAskHandlerSync, ActorAskImmediateHandlerSync, ActorMessageFuture, ActorMessageHandler,
         ActorMessageHandlerSync, ActorResponse, ActorTellHandlerSync, AskDisposition,
@@ -67,30 +68,32 @@ struct SplitEchoActor {
 
 #[derive(Clone)]
 struct ProxyAskActor {
-    destination: RemoteConnection,
+    replies: BenchReplyEndpoint,
 }
 
 #[derive(Clone)]
 struct TimeoutProxyAskActor {
-    destination: RemoteConnection,
+    replies: BenchReplyEndpoint,
 }
 
 #[derive(Clone)]
 struct AlignedTimeoutProxyAskActor {
-    destination: RemoteConnection,
+    replies: BenchReplyEndpoint,
 }
 
 #[derive(Clone)]
 struct OuterTimeoutProxyAskActor {
-    destination: RemoteConnection,
+    replies: BenchReplyEndpoint,
 }
 
 #[derive(Clone)]
-struct DeferredEchoProxyActor;
+struct DeferredEchoProxyActor {
+    replies: BenchReplyEndpoint,
+}
 
 #[derive(Clone)]
 struct DeferredTimeoutProxyAskActor {
-    destination: RemoteConnection,
+    replies: BenchReplyEndpoint,
 }
 
 #[derive(Clone)]
@@ -103,19 +106,210 @@ struct AsyncProxyActor {
 
 #[derive(Clone)]
 struct WorkerProxyAskActor {
-    tx: mpsc::UnboundedSender<(Bytes, icanact_remote::AskResponder)>,
+    tx: mpsc::Sender<BenchReplyJob>,
+    session: Arc<std::sync::OnceLock<icanact_remote::ReplySession>>,
 }
 
 #[derive(Clone)]
 struct BoundForwarderProxyAskActor {
-    workers: Arc<Vec<mpsc::Sender<(Bytes, icanact_remote::AskResponder)>>>,
+    workers: Arc<Vec<mpsc::Sender<BenchReplyJob>>>,
+    session: Arc<std::sync::OnceLock<icanact_remote::ReplySession>>,
     next_worker: Arc<AtomicUsize>,
 }
 
 #[derive(Clone)]
 struct BoundTimeoutProxyAskActor {
-    workers: Arc<Vec<mpsc::Sender<(Bytes, icanact_remote::AskResponder)>>>,
+    workers: Arc<Vec<mpsc::Sender<BenchReplyJob>>>,
+    session: Arc<std::sync::OnceLock<icanact_remote::ReplySession>>,
     next_worker: Arc<AtomicUsize>,
+}
+
+// Every proxy fixture binds one physical source connection. Its fixed reply
+// table bounds queued plus running jobs to 1,024; at most 512 run concurrently.
+// A request retains at most 64 KiB (including its backing allocation), so the
+// input-owner ceiling is 64 MiB. These fixtures send 256-byte echoes only.
+// Full queues/tables reject with WriteQueueFull before consuming the ask claim.
+// Numeric tokens live until completion, cancellation, or fixture teardown.
+// Proxy hops use the native owned request APIs. The historical spawn-per-ask
+// variants now share a bounded concurrent scheduler; measurements across this
+// fixture revision require a fresh paired baseline.
+const BENCH_REPLY_CAPACITY: usize = 1_024;
+const BENCH_REPLY_CONCURRENCY: usize = 512;
+const BENCH_REPLY_MAX_RETAINED_BYTES: usize = 64 * 1024;
+type BenchReplyJob = (ForwardPayload, icanact_remote::ForwardReplyToken);
+
+#[derive(Clone)]
+struct BenchReplyEndpoint {
+    tx: mpsc::Sender<BenchReplyJob>,
+    session: Arc<std::sync::OnceLock<icanact_remote::ReplySession>>,
+}
+
+#[derive(Clone, Copy)]
+enum BenchProxyMode {
+    Echo,
+    NoTimeout,
+    Timeout,
+    OuterTimeout,
+    DeferredTimeout,
+}
+
+fn enqueue_bench_reply(
+    tx: &mpsc::Sender<BenchReplyJob>,
+    session: &std::sync::OnceLock<icanact_remote::ReplySession>,
+    payload: AlignedBytes,
+    context: AskContext<'_>,
+) -> icanact_remote::Result<()> {
+    let payload = ForwardPayload::try_from(payload)?;
+    if payload.retained_bytes() > BENCH_REPLY_MAX_RETAINED_BYTES {
+        return Err(icanact_remote::GossipError::MessageTooLarge {
+            size: payload.retained_bytes(),
+            max: BENCH_REPLY_MAX_RETAINED_BYTES,
+        });
+    }
+    let permit = tx.try_reserve().map_err(|error| match error {
+        mpsc::error::TrySendError::Full(_) => icanact_remote::GossipError::WriteQueueFull,
+        mpsc::error::TrySendError::Closed(_) => icanact_remote::GossipError::Shutdown,
+    })?;
+    let responder = context.responder();
+    if session.get().is_none() {
+        let bound = responder.reply_session_with_capacity(BENCH_REPLY_CAPACITY)?;
+        let _ = session.set(bound);
+    }
+    let session = session.get().ok_or(icanact_remote::GossipError::Shutdown)?;
+    let admission = responder.prepare_forward_reply(session)?;
+    permit.send((payload, admission.token()));
+    admission.commit();
+    Ok(())
+}
+
+struct BenchReplyGuard<'a> {
+    session: &'a icanact_remote::ReplySession,
+    token: Option<icanact_remote::ForwardReplyToken>,
+}
+
+impl Drop for BenchReplyGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            self.session.cancel(token);
+        }
+    }
+}
+
+struct BenchReplyQueue {
+    rx: mpsc::Receiver<BenchReplyJob>,
+    session: Arc<std::sync::OnceLock<icanact_remote::ReplySession>>,
+}
+
+impl Drop for BenchReplyQueue {
+    fn drop(&mut self) {
+        self.rx.close();
+        if let Some(session) = self.session.get() {
+            while let Ok((_, token)) = self.rx.try_recv() {
+                session.cancel(token);
+            }
+        }
+    }
+}
+
+async fn run_bench_reply(
+    session: &icanact_remote::ReplySession,
+    destination: Option<&RemoteConnection>,
+    mode: BenchProxyMode,
+    (payload, token): BenchReplyJob,
+) {
+    let mut reply = BenchReplyGuard {
+        session,
+        token: Some(token),
+    };
+    if matches!(mode, BenchProxyMode::Echo) {
+        let _ = session
+            .reply_owned(reply.token.take().unwrap(), payload)
+            .await;
+        return;
+    }
+    let destination = destination.expect("forwarding mode has a bound destination");
+    let result = match mode {
+        BenchProxyMode::NoTimeout => {
+            destination
+                .ask_actor_frame_no_timeout_owned(BENCH_ACTOR_ID, BENCH_TYPE_HASH, payload)
+                .await
+        }
+        BenchProxyMode::Timeout => {
+            destination
+                .ask_actor_frame_owned(BENCH_ACTOR_ID, BENCH_TYPE_HASH, payload, ASK_BENCH_TIMEOUT)
+                .await
+        }
+        BenchProxyMode::OuterTimeout => {
+            match tokio::time::timeout(
+                ASK_BENCH_TIMEOUT,
+                destination.ask_actor_frame_no_timeout_owned(
+                    BENCH_ACTOR_ID,
+                    BENCH_TYPE_HASH,
+                    payload,
+                ),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => return,
+            }
+        }
+        BenchProxyMode::DeferredTimeout => {
+            match destination
+                .ask_actor_frame_deferred_owned(
+                    BENCH_ACTOR_ID,
+                    BENCH_TYPE_HASH,
+                    payload,
+                    ASK_BENCH_TIMEOUT,
+                )
+                .await
+            {
+                Ok(pending) => pending.wait_aligned().await,
+                Err(error) => Err(error),
+            }
+        }
+        BenchProxyMode::Echo => unreachable!("echo was handled before forwarding"),
+    };
+    if let Ok(payload) = result {
+        let payload = ForwardPayload::try_from(payload).expect("owned reply");
+        assert!(payload.retained_bytes() <= BENCH_REPLY_MAX_RETAINED_BYTES);
+        let _ = session.try_reply_owned(reply.token.take().unwrap(), payload);
+    }
+}
+
+fn bench_reply_endpoint(
+    destination: Option<RemoteConnection>,
+    mode: BenchProxyMode,
+) -> BenchReplyEndpoint {
+    let (tx, rx) = mpsc::channel(BENCH_REPLY_CAPACITY);
+    let session = Arc::new(std::sync::OnceLock::new());
+    let replies = Arc::clone(&session);
+    let mut queue = BenchReplyQueue {
+        rx,
+        session: Arc::clone(&session),
+    };
+    tokio::spawn(async move {
+        // The endpoint owners are retained once for the worker lifetime.
+        // Per-job futures borrow them and carry only a numeric reply token.
+        let mut pending = FuturesUnordered::new();
+        let mut closed = false;
+        loop {
+            tokio::select! {
+                next = queue.rx.recv(), if !closed && pending.len() < BENCH_REPLY_CONCURRENCY => {
+                    match next {
+                        Some(job) => {
+                            let session = replies.get().expect("session bound before publication");
+                            pending.push(run_bench_reply(session, destination.as_ref(), mode, job));
+                        }
+                        None => closed = true,
+                    }
+                }
+                _ = pending.next(), if !pending.is_empty() => {}
+                else => break,
+            }
+        }
+    });
+    BenchReplyEndpoint { tx, session }
 }
 
 #[cfg(any(feature = "test-helpers", debug_assertions))]
@@ -179,9 +373,9 @@ impl ActorAskImmediateHandlerSync for SplitEchoActor {
         payload: AlignedBytes,
     ) -> icanact_remote::Result<AskDisposition> {
         if actor_id != BENCH_ACTOR_ID || type_hash != BENCH_TYPE_HASH {
-            return Ok(AskDisposition::Immediate(
-                ActorResponse::Bytes(Bytes::new()),
-            ));
+            return Ok(AskDisposition::Immediate(ActorResponse::Bytes(
+                icanact_remote::ForwardPayload::from_static(b""),
+            )));
         }
         let received = self.received.fetch_add(1, Ordering::Relaxed) + 1;
         let notify_at = self.notify_at.load(Ordering::Relaxed);
@@ -201,22 +395,12 @@ impl ActorAskHandlerSync for ProxyAskActor {
         context: AskContext<'_>,
     ) -> icanact_remote::Result<AskDisposition> {
         if actor_id != PROXY_ACTOR_ID || type_hash != PROXY_TYPE_HASH {
-            return Ok(AskDisposition::Immediate(
-                ActorResponse::Bytes(Bytes::new()),
-            ));
+            return Ok(AskDisposition::Immediate(ActorResponse::Bytes(
+                icanact_remote::ForwardPayload::from_static(b""),
+            )));
         }
 
-        let destination = self.destination.clone();
-        let responder = context.responder();
-        let payload = payload.into_bytes();
-        tokio::spawn(async move {
-            if let Ok(reply) = destination
-                .ask_actor_frame_no_timeout(BENCH_ACTOR_ID, BENCH_TYPE_HASH, payload)
-                .await
-            {
-                let _ = responder.try_reply_bytes(reply);
-            }
-        });
+        enqueue_bench_reply(&self.replies.tx, &self.replies.session, payload, context)?;
 
         Ok(AskDisposition::Deferred)
     }
@@ -231,16 +415,12 @@ impl ActorAskHandlerSync for DeferredEchoProxyActor {
         context: AskContext<'_>,
     ) -> icanact_remote::Result<AskDisposition> {
         if actor_id != DEFERRED_PROXY_ACTOR_ID || type_hash != DEFERRED_PROXY_TYPE_HASH {
-            return Ok(AskDisposition::Immediate(
-                ActorResponse::Bytes(Bytes::new()),
-            ));
+            return Ok(AskDisposition::Immediate(ActorResponse::Bytes(
+                icanact_remote::ForwardPayload::from_static(b""),
+            )));
         }
 
-        let responder = context.responder();
-        let payload = payload.into_bytes();
-        tokio::spawn(async move {
-            let _ = responder.reply_bytes(payload).await;
-        });
+        enqueue_bench_reply(&self.replies.tx, &self.replies.session, payload, context)?;
 
         Ok(AskDisposition::Deferred)
     }
@@ -255,22 +435,12 @@ impl ActorAskHandlerSync for TimeoutProxyAskActor {
         context: AskContext<'_>,
     ) -> icanact_remote::Result<AskDisposition> {
         if actor_id != TIMEOUT_PROXY_ACTOR_ID || type_hash != TIMEOUT_PROXY_TYPE_HASH {
-            return Ok(AskDisposition::Immediate(
-                ActorResponse::Bytes(Bytes::new()),
-            ));
+            return Ok(AskDisposition::Immediate(ActorResponse::Bytes(
+                icanact_remote::ForwardPayload::from_static(b""),
+            )));
         }
 
-        let destination = self.destination.clone();
-        let responder = context.responder();
-        let payload = payload.into_bytes();
-        tokio::spawn(async move {
-            if let Ok(reply) = destination
-                .ask_actor_frame(BENCH_ACTOR_ID, BENCH_TYPE_HASH, payload, ASK_BENCH_TIMEOUT)
-                .await
-            {
-                let _ = responder.try_reply_bytes(reply);
-            }
-        });
+        enqueue_bench_reply(&self.replies.tx, &self.replies.session, payload, context)?;
 
         Ok(AskDisposition::Deferred)
     }
@@ -287,27 +457,12 @@ impl ActorAskHandlerSync for AlignedTimeoutProxyAskActor {
         if actor_id != ALIGNED_TIMEOUT_PROXY_ACTOR_ID
             || type_hash != ALIGNED_TIMEOUT_PROXY_TYPE_HASH
         {
-            return Ok(AskDisposition::Immediate(
-                ActorResponse::Bytes(Bytes::new()),
-            ));
+            return Ok(AskDisposition::Immediate(ActorResponse::Bytes(
+                icanact_remote::ForwardPayload::from_static(b""),
+            )));
         }
 
-        let destination = self.destination.clone();
-        let responder = context.responder();
-        let payload = payload.into_bytes();
-        tokio::spawn(async move {
-            if let Ok(reply) = destination
-                .ask_actor_frame_aligned(
-                    BENCH_ACTOR_ID,
-                    BENCH_TYPE_HASH,
-                    payload,
-                    ASK_BENCH_TIMEOUT,
-                )
-                .await
-            {
-                let _ = responder.try_reply_bytes(reply.into_bytes());
-            }
-        });
+        enqueue_bench_reply(&self.replies.tx, &self.replies.session, payload, context)?;
 
         Ok(AskDisposition::Deferred)
     }
@@ -322,24 +477,12 @@ impl ActorAskHandlerSync for OuterTimeoutProxyAskActor {
         context: AskContext<'_>,
     ) -> icanact_remote::Result<AskDisposition> {
         if actor_id != OUTER_TIMEOUT_PROXY_ACTOR_ID || type_hash != OUTER_TIMEOUT_PROXY_TYPE_HASH {
-            return Ok(AskDisposition::Immediate(
-                ActorResponse::Bytes(Bytes::new()),
-            ));
+            return Ok(AskDisposition::Immediate(ActorResponse::Bytes(
+                icanact_remote::ForwardPayload::from_static(b""),
+            )));
         }
 
-        let destination = self.destination.clone();
-        let responder = context.responder();
-        let payload = payload.into_bytes();
-        tokio::spawn(async move {
-            if let Ok(Ok(reply)) = tokio::time::timeout(
-                ASK_BENCH_TIMEOUT,
-                destination.ask_actor_frame_no_timeout(BENCH_ACTOR_ID, BENCH_TYPE_HASH, payload),
-            )
-            .await
-            {
-                let _ = responder.try_reply_bytes(reply);
-            }
-        });
+        enqueue_bench_reply(&self.replies.tx, &self.replies.session, payload, context)?;
 
         Ok(AskDisposition::Deferred)
     }
@@ -356,28 +499,12 @@ impl ActorAskHandlerSync for DeferredTimeoutProxyAskActor {
         if actor_id != DEFERRED_TIMEOUT_PROXY_ACTOR_ID
             || type_hash != DEFERRED_TIMEOUT_PROXY_TYPE_HASH
         {
-            return Ok(AskDisposition::Immediate(
-                ActorResponse::Bytes(Bytes::new()),
-            ));
+            return Ok(AskDisposition::Immediate(ActorResponse::Bytes(
+                icanact_remote::ForwardPayload::from_static(b""),
+            )));
         }
 
-        let destination = self.destination.clone();
-        let responder = context.responder();
-        let payload = payload.into_bytes();
-        tokio::spawn(async move {
-            if let Ok(pending) = destination
-                .ask_actor_frame_deferred(
-                    BENCH_ACTOR_ID,
-                    BENCH_TYPE_HASH,
-                    payload,
-                    ASK_BENCH_TIMEOUT,
-                )
-                .await
-                && let Ok(reply) = pending.wait().await
-            {
-                let _ = responder.try_reply_bytes(reply);
-            }
-        });
+        enqueue_bench_reply(&self.replies.tx, &self.replies.session, payload, context)?;
 
         Ok(AskDisposition::Deferred)
     }
@@ -394,12 +521,14 @@ impl ActorAskHandlerSync for NonblockingDeferredEchoProxyActor {
         if actor_id != NONBLOCKING_DEFERRED_PROXY_ACTOR_ID
             || type_hash != NONBLOCKING_DEFERRED_PROXY_TYPE_HASH
         {
-            return Ok(AskDisposition::Immediate(
-                ActorResponse::Bytes(Bytes::new()),
-            ));
+            return Ok(AskDisposition::Immediate(ActorResponse::Bytes(
+                icanact_remote::ForwardPayload::from_static(b""),
+            )));
         }
 
-        context.responder().try_reply_bytes(payload.into_bytes())?;
+        context
+            .responder()
+            .try_reply_bytes(ForwardPayload::try_from(payload)?)?;
         Ok(AskDisposition::Deferred)
     }
 }
@@ -412,7 +541,7 @@ impl ActorMessageHandler for AsyncProxyActor {
         payload: AlignedBytes,
         correlation_id: Option<u32>,
     ) -> ActorMessageFuture<'_> {
-        let destination = self.destination.clone();
+        let destination = &self.destination;
         Box::pin(async move {
             if actor_id != ASYNC_PROXY_ACTOR_ID || type_hash != ASYNC_PROXY_TYPE_HASH {
                 return Ok(None);
@@ -421,9 +550,13 @@ impl ActorMessageHandler for AsyncProxyActor {
                 return Ok(None);
             }
             let reply = destination
-                .ask_actor_frame_no_timeout(BENCH_ACTOR_ID, BENCH_TYPE_HASH, payload.into_bytes())
+                .ask_actor_frame_no_timeout_owned(
+                    BENCH_ACTOR_ID,
+                    BENCH_TYPE_HASH,
+                    ForwardPayload::try_from(payload)?,
+                )
                 .await?;
-            Ok(Some(ActorResponse::Bytes(reply)))
+            Ok(Some(ActorResponse::Aligned(reply)))
         })
     }
 }
@@ -437,14 +570,12 @@ impl ActorAskHandlerSync for WorkerProxyAskActor {
         context: AskContext<'_>,
     ) -> icanact_remote::Result<AskDisposition> {
         if actor_id != WORKER_PROXY_ACTOR_ID || type_hash != WORKER_PROXY_TYPE_HASH {
-            return Ok(AskDisposition::Immediate(
-                ActorResponse::Bytes(Bytes::new()),
-            ));
+            return Ok(AskDisposition::Immediate(ActorResponse::Bytes(
+                icanact_remote::ForwardPayload::from_static(b""),
+            )));
         }
 
-        self.tx
-            .send((payload.into_bytes(), context.responder()))
-            .map_err(|_| icanact_remote::GossipError::Shutdown)?;
+        enqueue_bench_reply(&self.tx, &self.session, payload, context)?;
 
         Ok(AskDisposition::Deferred)
     }
@@ -461,18 +592,13 @@ impl ActorAskHandlerSync for BoundForwarderProxyAskActor {
         if actor_id != BOUND_FORWARDER_PROXY_ACTOR_ID
             || type_hash != BOUND_FORWARDER_PROXY_TYPE_HASH
         {
-            return Ok(AskDisposition::Immediate(
-                ActorResponse::Bytes(Bytes::new()),
-            ));
+            return Ok(AskDisposition::Immediate(ActorResponse::Bytes(
+                icanact_remote::ForwardPayload::from_static(b""),
+            )));
         }
 
         let worker_idx = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.workers.len();
-        self.workers[worker_idx]
-            .try_send((payload.into_bytes(), context.responder()))
-            .map_err(|err| match err {
-                mpsc::error::TrySendError::Full(_) => icanact_remote::GossipError::WriteQueueFull,
-                mpsc::error::TrySendError::Closed(_) => icanact_remote::GossipError::Shutdown,
-            })?;
+        enqueue_bench_reply(&self.workers[worker_idx], &self.session, payload, context)?;
         Ok(AskDisposition::Deferred)
     }
 }
@@ -486,18 +612,13 @@ impl ActorAskHandlerSync for BoundTimeoutProxyAskActor {
         context: AskContext<'_>,
     ) -> icanact_remote::Result<AskDisposition> {
         if actor_id != BOUND_TIMEOUT_PROXY_ACTOR_ID || type_hash != BOUND_TIMEOUT_PROXY_TYPE_HASH {
-            return Ok(AskDisposition::Immediate(
-                ActorResponse::Bytes(Bytes::new()),
-            ));
+            return Ok(AskDisposition::Immediate(ActorResponse::Bytes(
+                icanact_remote::ForwardPayload::from_static(b""),
+            )));
         }
 
         let worker_idx = self.next_worker.fetch_add(1, Ordering::Relaxed) % self.workers.len();
-        self.workers[worker_idx]
-            .try_send((payload.into_bytes(), context.responder()))
-            .map_err(|err| match err {
-                mpsc::error::TrySendError::Full(_) => icanact_remote::GossipError::WriteQueueFull,
-                mpsc::error::TrySendError::Closed(_) => icanact_remote::GossipError::Shutdown,
-            })?;
+        enqueue_bench_reply(&self.workers[worker_idx], &self.session, payload, context)?;
         Ok(AskDisposition::Deferred)
     }
 }
@@ -525,6 +646,7 @@ async fn measure_concurrent_asks(
     duration: Duration,
 ) -> (u64, Duration, Vec<u64>) {
     assert!(matches!(inflight, 1 | 8 | 64 | 512));
+    let session = remote.session().await.unwrap();
     let start = Instant::now();
     let deadline = start + duration;
     let mut pending = FuturesUnordered::new();
@@ -534,20 +656,20 @@ async fn measure_concurrent_asks(
         while pending.len() < inflight && Instant::now() < deadline {
             let id = next;
             next += 1;
-            let remote = remote.clone();
+            let remote = &session;
             pending.push(async move {
                 // Unique identity proves correlations cannot silently swap
                 // equally-sized echo responses under concurrent completion.
                 let mut bytes = [13u8; PAYLOAD_BYTES];
                 bytes[..8].copy_from_slice(&id.to_be_bytes());
-                let payload = Bytes::copy_from_slice(&bytes);
+                let payload = ForwardPayload::from(bytes.to_vec());
                 let started = Instant::now();
                 let reply = remote
-                    .ask_actor_frame_no_timeout(BENCH_ACTOR_ID, BENCH_TYPE_HASH, payload.clone())
+                    .ask_actor_frame_no_timeout_owned(BENCH_ACTOR_ID, BENCH_TYPE_HASH, payload)
                     .await
                     .expect("measured ask must complete successfully");
                 let latency = started.elapsed().as_nanos() as u64;
-                assert_eq!(reply, payload, "response identity/content mismatch");
+                assert_eq!(reply.as_ref(), &bytes, "response identity/content mismatch");
                 latency
             });
         }
@@ -614,8 +736,8 @@ async fn concurrent_ask_fixture(
     )
     .await
     .expect("measured requests must not stall");
-    sender.shutdown().await;
-    receiver.shutdown().await;
+    sender.shutdown().await.unwrap();
+    receiver.shutdown().await.unwrap();
     result
 }
 
@@ -727,6 +849,7 @@ async fn measure_offered_asks(
         offered > 0,
         "offer window must schedule at least one request"
     );
+    let session = remote.session().await.unwrap();
     let start = Instant::now();
     let mut pending = FuturesUnordered::new();
     let mut latencies = Vec::with_capacity(offered as usize);
@@ -781,20 +904,24 @@ async fn measure_offered_asks(
             msg = rx.recv(), if !at_cap => {
                 match msg {
                     Some((id, scheduled)) => {
-                        let remote = remote.clone();
+                        let remote = &session;
                         pending.push(async move {
                             let mut bytes = [13u8; PAYLOAD_BYTES];
                             bytes[..8].copy_from_slice(&id.to_be_bytes());
-                            let payload = Bytes::copy_from_slice(&bytes);
+                            let payload = ForwardPayload::from(bytes.to_vec());
                             let reply = remote
-                                .ask_actor_frame_no_timeout(
+                                .ask_actor_frame_no_timeout_owned(
                                     BENCH_ACTOR_ID,
                                     BENCH_TYPE_HASH,
-                                    payload.clone(),
+                                    payload,
                                 )
                                 .await
                                 .expect("offered ask must complete successfully");
-                            assert_eq!(reply, payload, "response identity/content mismatch");
+                            assert_eq!(
+                                reply.as_ref(),
+                                &bytes,
+                                "response identity/content mismatch"
+                            );
                             Instant::now()
                                 .saturating_duration_since(scheduled)
                                 .as_nanos() as u64
@@ -883,8 +1010,8 @@ async fn offered_ask_fixture(
     )
     .await
     .expect("offered-load measurement must not stall");
-    sender.shutdown().await;
-    receiver.shutdown().await;
+    sender.shutdown().await.unwrap();
+    receiver.shutdown().await.unwrap();
     result
 }
 
@@ -1042,11 +1169,11 @@ async fn run_connect_to_peer_contention_benchmark(label: &str, lanes: usize, rou
 
     let peer_id = receiver.registry.peer_id.clone();
     let target_addr = receiver.registry.bind_addr;
-    let _ = sender
+    sender
         .registry
         .connection_pool
-        .peer_id_to_addr
-        .upsert_sync(peer_id.clone(), target_addr);
+        .set_discovered_peer_addr(&peer_id, target_addr)
+        .expect("benchmark learned route must be admitted");
 
     let restore_mapping =
         bench_env_bool("ICANACT_REMOTE_CONNECT_CONTENTION_RESTORE_MAPPING", false);
@@ -1087,8 +1214,8 @@ async fn run_connect_to_peer_contention_benchmark(label: &str, lanes: usize, rou
         checksum
     );
 
-    sender.shutdown().await;
-    receiver.shutdown().await;
+    sender.shutdown().await.unwrap();
+    receiver.shutdown().await.unwrap();
 }
 
 async fn run_connect_to_peer_contention_rounds(
@@ -1108,10 +1235,10 @@ async fn run_connect_to_peer_contention_rounds(
             .disconnect_connection_by_peer_id(&peer_id);
         receiver_registry.connection_pool.close_all_connections();
         if restore_mapping {
-            let _ = sender_registry
+            sender_registry
                 .connection_pool
-                .peer_id_to_addr
-                .upsert_sync(peer_id.clone(), target_addr);
+                .set_discovered_peer_addr(&peer_id, target_addr)
+                .expect("benchmark restored route must be admitted");
         }
         sleep(Duration::from_millis(20)).await;
 
@@ -1170,13 +1297,17 @@ async fn register_proxy_ask_actor(
     destination: RemoteConnection,
 ) {
     registry
-        .set_actor_ask_handler_sync(Arc::new(ProxyAskActor { destination }))
+        .set_actor_ask_handler_sync(Arc::new(ProxyAskActor {
+            replies: bench_reply_endpoint(Some(destination), BenchProxyMode::NoTimeout),
+        }))
         .await;
 }
 
 async fn register_deferred_echo_proxy_actor(registry: &icanact_remote::registry::GossipRegistry) {
     registry
-        .set_actor_ask_handler_sync(Arc::new(DeferredEchoProxyActor))
+        .set_actor_ask_handler_sync(Arc::new(DeferredEchoProxyActor {
+            replies: bench_reply_endpoint(None, BenchProxyMode::Echo),
+        }))
         .await;
 }
 
@@ -1185,7 +1316,9 @@ async fn register_timeout_proxy_ask_actor(
     destination: RemoteConnection,
 ) {
     registry
-        .set_actor_ask_handler_sync(Arc::new(TimeoutProxyAskActor { destination }))
+        .set_actor_ask_handler_sync(Arc::new(TimeoutProxyAskActor {
+            replies: bench_reply_endpoint(Some(destination), BenchProxyMode::Timeout),
+        }))
         .await;
 }
 
@@ -1194,7 +1327,9 @@ async fn register_aligned_timeout_proxy_ask_actor(
     destination: RemoteConnection,
 ) {
     registry
-        .set_actor_ask_handler_sync(Arc::new(AlignedTimeoutProxyAskActor { destination }))
+        .set_actor_ask_handler_sync(Arc::new(AlignedTimeoutProxyAskActor {
+            replies: bench_reply_endpoint(Some(destination), BenchProxyMode::Timeout),
+        }))
         .await;
 }
 
@@ -1203,7 +1338,9 @@ async fn register_outer_timeout_proxy_ask_actor(
     destination: RemoteConnection,
 ) {
     registry
-        .set_actor_ask_handler_sync(Arc::new(OuterTimeoutProxyAskActor { destination }))
+        .set_actor_ask_handler_sync(Arc::new(OuterTimeoutProxyAskActor {
+            replies: bench_reply_endpoint(Some(destination), BenchProxyMode::OuterTimeout),
+        }))
         .await;
 }
 
@@ -1212,7 +1349,9 @@ async fn register_deferred_timeout_proxy_ask_actor(
     destination: RemoteConnection,
 ) {
     registry
-        .set_actor_ask_handler_sync(Arc::new(DeferredTimeoutProxyAskActor { destination }))
+        .set_actor_ask_handler_sync(Arc::new(DeferredTimeoutProxyAskActor {
+            replies: bench_reply_endpoint(Some(destination), BenchProxyMode::DeferredTimeout),
+        }))
         .await;
 }
 
@@ -1238,32 +1377,33 @@ async fn register_worker_proxy_ask_actor(
     destination: RemoteConnection,
     workers: usize,
 ) {
-    let (tx, rx) = mpsc::unbounded_channel::<(Bytes, icanact_remote::AskResponder)>();
-    let shared_rx = Arc::new(tokio::sync::Mutex::new(rx));
+    let (tx, rx) = mpsc::channel::<BenchReplyJob>(BENCH_REPLY_CAPACITY);
+    let session = Arc::new(std::sync::OnceLock::new());
+    let shared_rx = Arc::new(tokio::sync::Mutex::new(BenchReplyQueue {
+        rx,
+        session: Arc::clone(&session),
+    }));
     for _ in 0..workers {
         let destination = destination.clone();
-        let shared_rx = shared_rx.clone();
+        let shared_rx = Arc::clone(&shared_rx);
+        let replies = Arc::clone(&session);
         tokio::spawn(async move {
             loop {
                 let next = {
-                    let mut rx = shared_rx.lock().await;
-                    rx.recv().await
+                    let mut queue = shared_rx.lock().await;
+                    queue.rx.recv().await
                 };
-                let Some((payload, responder)) = next else {
+                let Some(job) = next else {
                     break;
                 };
-                if let Ok(reply) = destination
-                    .ask_actor_frame_no_timeout(BENCH_ACTOR_ID, BENCH_TYPE_HASH, payload)
-                    .await
-                {
-                    let _ = responder.try_reply_bytes(reply);
-                }
+                let session = replies.get().expect("session bound before publication");
+                run_bench_reply(session, Some(&destination), BenchProxyMode::NoTimeout, job).await;
             }
         });
     }
 
     registry
-        .set_actor_ask_handler_sync(Arc::new(WorkerProxyAskActor { tx }))
+        .set_actor_ask_handler_sync(Arc::new(WorkerProxyAskActor { tx, session }))
         .await;
 }
 
@@ -1275,18 +1415,20 @@ async fn register_bound_forwarder_proxy_ask_actor(
 ) {
     let workers = workers.max(1);
     let capacity = capacity.max(128);
+    let session = Arc::new(std::sync::OnceLock::new());
     let mut senders = Vec::with_capacity(workers);
     for _ in 0..workers {
-        let (tx, mut rx) = mpsc::channel::<(Bytes, icanact_remote::AskResponder)>(capacity);
+        let (tx, rx) = mpsc::channel::<BenchReplyJob>(capacity);
+        let mut queue = BenchReplyQueue {
+            rx,
+            session: Arc::clone(&session),
+        };
+        let replies = Arc::clone(&session);
         let destination = destination.clone();
         tokio::spawn(async move {
-            while let Some((payload, responder)) = rx.recv().await {
-                if let Ok(reply) = destination
-                    .ask_actor_frame_no_timeout(BENCH_ACTOR_ID, BENCH_TYPE_HASH, payload)
-                    .await
-                {
-                    let _ = responder.try_reply_bytes(reply);
-                }
+            while let Some(job) = queue.rx.recv().await {
+                let session = replies.get().expect("session bound before publication");
+                run_bench_reply(session, Some(&destination), BenchProxyMode::NoTimeout, job).await;
             }
         });
         senders.push(tx);
@@ -1295,6 +1437,7 @@ async fn register_bound_forwarder_proxy_ask_actor(
     registry
         .set_actor_ask_handler_sync(Arc::new(BoundForwarderProxyAskActor {
             workers: Arc::new(senders),
+            session,
             next_worker: Arc::new(AtomicUsize::new(0)),
         }))
         .await;
@@ -1308,15 +1451,26 @@ async fn register_bound_timeout_proxy_ask_actor(
 ) {
     let workers = workers.max(1);
     let capacity = capacity.max(128);
+    let session = Arc::new(std::sync::OnceLock::new());
     let mut senders = Vec::with_capacity(workers);
     for _ in 0..workers {
-        let (tx, mut rx) = mpsc::channel::<(Bytes, icanact_remote::AskResponder)>(capacity);
+        let (tx, rx) = mpsc::channel::<BenchReplyJob>(capacity);
+        let mut queue = BenchReplyQueue {
+            rx,
+            session: Arc::clone(&session),
+        };
+        let replies = Arc::clone(&session);
         let destination = destination.clone();
         tokio::spawn(async move {
-            while let Some((payload, responder)) = rx.recv().await {
-                match tokio::time::timeout(
+            while let Some((payload, token)) = queue.rx.recv().await {
+                let session = replies.get().expect("session bound before publication");
+                let mut reply = BenchReplyGuard {
+                    session,
+                    token: Some(token),
+                };
+                let response = match tokio::time::timeout(
                     ASK_BENCH_TIMEOUT,
-                    destination.ask_actor_frame_no_timeout(
+                    destination.ask_actor_frame_no_timeout_owned(
                         BENCH_ACTOR_ID,
                         BENCH_TYPE_HASH,
                         payload,
@@ -1324,18 +1478,12 @@ async fn register_bound_timeout_proxy_ask_actor(
                 )
                 .await
                 {
-                    Ok(Ok(reply)) => {
-                        let _ = responder.try_reply_bytes(reply);
-                    }
-                    Ok(Err(_)) => {
-                        let _ =
-                            responder.try_reply_bytes(Bytes::from_static(b"bound_timeout_error"));
-                    }
-                    Err(_) => {
-                        let _ =
-                            responder.try_reply_bytes(Bytes::from_static(b"bound_timeout_timeout"));
-                    }
-                }
+                    Ok(Ok(payload)) => ForwardPayload::try_from(payload).expect("owned reply"),
+                    Ok(Err(_)) => ForwardPayload::from_static(b"bound_timeout_error"),
+                    Err(_) => ForwardPayload::from_static(b"bound_timeout_timeout"),
+                };
+                assert!(response.retained_bytes() <= BENCH_REPLY_MAX_RETAINED_BYTES);
+                let _ = session.try_reply_owned(reply.token.take().unwrap(), response);
             }
         });
         senders.push(tx);
@@ -1344,6 +1492,7 @@ async fn register_bound_timeout_proxy_ask_actor(
     registry
         .set_actor_ask_handler_sync(Arc::new(BoundTimeoutProxyAskActor {
             workers: Arc::new(senders),
+            session,
             next_worker: Arc::new(AtomicUsize::new(0)),
         }))
         .await;
@@ -1395,29 +1544,27 @@ async fn run_actor_ask_inflight_benchmark(label: &str, inflight: usize, ask_coun
         .lookup_peer(&receiver.registry.peer_id)
         .await
         .unwrap();
-    let payload = Bytes::from(vec![3u8; PAYLOAD_BYTES]);
+    let remote = remote.session().await.unwrap();
+    let payload: &'static [u8] = &[3u8; PAYLOAD_BYTES];
 
     let drive = |count: u64| {
-        let remote = remote.clone();
-        let payload = payload.clone();
+        let remote = &remote;
         async move {
             let mut pending: FuturesUnordered<
-                futures::future::BoxFuture<'static, icanact_remote::Result<Bytes>>,
+                futures::future::BoxFuture<'_, icanact_remote::Result<AlignedBytes>>,
             > = FuturesUnordered::new();
             let mut next = 0u64;
             let mut completed = 0u64;
             let mut checksum = 0u64;
 
             while next < count && pending.len() < inflight {
-                let remote = remote.clone();
-                let payload = payload.clone();
                 pending.push(
                     async move {
                         remote
-                            .ask_actor_frame(
+                            .ask_actor_frame_owned(
                                 BENCH_ACTOR_ID,
                                 BENCH_TYPE_HASH,
-                                payload,
+                                ForwardPayload::from_static(payload),
                                 ASK_BENCH_TIMEOUT,
                             )
                             .await
@@ -1440,15 +1587,13 @@ async fn run_actor_ask_inflight_benchmark(label: &str, inflight: usize, ask_coun
                 completed += 1;
                 checksum = checksum.wrapping_add(reply.len() as u64);
                 if next < count {
-                    let remote = remote.clone();
-                    let payload = payload.clone();
                     pending.push(
                         async move {
                             remote
-                                .ask_actor_frame(
+                                .ask_actor_frame_owned(
                                     BENCH_ACTOR_ID,
                                     BENCH_TYPE_HASH,
-                                    payload,
+                                    ForwardPayload::from_static(payload),
                                     ASK_BENCH_TIMEOUT,
                                 )
                                 .await
@@ -1480,8 +1625,8 @@ async fn run_actor_ask_inflight_benchmark(label: &str, inflight: usize, ask_coun
         checksum
     );
 
-    sender.shutdown().await;
-    receiver.shutdown().await;
+    sender.shutdown().await.unwrap();
+    receiver.shutdown().await.unwrap();
 }
 
 async fn run_direct_ask_no_timeout_inflight_benchmark(
@@ -1505,22 +1650,27 @@ async fn run_direct_ask_no_timeout_inflight_benchmark(
         .lookup_peer(&receiver.registry.peer_id)
         .await
         .unwrap();
-    let payload = Bytes::from(vec![11u8; PAYLOAD_BYTES]);
+    let remote = remote.session().await.unwrap();
+    let payload: &'static [u8] = &[11u8; PAYLOAD_BYTES];
 
     let drive = |count: u64| {
-        let remote = remote.clone();
-        let payload = payload.clone();
+        let remote = &remote;
         async move {
             let mut pending: FuturesUnordered<
-                futures::future::BoxFuture<'static, icanact_remote::Result<Bytes>>,
+                futures::future::BoxFuture<'_, icanact_remote::Result<AlignedBytes>>,
             > = FuturesUnordered::new();
             let mut next = 0u64;
             let mut checksum = 0u64;
 
             while next < count && pending.len() < inflight {
-                let remote = remote.clone();
-                let payload = payload.clone();
-                pending.push(async move { remote.ask_direct_no_timeout(payload).await }.boxed());
+                pending.push(
+                    async move {
+                        remote
+                            .ask_direct_no_timeout_owned(ForwardPayload::from_static(payload))
+                            .await
+                    }
+                    .boxed(),
+                );
                 next += 1;
             }
 
@@ -1528,10 +1678,14 @@ async fn run_direct_ask_no_timeout_inflight_benchmark(
                 let reply = result.unwrap();
                 checksum = checksum.wrapping_add(reply.len() as u64);
                 if next < count {
-                    let remote = remote.clone();
-                    let payload = payload.clone();
-                    pending
-                        .push(async move { remote.ask_direct_no_timeout(payload).await }.boxed());
+                    pending.push(
+                        async move {
+                            remote
+                                .ask_direct_no_timeout_owned(ForwardPayload::from_static(payload))
+                                .await
+                        }
+                        .boxed(),
+                    );
                     next += 1;
                 }
             }
@@ -1556,8 +1710,8 @@ async fn run_direct_ask_no_timeout_inflight_benchmark(
         checksum
     );
 
-    sender.shutdown().await;
-    receiver.shutdown().await;
+    sender.shutdown().await.unwrap();
+    receiver.shutdown().await.unwrap();
 }
 
 async fn run_actor_ask_no_timeout_inflight_benchmark(label: &str, inflight: usize, ask_count: u64) {
@@ -1585,25 +1739,27 @@ async fn run_actor_ask_no_timeout_inflight_benchmark(label: &str, inflight: usiz
         .lookup_peer(&receiver.registry.peer_id)
         .await
         .unwrap();
-    let payload = Bytes::from(vec![13u8; PAYLOAD_BYTES]);
+    let remote = remote.session().await.unwrap();
+    let payload: &'static [u8] = &[13u8; PAYLOAD_BYTES];
 
     let drive = |count: u64| {
-        let remote = remote.clone();
-        let payload = payload.clone();
+        let remote = &remote;
         async move {
             let mut pending: FuturesUnordered<
-                futures::future::BoxFuture<'static, icanact_remote::Result<Bytes>>,
+                futures::future::BoxFuture<'_, icanact_remote::Result<AlignedBytes>>,
             > = FuturesUnordered::new();
             let mut next = 0u64;
             let mut checksum = 0u64;
 
             while next < count && pending.len() < inflight {
-                let remote = remote.clone();
-                let payload = payload.clone();
                 pending.push(
                     async move {
                         remote
-                            .ask_actor_frame_no_timeout(BENCH_ACTOR_ID, BENCH_TYPE_HASH, payload)
+                            .ask_actor_frame_no_timeout_owned(
+                                BENCH_ACTOR_ID,
+                                BENCH_TYPE_HASH,
+                                ForwardPayload::from_static(payload),
+                            )
                             .await
                     }
                     .boxed(),
@@ -1615,15 +1771,13 @@ async fn run_actor_ask_no_timeout_inflight_benchmark(label: &str, inflight: usiz
                 let reply = result.unwrap();
                 checksum = checksum.wrapping_add(reply.len() as u64);
                 if next < count {
-                    let remote = remote.clone();
-                    let payload = payload.clone();
                     pending.push(
                         async move {
                             remote
-                                .ask_actor_frame_no_timeout(
+                                .ask_actor_frame_no_timeout_owned(
                                     BENCH_ACTOR_ID,
                                     BENCH_TYPE_HASH,
-                                    payload,
+                                    ForwardPayload::from_static(payload),
                                 )
                                 .await
                         }
@@ -1653,8 +1807,8 @@ async fn run_actor_ask_no_timeout_inflight_benchmark(label: &str, inflight: usiz
         checksum
     );
 
-    sender.shutdown().await;
-    receiver.shutdown().await;
+    sender.shutdown().await.unwrap();
+    receiver.shutdown().await.unwrap();
 }
 
 async fn run_actor_ask_no_timeout_split_inflight_benchmark(
@@ -1686,25 +1840,27 @@ async fn run_actor_ask_no_timeout_split_inflight_benchmark(
         .lookup_peer(&receiver.registry.peer_id)
         .await
         .unwrap();
-    let payload = Bytes::from(vec![14u8; PAYLOAD_BYTES]);
+    let remote = remote.session().await.unwrap();
+    let payload: &'static [u8] = &[14u8; PAYLOAD_BYTES];
 
     let drive = |count: u64| {
-        let remote = remote.clone();
-        let payload = payload.clone();
+        let remote = &remote;
         async move {
             let mut pending: FuturesUnordered<
-                futures::future::BoxFuture<'static, icanact_remote::Result<Bytes>>,
+                futures::future::BoxFuture<'_, icanact_remote::Result<AlignedBytes>>,
             > = FuturesUnordered::new();
             let mut next = 0u64;
             let mut checksum = 0u64;
 
             while next < count && pending.len() < inflight {
-                let remote = remote.clone();
-                let payload = payload.clone();
                 pending.push(
                     async move {
                         remote
-                            .ask_actor_frame_no_timeout(BENCH_ACTOR_ID, BENCH_TYPE_HASH, payload)
+                            .ask_actor_frame_no_timeout_owned(
+                                BENCH_ACTOR_ID,
+                                BENCH_TYPE_HASH,
+                                ForwardPayload::from_static(payload),
+                            )
                             .await
                     }
                     .boxed(),
@@ -1716,15 +1872,13 @@ async fn run_actor_ask_no_timeout_split_inflight_benchmark(
                 let reply = result.unwrap();
                 checksum = checksum.wrapping_add(reply.len() as u64);
                 if next < count {
-                    let remote = remote.clone();
-                    let payload = payload.clone();
                     pending.push(
                         async move {
                             remote
-                                .ask_actor_frame_no_timeout(
+                                .ask_actor_frame_no_timeout_owned(
                                     BENCH_ACTOR_ID,
                                     BENCH_TYPE_HASH,
-                                    payload,
+                                    ForwardPayload::from_static(payload),
                                 )
                                 .await
                         }
@@ -1754,8 +1908,8 @@ async fn run_actor_ask_no_timeout_split_inflight_benchmark(
         checksum
     );
 
-    sender.shutdown().await;
-    receiver.shutdown().await;
+    sender.shutdown().await.unwrap();
+    receiver.shutdown().await.unwrap();
 }
 
 async fn run_actor_ask_deferred_inflight_benchmark(label: &str, inflight: usize, ask_count: u64) {
@@ -1784,20 +1938,19 @@ async fn run_actor_ask_deferred_inflight_benchmark(label: &str, inflight: usize,
         .await
         .unwrap();
     let conn = remote.connection_ref().expect("connected remote ref");
-    let payload = Bytes::from(vec![16u8; PAYLOAD_BYTES]);
+    let payload: &'static [u8] = &[16u8; PAYLOAD_BYTES];
 
     let drive = |count: u64| {
-        let conn = conn.clone();
-        let payload = payload.clone();
+        let conn = &conn;
         async move {
             if inflight == 1 {
                 let mut checksum = 0u64;
                 for _ in 0..count {
                     let reply = conn
-                        .ask_actor_frame(
+                        .ask_actor_frame_owned(
                             BENCH_ACTOR_ID,
                             BENCH_TYPE_HASH,
-                            payload.clone(),
+                            ForwardPayload::from_static(payload),
                             ASK_BENCH_TIMEOUT,
                         )
                         .await
@@ -1808,21 +1961,19 @@ async fn run_actor_ask_deferred_inflight_benchmark(label: &str, inflight: usize,
             }
 
             let mut pending: FuturesUnordered<
-                futures::future::BoxFuture<'static, icanact_remote::Result<Bytes>>,
+                futures::future::BoxFuture<'_, icanact_remote::Result<AlignedBytes>>,
             > = FuturesUnordered::new();
             let mut next = 0u64;
             let mut checksum = 0u64;
 
             while next < count && pending.len() < inflight {
-                let conn = conn.clone();
-                let payload = payload.clone();
                 pending.push(
                     async move {
                         let pending = conn
-                            .ask_actor_frame_deferred(
+                            .ask_actor_frame_deferred_owned(
                                 BENCH_ACTOR_ID,
                                 BENCH_TYPE_HASH,
-                                payload,
+                                ForwardPayload::from_static(payload),
                                 ASK_BENCH_TIMEOUT,
                             )
                             .await?;
@@ -1837,15 +1988,13 @@ async fn run_actor_ask_deferred_inflight_benchmark(label: &str, inflight: usize,
                 let reply = result.unwrap();
                 checksum = checksum.wrapping_add(reply.len() as u64);
                 if next < count {
-                    let conn = conn.clone();
-                    let payload = payload.clone();
                     pending.push(
                         async move {
                             let pending = conn
-                                .ask_actor_frame_deferred(
+                                .ask_actor_frame_deferred_owned(
                                     BENCH_ACTOR_ID,
                                     BENCH_TYPE_HASH,
-                                    payload,
+                                    ForwardPayload::from_static(payload),
                                     ASK_BENCH_TIMEOUT,
                                 )
                                 .await?;
@@ -1877,8 +2026,8 @@ async fn run_actor_ask_deferred_inflight_benchmark(label: &str, inflight: usize,
         checksum
     );
 
-    sender.shutdown().await;
-    receiver.shutdown().await;
+    sender.shutdown().await.unwrap();
+    receiver.shutdown().await.unwrap();
 }
 
 async fn run_actor_ask_deferred_split_inflight_benchmark(
@@ -1911,28 +2060,25 @@ async fn run_actor_ask_deferred_split_inflight_benchmark(
         .await
         .unwrap();
     let conn = remote.connection_ref().expect("connected remote ref");
-    let payload = Bytes::from(vec![17u8; PAYLOAD_BYTES]);
+    let payload: &'static [u8] = &[17u8; PAYLOAD_BYTES];
 
     let drive = |count: u64| {
-        let conn = conn.clone();
-        let payload = payload.clone();
+        let conn = &conn;
         async move {
             let mut pending: FuturesUnordered<
-                futures::future::BoxFuture<'static, icanact_remote::Result<Bytes>>,
+                futures::future::BoxFuture<'_, icanact_remote::Result<AlignedBytes>>,
             > = FuturesUnordered::new();
             let mut next = 0u64;
             let mut checksum = 0u64;
 
             while next < count && pending.len() < inflight {
-                let conn = conn.clone();
-                let payload = payload.clone();
                 pending.push(
                     async move {
                         let pending = conn
-                            .ask_actor_frame_deferred(
+                            .ask_actor_frame_deferred_owned(
                                 BENCH_ACTOR_ID,
                                 BENCH_TYPE_HASH,
-                                payload,
+                                ForwardPayload::from_static(payload),
                                 ASK_BENCH_TIMEOUT,
                             )
                             .await?;
@@ -1947,15 +2093,13 @@ async fn run_actor_ask_deferred_split_inflight_benchmark(
                 let reply = result.unwrap();
                 checksum = checksum.wrapping_add(reply.len() as u64);
                 if next < count {
-                    let conn = conn.clone();
-                    let payload = payload.clone();
                     pending.push(
                         async move {
                             let pending = conn
-                                .ask_actor_frame_deferred(
+                                .ask_actor_frame_deferred_owned(
                                     BENCH_ACTOR_ID,
                                     BENCH_TYPE_HASH,
-                                    payload,
+                                    ForwardPayload::from_static(payload),
                                     ASK_BENCH_TIMEOUT,
                                 )
                                 .await?;
@@ -1987,8 +2131,8 @@ async fn run_actor_ask_deferred_split_inflight_benchmark(
         checksum
     );
 
-    sender.shutdown().await;
-    receiver.shutdown().await;
+    sender.shutdown().await.unwrap();
+    receiver.shutdown().await.unwrap();
 }
 
 async fn run_actor_ask_split_inflight_benchmark(
@@ -2022,27 +2166,24 @@ async fn run_actor_ask_split_inflight_benchmark(
         .await
         .unwrap();
     let conn = remote.connection_ref().expect("connected remote ref");
-    let payload = Bytes::from(vec![20u8; PAYLOAD_BYTES]);
+    let payload: &'static [u8] = &[20u8; PAYLOAD_BYTES];
 
     let drive = |count: u64| {
-        let conn = conn.clone();
-        let payload = payload.clone();
+        let conn = &conn;
         async move {
             let mut pending: FuturesUnordered<
-                futures::future::BoxFuture<'static, icanact_remote::Result<Bytes>>,
+                futures::future::BoxFuture<'_, icanact_remote::Result<AlignedBytes>>,
             > = FuturesUnordered::new();
             let mut next = 0u64;
             let mut checksum = 0u64;
 
             while next < count && pending.len() < inflight {
-                let conn = conn.clone();
-                let payload = payload.clone();
                 pending.push(
                     async move {
-                        conn.ask_actor_frame(
+                        conn.ask_actor_frame_owned(
                             BENCH_ACTOR_ID,
                             BENCH_TYPE_HASH,
-                            payload,
+                            ForwardPayload::from_static(payload),
                             ASK_BENCH_TIMEOUT,
                         )
                         .await
@@ -2056,14 +2197,12 @@ async fn run_actor_ask_split_inflight_benchmark(
                 let reply = result.unwrap();
                 checksum = checksum.wrapping_add(reply.len() as u64);
                 if next < count {
-                    let conn = conn.clone();
-                    let payload = payload.clone();
                     pending.push(
                         async move {
-                            conn.ask_actor_frame(
+                            conn.ask_actor_frame_owned(
                                 BENCH_ACTOR_ID,
                                 BENCH_TYPE_HASH,
-                                payload,
+                                ForwardPayload::from_static(payload),
                                 ASK_BENCH_TIMEOUT,
                             )
                             .await
@@ -2096,8 +2235,8 @@ async fn run_actor_ask_split_inflight_benchmark(
         checksum
     );
 
-    sender.shutdown().await;
-    receiver.shutdown().await;
+    sender.shutdown().await.unwrap();
+    receiver.shutdown().await.unwrap();
 }
 
 async fn run_actor_ask_proxy_split_inflight_benchmark(
@@ -2140,20 +2279,19 @@ async fn run_actor_ask_proxy_split_inflight_benchmark(
 
     let proxy_remote = source.lookup_peer(&middle.registry.peer_id).await.unwrap();
     let proxy_conn = proxy_remote.connection_ref().expect("connected proxy ref");
-    let payload = Bytes::from(vec![18u8; PAYLOAD_BYTES]);
+    let payload: &'static [u8] = &[18u8; PAYLOAD_BYTES];
 
     let drive = |count: u64| {
-        let proxy_conn = proxy_conn.clone();
-        let payload = payload.clone();
+        let proxy_conn = &proxy_conn;
         async move {
             if inflight == 1 {
                 let mut checksum = 0u64;
                 for idx in 0..count {
                     let reply = proxy_conn
-                        .ask_actor_frame(
+                        .ask_actor_frame_owned(
                             PROXY_ACTOR_ID,
                             PROXY_TYPE_HASH,
-                            payload.clone(),
+                            ForwardPayload::from_static(payload),
                             ASK_BENCH_TIMEOUT,
                         )
                         .await
@@ -2168,21 +2306,19 @@ async fn run_actor_ask_proxy_split_inflight_benchmark(
             }
 
             let mut pending: FuturesUnordered<
-                futures::future::BoxFuture<'static, icanact_remote::Result<Bytes>>,
+                futures::future::BoxFuture<'_, icanact_remote::Result<AlignedBytes>>,
             > = FuturesUnordered::new();
             let mut next = 0u64;
             let mut checksum = 0u64;
 
             while next < count && pending.len() < inflight {
-                let proxy_conn = proxy_conn.clone();
-                let payload = payload.clone();
                 pending.push(
                     async move {
                         proxy_conn
-                            .ask_actor_frame(
+                            .ask_actor_frame_owned(
                                 PROXY_ACTOR_ID,
                                 PROXY_TYPE_HASH,
-                                payload,
+                                ForwardPayload::from_static(payload),
                                 ASK_BENCH_TIMEOUT,
                             )
                             .await
@@ -2196,15 +2332,13 @@ async fn run_actor_ask_proxy_split_inflight_benchmark(
                 let reply = result.unwrap();
                 checksum = checksum.wrapping_add(reply.len() as u64);
                 if next < count {
-                    let proxy_conn = proxy_conn.clone();
-                    let payload = payload.clone();
                     pending.push(
                         async move {
                             proxy_conn
-                                .ask_actor_frame(
+                                .ask_actor_frame_owned(
                                     PROXY_ACTOR_ID,
                                     PROXY_TYPE_HASH,
-                                    payload,
+                                    ForwardPayload::from_static(payload),
                                     ASK_BENCH_TIMEOUT,
                                 )
                                 .await
@@ -2237,9 +2371,9 @@ async fn run_actor_ask_proxy_split_inflight_benchmark(
         checksum
     );
 
-    source.shutdown().await;
-    middle.shutdown().await;
-    destination.shutdown().await;
+    source.shutdown().await.unwrap();
+    middle.shutdown().await.unwrap();
+    destination.shutdown().await.unwrap();
 }
 
 async fn run_actor_ask_timeout_proxy_inflight_benchmark(
@@ -2282,20 +2416,19 @@ async fn run_actor_ask_timeout_proxy_inflight_benchmark(
 
     let proxy_remote = source.lookup_peer(&middle.registry.peer_id).await.unwrap();
     let proxy_conn = proxy_remote.connection_ref().expect("connected proxy ref");
-    let payload = Bytes::from(vec![29u8; PAYLOAD_BYTES]);
+    let payload: &'static [u8] = &[29u8; PAYLOAD_BYTES];
 
     let drive = |count: u64| {
-        let proxy_conn = proxy_conn.clone();
-        let payload = payload.clone();
+        let proxy_conn = &proxy_conn;
         async move {
             if inflight == 1 {
                 let mut checksum = 0u64;
                 for idx in 0..count {
                     let reply = proxy_conn
-                        .ask_actor_frame(
+                        .ask_actor_frame_owned(
                             TIMEOUT_PROXY_ACTOR_ID,
                             TIMEOUT_PROXY_TYPE_HASH,
-                            payload.clone(),
+                            ForwardPayload::from_static(payload),
                             ASK_BENCH_TIMEOUT,
                         )
                         .await
@@ -2310,21 +2443,19 @@ async fn run_actor_ask_timeout_proxy_inflight_benchmark(
             }
 
             let mut pending: FuturesUnordered<
-                futures::future::BoxFuture<'static, icanact_remote::Result<Bytes>>,
+                futures::future::BoxFuture<'_, icanact_remote::Result<AlignedBytes>>,
             > = FuturesUnordered::new();
             let mut next = 0u64;
             let mut checksum = 0u64;
 
             while next < count && pending.len() < inflight {
-                let proxy_conn = proxy_conn.clone();
-                let payload = payload.clone();
                 pending.push(
                     async move {
                         proxy_conn
-                            .ask_actor_frame(
+                            .ask_actor_frame_owned(
                                 TIMEOUT_PROXY_ACTOR_ID,
                                 TIMEOUT_PROXY_TYPE_HASH,
-                                payload,
+                                ForwardPayload::from_static(payload),
                                 ASK_BENCH_TIMEOUT,
                             )
                             .await
@@ -2338,15 +2469,13 @@ async fn run_actor_ask_timeout_proxy_inflight_benchmark(
                 let reply = result.unwrap();
                 checksum = checksum.wrapping_add(reply.len() as u64);
                 if next < count {
-                    let proxy_conn = proxy_conn.clone();
-                    let payload = payload.clone();
                     pending.push(
                         async move {
                             proxy_conn
-                                .ask_actor_frame(
+                                .ask_actor_frame_owned(
                                     TIMEOUT_PROXY_ACTOR_ID,
                                     TIMEOUT_PROXY_TYPE_HASH,
-                                    payload,
+                                    ForwardPayload::from_static(payload),
                                     ASK_BENCH_TIMEOUT,
                                 )
                                 .await
@@ -2379,9 +2508,9 @@ async fn run_actor_ask_timeout_proxy_inflight_benchmark(
         checksum
     );
 
-    source.shutdown().await;
-    middle.shutdown().await;
-    destination.shutdown().await;
+    source.shutdown().await.unwrap();
+    middle.shutdown().await.unwrap();
+    destination.shutdown().await.unwrap();
 }
 
 async fn run_actor_ask_aligned_timeout_proxy_inflight_benchmark(
@@ -2424,20 +2553,19 @@ async fn run_actor_ask_aligned_timeout_proxy_inflight_benchmark(
 
     let proxy_remote = source.lookup_peer(&middle.registry.peer_id).await.unwrap();
     let proxy_conn = proxy_remote.connection_ref().expect("connected proxy ref");
-    let payload = Bytes::from(vec![33u8; PAYLOAD_BYTES]);
+    let payload: &'static [u8] = &[33u8; PAYLOAD_BYTES];
 
     let drive = |count: u64| {
-        let proxy_conn = proxy_conn.clone();
-        let payload = payload.clone();
+        let proxy_conn = &proxy_conn;
         async move {
             if inflight == 1 {
                 let mut checksum = 0u64;
                 for idx in 0..count {
                     let reply = proxy_conn
-                        .ask_actor_frame(
+                        .ask_actor_frame_owned(
                             ALIGNED_TIMEOUT_PROXY_ACTOR_ID,
                             ALIGNED_TIMEOUT_PROXY_TYPE_HASH,
-                            payload.clone(),
+                            ForwardPayload::from_static(payload),
                             ASK_BENCH_TIMEOUT,
                         )
                         .await
@@ -2452,21 +2580,19 @@ async fn run_actor_ask_aligned_timeout_proxy_inflight_benchmark(
             }
 
             let mut pending: FuturesUnordered<
-                futures::future::BoxFuture<'static, icanact_remote::Result<Bytes>>,
+                futures::future::BoxFuture<'_, icanact_remote::Result<AlignedBytes>>,
             > = FuturesUnordered::new();
             let mut next = 0u64;
             let mut checksum = 0u64;
 
             while next < count && pending.len() < inflight {
-                let proxy_conn = proxy_conn.clone();
-                let payload = payload.clone();
                 pending.push(
                     async move {
                         proxy_conn
-                            .ask_actor_frame(
+                            .ask_actor_frame_owned(
                                 ALIGNED_TIMEOUT_PROXY_ACTOR_ID,
                                 ALIGNED_TIMEOUT_PROXY_TYPE_HASH,
-                                payload,
+                                ForwardPayload::from_static(payload),
                                 ASK_BENCH_TIMEOUT,
                             )
                             .await
@@ -2480,15 +2606,13 @@ async fn run_actor_ask_aligned_timeout_proxy_inflight_benchmark(
                 let reply = result.unwrap();
                 checksum = checksum.wrapping_add(reply.len() as u64);
                 if next < count {
-                    let proxy_conn = proxy_conn.clone();
-                    let payload = payload.clone();
                     pending.push(
                         async move {
                             proxy_conn
-                                .ask_actor_frame(
+                                .ask_actor_frame_owned(
                                     ALIGNED_TIMEOUT_PROXY_ACTOR_ID,
                                     ALIGNED_TIMEOUT_PROXY_TYPE_HASH,
-                                    payload,
+                                    ForwardPayload::from_static(payload),
                                     ASK_BENCH_TIMEOUT,
                                 )
                                 .await
@@ -2521,9 +2645,9 @@ async fn run_actor_ask_aligned_timeout_proxy_inflight_benchmark(
         checksum
     );
 
-    source.shutdown().await;
-    middle.shutdown().await;
-    destination.shutdown().await;
+    source.shutdown().await.unwrap();
+    middle.shutdown().await.unwrap();
+    destination.shutdown().await.unwrap();
 }
 
 async fn run_actor_ask_outer_timeout_proxy_inflight_benchmark(
@@ -2566,20 +2690,19 @@ async fn run_actor_ask_outer_timeout_proxy_inflight_benchmark(
 
     let proxy_remote = source.lookup_peer(&middle.registry.peer_id).await.unwrap();
     let proxy_conn = proxy_remote.connection_ref().expect("connected proxy ref");
-    let payload = Bytes::from(vec![35u8; PAYLOAD_BYTES]);
+    let payload: &'static [u8] = &[35u8; PAYLOAD_BYTES];
 
     let drive = |count: u64| {
-        let proxy_conn = proxy_conn.clone();
-        let payload = payload.clone();
+        let proxy_conn = &proxy_conn;
         async move {
             if inflight == 1 {
                 let mut checksum = 0u64;
                 for idx in 0..count {
                     let reply = proxy_conn
-                        .ask_actor_frame(
+                        .ask_actor_frame_owned(
                             OUTER_TIMEOUT_PROXY_ACTOR_ID,
                             OUTER_TIMEOUT_PROXY_TYPE_HASH,
-                            payload.clone(),
+                            ForwardPayload::from_static(payload),
                             ASK_BENCH_TIMEOUT,
                         )
                         .await
@@ -2594,21 +2717,19 @@ async fn run_actor_ask_outer_timeout_proxy_inflight_benchmark(
             }
 
             let mut pending: FuturesUnordered<
-                futures::future::BoxFuture<'static, icanact_remote::Result<Bytes>>,
+                futures::future::BoxFuture<'_, icanact_remote::Result<AlignedBytes>>,
             > = FuturesUnordered::new();
             let mut next = 0u64;
             let mut checksum = 0u64;
 
             while next < count && pending.len() < inflight {
-                let proxy_conn = proxy_conn.clone();
-                let payload = payload.clone();
                 pending.push(
                     async move {
                         proxy_conn
-                            .ask_actor_frame(
+                            .ask_actor_frame_owned(
                                 OUTER_TIMEOUT_PROXY_ACTOR_ID,
                                 OUTER_TIMEOUT_PROXY_TYPE_HASH,
-                                payload,
+                                ForwardPayload::from_static(payload),
                                 ASK_BENCH_TIMEOUT,
                             )
                             .await
@@ -2622,15 +2743,13 @@ async fn run_actor_ask_outer_timeout_proxy_inflight_benchmark(
                 let reply = result.unwrap();
                 checksum = checksum.wrapping_add(reply.len() as u64);
                 if next < count {
-                    let proxy_conn = proxy_conn.clone();
-                    let payload = payload.clone();
                     pending.push(
                         async move {
                             proxy_conn
-                                .ask_actor_frame(
+                                .ask_actor_frame_owned(
                                     OUTER_TIMEOUT_PROXY_ACTOR_ID,
                                     OUTER_TIMEOUT_PROXY_TYPE_HASH,
-                                    payload,
+                                    ForwardPayload::from_static(payload),
                                     ASK_BENCH_TIMEOUT,
                                 )
                                 .await
@@ -2663,9 +2782,9 @@ async fn run_actor_ask_outer_timeout_proxy_inflight_benchmark(
         checksum
     );
 
-    source.shutdown().await;
-    middle.shutdown().await;
-    destination.shutdown().await;
+    source.shutdown().await.unwrap();
+    middle.shutdown().await.unwrap();
+    destination.shutdown().await.unwrap();
 }
 
 async fn run_actor_ask_deferred_timeout_proxy_inflight_benchmark(
@@ -2708,20 +2827,19 @@ async fn run_actor_ask_deferred_timeout_proxy_inflight_benchmark(
 
     let proxy_remote = source.lookup_peer(&middle.registry.peer_id).await.unwrap();
     let proxy_conn = proxy_remote.connection_ref().expect("connected proxy ref");
-    let payload = Bytes::from(vec![30u8; PAYLOAD_BYTES]);
+    let payload: &'static [u8] = &[30u8; PAYLOAD_BYTES];
 
     let drive = |count: u64| {
-        let proxy_conn = proxy_conn.clone();
-        let payload = payload.clone();
+        let proxy_conn = &proxy_conn;
         async move {
             if inflight == 1 {
                 let mut checksum = 0u64;
                 for idx in 0..count {
                     let reply = proxy_conn
-                        .ask_actor_frame(
+                        .ask_actor_frame_owned(
                             DEFERRED_TIMEOUT_PROXY_ACTOR_ID,
                             DEFERRED_TIMEOUT_PROXY_TYPE_HASH,
-                            payload.clone(),
+                            ForwardPayload::from_static(payload),
                             ASK_BENCH_TIMEOUT,
                         )
                         .await
@@ -2736,21 +2854,19 @@ async fn run_actor_ask_deferred_timeout_proxy_inflight_benchmark(
             }
 
             let mut pending: FuturesUnordered<
-                futures::future::BoxFuture<'static, icanact_remote::Result<Bytes>>,
+                futures::future::BoxFuture<'_, icanact_remote::Result<AlignedBytes>>,
             > = FuturesUnordered::new();
             let mut next = 0u64;
             let mut checksum = 0u64;
 
             while next < count && pending.len() < inflight {
-                let proxy_conn = proxy_conn.clone();
-                let payload = payload.clone();
                 pending.push(
                     async move {
                         proxy_conn
-                            .ask_actor_frame(
+                            .ask_actor_frame_owned(
                                 DEFERRED_TIMEOUT_PROXY_ACTOR_ID,
                                 DEFERRED_TIMEOUT_PROXY_TYPE_HASH,
-                                payload,
+                                ForwardPayload::from_static(payload),
                                 ASK_BENCH_TIMEOUT,
                             )
                             .await
@@ -2764,15 +2880,13 @@ async fn run_actor_ask_deferred_timeout_proxy_inflight_benchmark(
                 let reply = result.unwrap();
                 checksum = checksum.wrapping_add(reply.len() as u64);
                 if next < count {
-                    let proxy_conn = proxy_conn.clone();
-                    let payload = payload.clone();
                     pending.push(
                         async move {
                             proxy_conn
-                                .ask_actor_frame(
+                                .ask_actor_frame_owned(
                                     DEFERRED_TIMEOUT_PROXY_ACTOR_ID,
                                     DEFERRED_TIMEOUT_PROXY_TYPE_HASH,
-                                    payload,
+                                    ForwardPayload::from_static(payload),
                                     ASK_BENCH_TIMEOUT,
                                 )
                                 .await
@@ -2805,9 +2919,9 @@ async fn run_actor_ask_deferred_timeout_proxy_inflight_benchmark(
         checksum
     );
 
-    source.shutdown().await;
-    middle.shutdown().await;
-    destination.shutdown().await;
+    source.shutdown().await.unwrap();
+    middle.shutdown().await.unwrap();
+    destination.shutdown().await.unwrap();
 }
 
 async fn probe_actor_ask_split_inflight(label: &str, inflight: usize, ask_count: u64) {
@@ -2837,10 +2951,10 @@ async fn probe_actor_ask_split_inflight(label: &str, inflight: usize, ask_count:
         .unwrap()
         .connection_ref()
         .expect("connected remote ref");
-    let payload = Bytes::from(vec![21u8; PAYLOAD_BYTES]);
+    let payload: &'static [u8] = &[21u8; PAYLOAD_BYTES];
 
     let mut pending: FuturesUnordered<
-        futures::future::BoxFuture<'static, (u64, icanact_remote::Result<Bytes>)>,
+        futures::future::BoxFuture<'_, (u64, icanact_remote::Result<AlignedBytes>)>,
     > = FuturesUnordered::new();
     let mut next = 0u64;
     let mut completed = 0u64;
@@ -2848,17 +2962,16 @@ async fn probe_actor_ask_split_inflight(label: &str, inflight: usize, ask_count:
     let start = Instant::now();
 
     while next < ask_count && pending.len() < inflight {
-        let conn = conn.clone();
-        let payload = payload.clone();
+        let conn = &conn;
         let idx = next;
         pending.push(
             async move {
                 (
                     idx,
-                    conn.ask_actor_frame(
+                    conn.ask_actor_frame_owned(
                         BENCH_ACTOR_ID,
                         BENCH_TYPE_HASH,
-                        payload,
+                        ForwardPayload::from_static(payload),
                         ASK_BENCH_TIMEOUT,
                     )
                     .await,
@@ -2876,17 +2989,16 @@ async fn probe_actor_ask_split_inflight(label: &str, inflight: usize, ask_count:
                 completed += 1;
                 checksum = checksum.wrapping_add(reply.len() as u64);
                 if next < ask_count {
-                    let conn = conn.clone();
-                    let payload = payload.clone();
+                    let conn = &conn;
                     let next_idx = next;
                     pending.push(
                         async move {
                             (
                                 next_idx,
-                                conn.ask_actor_frame(
+                                conn.ask_actor_frame_owned(
                                     BENCH_ACTOR_ID,
                                     BENCH_TYPE_HASH,
-                                    payload,
+                                    ForwardPayload::from_static(payload),
                                     ASK_BENCH_TIMEOUT,
                                 )
                                 .await,
@@ -2922,8 +3034,8 @@ async fn probe_actor_ask_split_inflight(label: &str, inflight: usize, ask_count:
         status
     );
 
-    sender.shutdown().await;
-    receiver.shutdown().await;
+    sender.shutdown().await.unwrap();
+    receiver.shutdown().await.unwrap();
 }
 
 async fn probe_actor_ask_proxy_split_inflight(label: &str, inflight: usize, ask_count: u64) {
@@ -2965,10 +3077,10 @@ async fn probe_actor_ask_proxy_split_inflight(label: &str, inflight: usize, ask_
         .unwrap()
         .connection_ref()
         .expect("connected proxy ref");
-    let payload = Bytes::from(vec![22u8; PAYLOAD_BYTES]);
+    let payload: &'static [u8] = &[22u8; PAYLOAD_BYTES];
 
     let mut pending: FuturesUnordered<
-        futures::future::BoxFuture<'static, (u64, icanact_remote::Result<Bytes>)>,
+        futures::future::BoxFuture<'_, (u64, icanact_remote::Result<AlignedBytes>)>,
     > = FuturesUnordered::new();
     let mut next = 0u64;
     let mut completed = 0u64;
@@ -2976,18 +3088,17 @@ async fn probe_actor_ask_proxy_split_inflight(label: &str, inflight: usize, ask_
     let start = Instant::now();
 
     while next < ask_count && pending.len() < inflight {
-        let proxy_conn = proxy_conn.clone();
-        let payload = payload.clone();
+        let proxy_conn = &proxy_conn;
         let idx = next;
         pending.push(
             async move {
                 (
                     idx,
                     proxy_conn
-                        .ask_actor_frame(
+                        .ask_actor_frame_owned(
                             PROXY_ACTOR_ID,
                             PROXY_TYPE_HASH,
-                            payload,
+                            ForwardPayload::from_static(payload),
                             ASK_BENCH_TIMEOUT,
                         )
                         .await,
@@ -3005,18 +3116,17 @@ async fn probe_actor_ask_proxy_split_inflight(label: &str, inflight: usize, ask_
                 completed += 1;
                 checksum = checksum.wrapping_add(reply.len() as u64);
                 if next < ask_count {
-                    let proxy_conn = proxy_conn.clone();
-                    let payload = payload.clone();
+                    let proxy_conn = &proxy_conn;
                     let next_idx = next;
                     pending.push(
                         async move {
                             (
                                 next_idx,
                                 proxy_conn
-                                    .ask_actor_frame(
+                                    .ask_actor_frame_owned(
                                         PROXY_ACTOR_ID,
                                         PROXY_TYPE_HASH,
-                                        payload,
+                                        ForwardPayload::from_static(payload),
                                         ASK_BENCH_TIMEOUT,
                                     )
                                     .await,
@@ -3052,9 +3162,9 @@ async fn probe_actor_ask_proxy_split_inflight(label: &str, inflight: usize, ask_
         status
     );
 
-    source.shutdown().await;
-    middle.shutdown().await;
-    destination.shutdown().await;
+    source.shutdown().await.unwrap();
+    middle.shutdown().await.unwrap();
+    destination.shutdown().await.unwrap();
 }
 
 async fn probe_actor_ask_timeout_proxy_inflight(label: &str, inflight: usize, ask_count: u64) {
@@ -3096,10 +3206,10 @@ async fn probe_actor_ask_timeout_proxy_inflight(label: &str, inflight: usize, as
         .unwrap()
         .connection_ref()
         .expect("connected proxy ref");
-    let payload = Bytes::from(vec![27u8; PAYLOAD_BYTES]);
+    let payload: &'static [u8] = &[27u8; PAYLOAD_BYTES];
 
     let mut pending: FuturesUnordered<
-        futures::future::BoxFuture<'static, (u64, icanact_remote::Result<Bytes>)>,
+        futures::future::BoxFuture<'_, (u64, icanact_remote::Result<AlignedBytes>)>,
     > = FuturesUnordered::new();
     let mut next = 0u64;
     let mut completed = 0u64;
@@ -3107,18 +3217,17 @@ async fn probe_actor_ask_timeout_proxy_inflight(label: &str, inflight: usize, as
     let start = Instant::now();
 
     while next < ask_count && pending.len() < inflight {
-        let proxy_conn = proxy_conn.clone();
-        let payload = payload.clone();
+        let proxy_conn = &proxy_conn;
         let idx = next;
         pending.push(
             async move {
                 (
                     idx,
                     proxy_conn
-                        .ask_actor_frame(
+                        .ask_actor_frame_owned(
                             TIMEOUT_PROXY_ACTOR_ID,
                             TIMEOUT_PROXY_TYPE_HASH,
-                            payload,
+                            ForwardPayload::from_static(payload),
                             ASK_BENCH_TIMEOUT,
                         )
                         .await,
@@ -3136,18 +3245,17 @@ async fn probe_actor_ask_timeout_proxy_inflight(label: &str, inflight: usize, as
                 completed += 1;
                 checksum = checksum.wrapping_add(reply.len() as u64);
                 if next < ask_count {
-                    let proxy_conn = proxy_conn.clone();
-                    let payload = payload.clone();
+                    let proxy_conn = &proxy_conn;
                     let next_idx = next;
                     pending.push(
                         async move {
                             (
                                 next_idx,
                                 proxy_conn
-                                    .ask_actor_frame(
+                                    .ask_actor_frame_owned(
                                         TIMEOUT_PROXY_ACTOR_ID,
                                         TIMEOUT_PROXY_TYPE_HASH,
-                                        payload,
+                                        ForwardPayload::from_static(payload),
                                         ASK_BENCH_TIMEOUT,
                                     )
                                     .await,
@@ -3183,9 +3291,9 @@ async fn probe_actor_ask_timeout_proxy_inflight(label: &str, inflight: usize, as
         status
     );
 
-    source.shutdown().await;
-    middle.shutdown().await;
-    destination.shutdown().await;
+    source.shutdown().await.unwrap();
+    middle.shutdown().await.unwrap();
+    destination.shutdown().await.unwrap();
 }
 
 async fn probe_actor_ask_deferred_timeout_proxy_inflight(
@@ -3231,10 +3339,10 @@ async fn probe_actor_ask_deferred_timeout_proxy_inflight(
         .unwrap()
         .connection_ref()
         .expect("connected proxy ref");
-    let payload = Bytes::from(vec![28u8; PAYLOAD_BYTES]);
+    let payload: &'static [u8] = &[28u8; PAYLOAD_BYTES];
 
     let mut pending: FuturesUnordered<
-        futures::future::BoxFuture<'static, (u64, icanact_remote::Result<Bytes>)>,
+        futures::future::BoxFuture<'_, (u64, icanact_remote::Result<AlignedBytes>)>,
     > = FuturesUnordered::new();
     let mut next = 0u64;
     let mut completed = 0u64;
@@ -3242,18 +3350,17 @@ async fn probe_actor_ask_deferred_timeout_proxy_inflight(
     let start = Instant::now();
 
     while next < ask_count && pending.len() < inflight {
-        let proxy_conn = proxy_conn.clone();
-        let payload = payload.clone();
+        let proxy_conn = &proxy_conn;
         let idx = next;
         pending.push(
             async move {
                 (
                     idx,
                     proxy_conn
-                        .ask_actor_frame(
+                        .ask_actor_frame_owned(
                             DEFERRED_TIMEOUT_PROXY_ACTOR_ID,
                             DEFERRED_TIMEOUT_PROXY_TYPE_HASH,
-                            payload,
+                            ForwardPayload::from_static(payload),
                             ASK_BENCH_TIMEOUT,
                         )
                         .await,
@@ -3271,18 +3378,17 @@ async fn probe_actor_ask_deferred_timeout_proxy_inflight(
                 completed += 1;
                 checksum = checksum.wrapping_add(reply.len() as u64);
                 if next < ask_count {
-                    let proxy_conn = proxy_conn.clone();
-                    let payload = payload.clone();
+                    let proxy_conn = &proxy_conn;
                     let next_idx = next;
                     pending.push(
                         async move {
                             (
                                 next_idx,
                                 proxy_conn
-                                    .ask_actor_frame(
+                                    .ask_actor_frame_owned(
                                         DEFERRED_TIMEOUT_PROXY_ACTOR_ID,
                                         DEFERRED_TIMEOUT_PROXY_TYPE_HASH,
-                                        payload,
+                                        ForwardPayload::from_static(payload),
                                         ASK_BENCH_TIMEOUT,
                                     )
                                     .await,
@@ -3318,9 +3424,9 @@ async fn probe_actor_ask_deferred_timeout_proxy_inflight(
         status
     );
 
-    source.shutdown().await;
-    middle.shutdown().await;
-    destination.shutdown().await;
+    source.shutdown().await.unwrap();
+    middle.shutdown().await.unwrap();
+    destination.shutdown().await.unwrap();
 }
 
 async fn probe_actor_ask_deferred_proxy_inflight(label: &str, inflight: usize, ask_count: u64) {
@@ -3344,10 +3450,10 @@ async fn probe_actor_ask_deferred_proxy_inflight(label: &str, inflight: usize, a
         .unwrap()
         .connection_ref()
         .expect("connected proxy ref");
-    let payload = Bytes::from(vec![23u8; PAYLOAD_BYTES]);
+    let payload: &'static [u8] = &[23u8; PAYLOAD_BYTES];
 
     let mut pending: FuturesUnordered<
-        futures::future::BoxFuture<'static, (u64, icanact_remote::Result<Bytes>)>,
+        futures::future::BoxFuture<'_, (u64, icanact_remote::Result<AlignedBytes>)>,
     > = FuturesUnordered::new();
     let mut next = 0u64;
     let mut completed = 0u64;
@@ -3355,18 +3461,17 @@ async fn probe_actor_ask_deferred_proxy_inflight(label: &str, inflight: usize, a
     let start = Instant::now();
 
     while next < ask_count && pending.len() < inflight {
-        let middle_conn = middle_conn.clone();
-        let payload = payload.clone();
+        let middle_conn = &middle_conn;
         let idx = next;
         pending.push(
             async move {
                 (
                     idx,
                     middle_conn
-                        .ask_actor_frame(
+                        .ask_actor_frame_owned(
                             DEFERRED_PROXY_ACTOR_ID,
                             DEFERRED_PROXY_TYPE_HASH,
-                            payload,
+                            ForwardPayload::from_static(payload),
                             ASK_BENCH_TIMEOUT,
                         )
                         .await,
@@ -3384,18 +3489,17 @@ async fn probe_actor_ask_deferred_proxy_inflight(label: &str, inflight: usize, a
                 completed += 1;
                 checksum = checksum.wrapping_add(reply.len() as u64);
                 if next < ask_count {
-                    let middle_conn = middle_conn.clone();
-                    let payload = payload.clone();
+                    let middle_conn = &middle_conn;
                     let next_idx = next;
                     pending.push(
                         async move {
                             (
                                 next_idx,
                                 middle_conn
-                                    .ask_actor_frame(
+                                    .ask_actor_frame_owned(
                                         DEFERRED_PROXY_ACTOR_ID,
                                         DEFERRED_PROXY_TYPE_HASH,
-                                        payload,
+                                        ForwardPayload::from_static(payload),
                                         ASK_BENCH_TIMEOUT,
                                     )
                                     .await,
@@ -3431,8 +3535,8 @@ async fn probe_actor_ask_deferred_proxy_inflight(label: &str, inflight: usize, a
         status
     );
 
-    source.shutdown().await;
-    middle.shutdown().await;
+    source.shutdown().await.unwrap();
+    middle.shutdown().await.unwrap();
 }
 
 async fn probe_actor_ask_nonblocking_deferred_proxy_inflight(
@@ -3460,10 +3564,10 @@ async fn probe_actor_ask_nonblocking_deferred_proxy_inflight(
         .unwrap()
         .connection_ref()
         .expect("connected proxy ref");
-    let payload = Bytes::from(vec![25u8; PAYLOAD_BYTES]);
+    let payload: &'static [u8] = &[25u8; PAYLOAD_BYTES];
 
     let mut pending: FuturesUnordered<
-        futures::future::BoxFuture<'static, (u64, icanact_remote::Result<Bytes>)>,
+        futures::future::BoxFuture<'_, (u64, icanact_remote::Result<AlignedBytes>)>,
     > = FuturesUnordered::new();
     let mut next = 0u64;
     let mut completed = 0u64;
@@ -3471,18 +3575,17 @@ async fn probe_actor_ask_nonblocking_deferred_proxy_inflight(
     let start = Instant::now();
 
     while next < ask_count && pending.len() < inflight {
-        let middle_conn = middle_conn.clone();
-        let payload = payload.clone();
+        let middle_conn = &middle_conn;
         let idx = next;
         pending.push(
             async move {
                 (
                     idx,
                     middle_conn
-                        .ask_actor_frame(
+                        .ask_actor_frame_owned(
                             NONBLOCKING_DEFERRED_PROXY_ACTOR_ID,
                             NONBLOCKING_DEFERRED_PROXY_TYPE_HASH,
-                            payload,
+                            ForwardPayload::from_static(payload),
                             ASK_BENCH_TIMEOUT,
                         )
                         .await,
@@ -3500,18 +3603,17 @@ async fn probe_actor_ask_nonblocking_deferred_proxy_inflight(
                 completed += 1;
                 checksum = checksum.wrapping_add(reply.len() as u64);
                 if next < ask_count {
-                    let middle_conn = middle_conn.clone();
-                    let payload = payload.clone();
+                    let middle_conn = &middle_conn;
                     let next_idx = next;
                     pending.push(
                         async move {
                             (
                                 next_idx,
                                 middle_conn
-                                    .ask_actor_frame(
+                                    .ask_actor_frame_owned(
                                         NONBLOCKING_DEFERRED_PROXY_ACTOR_ID,
                                         NONBLOCKING_DEFERRED_PROXY_TYPE_HASH,
-                                        payload,
+                                        ForwardPayload::from_static(payload),
                                         ASK_BENCH_TIMEOUT,
                                     )
                                     .await,
@@ -3547,8 +3649,8 @@ async fn probe_actor_ask_nonblocking_deferred_proxy_inflight(
         status
     );
 
-    source.shutdown().await;
-    middle.shutdown().await;
+    source.shutdown().await.unwrap();
+    middle.shutdown().await.unwrap();
 }
 
 async fn probe_actor_ask_async_proxy_inflight(label: &str, inflight: usize, ask_count: u64) {
@@ -3590,10 +3692,10 @@ async fn probe_actor_ask_async_proxy_inflight(label: &str, inflight: usize, ask_
         .unwrap()
         .connection_ref()
         .expect("connected proxy ref");
-    let payload = Bytes::from(vec![26u8; PAYLOAD_BYTES]);
+    let payload: &'static [u8] = &[26u8; PAYLOAD_BYTES];
 
     let mut pending: FuturesUnordered<
-        futures::future::BoxFuture<'static, (u64, icanact_remote::Result<Bytes>)>,
+        futures::future::BoxFuture<'_, (u64, icanact_remote::Result<AlignedBytes>)>,
     > = FuturesUnordered::new();
     let mut next = 0u64;
     let mut completed = 0u64;
@@ -3601,18 +3703,17 @@ async fn probe_actor_ask_async_proxy_inflight(label: &str, inflight: usize, ask_
     let start = Instant::now();
 
     while next < ask_count && pending.len() < inflight {
-        let proxy_conn = proxy_conn.clone();
-        let payload = payload.clone();
+        let proxy_conn = &proxy_conn;
         let idx = next;
         pending.push(
             async move {
                 (
                     idx,
                     proxy_conn
-                        .ask_actor_frame(
+                        .ask_actor_frame_owned(
                             ASYNC_PROXY_ACTOR_ID,
                             ASYNC_PROXY_TYPE_HASH,
-                            payload,
+                            ForwardPayload::from_static(payload),
                             ASK_BENCH_TIMEOUT,
                         )
                         .await,
@@ -3630,18 +3731,17 @@ async fn probe_actor_ask_async_proxy_inflight(label: &str, inflight: usize, ask_
                 completed += 1;
                 checksum = checksum.wrapping_add(reply.len() as u64);
                 if next < ask_count {
-                    let proxy_conn = proxy_conn.clone();
-                    let payload = payload.clone();
+                    let proxy_conn = &proxy_conn;
                     let next_idx = next;
                     pending.push(
                         async move {
                             (
                                 next_idx,
                                 proxy_conn
-                                    .ask_actor_frame(
+                                    .ask_actor_frame_owned(
                                         ASYNC_PROXY_ACTOR_ID,
                                         ASYNC_PROXY_TYPE_HASH,
-                                        payload,
+                                        ForwardPayload::from_static(payload),
                                         ASK_BENCH_TIMEOUT,
                                     )
                                     .await,
@@ -3677,9 +3777,9 @@ async fn probe_actor_ask_async_proxy_inflight(label: &str, inflight: usize, ask_
         status
     );
 
-    source.shutdown().await;
-    middle.shutdown().await;
-    destination.shutdown().await;
+    source.shutdown().await.unwrap();
+    middle.shutdown().await.unwrap();
+    destination.shutdown().await.unwrap();
 }
 
 async fn probe_actor_ask_worker_proxy_inflight(
@@ -3726,10 +3826,10 @@ async fn probe_actor_ask_worker_proxy_inflight(
         .unwrap()
         .connection_ref()
         .expect("connected proxy ref");
-    let payload = Bytes::from(vec![24u8; PAYLOAD_BYTES]);
+    let payload: &'static [u8] = &[24u8; PAYLOAD_BYTES];
 
     let mut pending: FuturesUnordered<
-        futures::future::BoxFuture<'static, (u64, icanact_remote::Result<Bytes>)>,
+        futures::future::BoxFuture<'_, (u64, icanact_remote::Result<AlignedBytes>)>,
     > = FuturesUnordered::new();
     let mut next = 0u64;
     let mut completed = 0u64;
@@ -3737,18 +3837,17 @@ async fn probe_actor_ask_worker_proxy_inflight(
     let start = Instant::now();
 
     while next < ask_count && pending.len() < inflight {
-        let proxy_conn = proxy_conn.clone();
-        let payload = payload.clone();
+        let proxy_conn = &proxy_conn;
         let idx = next;
         pending.push(
             async move {
                 (
                     idx,
                     proxy_conn
-                        .ask_actor_frame(
+                        .ask_actor_frame_owned(
                             WORKER_PROXY_ACTOR_ID,
                             WORKER_PROXY_TYPE_HASH,
-                            payload,
+                            ForwardPayload::from_static(payload),
                             ASK_BENCH_TIMEOUT,
                         )
                         .await,
@@ -3766,18 +3865,17 @@ async fn probe_actor_ask_worker_proxy_inflight(
                 completed += 1;
                 checksum = checksum.wrapping_add(reply.len() as u64);
                 if next < ask_count {
-                    let proxy_conn = proxy_conn.clone();
-                    let payload = payload.clone();
+                    let proxy_conn = &proxy_conn;
                     let next_idx = next;
                     pending.push(
                         async move {
                             (
                                 next_idx,
                                 proxy_conn
-                                    .ask_actor_frame(
+                                    .ask_actor_frame_owned(
                                         WORKER_PROXY_ACTOR_ID,
                                         WORKER_PROXY_TYPE_HASH,
-                                        payload,
+                                        ForwardPayload::from_static(payload),
                                         ASK_BENCH_TIMEOUT,
                                     )
                                     .await,
@@ -3814,9 +3912,9 @@ async fn probe_actor_ask_worker_proxy_inflight(
         status
     );
 
-    source.shutdown().await;
-    middle.shutdown().await;
-    destination.shutdown().await;
+    source.shutdown().await.unwrap();
+    middle.shutdown().await.unwrap();
+    destination.shutdown().await.unwrap();
 }
 
 async fn probe_actor_ask_bound_forwarder_proxy_inflight(
@@ -3870,10 +3968,10 @@ async fn probe_actor_ask_bound_forwarder_proxy_inflight(
         .unwrap()
         .connection_ref()
         .expect("connected proxy ref");
-    let payload = Bytes::from(vec![37u8; PAYLOAD_BYTES]);
+    let payload: &'static [u8] = &[37u8; PAYLOAD_BYTES];
 
     let mut pending: FuturesUnordered<
-        futures::future::BoxFuture<'static, (u64, icanact_remote::Result<Bytes>)>,
+        futures::future::BoxFuture<'_, (u64, icanact_remote::Result<AlignedBytes>)>,
     > = FuturesUnordered::new();
     let mut next = 0u64;
     let mut completed = 0u64;
@@ -3881,18 +3979,17 @@ async fn probe_actor_ask_bound_forwarder_proxy_inflight(
     let start = Instant::now();
 
     while next < ask_count && pending.len() < inflight {
-        let proxy_conn = proxy_conn.clone();
-        let payload = payload.clone();
+        let proxy_conn = &proxy_conn;
         let idx = next;
         pending.push(
             async move {
                 (
                     idx,
                     proxy_conn
-                        .ask_actor_frame(
+                        .ask_actor_frame_owned(
                             BOUND_FORWARDER_PROXY_ACTOR_ID,
                             BOUND_FORWARDER_PROXY_TYPE_HASH,
-                            payload,
+                            ForwardPayload::from_static(payload),
                             ASK_BENCH_TIMEOUT,
                         )
                         .await,
@@ -3911,18 +4008,17 @@ async fn probe_actor_ask_bound_forwarder_proxy_inflight(
         completed += 1;
 
         if next < ask_count {
-            let proxy_conn = proxy_conn.clone();
-            let payload = payload.clone();
+            let proxy_conn = &proxy_conn;
             let next_idx = next;
             pending.push(
                 async move {
                     (
                         next_idx,
                         proxy_conn
-                            .ask_actor_frame(
+                            .ask_actor_frame_owned(
                                 BOUND_FORWARDER_PROXY_ACTOR_ID,
                                 BOUND_FORWARDER_PROXY_TYPE_HASH,
-                                payload,
+                                ForwardPayload::from_static(payload),
                                 ASK_BENCH_TIMEOUT,
                             )
                             .await,
@@ -3953,9 +4049,9 @@ async fn probe_actor_ask_bound_forwarder_proxy_inflight(
         checksum
     );
 
-    source.shutdown().await;
-    middle.shutdown().await;
-    destination.shutdown().await;
+    source.shutdown().await.unwrap();
+    middle.shutdown().await.unwrap();
+    destination.shutdown().await.unwrap();
 }
 
 async fn probe_actor_ask_bound_timeout_proxy_inflight(
@@ -4004,10 +4100,10 @@ async fn probe_actor_ask_bound_timeout_proxy_inflight(
         .unwrap()
         .connection_ref()
         .expect("connected proxy ref");
-    let payload = Bytes::from(vec![38u8; PAYLOAD_BYTES]);
+    let payload: &'static [u8] = &[38u8; PAYLOAD_BYTES];
 
     let mut pending: FuturesUnordered<
-        futures::future::BoxFuture<'static, (u64, icanact_remote::Result<Bytes>)>,
+        futures::future::BoxFuture<'_, (u64, icanact_remote::Result<AlignedBytes>)>,
     > = FuturesUnordered::new();
     let mut next = 0u64;
     let mut completed = 0u64;
@@ -4015,18 +4111,17 @@ async fn probe_actor_ask_bound_timeout_proxy_inflight(
     let start = Instant::now();
 
     while next < ask_count && pending.len() < inflight {
-        let proxy_conn = proxy_conn.clone();
-        let payload = payload.clone();
+        let proxy_conn = &proxy_conn;
         let idx = next;
         pending.push(
             async move {
                 (
                     idx,
                     proxy_conn
-                        .ask_actor_frame(
+                        .ask_actor_frame_owned(
                             BOUND_TIMEOUT_PROXY_ACTOR_ID,
                             BOUND_TIMEOUT_PROXY_TYPE_HASH,
-                            payload,
+                            ForwardPayload::from_static(payload),
                             ASK_BENCH_TIMEOUT,
                         )
                         .await,
@@ -4045,18 +4140,17 @@ async fn probe_actor_ask_bound_timeout_proxy_inflight(
         completed += 1;
 
         if next < ask_count {
-            let proxy_conn = proxy_conn.clone();
-            let payload = payload.clone();
+            let proxy_conn = &proxy_conn;
             let next_idx = next;
             pending.push(
                 async move {
                     (
                         next_idx,
                         proxy_conn
-                            .ask_actor_frame(
+                            .ask_actor_frame_owned(
                                 BOUND_TIMEOUT_PROXY_ACTOR_ID,
                                 BOUND_TIMEOUT_PROXY_TYPE_HASH,
-                                payload,
+                                ForwardPayload::from_static(payload),
                                 ASK_BENCH_TIMEOUT,
                             )
                             .await,
@@ -4087,9 +4181,9 @@ async fn probe_actor_ask_bound_timeout_proxy_inflight(
         checksum
     );
 
-    source.shutdown().await;
-    middle.shutdown().await;
-    destination.shutdown().await;
+    source.shutdown().await.unwrap();
+    middle.shutdown().await.unwrap();
+    destination.shutdown().await.unwrap();
 }
 
 async fn run_actor_ask_outer_timeout_inflight_benchmark(
@@ -4121,29 +4215,27 @@ async fn run_actor_ask_outer_timeout_inflight_benchmark(
         .lookup_peer(&receiver.registry.peer_id)
         .await
         .unwrap();
-    let payload = Bytes::from(vec![15u8; PAYLOAD_BYTES]);
+    let remote = remote.session().await.unwrap();
+    let payload: &'static [u8] = &[15u8; PAYLOAD_BYTES];
 
     let drive = |count: u64| {
-        let remote = remote.clone();
-        let payload = payload.clone();
+        let remote = &remote;
         async move {
             let mut pending: FuturesUnordered<
-                futures::future::BoxFuture<'static, icanact_remote::Result<Bytes>>,
+                futures::future::BoxFuture<'_, icanact_remote::Result<AlignedBytes>>,
             > = FuturesUnordered::new();
             let mut next = 0u64;
             let mut checksum = 0u64;
 
             while next < count && pending.len() < inflight {
-                let remote = remote.clone();
-                let payload = payload.clone();
                 pending.push(
                     async move {
                         tokio::time::timeout(
                             ASK_BENCH_TIMEOUT,
-                            remote.ask_actor_frame_no_timeout(
+                            remote.ask_actor_frame_no_timeout_owned(
                                 BENCH_ACTOR_ID,
                                 BENCH_TYPE_HASH,
-                                payload,
+                                ForwardPayload::from_static(payload),
                             ),
                         )
                         .await
@@ -4158,16 +4250,14 @@ async fn run_actor_ask_outer_timeout_inflight_benchmark(
                 let reply = result.unwrap();
                 checksum = checksum.wrapping_add(reply.len() as u64);
                 if next < count {
-                    let remote = remote.clone();
-                    let payload = payload.clone();
                     pending.push(
                         async move {
                             tokio::time::timeout(
                                 ASK_BENCH_TIMEOUT,
-                                remote.ask_actor_frame_no_timeout(
+                                remote.ask_actor_frame_no_timeout_owned(
                                     BENCH_ACTOR_ID,
                                     BENCH_TYPE_HASH,
-                                    payload,
+                                    ForwardPayload::from_static(payload),
                                 ),
                             )
                             .await
@@ -4199,8 +4289,8 @@ async fn run_actor_ask_outer_timeout_inflight_benchmark(
         checksum
     );
 
-    sender.shutdown().await;
-    receiver.shutdown().await;
+    sender.shutdown().await.unwrap();
+    receiver.shutdown().await.unwrap();
 }
 
 async fn run_actor_ask_no_timeout_single_flight_benchmark(label: &str, ask_count: u64) {
@@ -4228,11 +4318,16 @@ async fn run_actor_ask_no_timeout_single_flight_benchmark(label: &str, ask_count
         .lookup_peer(&receiver.registry.peer_id)
         .await
         .unwrap();
-    let payload = Bytes::from(vec![21u8; PAYLOAD_BYTES]);
+    let remote = remote.session().await.unwrap();
+    let payload: &'static [u8] = &[21u8; PAYLOAD_BYTES];
 
     for _ in 0..(WARMUP_MESSAGES / 10) {
         let reply = remote
-            .ask_actor_frame_no_timeout(BENCH_ACTOR_ID, BENCH_TYPE_HASH, payload.clone())
+            .ask_actor_frame_no_timeout_owned(
+                BENCH_ACTOR_ID,
+                BENCH_TYPE_HASH,
+                ForwardPayload::from_static(payload),
+            )
             .await
             .unwrap();
         assert_eq!(reply.len(), PAYLOAD_BYTES);
@@ -4241,7 +4336,11 @@ async fn run_actor_ask_no_timeout_single_flight_benchmark(label: &str, ask_count
     let start = Instant::now();
     for _ in 0..ask_count {
         let reply = remote
-            .ask_actor_frame_no_timeout(BENCH_ACTOR_ID, BENCH_TYPE_HASH, payload.clone())
+            .ask_actor_frame_no_timeout_owned(
+                BENCH_ACTOR_ID,
+                BENCH_TYPE_HASH,
+                ForwardPayload::from_static(payload),
+            )
             .await
             .unwrap();
         assert_eq!(reply.len(), PAYLOAD_BYTES);
@@ -4257,8 +4356,8 @@ async fn run_actor_ask_no_timeout_single_flight_benchmark(label: &str, ask_count
         req_per_sec
     );
 
-    sender.shutdown().await;
-    receiver.shutdown().await;
+    sender.shutdown().await.unwrap();
+    receiver.shutdown().await.unwrap();
 }
 
 async fn run_direct_ask_no_timeout_single_flight_benchmark(label: &str, ask_count: u64) {
@@ -4278,16 +4377,23 @@ async fn run_direct_ask_no_timeout_single_flight_benchmark(label: &str, ask_coun
         .lookup_peer(&receiver.registry.peer_id)
         .await
         .unwrap();
-    let payload = Bytes::from(vec![23u8; PAYLOAD_BYTES]);
+    let remote = remote.session().await.unwrap();
+    let payload: &'static [u8] = &[23u8; PAYLOAD_BYTES];
 
     for _ in 0..(WARMUP_MESSAGES / 10) {
-        let reply = remote.ask_direct_no_timeout(payload.clone()).await.unwrap();
+        let reply = remote
+            .ask_direct_no_timeout_owned(ForwardPayload::from_static(payload))
+            .await
+            .unwrap();
         assert_eq!(reply.len(), PAYLOAD_BYTES);
     }
 
     let start = Instant::now();
     for _ in 0..ask_count {
-        let reply = remote.ask_direct_no_timeout(payload.clone()).await.unwrap();
+        let reply = remote
+            .ask_direct_no_timeout_owned(ForwardPayload::from_static(payload))
+            .await
+            .unwrap();
         assert_eq!(reply.len(), PAYLOAD_BYTES);
     }
     let elapsed = start.elapsed();
@@ -4301,8 +4407,8 @@ async fn run_direct_ask_no_timeout_single_flight_benchmark(label: &str, ask_coun
         req_per_sec
     );
 
-    sender.shutdown().await;
-    receiver.shutdown().await;
+    sender.shutdown().await.unwrap();
+    receiver.shutdown().await.unwrap();
 }
 
 #[cfg(any(feature = "test-helpers", debug_assertions))]
@@ -4327,6 +4433,7 @@ async fn run_typed_ask_benchmark(label: &str, archived: bool, ask_count: u64) {
         .lookup_address(receiver.registry.bind_addr)
         .await
         .unwrap();
+    let remote = remote.session().await.unwrap();
     let request = TypedBenchPing {
         id: 42,
         nonce: 0xDEAD_BEEF_CAFE_BABE,
@@ -4374,8 +4481,8 @@ async fn run_typed_ask_benchmark(label: &str, archived: bool, ask_count: u64) {
         req_per_sec
     );
 
-    sender.shutdown().await;
-    receiver.shutdown().await;
+    sender.shutdown().await.unwrap();
+    receiver.shutdown().await.unwrap();
 
     unsafe {
         std::env::remove_var("ICANACT_REMOTE_TYPED_ECHO");
@@ -4411,11 +4518,16 @@ async fn test_tell_actor_frame_enqueue_throughput() {
         .lookup_peer(&receiver.registry.peer_id)
         .await
         .unwrap();
-    let payload = Bytes::from(vec![0u8; PAYLOAD_BYTES]);
+    let remote = remote.session().await.unwrap();
+    let payload: &'static [u8] = &[0u8; PAYLOAD_BYTES];
 
     for _ in 0..WARMUP_MESSAGES {
         remote
-            .tell_actor_frame(BENCH_ACTOR_ID, BENCH_TYPE_HASH, payload.clone())
+            .tell_actor_frame_owned(
+                BENCH_ACTOR_ID,
+                BENCH_TYPE_HASH,
+                ForwardPayload::from_static(payload),
+            )
             .await
             .unwrap();
     }
@@ -4423,7 +4535,11 @@ async fn test_tell_actor_frame_enqueue_throughput() {
     let start = Instant::now();
     for _ in 0..MESSAGE_COUNT {
         remote
-            .tell_actor_frame(BENCH_ACTOR_ID, BENCH_TYPE_HASH, payload.clone())
+            .tell_actor_frame_owned(
+                BENCH_ACTOR_ID,
+                BENCH_TYPE_HASH,
+                ForwardPayload::from_static(payload),
+            )
             .await
             .unwrap();
     }
@@ -4446,8 +4562,8 @@ async fn test_tell_actor_frame_enqueue_throughput() {
     )
     .await;
 
-    sender.shutdown().await;
-    receiver.shutdown().await;
+    sender.shutdown().await.unwrap();
+    receiver.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -4480,11 +4596,16 @@ async fn test_tell_actor_frame_delivered_throughput() {
         .lookup_peer(&receiver.registry.peer_id)
         .await
         .unwrap();
-    let payload = Bytes::from(vec![0u8; PAYLOAD_BYTES]);
+    let remote = remote.session().await.unwrap();
+    let payload: &'static [u8] = &[0u8; PAYLOAD_BYTES];
 
     for _ in 0..WARMUP_MESSAGES {
         remote
-            .tell_actor_frame(BENCH_ACTOR_ID, BENCH_TYPE_HASH, payload.clone())
+            .tell_actor_frame_owned(
+                BENCH_ACTOR_ID,
+                BENCH_TYPE_HASH,
+                ForwardPayload::from_static(payload),
+            )
             .await
             .unwrap();
     }
@@ -4503,7 +4624,11 @@ async fn test_tell_actor_frame_delivered_throughput() {
     let start = Instant::now();
     for _ in 0..MESSAGE_COUNT {
         remote
-            .tell_actor_frame(BENCH_ACTOR_ID, BENCH_TYPE_HASH, payload.clone())
+            .tell_actor_frame_owned(
+                BENCH_ACTOR_ID,
+                BENCH_TYPE_HASH,
+                ForwardPayload::from_static(payload),
+            )
             .await
             .unwrap();
     }
@@ -4525,8 +4650,8 @@ async fn test_tell_actor_frame_delivered_throughput() {
         msg_per_sec
     );
 
-    sender.shutdown().await;
-    receiver.shutdown().await;
+    sender.shutdown().await.unwrap();
+    receiver.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -4556,12 +4681,18 @@ async fn test_ask_actor_frame_throughput() {
         .lookup_peer(&receiver.registry.peer_id)
         .await
         .unwrap();
-    let payload = Bytes::from(vec![1u8; PAYLOAD_BYTES]);
+    let remote = remote.session().await.unwrap();
+    let payload: &'static [u8] = &[1u8; PAYLOAD_BYTES];
     let timeout = Duration::from_secs(2);
 
     for _ in 0..(WARMUP_MESSAGES / 10) {
         let reply = remote
-            .ask_actor_frame(BENCH_ACTOR_ID, BENCH_TYPE_HASH, payload.clone(), timeout)
+            .ask_actor_frame_owned(
+                BENCH_ACTOR_ID,
+                BENCH_TYPE_HASH,
+                ForwardPayload::from_static(payload),
+                timeout,
+            )
             .await
             .unwrap();
         assert_eq!(reply.len(), PAYLOAD_BYTES);
@@ -4571,7 +4702,12 @@ async fn test_ask_actor_frame_throughput() {
     let start = Instant::now();
     for _ in 0..ask_count {
         let reply = remote
-            .ask_actor_frame(BENCH_ACTOR_ID, BENCH_TYPE_HASH, payload.clone(), timeout)
+            .ask_actor_frame_owned(
+                BENCH_ACTOR_ID,
+                BENCH_TYPE_HASH,
+                ForwardPayload::from_static(payload),
+                timeout,
+            )
             .await
             .unwrap();
         assert_eq!(reply.len(), PAYLOAD_BYTES);
@@ -4587,8 +4723,8 @@ async fn test_ask_actor_frame_throughput() {
         req_per_sec
     );
 
-    sender.shutdown().await;
-    receiver.shutdown().await;
+    sender.shutdown().await.unwrap();
+    receiver.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -4610,18 +4746,25 @@ async fn test_ask_direct_throughput() {
         .lookup_peer(&receiver.registry.peer_id)
         .await
         .unwrap();
-    let payload = Bytes::from(vec![2u8; PAYLOAD_BYTES]);
+    let remote = remote.session().await.unwrap();
+    let payload: &'static [u8] = &[2u8; PAYLOAD_BYTES];
     let timeout = Duration::from_secs(2);
 
     for _ in 0..(WARMUP_MESSAGES / 10) {
-        let reply = remote.ask_direct(payload.clone(), timeout).await.unwrap();
+        let reply = remote
+            .ask_direct_owned(ForwardPayload::from_static(payload), timeout)
+            .await
+            .unwrap();
         assert_eq!(reply.len(), PAYLOAD_BYTES);
     }
 
     let ask_count = MESSAGE_COUNT / 10;
     let start = Instant::now();
     for _ in 0..ask_count {
-        let reply = remote.ask_direct(payload.clone(), timeout).await.unwrap();
+        let reply = remote
+            .ask_direct_owned(ForwardPayload::from_static(payload), timeout)
+            .await
+            .unwrap();
         assert_eq!(reply.len(), PAYLOAD_BYTES);
     }
     let elapsed = start.elapsed();
@@ -4635,8 +4778,8 @@ async fn test_ask_direct_throughput() {
         req_per_sec
     );
 
-    sender.shutdown().await;
-    receiver.shutdown().await;
+    sender.shutdown().await.unwrap();
+    receiver.shutdown().await.unwrap();
 }
 
 /// An inbound `DirectAsk` with no registered handler must never fabricate a
@@ -4686,8 +4829,8 @@ async fn direct_ask_never_echoes_and_always_nacks() {
         Err(other) => panic!("expected AskNacked(NoDispatcher), got a different error: {other}"),
     }
 
-    sender.shutdown().await;
-    receiver.shutdown().await;
+    sender.shutdown().await.unwrap();
+    receiver.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -4724,18 +4867,14 @@ async fn test_connect_to_peer_contention_has_no_errors() {
     // This correctness regression expects disconnect/reconnect rounds to
     // preserve a required peer. Install that production precondition through
     // the registry owner instead of writing the legacy address cache directly;
-    // the benchmark helper's restore_mapping switch separately measures raw
-    // cache-loss behavior.
+    // the benchmark helper's restore_mapping switch separately measures admitted
+    // learned-route restoration.
     sender
         .registry
         .configure_peer(peer_id.clone(), target_addr)
         .await;
     assert_eq!(
-        sender
-            .registry
-            .connection_pool
-            .peer_id_to_addr
-            .read_sync(&peer_id, |_, addr| *addr),
+        sender.registry.connection_pool.indexed_route_addr(&peer_id),
         Some(target_addr),
         "contention fixture requires a durable configured peer mapping"
     );
@@ -4756,8 +4895,8 @@ async fn test_connect_to_peer_contention_has_no_errors() {
         "concurrent connect_to_peer should not lose peer mapping"
     );
 
-    sender.shutdown().await;
-    receiver.shutdown().await;
+    sender.shutdown().await.unwrap();
+    receiver.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -4779,15 +4918,11 @@ async fn test_disconnect_connection_by_peer_id_preserves_configured_address() {
         .connection_pool
         .disconnect_connection_by_peer_id(&peer_id);
 
-    let preserved = sender
-        .registry
-        .connection_pool
-        .peer_id_to_addr
-        .read_sync(&peer_id, |_, addr| *addr);
+    let preserved = sender.registry.connection_pool.indexed_route_addr(&peer_id);
     assert_eq!(preserved, Some(target_addr));
 
-    sender.shutdown().await;
-    receiver.shutdown().await;
+    sender.shutdown().await.unwrap();
+    receiver.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -5168,14 +5303,15 @@ async fn test_proxy_actor_ask_round_trip() {
     sleep(Duration::from_millis(300)).await;
 
     let proxy_remote = source.lookup_peer(&middle.registry.peer_id).await.unwrap();
-    let payload = Bytes::from(vec![19u8; PAYLOAD_BYTES]);
+    let proxy_remote = proxy_remote.session().await.unwrap();
+    let payload: &'static [u8] = &[19u8; PAYLOAD_BYTES];
 
     for _ in 0..64 {
         let reply = proxy_remote
-            .ask_actor_frame(
+            .ask_actor_frame_owned(
                 PROXY_ACTOR_ID,
                 PROXY_TYPE_HASH,
-                payload.clone(),
+                ForwardPayload::from_static(payload),
                 ASK_BENCH_TIMEOUT,
             )
             .await
@@ -5183,9 +5319,9 @@ async fn test_proxy_actor_ask_round_trip() {
         assert_eq!(reply.len(), PAYLOAD_BYTES);
     }
 
-    source.shutdown().await;
-    middle.shutdown().await;
-    destination.shutdown().await;
+    source.shutdown().await.unwrap();
+    middle.shutdown().await.unwrap();
+    destination.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5223,14 +5359,15 @@ async fn test_timeout_proxy_actor_ask_round_trip() {
     sleep(Duration::from_millis(300)).await;
 
     let proxy_remote = source.lookup_peer(&middle.registry.peer_id).await.unwrap();
-    let payload = Bytes::from(vec![31u8; PAYLOAD_BYTES]);
+    let proxy_remote = proxy_remote.session().await.unwrap();
+    let payload: &'static [u8] = &[31u8; PAYLOAD_BYTES];
 
     for _ in 0..64 {
         let reply = proxy_remote
-            .ask_actor_frame(
+            .ask_actor_frame_owned(
                 TIMEOUT_PROXY_ACTOR_ID,
                 TIMEOUT_PROXY_TYPE_HASH,
-                payload.clone(),
+                ForwardPayload::from_static(payload),
                 ASK_BENCH_TIMEOUT,
             )
             .await
@@ -5238,9 +5375,9 @@ async fn test_timeout_proxy_actor_ask_round_trip() {
         assert_eq!(reply.len(), PAYLOAD_BYTES);
     }
 
-    source.shutdown().await;
-    middle.shutdown().await;
-    destination.shutdown().await;
+    source.shutdown().await.unwrap();
+    middle.shutdown().await.unwrap();
+    destination.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5282,14 +5419,15 @@ async fn test_aligned_timeout_proxy_actor_ask_round_trip() {
     sleep(Duration::from_millis(300)).await;
 
     let proxy_remote = source.lookup_peer(&middle.registry.peer_id).await.unwrap();
-    let payload = Bytes::from(vec![34u8; PAYLOAD_BYTES]);
+    let proxy_remote = proxy_remote.session().await.unwrap();
+    let payload: &'static [u8] = &[34u8; PAYLOAD_BYTES];
 
     for _ in 0..64 {
         let reply = proxy_remote
-            .ask_actor_frame(
+            .ask_actor_frame_owned(
                 ALIGNED_TIMEOUT_PROXY_ACTOR_ID,
                 ALIGNED_TIMEOUT_PROXY_TYPE_HASH,
-                payload.clone(),
+                ForwardPayload::from_static(payload),
                 ASK_BENCH_TIMEOUT,
             )
             .await
@@ -5297,9 +5435,9 @@ async fn test_aligned_timeout_proxy_actor_ask_round_trip() {
         assert_eq!(reply.len(), PAYLOAD_BYTES);
     }
 
-    source.shutdown().await;
-    middle.shutdown().await;
-    destination.shutdown().await;
+    source.shutdown().await.unwrap();
+    middle.shutdown().await.unwrap();
+    destination.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5338,14 +5476,15 @@ async fn test_outer_timeout_proxy_actor_ask_round_trip() {
     sleep(Duration::from_millis(300)).await;
 
     let proxy_remote = source.lookup_peer(&middle.registry.peer_id).await.unwrap();
-    let payload = Bytes::from(vec![36u8; PAYLOAD_BYTES]);
+    let proxy_remote = proxy_remote.session().await.unwrap();
+    let payload: &'static [u8] = &[36u8; PAYLOAD_BYTES];
 
     for _ in 0..64 {
         let reply = proxy_remote
-            .ask_actor_frame(
+            .ask_actor_frame_owned(
                 OUTER_TIMEOUT_PROXY_ACTOR_ID,
                 OUTER_TIMEOUT_PROXY_TYPE_HASH,
-                payload.clone(),
+                ForwardPayload::from_static(payload),
                 ASK_BENCH_TIMEOUT,
             )
             .await
@@ -5353,9 +5492,9 @@ async fn test_outer_timeout_proxy_actor_ask_round_trip() {
         assert_eq!(reply.len(), PAYLOAD_BYTES);
     }
 
-    source.shutdown().await;
-    middle.shutdown().await;
-    destination.shutdown().await;
+    source.shutdown().await.unwrap();
+    middle.shutdown().await.unwrap();
+    destination.shutdown().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5397,14 +5536,15 @@ async fn test_deferred_timeout_proxy_actor_ask_round_trip() {
     sleep(Duration::from_millis(300)).await;
 
     let proxy_remote = source.lookup_peer(&middle.registry.peer_id).await.unwrap();
-    let payload = Bytes::from(vec![32u8; PAYLOAD_BYTES]);
+    let proxy_remote = proxy_remote.session().await.unwrap();
+    let payload: &'static [u8] = &[32u8; PAYLOAD_BYTES];
 
     for _ in 0..64 {
         let reply = proxy_remote
-            .ask_actor_frame(
+            .ask_actor_frame_owned(
                 DEFERRED_TIMEOUT_PROXY_ACTOR_ID,
                 DEFERRED_TIMEOUT_PROXY_TYPE_HASH,
-                payload.clone(),
+                ForwardPayload::from_static(payload),
                 ASK_BENCH_TIMEOUT,
             )
             .await
@@ -5412,9 +5552,9 @@ async fn test_deferred_timeout_proxy_actor_ask_round_trip() {
         assert_eq!(reply.len(), PAYLOAD_BYTES);
     }
 
-    source.shutdown().await;
-    middle.shutdown().await;
-    destination.shutdown().await;
+    source.shutdown().await.unwrap();
+    middle.shutdown().await.unwrap();
+    destination.shutdown().await.unwrap();
 }
 
 #[test]

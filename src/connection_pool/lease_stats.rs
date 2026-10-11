@@ -70,9 +70,9 @@ impl LeaseStats {
 #[cfg(test)]
 mod tests {
     use crate::connection_pool::{BufferConfig, ChannelId, LockFreeStreamHandle};
-    use crate::{AskResponder, ReplyDeliveryBudget, ReplyPayload};
+    use crate::{ReplyDeliveryBudget, ReplyPayload};
     use bytes::Bytes;
-    use std::sync::{Arc, atomic::AtomicBool};
+    use std::sync::Arc;
     use tokio::io::AsyncReadExt;
 
     #[test]
@@ -173,13 +173,13 @@ mod tests {
             None,
         );
         let handle = Arc::new(handle);
-        let responder = AskResponder::from_stream_handle(
-            100,
-            Arc::clone(&handle),
-            Arc::new(AtomicBool::new(false)),
-        );
-        let lease = responder
-            .try_reply_lease(&budget, 32)
+        let context =
+            crate::AskContext::from_stream_handle_with_request_id(100, &handle, None, None);
+        let reply_session = context.reply_session().expect("reply session");
+        let delivery = budget.bind(&reply_session).expect("delivery session");
+        let lease = context
+            .responder()
+            .try_reply_lease(&delivery, 32)
             .expect("lease admission");
         let reserved = handle.reply_slots().stats_snapshot();
         assert_eq!(reserved.live_slots, 1);
@@ -205,13 +205,11 @@ mod tests {
             .expect("response payload");
         assert_eq!(Bytes::from(payload), Bytes::from_static(b"reply"));
 
-        let canceled = AskResponder::from_stream_handle(
-            101,
-            Arc::clone(&handle),
-            Arc::new(AtomicBool::new(false)),
-        )
-        .try_reply_lease(&budget, 32)
-        .expect("second lease admission");
+        let canceled =
+            crate::AskContext::from_stream_handle_with_request_id(101, &handle, None, None)
+                .responder()
+                .try_reply_lease(&delivery, 32)
+                .expect("second lease admission");
         drop(canceled);
         let before_shutdown = handle.reply_slots().stats_snapshot();
         assert_eq!(before_shutdown.cancellation_publications, 1);
