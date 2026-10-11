@@ -715,6 +715,110 @@ impl<T> GossipRegistryHandle<T> {
 }
 
 impl<T> GossipClient<T> {
+    /// Capture exact certificate-owned stream evidence from a previously
+    /// obtained handle. A reindexed/replaced address is a typed miss, never a
+    /// successor relookup. The handle's public address hint cannot forge scope.
+    pub fn capture_session(
+        &self,
+        connection: &crate::RemoteConnection,
+    ) -> std::result::Result<crate::AuthenticatedSessionReceipt, crate::SessionCaptureError> {
+        let target = self
+            .registry
+            .connection_pool
+            .observed_handle_connection(connection.control_session_handle())
+            .ok_or(crate::SessionCaptureError::Stale)?;
+        crate::AuthenticatedSessionReceipt::capture(&self.registry.connection_pool, &target)
+    }
+
+    /// Recover only an actual indexed, certificate-authenticated session;
+    /// never infer identity from an address-to-peer cache.
+    pub fn capture_session_at_address(
+        &self,
+        address: std::net::SocketAddr,
+    ) -> std::result::Result<crate::AuthenticatedSessionReceipt, crate::SessionCaptureError> {
+        let target = self
+            .registry
+            .connection_pool
+            .connections_by_addr
+            .read_sync(&address, |_, target| std::sync::Arc::clone(target))
+            .ok_or(crate::SessionCaptureError::Unavailable)?;
+        crate::AuthenticatedSessionReceipt::capture(&self.registry.connection_pool, &target)
+    }
+
+    /// Compare-and-disconnect the exact observed physical instance through
+    /// transport's native CAS. Stale/foreign evidence cannot remove a successor.
+    /// Applied requests retirement; it does not prove physical IO completion.
+    pub fn disconnect_session(
+        &self,
+        receipt: &crate::AuthenticatedSessionReceipt,
+    ) -> crate::SessionMutationOutcome {
+        use crate::SessionMutationOutcome::*;
+        if !receipt.belongs_to(&self.registry.connection_pool) {
+            return ForeignOwner;
+        }
+        let Some(target) = receipt.connection.upgrade() else {
+            return Stale;
+        };
+        if self
+            .registry
+            .connection_pool
+            .disconnect_connection_instance(receipt.peer_id(), &target)
+        {
+            Applied
+        } else {
+            Stale
+        }
+    }
+
+    /// Commit DNS metadata only while the exact observed session still owns
+    /// both the requested address index and the peer's current slot. The async
+    /// gossip lock precedes synchronous control guards; none spans an await.
+    /// Missing/reassigned addresses or peers are stale, never identity guesses.
+    pub async fn set_peer_dns_for_session(
+        &self,
+        receipt: &crate::AuthenticatedSessionReceipt,
+        address: std::net::SocketAddr,
+        dns_name: String,
+    ) -> crate::SessionMutationOutcome {
+        use crate::SessionMutationOutcome::*;
+        if !receipt.belongs_to(&self.registry.connection_pool) {
+            return ForeignOwner;
+        }
+        let Some(target) = receipt.connection.upgrade() else {
+            return Stale;
+        };
+        let mut state = self.registry.gossip_state.lock().await;
+        let Some(row) = state.peers.get_mut(&address) else {
+            return Stale;
+        };
+        if row.node_id != Some(receipt.peer_id().to_node_id()) {
+            return Stale;
+        }
+        // The address read guard prevents reindexing this alias across the
+        // check/apply boundary. The peer control guard simultaneously prevents
+        // current-slot replacement. Both are control-plane-only, with no user
+        // callbacks or await while held; publication releases its peer guard
+        // before acquiring address-index writers, preserving lock order.
+        if self
+            .registry
+            .connection_pool
+            .connections_by_addr
+            .read_sync(&address, |_, indexed| {
+                std::sync::Arc::ptr_eq(indexed, &target)
+                    && self.registry.connection_pool.with_current_session_control(
+                        receipt.peer_id(),
+                        &target,
+                        || row.dns_name = Some(dns_name),
+                    )
+            })
+            .unwrap_or(false)
+        {
+            Applied
+        } else {
+            Stale
+        }
+    }
+
     pub(crate) fn from_registry(registry: Arc<GossipRegistry>) -> Self {
         Self {
             registry,
@@ -4403,6 +4507,7 @@ where
         // CRITICAL: Set embedded_peer_id so responses can find the shared correlation tracker
         // even after addr_to_peer_id mapping is migrated from ephemeral to bind address
         connection.embedded_peer_id = Some(peer_id.clone());
+        connection.authenticated_peer_id = Some(peer_id.clone());
         connection.peer_capabilities = registry
             .peer_capabilities
             .read_sync(&peer_addr, |_, caps| *caps);

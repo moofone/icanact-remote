@@ -475,6 +475,23 @@ impl<T> ConnectionPool<T> {
         CorrelationTracker::new()
     }
 
+    pub(crate) fn observed_handle_connection(&self, handle: &ConnectionHandle<T>) -> Option<Arc<LockFreeConnection>> {
+        self.connections_by_addr.read_sync(&handle.addr, |_, target| {
+            handle.matches_stream(target).then(|| Arc::clone(target))
+        }).flatten()
+    }
+
+    /// Control-plane mutation only. Publications/removals of this peer's
+    /// current slot share this guard; established connection lookup does not.
+    pub(crate) fn with_current_session_control(&self, peer: &crate::PeerId, target: &Arc<LockFreeConnection>, apply: impl FnOnce()) -> bool {
+        self.peer_sessions.read_sync(peer, |_, session| {
+            let _guard = session.control_mutation.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if session.current_connection().is_some_and(|current| Arc::ptr_eq(&current, target)) {
+                apply(); true
+            } else { false }
+        }).unwrap_or(false)
+    }
+
     fn make_connection_handle(
         &self,
         addr: SocketAddr,
@@ -4042,6 +4059,7 @@ impl<T> ConnectionPool<T> {
         // listening port, shared by every connection ever made to it) --
         // see `ReadContext::session_source` and `LockFreeConnection::session_source`.
         conn.session_source = local_session_addr;
+        conn.authenticated_peer_id = fresh_session_node_id.as_ref().map(crate::PeerId::from_public_key);
         conn.stream_handle = Some(stream_handle.clone());
         conn.set_state(ConnectionState::Connected);
         conn.update_last_used();
