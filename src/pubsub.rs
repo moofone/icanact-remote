@@ -1360,9 +1360,12 @@ impl RoutedPubSub {
         drop(hot_subscriber);
 
         let mut delivered = 0u32;
+        let mut shared_payload: Option<Bytes> = None;
         let borrowed_subscribers = self.borrowed_subscribers.load();
         if let Some(callbacks) = borrowed_subscribers.get(&(topic_key, type_hash)).cloned() {
-            let owned = Bytes::copy_from_slice(payload);
+            let owned = shared_payload
+                .get_or_insert_with(|| Bytes::copy_from_slice(payload))
+                .clone();
             for entry in callbacks.iter() {
                 if entry.enqueue(Bytes::clone(&owned), metadata) {
                     delivered = delivered.saturating_add(1);
@@ -1377,7 +1380,9 @@ impl RoutedPubSub {
 
         let subscribers = self.subscribers.load();
         if let Some(callbacks) = subscribers.get(&(topic_key, type_hash)).cloned() {
-            let owned = Bytes::copy_from_slice(payload);
+            let owned = shared_payload
+                .get_or_insert_with(|| Bytes::copy_from_slice(payload))
+                .clone();
             for entry in callbacks.iter() {
                 if entry.enqueue(Bytes::clone(&owned)) {
                     delivered = delivered.saturating_add(1);
@@ -1392,7 +1397,9 @@ impl RoutedPubSub {
 
         let type_subscribers = self.type_subscribers.load();
         if let Some(callbacks) = type_subscribers.get(&type_hash).cloned() {
-            let owned = Bytes::copy_from_slice(payload);
+            let owned = shared_payload
+                .get_or_insert_with(|| Bytes::copy_from_slice(payload))
+                .clone();
             for callback in callbacks.iter() {
                 if callback.enqueue(topic_key, Bytes::clone(&owned)) {
                     delivered = delivered.saturating_add(1);
@@ -1424,15 +1431,21 @@ impl RoutedPubSub {
 
     fn lookup_next_hop_conn(&self, next_hop: &PeerId) -> Result<crate::RemoteConnection> {
         let conns = self.conns.load();
-        if let Some(conn) = conns.get(next_hop) {
+        if let Some(conn) = conns.get(next_hop)
+            && !conn.is_closed()
+        {
             return Ok(conn.clone());
         }
+        drop(conns);
         if let Some(peer_ref) = self.client.lookup_connected_peer(next_hop)
             && let Some(conn) = peer_ref.connection_ref()
+            && !conn.is_closed()
         {
-            let mut next = (**conns).clone();
-            next.insert(next_hop.clone(), conn.clone());
-            self.conns.store(Arc::new(next));
+            self.conns.rcu(|current| {
+                let mut next = (**current).clone();
+                next.insert(next_hop.clone(), conn.clone());
+                Arc::new(next)
+            });
             return Ok(conn);
         }
         self.counters
@@ -2192,6 +2205,120 @@ mod tests {
             ),
         );
         pubsub.subscribers.store(Arc::new(next));
+    }
+
+    fn test_pool_connection(
+        addr: std::net::SocketAddr,
+        schema_hash: Option<u64>,
+    ) -> (
+        Arc<crate::connection_pool::LockFreeConnection>,
+        Arc<crate::connection_pool::LockFreeStreamHandle>,
+    ) {
+        let (io, _peer_io) = tokio::io::duplex(1024);
+        let (stream_handle, _writer_task, _reader_task) =
+            crate::connection_pool::LockFreeStreamHandle::new(
+                io,
+                addr,
+                crate::connection_pool::ChannelId::Global,
+                crate::connection_pool::BufferConfig::default(),
+                schema_hash,
+                None,
+            );
+        let stream_handle = Arc::new(stream_handle);
+        let mut conn = crate::connection_pool::LockFreeConnection::new(
+            addr,
+            crate::connection_pool::ConnectionDirection::Outbound,
+        );
+        conn.stream_handle = Some(Arc::clone(&stream_handle));
+        conn.set_state(crate::connection_pool::ConnectionState::Connected);
+        (Arc::new(conn), stream_handle)
+    }
+
+    #[tokio::test]
+    async fn lookup_next_hop_conn_replaces_closed_cached_connection() {
+        let pubsub = test_pubsub("pubsub-next-hop-closed-cache");
+        let next_hop = crate::KeyPair::new_for_testing("pubsub-next-hop-closed-peer").peer_id();
+        let schema_hash = pubsub.registry.config.schema_hash;
+
+        let stale_addr: std::net::SocketAddr = "127.0.0.1:42001".parse().unwrap();
+        let (stale_conn, stale_stream) = test_pool_connection(stale_addr, schema_hash);
+        assert!(pubsub.registry.connection_pool.add_connection_by_peer_id(
+            next_hop.clone(),
+            stale_addr,
+            stale_conn,
+        ));
+        let stale_remote = pubsub
+            .client
+            .lookup_connected_peer(&next_hop)
+            .and_then(|peer| peer.connection_ref())
+            .expect("stale connection is published in the pool");
+        let mut cached = HashMap::new();
+        cached.insert(next_hop.clone(), stale_remote);
+        pubsub.conns.store(Arc::new(cached));
+
+        let live_addr: std::net::SocketAddr = "127.0.0.1:42002".parse().unwrap();
+        let (live_conn, _live_stream) = test_pool_connection(live_addr, schema_hash);
+        assert!(pubsub.registry.connection_pool.add_connection_by_peer_id(
+            next_hop.clone(),
+            live_addr,
+            live_conn,
+        ));
+        stale_stream.force_exit_signal_for_test();
+        assert!(pubsub.conns.load().get(&next_hop).unwrap().is_closed());
+
+        let resolved = pubsub
+            .lookup_next_hop_conn(&next_hop)
+            .expect("a live pool connection exists for the next hop");
+        assert!(
+            !resolved.is_closed(),
+            "a closed cached connection must be bypassed"
+        );
+        assert!(
+            !pubsub.conns.load().get(&next_hop).unwrap().is_closed(),
+            "the closed cache entry must be replaced by the live connection"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deliver_local_borrowed_copies_payload_once_across_subscriber_kinds() {
+        let pubsub = test_pubsub("pubsub-deliver-local-shared-payload");
+        let (owned_tx, owned_rx) = std::sync::mpsc::channel::<Bytes>();
+        let (type_tx, type_rx) = std::sync::mpsc::channel::<Bytes>();
+        let owned_tx = Mutex::new(owned_tx);
+        add_test_subscriber(&pubsub, 7, 9, move |bytes| {
+            owned_tx.lock().unwrap().send(bytes).unwrap();
+        });
+        let type_tx = Mutex::new(type_tx);
+        let mut type_map = (*pubsub.type_subscribers.load_full()).clone();
+        type_map.insert(
+            9,
+            Arc::from(
+                vec![TypeSubscriberEntry::new(
+                    2,
+                    tokio::runtime::Handle::try_current().ok().as_ref(),
+                    move |_topic, bytes| {
+                        type_tx.lock().unwrap().send(bytes).unwrap();
+                    },
+                )]
+                .into_boxed_slice(),
+            ),
+        );
+        pubsub.type_subscribers.store(Arc::new(type_map));
+
+        let payload = b"shared-payload".to_vec();
+        let delivered =
+            pubsub.deliver_local_borrowed(7, 9, &payload, PubSubFrameMetadata::default());
+        assert_eq!(delivered, 2);
+        let timeout = Duration::from_secs(2);
+        let owned = owned_rx.recv_timeout(timeout).unwrap();
+        let typed = type_rx.recv_timeout(timeout).unwrap();
+        assert_eq!(owned.as_ref(), payload.as_slice());
+        assert_eq!(typed.as_ref(), payload.as_slice());
+        assert_eq!(
+            owned.as_ptr(),
+            typed.as_ptr(),
+            "payload must be copied at most once per local publish"
+        );
     }
 
     #[tokio::test]
