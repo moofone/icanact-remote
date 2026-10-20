@@ -1694,7 +1694,8 @@ fn park_pooled_inline_response(
 }
 
 async fn write_ask_disposition_io<S>(
-    ctx: &ReadContext,
+    max_message_size: usize,
+    expected_schema_hash: Option<u64>,
     _stream: &mut S,
     _bytes_written_counter: &Arc<AtomicUsize>,
     _bytes_since_flush: &mut usize,
@@ -1709,10 +1710,9 @@ where
     S: AsyncWrite + Unpin,
 {
     let write_start = perf.map(|_| Instant::now());
-    let inline_payload_limit = ctx
-        .max_message_size
-        .saturating_sub(crate::framing::ASK_RESPONSE_HEADER_LEN);
-    let schema_hash = ctx.expected_schema_hash;
+    let inline_payload_limit =
+        max_message_size.saturating_sub(crate::framing::ASK_RESPONSE_HEADER_LEN);
+    let schema_hash = expected_schema_hash;
     match disposition {
         crate::registry::AskDisposition::Deferred => {}
         crate::registry::AskDisposition::Nack(reason) => {
@@ -1737,7 +1737,7 @@ where
                         streaming_responses,
                         correlation_id,
                         payload,
-                        ctx.max_message_size,
+                        max_message_size,
                         schema_hash,
                     )?;
                     *wrote_response_bytes = true;
@@ -1754,7 +1754,7 @@ where
                         streaming_responses,
                         correlation_id,
                         payload.into_bytes(),
-                        ctx.max_message_size,
+                        max_message_size,
                         schema_hash,
                     )?;
                     *wrote_response_bytes = true;
@@ -1783,7 +1783,7 @@ where
                             payload,
                             prefix,
                             payload_len,
-                            ctx.max_message_size,
+                            max_message_size,
                             schema_hash,
                         )?;
                     } else {
@@ -1796,7 +1796,7 @@ where
                             streaming_responses,
                             correlation_id,
                             bytes,
-                            ctx.max_message_size,
+                            max_message_size,
                             schema_hash,
                         )?;
                     }
@@ -1816,7 +1816,7 @@ where
                         payload,
                         prefix,
                         payload_len,
-                        ctx.max_message_size,
+                        max_message_size,
                     )?;
                     *wrote_response_bytes = true;
                 }
@@ -1830,7 +1830,7 @@ where
                     streaming_responses,
                     correlation_id,
                     payload,
-                    ctx.max_message_size,
+                    max_message_size,
                     schema_hash,
                 )?;
                 *wrote_response_bytes = true;
@@ -1847,7 +1847,7 @@ where
                     streaming_responses,
                     correlation_id,
                     payload.into_bytes(),
-                    ctx.max_message_size,
+                    max_message_size,
                     schema_hash,
                 )?;
                 *wrote_response_bytes = true;
@@ -1870,7 +1870,7 @@ where
                     payload,
                     prefix,
                     payload_len,
-                    ctx.max_message_size,
+                    max_message_size,
                     schema_hash,
                 )?;
                 *wrote_response_bytes = true;
@@ -1881,7 +1881,7 @@ where
                     payload,
                     prefix,
                     payload_len,
-                    ctx.max_message_size,
+                    max_message_size,
                 )?;
                 *wrote_response_bytes = true;
             }
@@ -2214,28 +2214,10 @@ where
                     Err(e) => Some(crate::registry::AskDisposition::Nack(e.ask_nack_reason())),
                 };
                 if let Some(disposition) = disposition {
-                    let temp_ctx = ReadContext {
-                        authenticated_peer_id: None,
-                        streaming_state_handoff: None,
-                        registry_weak: Arc::downgrade(registry),
-                        peer_addr,
-                        session_source: peer_addr,
-                        peer_id: None,
-                        max_message_size: registry.config.max_message_size,
-                        expected_schema_hash: registry.config.schema_hash,
-                        aligned_pool: registry.connection_pool.aligned_bytes_pool(),
-                        inbound_routes: Arc::new(crate::route_interning::RouteTable::new()),
-                        response_correlation: None,
-                        response_writer: None,
-                        tell_handler_sync: None,
-                        tell_handler_sync_context: None,
-                        ask_immediate_handler_sync: None,
-                        ask_handler_sync: None,
-                        sync_actor_handler: None,
-                    };
                     let mut wrote_response_bytes = false;
                     write_ask_disposition_io(
-                        &temp_ctx,
+                        registry.config.max_message_size,
+                        registry.config.schema_hash,
                         stream,
                         bytes_written_counter,
                         bytes_since_flush,
@@ -2387,7 +2369,8 @@ where
                 };
                 if let Some(disposition) = disposition {
                     write_ask_disposition_io(
-                        ctx,
+                        ctx.max_message_size,
+                        ctx.expected_schema_hash,
                         stream,
                         bytes_written_counter,
                         bytes_since_flush,
@@ -2455,7 +2438,8 @@ where
                         .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 }
                 write_ask_disposition_io(
-                    ctx,
+                    ctx.max_message_size,
+                    ctx.expected_schema_hash,
                     stream,
                     bytes_written_counter,
                     bytes_since_flush,
@@ -2484,7 +2468,8 @@ where
                         .fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 }
                 write_ask_disposition_io(
-                    ctx,
+                    ctx.max_message_size,
+                    ctx.expected_schema_hash,
                     stream,
                     bytes_written_counter,
                     bytes_since_flush,
@@ -2530,7 +2515,8 @@ where
             };
             if let Some(disposition) = disposition {
                 write_ask_disposition_io(
-                    ctx,
+                    ctx.max_message_size,
+                    ctx.expected_schema_hash,
                     stream,
                     bytes_written_counter,
                     bytes_since_flush,
