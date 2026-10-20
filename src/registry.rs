@@ -2465,7 +2465,7 @@ impl GossipState {
             return false;
         }
         self.ownership_commit_seq.insert(peer_addr, commit_seq);
-        self.prune_ownership_watermarks();
+        self.prune_ownership_watermarks(&[peer_addr]);
         true
     }
 
@@ -2487,7 +2487,7 @@ impl GossipState {
         }
         self.ownership_commit_seq.insert(from, commit_seq);
         self.ownership_commit_seq.insert(to, commit_seq);
-        self.prune_ownership_watermarks();
+        self.prune_ownership_watermarks(&[from, to]);
         true
     }
 
@@ -2508,7 +2508,7 @@ impl GossipState {
     ) {
         let floor = self.ownership_commit_seq.entry(peer_addr).or_insert(0);
         *floor = (*floor).max(commit_seq);
-        self.prune_ownership_watermarks();
+        self.prune_ownership_watermarks(&[]);
     }
 
     /// Retention policy for the watermark table.
@@ -2521,7 +2521,10 @@ impl GossipState {
     /// projection cannot pass merely because its address-specific tombstone
     /// was compacted. The bound keeps address churn (ephemeral ports,
     /// restarts) from growing this table without weakening the fence.
-    fn prune_ownership_watermarks(&mut self) {
+    ///
+    /// `keep_addrs` are addresses being admitted by the caller that are not in
+    /// `peers` yet; they must not be classified as tombstones.
+    fn prune_ownership_watermarks(&mut self, keep_addrs: &[SocketAddr]) {
         if self.ownership_commit_seq.len() <= OWNERSHIP_WATERMARK_CAPACITY {
             return;
         }
@@ -2529,7 +2532,7 @@ impl GossipState {
         let mut tombstones: Vec<(SocketAddr, CommitSeq)> = self
             .ownership_commit_seq
             .iter()
-            .filter(|(addr, _)| !peers.contains_key(*addr))
+            .filter(|(addr, _)| !peers.contains_key(*addr) && !keep_addrs.contains(addr))
             .map(|(addr, seq)| (*addr, *seq))
             .collect();
         let excess = self
@@ -3770,6 +3773,17 @@ impl<T: 'static> GossipRegistry<T> {
 
                 state.release_actor_admission(&name);
                 if let Some(prior_owner) = prior_owner {
+                    if let Some((_, Some(location))) = snapshot
+                        .known_actor_locations
+                        .iter()
+                        .find(|(known_name, _)| *known_name == name)
+                    {
+                        let _ = state.try_charge_compact_snapshot(
+                            &name,
+                            location,
+                            self.config.max_message_size,
+                        );
+                    }
                     state.record_actor_admission(&prior_owner, &name);
                 }
             }
@@ -3784,22 +3798,28 @@ impl<T: 'static> GossipRegistry<T> {
             if let Some(discovery) = state.peer_discovery.as_mut() {
                 discovery.restore_peer_state(addr, snapshot.discovery_state);
             }
-            true
-        };
-
-        for (name, location) in &snapshot.known_actor_locations {
-            match location {
-                Some(location) => {
-                    let _ = self
-                        .actor_state
-                        .known_actors
-                        .upsert_sync(name.clone(), location.clone());
-                }
-                None => {
-                    let _ = self.actor_state.known_actors.remove_sync(name);
+            // Restored while still holding the gossip lock so the actor table
+            // and admission state change together. The `None` arm only
+            // removes the candidate's own entry, never a concurrent
+            // registration from another peer.
+            for (name, location) in &snapshot.known_actor_locations {
+                match location {
+                    Some(location) => {
+                        let _ = self
+                            .actor_state
+                            .known_actors
+                            .upsert_sync(name.clone(), location.clone());
+                    }
+                    None => {
+                        let _ = self
+                            .actor_state
+                            .known_actors
+                            .remove_if_sync(name, |current| current.peer_id == *candidate);
+                    }
                 }
             }
-        }
+            true
+        };
 
         for (address, caps) in &snapshot.peer_capabilities {
             match caps {
@@ -10584,12 +10604,13 @@ impl<T: 'static> GossipRegistry<T> {
     /// unreachable peers (its actual purpose). Best-effort: parses the owner's
     /// advertised address and asks the pool for a live connection.
     fn owner_peer_is_connected(&self, location: &RemoteActorLocation) -> bool {
-        location
-            .address
-            .parse::<SocketAddr>()
-            .ok()
-            .and_then(|addr| self.connection_pool.get_existing_connection(addr))
-            .is_some()
+        self.connection_pool
+            .has_connection_by_peer_id(&location.peer_id)
+            || location
+                .address
+                .parse::<SocketAddr>()
+                .ok()
+                .is_some_and(|addr| self.connection_pool.has_connection(&addr))
     }
 
     pub async fn cleanup_stale_actors(&self) {
@@ -13222,12 +13243,31 @@ impl<T: 'static> GossipRegistry<T> {
                 // retract the ownership this eviction actually invalidated.
                 let evicted_generation = gossip_state.ownership_watermark(addr);
                 let evicted = gossip_state.peers.remove(addr);
-                if let (Some(node_id), Some(generation)) =
-                    (evicted.and_then(|peer| peer.node_id), evicted_generation)
-                {
-                    evicted_owners.push((*addr, node_id.to_peer_id(), generation));
+                let evicted_peer_id = evicted
+                    .and_then(|peer| peer.node_id)
+                    .map(|node_id| node_id.to_peer_id());
+                if let (Some(peer_id), Some(generation)) = (&evicted_peer_id, evicted_generation) {
+                    evicted_owners.push((*addr, peer_id.clone(), generation));
                 }
-                gossip_state.peer_to_actors.remove(addr);
+                // Without `peer_to_actors`, `cleanup_dead_peers` can never
+                // reap this peer's actors, so release them here.
+                let evicted_actors = gossip_state.peer_to_actors.remove(addr);
+                for actor_name in evicted_actors.into_iter().flatten() {
+                    let removed = evicted_peer_id.as_ref().is_some_and(|peer_id| {
+                        self.actor_state
+                            .known_actors
+                            .remove_if_sync(actor_name.as_str(), |current| {
+                                current.peer_id == *peer_id
+                            })
+                            .is_some()
+                    });
+                    let admitted_by_evicted = evicted_peer_id.as_ref().is_some_and(|peer_id| {
+                        gossip_state.actor_admission_peer_by_name.get(&actor_name) == Some(peer_id)
+                    });
+                    if removed || admitted_by_evicted {
+                        gossip_state.release_actor_admission(&actor_name);
+                    }
+                }
 
                 if let Some(ref mut discovery) = gossip_state.peer_discovery {
                     discovery.on_peer_disconnected(*addr);
@@ -36659,5 +36699,244 @@ mod tests {
                 "split actors={n} visited {visited} bytes of {input_bytes} input (bound {visit_bound})"
             );
         }
+    }
+
+    /// PB-3: owner liveness must consult the peer-id session index, not only
+    /// the address alias. A port-0 advertised address can never match a
+    /// `connections_by_addr` entry, yet the owner is genuinely connected.
+    #[tokio::test]
+    async fn cleanup_stale_actors_keeps_actor_of_peer_id_connected_owner_with_port_zero_address() {
+        let mut config = test_config();
+        config.actor_ttl = Duration::from_secs(1);
+        let registry = GossipRegistry::<()>::new(test_addr(8_301), config);
+        let owner = test_peer_id("pb3-owner");
+        let conn_addr = test_addr(8_302);
+        publish_connected_instance(&registry, &owner, conn_addr).await;
+
+        let mut location = RemoteActorLocation::new_with_peer(test_addr(0), owner.clone());
+        location.wall_clock_time = 0;
+        assert_eq!(location.address, "127.0.0.1:0");
+        let _ = registry
+            .actor_state
+            .known_actors
+            .upsert_sync("pb3/actor".to_string(), location);
+
+        registry.cleanup_stale_actors().await;
+
+        assert!(
+            registry.actor_state.known_actors.contains_sync("pb3/actor"),
+            "an actor whose owner is connected by peer id must not be TTL-reaped"
+        );
+    }
+
+    /// PB-4: the address being admitted is not yet in `peers`; pruning must
+    /// not treat it as a tombstone.
+    #[tokio::test]
+    async fn addr_ownership_compaction_keeps_newly_admitted_address_not_yet_in_peers() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_120), test_config());
+        let mut state = registry.gossip_state.lock().await;
+        let addr_for = |index: usize| {
+            SocketAddr::from((
+                [10, ((index >> 8) & 0xff) as u8, (index & 0xff) as u8, 9],
+                32_000,
+            ))
+        };
+        for index in 0..OWNERSHIP_WATERMARK_TARGET {
+            let addr = addr_for(index);
+            state.peers.insert(addr, PeerInfo::local(addr));
+            state.ownership_commit_seq.insert(addr, 1);
+        }
+        // Fill the table with tombstones up to exactly the capacity.
+        for index in OWNERSHIP_WATERMARK_TARGET..OWNERSHIP_WATERMARK_CAPACITY {
+            state.ownership_commit_seq.insert(addr_for(index), 1);
+        }
+        assert_eq!(
+            state.ownership_commit_seq.len(),
+            OWNERSHIP_WATERMARK_CAPACITY
+        );
+        // Peers == target, so tombstones.len() <= excess after the next insert.
+        let new_addr = SocketAddr::from(([192, 168, 7, 7], 33_000));
+        let next_seq: CommitSeq = 100;
+
+        assert!(state.admit_ownership_projection(new_addr, next_seq));
+        assert_eq!(
+            state.ownership_watermark(&new_addr),
+            Some(next_seq),
+            "the just-admitted address must not be compacted away"
+        );
+        assert!(
+            state.admit_ownership_projection(new_addr, next_seq),
+            "a second guarded step for the same commit must still be admitted"
+        );
+    }
+
+    /// PB-6: rolling back a rejected claim must restore the prior owner's
+    /// compact snapshot charge, not leave it zeroed by the release.
+    #[tokio::test]
+    async fn rejected_inbound_rollback_restores_prior_owner_compact_charge() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_130), test_config());
+        let addr = test_addr(20_131);
+        let candidate = test_peer_id("pb6-candidate");
+        let prior_owner = test_peer_id("pb6-prior");
+        let name = "pb6/actor".to_string();
+        let prior_location =
+            RemoteActorLocation::new_with_peer(test_addr(20_132), prior_owner.clone());
+        let max_size = registry.config.max_message_size;
+        let _ = registry
+            .actor_state
+            .known_actors
+            .upsert_sync(name.clone(), prior_location.clone());
+        let expected_charge = GossipState::compact_record_charge(&name, &prior_location);
+
+        {
+            let mut state = registry.gossip_state.lock().await;
+            let mut peer = PeerInfo::local(addr);
+            peer.node_id = Some(candidate.to_node_id());
+            state.peers.insert(addr, peer);
+            state
+                .peer_to_actors
+                .entry(addr)
+                .or_default()
+                .insert(name.clone());
+            state.record_actor_admission(&prior_owner, &name);
+            state
+                .try_charge_compact_snapshot(&name, &prior_location, max_size)
+                .expect("charge");
+        }
+        let snapshot = registry
+            .snapshot_inbound_claim_projection(addr, addr, &candidate)
+            .await;
+        {
+            // The speculative claim displaces the prior owner.
+            let mut state = registry.gossip_state.lock().await;
+            state.release_actor_admission(&name);
+            state.record_actor_admission(&candidate, &name);
+            let candidate_location =
+                RemoteActorLocation::new_with_peer(test_addr(20_133), candidate.clone());
+            state
+                .try_charge_compact_snapshot(&name, &candidate_location, max_size)
+                .expect("charge");
+        }
+        let _ = registry.actor_state.known_actors.upsert_sync(
+            name.clone(),
+            RemoteActorLocation::new_with_peer(test_addr(20_133), candidate.clone()),
+        );
+
+        assert!(
+            registry
+                .restore_inbound_claim_projection(addr, &candidate, &snapshot)
+                .await
+        );
+
+        let state = registry.gossip_state.lock().await;
+        assert_eq!(
+            state.compact_charge_by_name.get(&name).copied(),
+            Some(expected_charge)
+        );
+        assert_eq!(
+            state.compact_admission_bytes,
+            GossipRegistry::<()>::GOSSIP_MESSAGE_SIZE_SLACK + expected_charge
+        );
+        assert_eq!(
+            state.actor_admission_peer_by_name.get(&name),
+            Some(&prior_owner)
+        );
+    }
+
+    /// PB-6: the `None` arm of the known_actors restore must not remove an
+    /// entry that a different peer registered concurrently.
+    #[tokio::test]
+    async fn rejected_inbound_rollback_keeps_known_actor_registered_by_another_peer() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_140), test_config());
+        let addr = test_addr(20_141);
+        let candidate = test_peer_id("pb6b-candidate");
+        let other = test_peer_id("pb6b-other");
+        let name = "pb6b/actor".to_string();
+        {
+            let mut state = registry.gossip_state.lock().await;
+            let mut peer = PeerInfo::local(addr);
+            peer.node_id = Some(candidate.to_node_id());
+            state.peers.insert(addr, peer);
+            state
+                .peer_to_actors
+                .entry(addr)
+                .or_default()
+                .insert(name.clone());
+        }
+        let snapshot = registry
+            .snapshot_inbound_claim_projection(addr, addr, &candidate)
+            .await;
+        let other_location = RemoteActorLocation::new_with_peer(test_addr(20_142), other);
+        let _ = registry
+            .actor_state
+            .known_actors
+            .upsert_sync(name.clone(), other_location.clone());
+
+        assert!(
+            registry
+                .restore_inbound_claim_projection(addr, &candidate, &snapshot)
+                .await
+        );
+        assert_eq!(
+            registry
+                .actor_state
+                .known_actors
+                .read_sync(&name, |_, location| location.clone()),
+            Some(other_location)
+        );
+    }
+
+    /// RL-2: evicting a peer over `max_peers` must reap its actors and release
+    /// their admission and compact charges.
+    #[tokio::test]
+    async fn enforce_bounds_eviction_releases_evicted_peer_actors() {
+        let config = GossipConfig {
+            max_peers: 1,
+            ..test_config()
+        };
+        let registry = GossipRegistry::<()>::new(test_addr(20_150), config);
+        let max_size = registry.config.max_message_size;
+        let evicted_addr = test_addr(20_151);
+        let kept_addr = test_addr(20_152);
+        let evicted_id = test_peer_id("rl2-evicted");
+        let name = "rl2/actor".to_string();
+        let location = RemoteActorLocation::new_with_peer(evicted_addr, evicted_id.clone());
+        let _ = registry
+            .actor_state
+            .known_actors
+            .upsert_sync(name.clone(), location.clone());
+        {
+            let mut state = registry.gossip_state.lock().await;
+            let mut old = PeerInfo::local(evicted_addr);
+            old.node_id = Some(evicted_id.to_node_id());
+            old.last_success = 1;
+            state.peers.insert(evicted_addr, old);
+            let mut newer = PeerInfo::local(kept_addr);
+            newer.last_success = 2;
+            state.peers.insert(kept_addr, newer);
+            state
+                .peer_to_actors
+                .entry(evicted_addr)
+                .or_default()
+                .insert(name.clone());
+            state.record_actor_admission(&evicted_id, &name);
+            state
+                .try_charge_compact_snapshot(&name, &location, max_size)
+                .expect("charge");
+            assert!(state.compact_admission_bytes > 0);
+        }
+
+        registry.enforce_bounds().await;
+
+        let state = registry.gossip_state.lock().await;
+        assert!(!state.peers.contains_key(&evicted_addr));
+        assert!(!registry.actor_state.known_actors.contains_sync(&name));
+        assert!(!state.actor_admissions_by_peer.contains_key(&evicted_id));
+        assert!(!state.actor_admission_peer_by_name.contains_key(&name));
+        assert_eq!(
+            state.compact_admission_bytes,
+            GossipRegistry::<()>::GOSSIP_MESSAGE_SIZE_SLACK
+        );
+        assert!(state.compact_charge_by_name.is_empty());
     }
 }
