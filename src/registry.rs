@@ -2284,7 +2284,7 @@ pub struct GossipState {
     pub gossip_sequence: u64,
     pub pending_changes: Vec<RegistryChange>,
     pub urgent_changes: Vec<RegistryChange>, // High/Critical priority changes
-    pub delta_history: Vec<HistoricalDelta>,
+    pub delta_history: std::collections::VecDeque<HistoricalDelta>,
     pub peers: HashMap<SocketAddr, PeerInfo>,
     pub delta_exchanges: u64,
     pub full_sync_exchanges: u64,
@@ -3439,7 +3439,7 @@ impl<T: 'static> GossipRegistry<T> {
                 gossip_sequence: 0,
                 pending_changes: Vec::new(),
                 urgent_changes: Vec::new(),
-                delta_history: Vec::new(),
+                delta_history: std::collections::VecDeque::new(),
                 peers: HashMap::new(),
                 delta_exchanges: 0,
                 full_sync_exchanges: 0,
@@ -3559,7 +3559,17 @@ impl<T: 'static> GossipRegistry<T> {
         let (peer, peer_to_actors, known_peer, discovery_state, actor_names, admissions) = {
             let state = self.gossip_state.lock().await;
             let peer = state.peers.get(&addr).cloned();
-            let peer_to_actors = state.peer_to_actors.get(&addr).cloned();
+            // Same-owner refresh never creates ownership, so the caller will
+            // never roll back to this snapshot; skip the actor-set clones.
+            let same_owner = peer
+                .as_ref()
+                .and_then(|peer| peer.node_id)
+                .is_some_and(|node_id| node_id == candidate.to_node_id());
+            let peer_to_actors = if same_owner {
+                None
+            } else {
+                state.peer_to_actors.get(&addr).cloned()
+            };
             let actor_names = peer_to_actors
                 .as_ref()
                 .map(|actors| actors.iter().cloned().collect::<Vec<_>>())
@@ -8145,7 +8155,7 @@ impl<T: 'static> GossipRegistry<T> {
         // because create_delta_from_state includes the full snapshot when since_sequence == 0.
         let oldest_available = gossip_state
             .delta_history
-            .first()
+            .front()
             .map(|d| d.sequence)
             .unwrap_or(gossip_state.gossip_sequence);
 
@@ -8161,6 +8171,26 @@ impl<T: 'static> GossipRegistry<T> {
         true
     }
 
+    /// Capacity for the change buffer built by `create_delta_from_state`.
+    fn delta_changes_capacity(
+        gossip_state: &GossipState,
+        local_actors_len: usize,
+        known_actors_len: usize,
+        since_sequence: u64,
+    ) -> usize {
+        if since_sequence == 0 {
+            local_actors_len + known_actors_len + gossip_state.pending_changes.len()
+        } else {
+            gossip_state.urgent_changes.len() + gossip_state.pending_changes.len()
+        }
+    }
+
+    /// Whether a delta/full-sync message for this peer must read the local and
+    /// known actor snapshots.
+    fn gossip_message_needs_actor_maps(use_delta: bool, peer_last_sequence: u64) -> bool {
+        !use_delta || peer_last_sequence == 0
+    }
+
     /// Create a delta containing changes since the specified sequence
     async fn create_delta_from_state(
         &self,
@@ -8169,8 +8199,12 @@ impl<T: 'static> GossipRegistry<T> {
         known_actors: &HashMap<String, RemoteActorLocation>,
         since_sequence: u64,
     ) -> Result<RegistryDelta> {
-        let estimated_size =
-            local_actors.len() + known_actors.len() + gossip_state.pending_changes.len();
+        let estimated_size = Self::delta_changes_capacity(
+            gossip_state,
+            local_actors.len(),
+            known_actors.len(),
+            since_sequence,
+        );
         let mut changes = Vec::with_capacity(estimated_size);
         let current_time = current_timestamp();
 
@@ -9245,9 +9279,13 @@ impl<T: 'static> GossipRegistry<T> {
             return Err(GossipError::Shutdown);
         }
 
-        // Get actor state snapshot for message creation (scc maps, no
-        // lock contention with gossip_state).
-        let (local_actors, known_actors) = self.snapshot_actor_maps();
+        // Actor snapshot (scc maps, no lock contention with gossip_state),
+        // taken lazily: only peers needing a full snapshot read it.
+        let mut actor_maps: Option<(
+            HashMap<String, RemoteActorLocation>,
+            HashMap<String, RemoteActorLocation>,
+        )> = None;
+        let empty_actors: HashMap<String, RemoteActorLocation> = HashMap::new();
 
         // Steps 2 + 3 under a single lock acquisition: the
         // commit-pending and select-peers phases used to release and
@@ -9301,14 +9339,24 @@ impl<T: 'static> GossipRegistry<T> {
                         .iter()
                         .map(Self::as_regular_gossip_change),
                 );
+                let max_clock_size = self.config.max_vector_clock_size;
+                for change in &combined {
+                    let clock = match change {
+                        RegistryChange::ActorAdded { location, .. } => &location.vector_clock,
+                        RegistryChange::ActorRemoved { vector_clock, .. } => vector_clock,
+                    };
+                    if clock.len() > max_clock_size {
+                        clock.compact(max_clock_size);
+                    }
+                }
                 let delta = HistoricalDelta {
                     sequence: gossip_state.gossip_sequence,
                     changes: combined,
                     recorded_at: Instant::now(),
                 };
-                gossip_state.delta_history.push(delta);
+                gossip_state.delta_history.push_back(delta);
                 if gossip_state.delta_history.len() > self.config.max_delta_history {
-                    gossip_state.delta_history.remove(0);
+                    gossip_state.delta_history.pop_front();
                 }
             }
 
@@ -9468,6 +9516,10 @@ impl<T: 'static> GossipRegistry<T> {
 
                 let use_delta = self.should_use_delta_state(&gossip_state, &peer_info);
 
+                if Self::gossip_message_needs_actor_maps(use_delta, peer_info.last_sequence) {
+                    actor_maps.get_or_insert_with(|| self.snapshot_actor_maps());
+                }
+
                 let message = if use_delta {
                     if let Some(message) = delta_messages.get(&peer_info.last_sequence) {
                         message.clone()
@@ -9475,8 +9527,8 @@ impl<T: 'static> GossipRegistry<T> {
                         match self
                             .create_delta_from_state(
                                 &gossip_state,
-                                &local_actors,
-                                &known_actors,
+                                actor_maps.as_ref().map_or(&empty_actors, |maps| &maps.0),
+                                actor_maps.as_ref().map_or(&empty_actors, |maps| &maps.1),
                                 peer_info.last_sequence,
                             )
                             .await
@@ -9496,10 +9548,12 @@ impl<T: 'static> GossipRegistry<T> {
                                     "failed to create delta, falling back to full sync"
                                 );
                                 if full_sync_message.is_none() {
+                                    let (local_actors, known_actors) = actor_maps
+                                        .get_or_insert_with(|| self.snapshot_actor_maps());
                                     full_sync_message = Some(
                                         self.create_full_sync_message_from_state(
-                                            &local_actors,
-                                            &known_actors,
+                                            local_actors,
+                                            known_actors,
                                             current_sequence,
                                         )
                                         .await,
@@ -9514,10 +9568,12 @@ impl<T: 'static> GossipRegistry<T> {
                     }
                 } else {
                     if full_sync_message.is_none() {
+                        let (local_actors, known_actors) =
+                            actor_maps.get_or_insert_with(|| self.snapshot_actor_maps());
                         full_sync_message = Some(
                             self.create_full_sync_message_from_state(
-                                &local_actors,
-                                &known_actors,
+                                local_actors,
+                                known_actors,
                                 current_sequence,
                             )
                             .await,
@@ -13135,24 +13191,6 @@ impl<T: 'static> GossipRegistry<T> {
             }
         }
 
-        // Compact vector clocks in delta history
-        for delta in &gossip_state.delta_history {
-            for change in &delta.changes {
-                match change {
-                    RegistryChange::ActorAdded { location, .. } => {
-                        if location.vector_clock.len() > max_clock_size {
-                            location.vector_clock.compact(max_clock_size);
-                        }
-                    }
-                    RegistryChange::ActorRemoved { vector_clock, .. } => {
-                        if vector_clock.len() > max_clock_size {
-                            vector_clock.compact(max_clock_size);
-                        }
-                    }
-                }
-            }
-        }
-
         // Bound pending changes.
         //
         // R-12(b): drop the OLDEST entries, not the newest. `truncate` kept the
@@ -13188,7 +13226,7 @@ impl<T: 'static> GossipRegistry<T> {
         if gossip_state.delta_history.len() > self.config.max_delta_history {
             let excess = gossip_state.delta_history.len() - self.config.max_delta_history;
             debug!("Trimming delta history by {} entries", excess);
-            gossip_state.delta_history.drain(0..excess);
+            gossip_state.delta_history.drain(..excess);
         }
 
         // Bound peers list.
@@ -24124,7 +24162,7 @@ mod tests {
 
         {
             let mut state = registry.gossip_state.lock().await;
-            state.delta_history = vec![
+            state.delta_history = std::collections::VecDeque::from(vec![
                 // Genuinely expired (> 120s old): should be purged.
                 HistoricalDelta {
                     sequence: 1,
@@ -24145,7 +24183,7 @@ mod tests {
                     changes: Vec::new(),
                     recorded_at: Instant::now() + Duration::from_secs(10_000),
                 },
-            ];
+            ]);
         }
 
         // Must not panic.
@@ -28290,7 +28328,7 @@ mod tests {
         {
             let mut state = reg.gossip_state.lock().await;
             state.gossip_sequence = 10;
-            state.delta_history = vec![
+            state.delta_history = std::collections::VecDeque::from(vec![
                 HistoricalDelta {
                     sequence: 8,
                     changes: Vec::new(),
@@ -28301,7 +28339,7 @@ mod tests {
                     changes: Vec::new(),
                     recorded_at: Instant::now(),
                 },
-            ];
+            ]);
             state.peers.insert(
                 peer_addr,
                 PeerInfo {
@@ -34550,7 +34588,8 @@ mod tests {
         {
             let mut state = registry.gossip_state.lock().await;
             let mut peer = PeerInfo::local(addr);
-            peer.node_id = Some(candidate.to_node_id());
+            // Rollback only applies when a different prior owner is displaced.
+            peer.node_id = Some(test_peer_id("prior-owner").to_node_id());
             state.peers.insert(addr, peer);
             state
                 .peer_to_actors
@@ -34574,6 +34613,16 @@ mod tests {
             state.record_actor_admission(&candidate, &new_candidate_actor);
             state.record_actor_admission(&unrelated, "rollback/unrelated-new");
         }
+
+        // Simulate the speculative claim that the rollback undoes.
+        registry
+            .gossip_state
+            .lock()
+            .await
+            .peers
+            .get_mut(&addr)
+            .expect("peer")
+            .node_id = Some(candidate.to_node_id());
 
         assert!(
             registry
@@ -36791,7 +36840,8 @@ mod tests {
         {
             let mut state = registry.gossip_state.lock().await;
             let mut peer = PeerInfo::local(addr);
-            peer.node_id = Some(candidate.to_node_id());
+            // Rollback only applies when a different prior owner is displaced.
+            peer.node_id = Some(test_peer_id("prior-owner").to_node_id());
             state.peers.insert(addr, peer);
             state
                 .peer_to_actors
@@ -36821,6 +36871,16 @@ mod tests {
             name.clone(),
             RemoteActorLocation::new_with_peer(test_addr(20_133), candidate.clone()),
         );
+
+        // Simulate the speculative claim that the rollback undoes.
+        registry
+            .gossip_state
+            .lock()
+            .await
+            .peers
+            .get_mut(&addr)
+            .expect("peer")
+            .node_id = Some(candidate.to_node_id());
 
         assert!(
             registry
@@ -36855,7 +36915,8 @@ mod tests {
         {
             let mut state = registry.gossip_state.lock().await;
             let mut peer = PeerInfo::local(addr);
-            peer.node_id = Some(candidate.to_node_id());
+            // Rollback only applies when a different prior owner is displaced.
+            peer.node_id = Some(test_peer_id("prior-owner").to_node_id());
             state.peers.insert(addr, peer);
             state
                 .peer_to_actors
@@ -36871,6 +36932,16 @@ mod tests {
             .actor_state
             .known_actors
             .upsert_sync(name.clone(), other_location.clone());
+
+        // Simulate the speculative claim that the rollback undoes.
+        registry
+            .gossip_state
+            .lock()
+            .await
+            .peers
+            .get_mut(&addr)
+            .expect("peer")
+            .node_id = Some(candidate.to_node_id());
 
         assert!(
             registry
@@ -36938,5 +37009,130 @@ mod tests {
             GossipRegistry::<()>::GOSSIP_MESSAGE_SIZE_SLACK
         );
         assert!(state.compact_charge_by_name.is_empty());
+    }
+
+    /// N-2: an already-synced peer's delta must not size its buffer for the
+    /// whole actor table.
+    #[tokio::test]
+    async fn create_delta_from_state_synced_peer_does_not_preallocate_actor_tables() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_300), test_config());
+        let state = registry.gossip_state.lock().await;
+        assert_eq!(
+            GossipRegistry::<()>::delta_changes_capacity(&state, 1_000, 5_000, 7),
+            0
+        );
+        assert_eq!(
+            GossipRegistry::<()>::delta_changes_capacity(&state, 1_000, 5_000, 0),
+            6_000
+        );
+    }
+
+    /// PF-2: only peers that need a full snapshot read the actor maps.
+    #[test]
+    fn gossip_message_needs_actor_maps_only_for_full_or_bootstrap() {
+        assert!(!GossipRegistry::<()>::gossip_message_needs_actor_maps(
+            true, 5
+        ));
+        assert!(GossipRegistry::<()>::gossip_message_needs_actor_maps(
+            true, 0
+        ));
+        assert!(GossipRegistry::<()>::gossip_message_needs_actor_maps(
+            false, 5
+        ));
+    }
+
+    /// PF-1: delta history is a deque so trimming the front is O(1).
+    #[tokio::test]
+    async fn delta_history_is_a_deque_trimmed_from_the_front() {
+        let mut config = test_config();
+        config.max_delta_history = 2;
+        let registry = GossipRegistry::<()>::new(test_addr(20_310), config);
+        for _ in 0..4 {
+            {
+                let mut state = registry.gossip_state.lock().await;
+                state.pending_changes.push(RegistryChange::ActorRemoved {
+                    name: "pf1/actor".to_string(),
+                    vector_clock: crate::VectorClock::new(),
+                    removing_node_id: registry.peer_id.to_node_id(),
+                    priority: RegistrationPriority::Normal,
+                });
+            }
+            let _ = registry.prepare_gossip_round().await;
+        }
+        let state = registry.gossip_state.lock().await;
+        assert_eq!(state.delta_history.len(), 2);
+        assert_eq!(state.delta_history.front().map(|d| d.sequence), Some(3));
+        assert_eq!(state.delta_history.back().map(|d| d.sequence), Some(4));
+    }
+
+    /// PF-3: clocks are compacted once when committed to history.
+    #[tokio::test]
+    async fn prepare_gossip_round_compacts_vector_clocks_when_committing_history() {
+        let mut config = test_config();
+        config.max_vector_clock_size = 2;
+        let registry = GossipRegistry::<()>::new(test_addr(20_320), config);
+        let clock = crate::VectorClock::new();
+        for seed in ["pf3-a", "pf3-b", "pf3-c", "pf3-d"] {
+            clock.increment(test_peer_id(seed).to_node_id());
+        }
+        assert_eq!(clock.len(), 4);
+        {
+            let mut state = registry.gossip_state.lock().await;
+            state.pending_changes.push(RegistryChange::ActorRemoved {
+                name: "pf3/actor".to_string(),
+                vector_clock: clock,
+                removing_node_id: registry.peer_id.to_node_id(),
+                priority: RegistrationPriority::Normal,
+            });
+        }
+        let _ = registry.prepare_gossip_round().await;
+        let state = registry.gossip_state.lock().await;
+        let delta = state.delta_history.back().expect("committed delta");
+        match &delta.changes[0] {
+            RegistryChange::ActorRemoved { vector_clock, .. } => {
+                assert!(vector_clock.len() <= 2, "len {}", vector_clock.len())
+            }
+            other => panic!("unexpected change {other:?}"),
+        }
+    }
+
+    /// UA-2: a same-owner refresh must not clone the peer's actor set.
+    #[tokio::test]
+    async fn inbound_claim_projection_same_owner_skips_actor_clones() {
+        let registry = GossipRegistry::<()>::new(test_addr(20_330), test_config());
+        let addr = test_addr(20_331);
+        let owner = test_peer_id("ua2-owner");
+        let other = test_peer_id("ua2-other");
+        let name = "ua2/actor".to_string();
+        {
+            let mut state = registry.gossip_state.lock().await;
+            let mut peer = PeerInfo::local(addr);
+            peer.node_id = Some(owner.to_node_id());
+            state.peers.insert(addr, peer);
+            state
+                .peer_to_actors
+                .entry(addr)
+                .or_default()
+                .insert(name.clone());
+            state.record_actor_admission(&owner, &name);
+        }
+        let _ = registry.actor_state.known_actors.upsert_sync(
+            name.clone(),
+            RemoteActorLocation::new_with_peer(test_addr(20_332), owner.clone()),
+        );
+
+        let same = registry
+            .snapshot_inbound_claim_projection(addr, addr, &owner)
+            .await;
+        assert!(same.known_actor_locations.is_empty());
+        assert!(same.peer_to_actors.is_none());
+        assert!(same.actor_admission_peer_by_name.is_empty());
+
+        let different = registry
+            .snapshot_inbound_claim_projection(addr, addr, &other)
+            .await;
+        assert_eq!(different.known_actor_locations.len(), 1);
+        assert!(different.peer_to_actors.is_some());
+        assert_eq!(different.actor_admission_peer_by_name.len(), 1);
     }
 }
