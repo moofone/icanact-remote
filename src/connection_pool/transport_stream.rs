@@ -26,8 +26,72 @@ fn outbound_session_authenticated_node_id(
     r11_session_authenticated_node_id(tls_stream.get_ref().1.peer_certificates())
 }
 
+/// Rolls back the connection-scoped ownership receipt committed during an
+/// outbound dial if the dial ends before `ExitGuard` (created synchronously by
+/// `LockFreeStreamHandle::new_with_instance_id`) takes over releasing it.
+/// Disarm immediately before handing the stream to the finalizer.
+struct OutboundClaimRollbackGuard {
+    registry_weak: std::sync::Weak<GossipRegistry>,
+    peer_id: crate::PeerId,
+    addr: SocketAddr,
+    local_session_addr: SocketAddr,
+    connection_instance_id: u64,
+    armed: bool,
+}
+
+impl OutboundClaimRollbackGuard {
+    fn armed(
+        registry_weak: std::sync::Weak<GossipRegistry>,
+        peer_id: crate::PeerId,
+        addr: SocketAddr,
+        local_session_addr: SocketAddr,
+        connection_instance_id: u64,
+    ) -> Self {
+        Self {
+            registry_weak,
+            peer_id,
+            addr,
+            local_session_addr,
+            connection_instance_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for OutboundClaimRollbackGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(registry) = self.registry_weak.upgrade() else {
+            return;
+        };
+        registry.clear_peer_capabilities(&self.addr);
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let peer_id = self.peer_id.clone();
+        let local_session_addr = self.local_session_addr;
+        let connection_instance_id = self.connection_instance_id;
+        runtime.spawn(async move {
+            registry
+                .release_connection_scoped_claims_with_instance(
+                    &peer_id,
+                    local_session_addr,
+                    Some(connection_instance_id),
+                )
+                .await;
+        });
+    }
+}
+
 #[cfg(test)]
 mod r11_outbound_arming_tests {
+    use super::OutboundClaimRollbackGuard;
     use super::r11_session_authenticated_node_id;
     use crate::SecretKey;
     use crate::tls::resolver::test_self_signed_cert;
@@ -88,6 +152,92 @@ mod r11_outbound_arming_tests {
             "R-11: a genuinely re-authenticated restart must still be able \
              to arm the exemption"
         );
+    }
+    /// PB-2: an outbound dial that fails after the connection-scoped claim is
+    /// committed but before `ExitGuard` exists must not strand the receipt.
+    #[tokio::test]
+    async fn dropping_armed_outbound_claim_guard_releases_connection_scoped_claim() {
+        let registry = std::sync::Arc::new(crate::registry::GossipRegistry::new(
+            "127.0.0.1:20901".parse().unwrap(),
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing("pb2-guard-test")),
+                ..crate::GossipConfig::default()
+            },
+        ));
+        let node_id = SecretKey::generate().public();
+        let peer_id = crate::PeerId::from(&node_id);
+        let addr: std::net::SocketAddr = "127.0.0.1:20902".parse().unwrap();
+        let session: std::net::SocketAddr = "127.0.0.1:30902".parse().unwrap();
+        let instance_id = crate::connection_pool::LockFreeStreamHandle::allocate_instance_id();
+
+        let (outcome, _) = registry
+            .add_connection_scoped_peer_claim_with_instance(
+                addr,
+                node_id,
+                crate::addr_ownership::ClaimKind::Verified,
+                session,
+                Some(instance_id),
+            )
+            .await;
+        assert_eq!(outcome, crate::addr_ownership::AddrClaimOutcome::Accepted);
+        assert!(registry.registry_owner.routes_to(&addr).is_some());
+
+        let guard = OutboundClaimRollbackGuard::armed(
+            std::sync::Arc::downgrade(&registry),
+            peer_id,
+            addr,
+            session,
+            instance_id,
+        );
+        drop(guard);
+
+        for _ in 0..200 {
+            if registry.registry_owner.routes_to(&addr).is_none() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            registry.registry_owner.routes_to(&addr),
+            None,
+            "armed guard drop must release the connection-scoped claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn disarmed_outbound_claim_guard_leaves_claim_in_place() {
+        let registry = std::sync::Arc::new(crate::registry::GossipRegistry::new(
+            "127.0.0.1:20903".parse().unwrap(),
+            crate::GossipConfig {
+                key_pair: Some(crate::KeyPair::new_for_testing("pb2-guard-test-2")),
+                ..crate::GossipConfig::default()
+            },
+        ));
+        let node_id = SecretKey::generate().public();
+        let peer_id = crate::PeerId::from(&node_id);
+        let addr: std::net::SocketAddr = "127.0.0.1:20904".parse().unwrap();
+        let session: std::net::SocketAddr = "127.0.0.1:30904".parse().unwrap();
+        let instance_id = crate::connection_pool::LockFreeStreamHandle::allocate_instance_id();
+        registry
+            .add_connection_scoped_peer_claim_with_instance(
+                addr,
+                node_id,
+                crate::addr_ownership::ClaimKind::Verified,
+                session,
+                Some(instance_id),
+            )
+            .await;
+        let mut guard = OutboundClaimRollbackGuard::armed(
+            std::sync::Arc::downgrade(&registry),
+            peer_id,
+            addr,
+            session,
+            instance_id,
+        );
+        guard.disarm();
+        drop(guard);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(registry.registry_owner.routes_to(&addr).is_some());
     }
 }
 
@@ -547,6 +697,7 @@ impl<T> ConnectionPool<T> {
                     let connection_instance_id =
                         crate::connection_pool::LockFreeStreamHandle::allocate_instance_id();
 
+                    let mut claim_rollback_guard: Option<OutboundClaimRollbackGuard> = None;
                     if let Some(certs) = tls_stream.get_ref().1.peer_certificates() {
                         if let Some(cert) = certs.first() {
                             if let Ok(node_id) = crate::tls::extract_node_id_from_cert(cert) {
@@ -605,6 +756,13 @@ impl<T> ConnectionPool<T> {
                                             "outbound dial identity lost address arbitration",
                                         )));
                                     }
+                                    claim_rollback_guard = Some(OutboundClaimRollbackGuard::armed(
+                                        registry_weak.clone(),
+                                        crate::PeerId::from(&node_id),
+                                        addr,
+                                        local_session_addr,
+                                        connection_instance_id,
+                                    ));
                                 }
                                 discovered_node_id = Some(node_id);
                             }
@@ -695,7 +853,6 @@ impl<T> ConnectionPool<T> {
                         registry_arc
                             .associate_peer_capabilities_with_node(addr, node_id)
                             .await;
-                        registry_arc.mark_peer_connected(addr).await;
                     }
 
                     // R-11: precompute what OUTBOUND sessions need to arm
@@ -737,6 +894,12 @@ impl<T> ConnectionPool<T> {
                     // exemption.
                     let fresh_session_node_id = outbound_session_authenticated_node_id(&tls_stream);
 
+                    // `finalize_new_outbound_connection_with_instance` builds the
+                    // stream handle (and its `ExitGuard`) synchronously before
+                    // its first await, so teardown release now owns the claim.
+                    if let Some(guard) = claim_rollback_guard.as_mut() {
+                        guard.disarm();
+                    }
                     let finalize_started = Instant::now();
                     let result = self
                         .finalize_new_outbound_connection_with_instance(
