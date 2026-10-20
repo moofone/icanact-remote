@@ -288,6 +288,41 @@ mod qa_pool_review {
     }
 
     #[test]
+    fn into_remaining_bytes_returns_buffer_to_pool_on_drop() {
+        let payload = PooledPayload::try_from_pooled_bytes(8, |buf| {
+            buf.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        })
+        .unwrap();
+        let ptr = match payload.inner.as_ref() {
+            Some(PooledPayloadInner::Bytes(buffer)) => buffer.as_ptr(),
+            _ => unreachable!(),
+        };
+        let bytes = payload.into_remaining_bytes();
+        assert_eq!(&bytes[..], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        drop(bytes);
+
+        let pool = byte_payload_pool();
+        let mut others = Vec::new();
+        let mut found = false;
+        while let Some(buffer) = pool.queue.pop() {
+            if buffer.as_ptr() == ptr {
+                found = true;
+                pool.release_reservation(buffer.capacity());
+                break;
+            }
+            others.push(buffer);
+        }
+        for buffer in others {
+            pool.release_reservation(buffer.capacity());
+            pool.release(buffer);
+        }
+        assert!(
+            found,
+            "dropping Bytes must return the Vec to BYTE_PAYLOAD_POOL"
+        );
+    }
+
+    #[test]
     fn into_remaining_bytes_preserves_payload_and_offset() {
         let mut payload = PooledPayload::try_from_pooled_bytes(8, |buf| {
             buf.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
@@ -444,6 +479,21 @@ where
     Ok(len)
 }
 
+/// Owner for `Bytes::from_owner` that returns its buffer to the byte pool on drop.
+struct PooledByteVecOwner(Vec<u8>);
+
+impl AsRef<[u8]> for PooledByteVecOwner {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for PooledByteVecOwner {
+    fn drop(&mut self) {
+        release_byte_buffer(std::mem::take(&mut self.0));
+    }
+}
+
 /// Pooled payload that implements bytes::Buf without copying.
 pub struct PooledPayload {
     inner: Option<PooledPayloadInner>,
@@ -489,7 +539,7 @@ impl PooledPayload {
         match self.inner.take() {
             Some(PooledPayloadInner::Bytes(buffer)) => {
                 if pos == 0 && buffer.len() == len {
-                    Bytes::from(buffer)
+                    Bytes::from_owner(PooledByteVecOwner(buffer))
                 } else {
                     let bytes = Bytes::copy_from_slice(&buffer[pos..len]);
                     release_byte_buffer(buffer);

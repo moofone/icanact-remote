@@ -3603,6 +3603,23 @@ impl<T> ConnectionPool<T> {
         peers
     }
 
+    /// Remove a connection observed dead at `addr` without deleting a
+    /// successor published there after the observation.
+    fn remove_observed_dead_connection(&self, addr: SocketAddr, conn: &Arc<LockFreeConnection>) {
+        if let Some(instance_id) = conn.stream_handle.as_ref().map(|h| h.instance_id()) {
+            let _ = self.remove_connection_instance_by_id(addr, instance_id);
+        } else if self
+            .connections_by_addr
+            .remove_if_sync(&addr, |current| Arc::ptr_eq(current, conn))
+            .is_some()
+        {
+            self.clear_address_route_if_retired(addr, conn);
+            self.release_counted_connection(conn);
+            conn.abort_tasks();
+            self.mark_routing_changed();
+        }
+    }
+
     /// Get or create a persistent connection to a peer
     /// Fast path: Check for existing connection without creating new ones
     pub fn get_existing_connection(&self, addr: SocketAddr) -> Option<ConnectionHandle<T>> {
@@ -3611,9 +3628,15 @@ impl<T> ConnectionPool<T> {
         let conn = self
             .connections_by_addr
             .read_sync(&addr, |_, v| v.clone())?;
-        if !conn.is_connected() {
+        let dead = if conn.stream_handle.is_some() {
+            !conn.has_live_stream()
+        } else {
+            !conn.is_connected()
+        };
+        if dead {
             debug!(addr = %addr, "removing disconnected connection");
-            let _ = self.connections_by_addr.remove_sync(&addr);
+            conn.set_state(ConnectionState::Disconnected);
+            self.remove_observed_dead_connection(addr, &conn);
             return None;
         }
 
@@ -3710,17 +3733,6 @@ impl<T> ConnectionPool<T> {
         let handle = self
             .get_connection_with_node_id(addr, node_id_for_tls)
             .await?;
-
-        // After successful connection, ensure it's indexed by node ID
-        if let Some(conn) = self.connections_by_addr.read_sync(&addr, |_, v| v.clone()) {
-            self.publish_current_peer_connection(peer_id, conn);
-            let _ = self.addr_to_peer_id.upsert_sync(addr, peer_id.clone());
-            debug!(
-                "CONNECTION POOL: Indexed new connection under peer ID '{}'",
-                peer_id
-            );
-        }
-
         Ok(handle)
     }
 
@@ -3775,7 +3787,7 @@ impl<T> ConnectionPool<T> {
                         if stream_handle.exit_flag.load(Ordering::Acquire) {
                             debug!(addr = %addr, "found closed stream handle, removing stale connection");
                             conn.set_state(ConnectionState::Disconnected);
-                            let _ = self.connections_by_addr.remove_sync(&addr);
+                            self.remove_observed_dead_connection(addr, &conn);
                         } else {
                             conn.update_last_used();
                             debug!(addr = %addr, "found existing lock-free connection, reusing handle");
@@ -3794,7 +3806,7 @@ impl<T> ConnectionPool<T> {
                     }
                 } else {
                     debug!(addr = %addr, "removing disconnected connection");
-                    let _ = self.connections_by_addr.remove_sync(&addr);
+                    self.remove_observed_dead_connection(addr, &conn);
                 }
             }
 
