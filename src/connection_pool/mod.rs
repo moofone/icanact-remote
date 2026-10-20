@@ -97,14 +97,6 @@ impl DisconnectDeliveryState {
                         };
                     }
                 }
-                2 => {
-                    // The callback already linearized entry. Publication is
-                    // deliberately reentrant and needs no exclusion.
-                    return DisconnectPublicationGuard {
-                        state: self,
-                        owned: false,
-                    };
-                }
                 _ => std::thread::yield_now(),
             }
         }
@@ -132,15 +124,15 @@ pub(crate) struct DisconnectDeliveryClaim {
 
 impl DisconnectDeliveryClaim {
     /// Enter user callback code iff publication did not supersede the armed
-    /// notification. The claim is dropped immediately after this CAS, so the
-    /// entered phase is only the linearization handoff, never a user-code lock.
+    /// notification. A single CAS moves Armed directly to Idle, so no
+    /// intermediate state exists for publication to observe.
     pub(crate) fn enter(mut self) -> bool {
         let entered = self
             .state
             .generation
             .compare_exchange(
                 self.armed,
-                self.armed.wrapping_add(1),
+                self.armed.wrapping_add(3),
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
@@ -152,17 +144,14 @@ impl DisconnectDeliveryClaim {
 
 impl Drop for DisconnectDeliveryClaim {
     fn drop(&mut self) {
-        let (expected, next) = if self.entered {
-            (self.armed.wrapping_add(1), self.armed.wrapping_add(3))
-        } else {
-            (self.armed, self.armed.wrapping_add(3))
-        };
-        let _ = self.state.generation.compare_exchange(
-            expected,
-            next,
-            Ordering::Release,
-            Ordering::Acquire,
-        );
+        if !self.entered {
+            let _ = self.state.generation.compare_exchange(
+                self.armed,
+                self.armed.wrapping_add(3),
+                Ordering::Release,
+                Ordering::Acquire,
+            );
+        }
     }
 }
 
@@ -228,6 +217,133 @@ mod disconnect_delivery_tests {
             STATE.try_arm().is_some(),
             "publication must leave the state idle"
         );
+    }
+
+    #[test]
+    fn publication_always_owns_publishing_state_while_callbacks_enter() {
+        static STATE: DisconnectDeliveryState = DisconnectDeliveryState::new();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let notifier_stop = stop.clone();
+        let notifier = std::thread::spawn(move || {
+            while !notifier_stop.load(std::sync::atomic::Ordering::Acquire) {
+                if let Some(claim) = STATE.try_arm() {
+                    let _ = claim.enter();
+                }
+            }
+        });
+        for _ in 0..200_000 {
+            let publication = STATE.begin();
+            assert_eq!(
+                STATE.generation.load(std::sync::atomic::Ordering::Acquire) & 3,
+                3,
+                "begin() must always own the Publishing state"
+            );
+            drop(publication);
+        }
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        notifier.join().unwrap();
+    }
+
+    #[test]
+    fn entered_claim_returns_to_idle_and_publication_then_blocks_arming() {
+        static STATE: DisconnectDeliveryState = DisconnectDeliveryState::new();
+        let claim = STATE.try_arm().expect("test callback must arm");
+        assert!(claim.enter());
+        let publication = STATE.begin();
+        assert_eq!(
+            STATE.generation.load(std::sync::atomic::Ordering::Acquire) & 3,
+            3
+        );
+        assert!(STATE.try_arm().is_none());
+        drop(publication);
+        assert!(STATE.try_arm().is_some());
+    }
+
+    #[test]
+    fn observed_dead_connection_removal_is_identity_scoped() {
+        let pool = ConnectionPool::<()>::new(4, Duration::from_secs(1));
+        let addr: SocketAddr = "127.0.0.1:41002".parse().unwrap();
+        let dead = Arc::new(LockFreeConnection::new(addr, ConnectionDirection::Outbound));
+        let replacement = Arc::new(LockFreeConnection::new(addr, ConnectionDirection::Outbound));
+        let _ = pool
+            .connections_by_addr
+            .upsert_sync(addr, replacement.clone());
+
+        pool.remove_observed_dead_connection(addr, &dead);
+        assert!(
+            pool.connections_by_addr
+                .read_sync(&addr, |_, c| Arc::ptr_eq(c, &replacement))
+                .unwrap_or(false),
+            "replacement published at addr must survive removal of the observed dead connection"
+        );
+
+        let _ = pool.connections_by_addr.upsert_sync(addr, dead.clone());
+        pool.remove_observed_dead_connection(addr, &dead);
+        assert!(
+            pool.connections_by_addr
+                .read_sync(&addr, |_, _| ())
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_connection_lookup_rejects_connected_state_with_exited_stream() {
+        let pool = ConnectionPool::<()>::new(4, Duration::from_secs(1));
+        let addr: SocketAddr = "127.0.0.1:41003".parse().unwrap();
+        let (io, _peer_io) = tokio::io::duplex(1024);
+        let (stream_handle, _w, _r) = super::LockFreeStreamHandle::new(
+            io,
+            addr,
+            super::ChannelId::Global,
+            super::BufferConfig::default(),
+            None,
+            None,
+        );
+        stream_handle
+            .exit_flag
+            .store(true, std::sync::atomic::Ordering::Release);
+        let mut conn = LockFreeConnection::new(addr, ConnectionDirection::Outbound);
+        conn.stream_handle = Some(Arc::new(stream_handle));
+        conn.set_state(super::ConnectionState::Connected);
+        let _ = pool.connections_by_addr.upsert_sync(addr, Arc::new(conn));
+
+        assert!(pool.get_existing_connection(addr).is_none());
+        assert!(
+            pool.connections_by_addr
+                .read_sync(&addr, |_, _| ())
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn get_connection_to_peer_at_does_not_publish_address_entry_under_peer() {
+        let pool = ConnectionPool::<()>::new(4, Duration::from_secs(1));
+        let addr: SocketAddr = "127.0.0.1:41004".parse().unwrap();
+        let peer_id = crate::KeyPair::new_for_testing("lane-a-peer").peer_id();
+        let (io, _peer_io) = tokio::io::duplex(1024);
+        let (stream_handle, _w, _r) = super::LockFreeStreamHandle::new(
+            io,
+            addr,
+            super::ChannelId::Global,
+            super::BufferConfig::default(),
+            None,
+            None,
+        );
+        let mut conn = LockFreeConnection::new(addr, ConnectionDirection::Outbound);
+        conn.stream_handle = Some(Arc::new(stream_handle));
+        conn.set_state(super::ConnectionState::Connected);
+        let conn = Arc::new(conn);
+        let _ = pool.connections_by_addr.upsert_sync(addr, conn);
+
+        pool.get_connection_to_peer_at(&peer_id, addr)
+            .await
+            .expect("address connection is reused");
+
+        assert!(
+            pool.get_connection_by_peer_id(&peer_id).is_none(),
+            "post-connect indexing must not overwrite peer session with the address entry"
+        );
+        assert!(pool.addr_to_peer_id.read_sync(&addr, |_, _| ()).is_none());
     }
 
     #[test]
